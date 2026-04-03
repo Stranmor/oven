@@ -171,11 +171,36 @@ impl TryFrom<forge_domain::Context> for Request {
             Some(Thinking::Disabled) | None => 8192,
         };
 
-        Ok(Self {
-            max_tokens: request
+        let max_tokens = match &thinking {
+            Some(Thinking::Enabled { budget_tokens }) => {
+                let req_max = request
+                    .max_tokens
+                    .map(|v| v as u64)
+                    .unwrap_or(default_max_tokens);
+                if req_max <= *budget_tokens {
+                    budget_tokens.saturating_add(1024)
+                } else {
+                    req_max
+                }
+            }
+            Some(Thinking::Adaptive { .. }) | Some(Thinking::Disabled) | None => request
                 .max_tokens
-                .map(|t| t as u64)
+                .map(|v| v as u64)
                 .unwrap_or(default_max_tokens),
+        };
+
+        let (temperature, top_p, top_k) = if thinking.is_some() {
+            (None, None, None)
+        } else {
+            (
+                request.temperature.map(|t| t.value()),
+                request.top_p.map(|t| t.value()),
+                request.top_k.map(|t| t.value() as u64),
+            )
+        };
+
+        Ok(Self {
+            max_tokens,
             messages: request
                 .messages
                 .into_iter()
@@ -192,9 +217,9 @@ impl TryFrom<forge_domain::Context> for Request {
             } else {
                 Some(system_messages)
             },
-            temperature: request.temperature.map(|t| t.value()),
-            top_p: request.top_p.map(|t| t.value()),
-            top_k: request.top_k.map(|t| t.value() as u64),
+            temperature,
+            top_p,
+            top_k,
             tool_choice: request.tool_choice.and_then(|tc| match tc {
                 forge_domain::ToolChoice::None => None,
                 other => Some(ToolChoice::from(other)),
@@ -266,13 +291,17 @@ impl TryFrom<ContextMessage> for Message {
                 }
 
                 if !chat_message.content.is_empty() {
-                    // NOTE: Anthropic does not allow empty text content.
                     content.push(Content::Text { text: chat_message.content, cache_control: None });
                 }
+
                 if let Some(tool_calls) = chat_message.tool_calls {
                     for tool_call in tool_calls {
                         content.push(tool_call.try_into()?);
                     }
+                }
+
+                if content.is_empty() {
+                    content.push(Content::Text { text: ".".to_string(), cache_control: None });
                 }
 
                 match chat_message.role {
