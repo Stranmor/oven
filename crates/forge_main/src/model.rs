@@ -674,6 +674,10 @@ pub enum AppCommand {
     #[command(skip)]
     AgentSwitch(String),
 
+    /// Paste image from clipboard
+    #[strum(props(usage = "Paste image from clipboard"))]
+    Paste,
+
     /// Generate and optionally commit changes with AI-generated message
     ///
     /// Examples:
@@ -745,6 +749,7 @@ impl AppCommand {
             AppCommand::WorkspaceInfo => "workspace-info",
             AppCommand::WorkspaceInit => "workspace-init",
             AppCommand::Subchats => "subchats",
+            AppCommand::Paste => "paste",
         }
     }
 
