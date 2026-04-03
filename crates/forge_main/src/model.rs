@@ -445,10 +445,11 @@ pub enum SlashCommand {
 
     /// Switch directly to a specific agent by ID
     #[strum(props(usage = "Switch directly to a specific agent"))]
+    AgentSwitch(String),
+
     /// Paste image from clipboard
     #[strum(props(usage = "Paste image from clipboard"))]
     Paste,
-    AgentSwitch(String),
 
     /// Generate and optionally commit changes with AI-generated message
     ///
