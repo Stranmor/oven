@@ -118,18 +118,15 @@ mod tests {
 
         let mut output = String::new();
 
-        // Check if first system message is cached
-        let system_cached = request
-            .system
-            .as_ref()
-            .and_then(|sys| sys.first())
-            .map(|msg| msg.is_cached())
-            .unwrap_or(false);
-
-        if system_cached {
-            output.push('[');
+        // Check which system messages are cached
+        if let Some(sys) = request.system.as_ref() {
+            for (i, msg) in sys.iter().enumerate() {
+                if msg.is_cached() {
+                    output.push('[');
+                }
+                output.push(system_messages.chars().nth(i).unwrap());
+            }
         }
-        output.push_str(system_messages);
 
         // Check which regular messages are cached
         let cached_indices = request
@@ -206,7 +203,7 @@ mod tests {
     #[test]
     fn test_with_system_message_multiple_conversation_messages() {
         let actual = create_test_context_with_system("ss", "uaua");
-        let expected = "[ssuau[a";
+        let expected = "[s[suau[a";
         assert_eq!(actual, expected);
     }
 

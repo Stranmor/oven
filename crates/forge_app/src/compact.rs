@@ -395,7 +395,11 @@ mod tests {
         let actual = compactor.compress_single_sequence(context, (2, 4)).unwrap();
 
         // Check the first assistant message (R0)
-        let first_assistant = actual.messages.iter().find(|msg| msg.has_role(forge_domain::Role::Assistant)).unwrap();
+        let first_assistant = actual
+            .messages
+            .iter()
+            .find(|msg| msg.has_role(forge_domain::Role::Assistant))
+            .unwrap();
         if let ContextMessage::Text(text_msg) = &**first_assistant {
             assert_eq!(
                 text_msg.reasoning_details.as_ref(),
@@ -407,7 +411,12 @@ mod tests {
         }
 
         // Check the targeted assistant message (R2), which is now the second assistant message
-        let second_assistant = actual.messages.iter().filter(|msg| msg.has_role(forge_domain::Role::Assistant)).nth(1).unwrap();
+        let second_assistant = actual
+            .messages
+            .iter()
+            .filter(|msg| msg.has_role(forge_domain::Role::Assistant))
+            .nth(1)
+            .unwrap();
         if let ContextMessage::Text(text_msg) = &**second_assistant {
             assert_eq!(
                 text_msg.reasoning_details.as_ref(),

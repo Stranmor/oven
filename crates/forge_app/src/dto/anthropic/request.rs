@@ -2,6 +2,8 @@ use derive_setters::Setters;
 use forge_domain::{ContextMessage, Image};
 use serde::{Deserialize, Serialize};
 
+const DEFAULT_THINKING_BUDGET_TOKENS: u64 = 10_000;
+
 #[derive(Serialize, Default, Setters)]
 #[setters(into, strip_option)]
 pub struct Request {
@@ -163,14 +165,17 @@ impl TryFrom<forge_domain::Context> for Request {
             (None, None)
         };
 
-        let default_max_tokens = if let Some(t) = &thinking {
-            t.budget_tokens + 4096
-        } else {
-            8192
+        let default_max_tokens = match &thinking {
+            Some(Thinking::Enabled { budget_tokens }) => budget_tokens.saturating_add(4096),
+            Some(Thinking::Adaptive { .. }) => DEFAULT_THINKING_BUDGET_TOKENS.saturating_add(4096),
+            Some(Thinking::Disabled) | None => 8192,
         };
 
         Ok(Self {
-            max_tokens: request.max_tokens.map(|t| t as u64).unwrap_or(default_max_tokens),
+            max_tokens: request
+                .max_tokens
+                .map(|t| t as u64)
+                .unwrap_or(default_max_tokens),
             messages: request
                 .messages
                 .into_iter()
@@ -182,11 +187,18 @@ impl TryFrom<forge_domain::Context> for Request {
                 .into_iter()
                 .map(ToolDefinition::try_from)
                 .collect::<std::result::Result<Vec<_>, _>>()?,
-            system: Some(system_messages),
+            system: if system_messages.is_empty() {
+                None
+            } else {
+                Some(system_messages)
+            },
             temperature: request.temperature.map(|t| t.value()),
             top_p: request.top_p.map(|t| t.value()),
             top_k: request.top_k.map(|t| t.value() as u64),
-            tool_choice: request.tool_choice.map(ToolChoice::from),
+            tool_choice: request.tool_choice.and_then(|tc| match tc {
+                forge_domain::ToolChoice::None => None,
+                other => Some(ToolChoice::from(other)),
+            }),
             stream: Some(request.stream.unwrap_or(true)),
             thinking,
             output_config,
