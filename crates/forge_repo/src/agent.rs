@@ -54,6 +54,12 @@ impl<I: FileInfoInfra + EnvironmentInfra + DirectoryReaderInfra> ForgeAgentRepos
 
         // Load custom agents from global directory
         let dir = self.infra.get_environment().agent_path();
+        if !self.infra.exists(&dir).await.unwrap_or(false) {
+            tracing::warn!(
+                "Global custom agents directory is missing: {}",
+                dir.display()
+            );
+        }
         let custom_agents = self.init_agent_dir(&dir).await?;
         agents.extend(custom_agents);
 
@@ -93,12 +99,19 @@ impl<I: FileInfoInfra + EnvironmentInfra + DirectoryReaderInfra> ForgeAgentRepos
 
         let mut agents = Vec::new();
         for (path, content) in files {
-            let mut agent = parse_agent_file(&content)
-                .with_context(|| format!("Failed to parse agent: {}", path.display()))?;
-
-            // Store the file path
-            agent.path = Some(path.display().to_string());
-            agents.push(agent);
+            match parse_agent_file(&content) {
+                Ok(mut agent) => {
+                    agent.path = Some(path.display().to_string());
+                    agents.push(agent);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to load/parse custom agent at {}: {}",
+                        path.display(),
+                        err
+                    );
+                }
+            }
         }
 
         Ok(agents)

@@ -369,6 +369,7 @@ mod tests {
         let test_id = ConversationId::generate();
         let fixture = ConversationRecord {
             conversation_id: test_id.into_string(),
+            parent_id: None,
             title: Some("Test Conversation".to_string()),
             context: None,
             created_at: Utc::now().naive_utc(),
@@ -813,6 +814,7 @@ mod tests {
         let test_id = ConversationId::generate();
         let fixture = ConversationRecord {
             conversation_id: test_id.into_string(),
+            parent_id: None,
             title: Some("Test Conversation".to_string()),
             context: Some("invalid json".to_string()), // Invalid JSON to trigger error
             created_at: Utc::now().naive_utc(),
