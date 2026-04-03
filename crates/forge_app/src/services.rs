@@ -643,7 +643,9 @@ impl<I: Services> ConversationService for I {
         &self,
         parent_id: &ConversationId,
     ) -> anyhow::Result<Option<Vec<Conversation>>> {
-        self.conversation_service().get_sub_conversations(parent_id).await
+        self.conversation_service()
+            .get_sub_conversations(parent_id)
+            .await
     }
 
     async fn last_conversation(&self) -> anyhow::Result<Option<Conversation>> {

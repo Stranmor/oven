@@ -142,6 +142,7 @@ impl Compactor {
             && let Some(ContextMessage::Text(msg)) = context
                 .messages
                 .iter_mut()
+                .skip(start)
                 .find(|msg| msg.has_role(forge_domain::Role::Assistant))
                 .map(|msg| &mut **msg)
             && msg
@@ -331,6 +332,71 @@ mod tests {
                 text_msg.reasoning_details.as_ref(),
                 Some(&non_empty_reasoning),
                 "Should skip most recent empty reasoning and preserve earlier non-empty"
+            );
+        } else {
+            panic!("Expected TextMessage");
+        }
+    }
+
+    #[test]
+    fn test_compact_reasoning_injection_skips_preceding_messages() {
+        use forge_domain::ReasoningFull;
+
+        let environment = test_environment();
+        let compactor = Compactor::new(Compact::new(), environment);
+
+        let preceding_reasoning = vec![ReasoningFull {
+            text: Some("Preceding thought".to_string()),
+            signature: Some("sig0".to_string()),
+            ..Default::default()
+        }];
+
+        let compacted_reasoning = vec![ReasoningFull {
+            text: Some("Compacted thought".to_string()),
+            signature: Some("sig1".to_string()),
+            ..Default::default()
+        }];
+
+        let context = Context::default()
+            .add_message(ContextMessage::user("M0", None))
+            .add_message(ContextMessage::assistant(
+                "R0",
+                None,
+                Some(preceding_reasoning.clone()),
+                None,
+            )) // Index 1: preceding assistant message
+            .add_message(ContextMessage::user("M1", None)) // Index 2: start of compaction
+            .add_message(ContextMessage::assistant(
+                "R1",
+                None,
+                Some(compacted_reasoning.clone()),
+                None,
+            )) // Index 3
+            .add_message(ContextMessage::user("M2", None)) // Index 4: end of compaction
+            .add_message(ContextMessage::assistant("R2", None, None, None)); // Index 5: target message
+
+        // Compact indices 2 to 4
+        let actual = compactor.compress_single_sequence(context, (2, 4)).unwrap();
+
+        // Check the first assistant message (R0)
+        let first_assistant = actual.messages.iter().find(|msg| msg.has_role(forge_domain::Role::Assistant)).unwrap();
+        if let ContextMessage::Text(text_msg) = &**first_assistant {
+            assert_eq!(
+                text_msg.reasoning_details.as_ref(),
+                Some(&preceding_reasoning),
+                "Preceding reasoning should remain unchanged"
+            );
+        } else {
+            panic!("Expected TextMessage");
+        }
+
+        // Check the targeted assistant message (R2), which is now the second assistant message
+        let second_assistant = actual.messages.iter().filter(|msg| msg.has_role(forge_domain::Role::Assistant)).nth(1).unwrap();
+        if let ContextMessage::Text(text_msg) = &**second_assistant {
+            assert_eq!(
+                text_msg.reasoning_details.as_ref(),
+                Some(&compacted_reasoning),
+                "Compacted reasoning should be injected into the targeted message"
             );
         } else {
             panic!("Expected TextMessage");
