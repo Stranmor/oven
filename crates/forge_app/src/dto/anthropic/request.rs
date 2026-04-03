@@ -191,11 +191,16 @@ impl TryFrom<forge_domain::Context> for Request {
                 .into_iter()
                 .map(ToolDefinition::try_from)
                 .collect::<std::result::Result<Vec<_>, _>>()?,
-            system: Some(system_messages),
+            system: if system_messages.is_empty() { None } else { Some(system_messages) },
             temperature: request.temperature.map(|t| t.value()),
             top_p: request.top_p.map(|t| t.value()),
             top_k: request.top_k.map(|t| t.value() as u64),
-            tool_choice: request.tool_choice.map(ToolChoice::from),
+            tool_choice: request.tool_choice.and_then(|tc| {
+                match tc {
+                    forge_domain::ToolChoice::None => None,
+                    other => Some(ToolChoice::from(other)),
+                }
+            }),
             stream: Some(request.stream.unwrap_or(true)),
             thinking,
             output_config,

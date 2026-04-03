@@ -24,12 +24,12 @@ impl Transformer for SetCache {
             return request;
         }
 
-        // Cache the very first system message, ideally you should keep static content
+        // Cache the very last system message, ideally you should keep static content
         // in it.
         if let Some(system_messages) = request.system.as_mut()
-            && let Some(first_message) = system_messages.first_mut()
+            && let Some(last_message) = system_messages.last_mut()
         {
-            *first_message = std::mem::take(first_message).cached(true);
+            *last_message = std::mem::take(last_message).cached(true);
         } else {
             // If no system messages, we can still cache the first message in the
             // conversation.
@@ -110,18 +110,15 @@ mod tests {
 
         let mut output = String::new();
 
-        // Check if first system message is cached
-        let system_cached = request
-            .system
-            .as_ref()
-            .and_then(|sys| sys.first())
-            .map(|msg| msg.is_cached())
-            .unwrap_or(false);
-
-        if system_cached {
-            output.push('[');
+        // Check which system messages are cached
+        if let Some(sys) = request.system.as_ref() {
+            for (i, msg) in sys.iter().enumerate() {
+                if msg.is_cached() {
+                    output.push('[');
+                }
+                output.push(system_messages.chars().nth(i).unwrap());
+            }
         }
-        output.push_str(system_messages);
 
         // Check which regular messages are cached
         let cached_indices = request
@@ -198,7 +195,7 @@ mod tests {
     #[test]
     fn test_with_system_message_multiple_conversation_messages() {
         let actual = create_test_context_with_system("ss", "uaua");
-        let expected = "[ssuau[a";
+        let expected = "s[suau[a";
         assert_eq!(actual, expected);
     }
 
@@ -217,8 +214,8 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_system_messages_only_first_cached() {
-        // This test assumes multiple system messages are possible, but only first is
+    fn test_multiple_system_messages_only_last_cached() {
+        // This test assumes multiple system messages are possible, but only last is
         // cached
         let context = Context {
             conversation_id: None,
@@ -247,10 +244,10 @@ mod tests {
         let mut transformer = SetCache;
         let request = transformer.transform(request);
 
-        // Check that only first system message is cached
+        // Check that only last system message is cached
         let system_messages = request.system.as_ref().unwrap();
-        assert_eq!(system_messages[0].is_cached(), true);
-        assert_eq!(system_messages[1].is_cached(), false);
+        assert_eq!(system_messages[0].is_cached(), false);
+        assert_eq!(system_messages[1].is_cached(), true);
 
         // Check that last conversation message is cached
         assert_eq!(request.get_messages().last().unwrap().is_cached(), true);
