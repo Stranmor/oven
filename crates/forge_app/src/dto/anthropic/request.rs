@@ -163,7 +163,14 @@ impl TryFrom<forge_domain::Context> for Request {
             (None, None)
         };
 
+        let default_max_tokens = if let Some(t) = &thinking {
+            t.budget_tokens + 4096
+        } else {
+            8192
+        };
+
         Ok(Self {
+            max_tokens: request.max_tokens.map(|t| t as u64).unwrap_or(default_max_tokens),
             messages: request
                 .messages
                 .into_iter()
@@ -868,5 +875,27 @@ mod tests {
         let actual = Request::try_from(fixture).unwrap();
 
         assert_eq!(actual.stream, Some(false));
+    }
+
+    #[test]
+    fn test_max_tokens_default_when_not_provided() {
+        let fixture = Context::default();
+        let actual = Request::try_from(fixture).unwrap();
+
+        assert_eq!(actual.max_tokens, 8192);
+    }
+
+    #[test]
+    fn test_max_tokens_when_thinking_enabled() {
+        let fixture = Context::default().reasoning(ReasoningConfig {
+            enabled: Some(true),
+            max_tokens: None,
+            effort: None,
+            exclude: None,
+        });
+        let actual = Request::try_from(fixture).unwrap();
+
+        // Default budget is 10000, max_tokens should be 10000 + 4096 = 14096
+        assert_eq!(actual.max_tokens, 14096);
     }
 }

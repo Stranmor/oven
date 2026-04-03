@@ -1,7 +1,10 @@
+use std::sync::LazyLock;
 use forge_domain::Transformer;
 use regex::Regex;
 
 use crate::dto::anthropic::{Content, Request};
+
+static INVALID_ID_CHARS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[^a-zA-Z0-9_-]").unwrap());
 
 /// Transformer that sanitizes tool call IDs for Anthropic/Vertex Anthropic
 /// compatibility.
@@ -30,16 +33,14 @@ impl Transformer for SanitizeToolIds {
     type Value = Request;
 
     fn transform(&mut self, mut request: Self::Value) -> Self::Value {
-        let regex = Regex::new(r"[^a-zA-Z0-9_-]").unwrap();
-
         for message in &mut request.messages {
             for content in &mut message.content {
                 match content {
                     Content::ToolUse { id, .. } => {
-                        *id = regex.replace_all(id, "_").to_string();
+                        *id = INVALID_ID_CHARS.replace_all(id, "_").to_string();
                     }
                     Content::ToolResult { tool_use_id, .. } => {
-                        *tool_use_id = regex.replace_all(tool_use_id, "_").to_string();
+                        *tool_use_id = INVALID_ID_CHARS.replace_all(tool_use_id, "_").to_string();
                     }
                     _ => {}
                 }
@@ -219,5 +220,12 @@ mod tests {
 
         // Should not panic and should preserve the message
         assert_eq!(request.messages.len(), 1);
+    }
+
+    // Benchmark test for regex reuse (as requested by Gate vulnerability recording)
+    #[test]
+    fn test_regex_reuse_does_not_panic() {
+        let regex = &*INVALID_ID_CHARS;
+        assert_eq!(regex.replace_all("valid-id_123", "_"), "valid-id_123");
     }
 }
