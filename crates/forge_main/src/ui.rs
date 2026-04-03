@@ -2898,7 +2898,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn() -> A + Send + Sync> UI<A, F> {
 
         // Print if the state is being reinitialized
         if self.state.conversation_id.is_none() {
-            self.print_conversation_status(is_new, id)?;
+            self.print_conversation_status(is_new, id).await?;
         }
 
         // Always set the conversation id in state
@@ -2907,7 +2907,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn() -> A + Send + Sync> UI<A, F> {
         Ok(id)
     }
 
-    fn print_conversation_status(
+    async fn print_conversation_status(
         &mut self,
         new_conversation: bool,
         id: ConversationId,
@@ -2919,6 +2919,14 @@ impl<A: API + ConsoleWriter + 'static, F: Fn() -> A + Send + Sync> UI<A, F> {
         };
 
         title.push_str(format!(" {}", id.into_string()).as_str());
+
+        if !new_conversation {
+            if let Ok(Some(conversation)) = self.api.conversation(&id).await {
+                if let Some(conv_title) = conversation.title {
+                    title.push_str(&format!(" ({})", conv_title));
+                }
+            }
+        }
 
         self.writeln_title(TitleFormat::debug(title))?;
         Ok(())
