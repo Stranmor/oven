@@ -4042,8 +4042,14 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             ChatResponse::TaskComplete => {
                 writer.finish()?;
                 if let Some(conversation_id) = self.state.conversation_id {
+                    let mut title_str = "Finished".to_string();
+                    if let Ok(Some(conversation)) = self.api.conversation(&conversation_id).await {
+                        if let Some(conv_title) = conversation.title {
+                            title_str = format!("Finished: {}", conv_title);
+                        }
+                    }
                     self.writeln_title(
-                        TitleFormat::debug("Finished").sub_title(conversation_id.into_string()),
+                        TitleFormat::debug(title_str).sub_title(conversation_id.into_string()),
                     )?;
                 }
                 if let Some(format) = self.config.auto_dump.clone() {
