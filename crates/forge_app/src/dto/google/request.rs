@@ -324,7 +324,7 @@ impl From<Context> for Request {
         // Convert messages (excluding system messages)
         // Group consecutive tool results into single Content objects to match Google's
         // API requirements
-        let mut contents: Vec<Content> = Vec::new();
+        let mut raw_contents: Vec<Content> = Vec::new();
         let mut pending_tool_parts: Vec<Part> = Vec::new();
 
         for msg in context
@@ -340,7 +340,7 @@ impl From<Context> for Request {
                 other => {
                     // Flush any pending tool results first
                     if !pending_tool_parts.is_empty() {
-                        contents.push(Content {
+                        raw_contents.push(Content {
                             role: Some(Role::User),
                             parts: std::mem::take(&mut pending_tool_parts),
                         });
@@ -349,7 +349,7 @@ impl From<Context> for Request {
                     // Add the current non-tool message
                     let content = Content::from(other);
                     if !content.parts.is_empty() {
-                        contents.push(content);
+                        raw_contents.push(content);
                     }
                 }
             }
@@ -357,7 +357,19 @@ impl From<Context> for Request {
 
         // Flush any remaining tool results
         if !pending_tool_parts.is_empty() {
-            contents.push(Content { role: Some(Role::User), parts: pending_tool_parts });
+            raw_contents.push(Content { role: Some(Role::User), parts: pending_tool_parts });
+        }
+
+        // Google API strictly requires alternating roles. Merge consecutive contents with the same role.
+        let mut contents: Vec<Content> = Vec::new();
+        for content in raw_contents {
+            if let Some(last) = contents.last_mut() {
+                if last.role == content.role {
+                    last.parts.extend(content.parts);
+                    continue;
+                }
+            }
+            contents.push(content);
         }
 
         // Convert tools

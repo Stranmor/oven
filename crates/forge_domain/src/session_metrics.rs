@@ -41,6 +41,31 @@ impl Metrics {
         self
     }
 
+    /// Merges another Metrics instance into this one
+    pub fn merge(&mut self, other: &Self) {
+        for (path, op) in &other.file_operations {
+            if let Some(existing) = self.file_operations.get_mut(path) {
+                existing.lines_added += op.lines_added;
+                existing.lines_removed += op.lines_removed;
+                if op.content_hash.is_some() {
+                    existing.content_hash = op.content_hash.clone();
+                }
+            } else {
+                self.file_operations.insert(path.clone(), op.clone());
+            }
+        }
+        for path in &other.files_accessed {
+            self.files_accessed.insert(path.clone());
+        }
+        for todo in &other.todos {
+            if let Some(existing) = self.todos.iter_mut().find(|t| t.content == todo.content) {
+                existing.status = todo.status.clone();
+            } else {
+                self.todos.push(todo.clone());
+            }
+        }
+    }
+
     /// Gets the session duration if tracking has started
     pub fn duration(&self, now: DateTime<Utc>) -> Option<Duration> {
         self.started_at

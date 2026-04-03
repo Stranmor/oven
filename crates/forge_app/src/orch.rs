@@ -208,8 +208,9 @@ impl<S: AgentService> Orchestrator<S> {
 
         // Retrieve the number of requests allowed per tick.
         let max_requests_per_turn = self.agent.max_requests_per_turn;
-        let tool_context =
-            ToolCallContext::new(self.conversation.metrics.clone()).sender(self.sender.clone());
+        let tool_context = ToolCallContext::new(self.conversation.metrics.clone())
+            .sender(self.sender.clone())
+            .conversation_id(Some(self.conversation.id));
 
         while !should_yield {
             // Set context for the current loop iteration
@@ -268,8 +269,14 @@ impl<S: AgentService> Orchestrator<S> {
 
             // Turn is completed, if finish_reason is 'stop'. Gemini models return stop as
             // finish reason with tool calls.
-            is_complete =
+            let is_stop_reason =
                 message.finish_reason == Some(FinishReason::Stop) && message.tool_calls.is_empty();
+
+            // We must also yield if the response has no tool calls AND no content,
+            // otherwise we will loop indefinitely sending empty text back.
+            let is_empty_loop = message.tool_calls.is_empty() && message.content.is_empty();
+
+            is_complete = is_stop_reason || is_empty_loop;
 
             // Should yield if a tool is asking for a follow-up
             should_yield = is_complete

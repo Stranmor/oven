@@ -61,6 +61,13 @@ impl ForgeEditor {
             ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
         );
 
+        // on CTRL + V press inserts an image from clipboard
+        keybindings.add_binding(
+            KeyModifiers::CONTROL,
+            KeyCode::Char('v'),
+            ReedlineEvent::ExecuteHostCommand("!forge_internal_paste_image".to_string()),
+        );
+
         keybindings
     }
 
@@ -100,10 +107,30 @@ impl ForgeEditor {
     }
 
     pub fn prompt(&mut self, prompt: &dyn Prompt) -> anyhow::Result<ReadResult> {
-        let signal = self.editor.read_line(prompt);
-        signal
-            .map(Into::into)
-            .map_err(|e| anyhow::anyhow!(ReadLineError(e)))
+        loop {
+            let signal = self.editor.read_line(prompt);
+            let signal = signal.map_err(|e| anyhow::anyhow!(ReadLineError(e)))?;
+            
+            match signal {
+                Signal::Success(buffer) => {
+                    if buffer == "!forge_internal_paste_image" {
+                        if let Some(img_path) = crate::image_paste::paste_image() {
+                            let text = format!(" @[{}] ", img_path.display());
+                            self.editor.run_edit_commands(&[EditCommand::InsertString(text)]);
+                        }
+                        continue;
+                    }
+                    let trimmed = buffer.trim();
+                    if trimmed.is_empty() {
+                        return Ok(ReadResult::Empty);
+                    } else {
+                        return Ok(ReadResult::Success(trimmed.to_string()));
+                    }
+                }
+                Signal::CtrlC => return Ok(ReadResult::Continue),
+                Signal::CtrlD => return Ok(ReadResult::Exit),
+            }
+        }
     }
 
     /// Sets the buffer content to be pre-filled on the next prompt
@@ -117,19 +144,4 @@ impl ForgeEditor {
 #[error(transparent)]
 pub struct ReadLineError(std::io::Error);
 
-impl From<Signal> for ReadResult {
-    fn from(signal: Signal) -> Self {
-        match signal {
-            Signal::Success(buffer) => {
-                let trimmed = buffer.trim();
-                if trimmed.is_empty() {
-                    ReadResult::Empty
-                } else {
-                    ReadResult::Success(trimmed.to_string())
-                }
-            }
-            Signal::CtrlC => ReadResult::Continue,
-            Signal::CtrlD => ReadResult::Exit,
-        }
-    }
-}
+

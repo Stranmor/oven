@@ -1781,6 +1781,48 @@ impl<A: API + ConsoleWriter + 'static, F: Fn() -> A + Send + Sync> UI<A, F> {
         Ok(())
     }
 
+    async fn list_subchats(&mut self) -> anyhow::Result<()> {
+        let parent_id = match &self.state.conversation_id {
+            Some(id) => id.clone(),
+            None => {
+                self.writeln_title(TitleFormat::error("No active conversation to find subchats for."))?;
+                return Ok(());
+            }
+        };
+
+        self.spinner.start(Some("Loading Subchats"))?;
+        let conversations = self.api.get_sub_conversations(&parent_id).await?;
+        self.spinner.stop(None)?;
+
+        if conversations.is_empty() {
+            self.writeln_title(TitleFormat::error(
+                "No subchats found for this conversation.",
+            ))?;
+            return Ok(());
+        }
+
+        if let Some(conversation) =
+            ConversationSelector::select_conversation(&conversations, self.state.conversation_id)
+                .await?
+        {
+            let conversation_id = conversation.id;
+            self.state.conversation_id = Some(conversation_id);
+
+            // Show conversation content
+            self.on_show_last_message(conversation, false).await?;
+
+            // Print log about conversation switching
+            self.writeln_title(TitleFormat::info(format!(
+                "Switched to subchat {}",
+                conversation_id.into_string().bold()
+            )))?;
+
+            // Show conversation info
+            self.on_info(false, Some(conversation_id)).await?;
+        }
+        Ok(())
+    }
+
     async fn on_show_conversations(&mut self, porcelain: bool) -> anyhow::Result<()> {
         let max_conversations = self.api.get_config().max_conversations;
         let conversations = self.api.get_conversations(Some(max_conversations)).await?;
@@ -1839,6 +1881,9 @@ impl<A: API + ConsoleWriter + 'static, F: Fn() -> A + Send + Sync> UI<A, F> {
         match command {
             SlashCommand::Conversations => {
                 self.list_conversations().await?;
+            }
+            SlashCommand::Subchats => {
+                self.list_subchats().await?;
             }
             SlashCommand::Compact => {
                 self.spinner.start(Some("Compacting"))?;

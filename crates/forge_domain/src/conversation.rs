@@ -42,6 +42,7 @@ impl FromStr for ConversationId {
 #[setters(into)]
 pub struct Conversation {
     pub id: ConversationId,
+    pub parent_id: Option<ConversationId>,
     pub title: Option<String>,
     pub context: Option<Context>,
     pub metrics: Metrics,
@@ -67,6 +68,7 @@ impl Conversation {
         let metrics = Metrics::default().started_at(created_at);
         Self {
             id,
+            parent_id: None,
             metrics,
             metadata: MetaData::new(created_at),
             title: None,
