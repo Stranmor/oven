@@ -3,7 +3,7 @@ use forge_domain::Transformer;
 use crate::dto::anthropic::Request;
 
 /// Transformer that implements a simple two-breakpoint cache strategy:
-/// - Always caches the first message in the conversation
+/// - Caches the last system message (if any), otherwise the first message in the conversation
 /// - Always caches the last message in the conversation
 /// - Removes cache control from the second-to-last message
 pub struct SetCache;
@@ -12,7 +12,7 @@ impl Transformer for SetCache {
     type Value = Request;
 
     /// Implements a simple two-breakpoint cache strategy:
-    /// 1. Cache the first system message as it should be static.
+    /// 1. Cache the last system message (to cache all system messages), or the first conversation message if no system messages exist.
     /// 2. Cache the last message (index messages.len() - 1)
     /// 3. Remove cache control from second-to-last message (index
     ///    messages.len() - 2)
@@ -25,16 +25,22 @@ impl Transformer for SetCache {
         }
 
         // Cache the very last system message, ideally you should keep static content
-        // in it.
-        if let Some(system_messages) = request.system.as_mut()
-            && let Some(last_message) = system_messages.last_mut()
-        {
+        // in it. If there are no system messages, cache the first conversation message.
+        if let Some(last_message) = request.system.as_mut().and_then(|sys| sys.last_mut()) {
             *last_message = std::mem::take(last_message).cached(true);
-        } else {
-            // If no system messages, we can still cache the first message in the
-            // conversation.
-            if let Some(first_message) = request.get_messages_mut().first_mut() {
-                *first_message = std::mem::take(first_message).cached(true);
+        } else if let Some(first_message) = request.get_messages_mut().first_mut() {
+            *first_message = std::mem::take(first_message).cached(true);
+        }
+
+        // Remove cache control from second-to-last message, unless it is the first conversation message
+        // and we have no system messages.
+        if len >= 2 {
+            let second_to_last_idx = len - 2;
+            let is_first_conv_msg_without_sys = request.system.as_ref().map_or(true, |s| s.is_empty()) && second_to_last_idx == 0;
+            
+            if !is_first_conv_msg_without_sys {
+                let second_to_last = &mut request.get_messages_mut()[second_to_last_idx];
+                *second_to_last = std::mem::take(second_to_last).cached(false);
             }
         }
 
