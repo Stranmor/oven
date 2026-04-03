@@ -73,7 +73,7 @@ enable-ansi-support.workspace = true
 windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
-arboard = "3.4"
+arboard = { version = "3.4", features = ["wayland-data-control"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "time", "test-util"] }

@@ -114,8 +114,14 @@ impl ForgeEditor {
             match signal {
                 Signal::Success(buffer) => {
                     if buffer == "!forge_internal_paste_image" {
-                        if let Some(img_path) = crate::image_paste::paste_image() {
-                            let text = format!(" @[{}] ", img_path.display());
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/forge_paste.log") {
+                            let _ = writeln!(&mut f, "Received !forge_internal_paste_image");
+                            use std::io::Write;
+                        }
+                        let img_paths = crate::image_paste::paste_image();
+
+                        if !img_paths.is_empty() {
+                            let text = img_paths.iter().map(|p| format!(" @[{}] ", p.display())).collect::<Vec<_>>().join("");
                             self.editor.run_edit_commands(&[EditCommand::InsertString(text)]);
                         }
                         continue;
