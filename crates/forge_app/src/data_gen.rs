@@ -155,7 +155,7 @@ impl<A: Services> DataGenerationApp<A> {
             })
             .flat_map(|data| match data {
                 Ok(data) => stream::iter(data).map(Ok).boxed(),
-                Err(err) => stream::iter(Err(err)).boxed(),
+                Err(err) => stream::iter(std::iter::once(Err(err))).boxed(),
             })
             .boxed();
 
