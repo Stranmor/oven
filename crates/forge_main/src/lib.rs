@@ -6,6 +6,7 @@ mod display_constants;
 mod editor;
 mod error;
 mod highlighter;
+mod image_paste;
 mod info;
 mod input;
 mod logs;

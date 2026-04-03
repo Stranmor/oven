@@ -66,9 +66,12 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> AgentEx
             // Create context with agent initiator since it's spawned by a parent agent
             // This is crucial for GitHub Copilot billing optimization
             let context = forge_domain::Context::default().initiator("agent".to_string());
-            let conversation = Conversation::generate()
+            let mut conversation = Conversation::generate()
                 .title(task.clone())
                 .context(context.clone());
+            if let Some(parent_id) = ctx.conversation_id {
+                conversation.parent_id = Some(parent_id);
+            }
             self.services
                 .conversation_service()
                 .upsert_conversation(conversation.clone())

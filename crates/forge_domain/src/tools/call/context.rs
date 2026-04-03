@@ -7,6 +7,7 @@ use crate::{ArcSender, ChatResponse, Metrics, TitleFormat, Todo, TodoItem};
 /// Provides additional context for tool calls.
 #[derive(Debug, Clone, Setters)]
 pub struct ToolCallContext {
+    pub conversation_id: Option<crate::ConversationId>,
     sender: Option<ArcSender>,
     metrics: Arc<Mutex<Metrics>>,
 }
@@ -14,7 +15,11 @@ pub struct ToolCallContext {
 impl ToolCallContext {
     /// Creates a new ToolCallContext with default values
     pub fn new(metrics: Metrics) -> Self {
-        Self { sender: None, metrics: Arc::new(Mutex::new(metrics)) }
+        Self {
+            conversation_id: None,
+            sender: None,
+            metrics: Arc::new(Mutex::new(metrics)),
+        }
     }
 
     /// Send a message through the sender if available

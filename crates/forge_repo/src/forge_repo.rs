@@ -136,6 +136,15 @@ impl<F: Send + Sync> ConversationRepository for ForgeRepo<F> {
             .await
     }
 
+    async fn get_sub_conversations(
+        &self,
+        parent_id: &ConversationId,
+    ) -> anyhow::Result<Option<Vec<Conversation>>> {
+        self.conversation_repository
+            .get_sub_conversations(parent_id)
+            .await
+    }
+
     async fn get_last_conversation(&self) -> anyhow::Result<Option<Conversation>> {
         self.conversation_repository.get_last_conversation().await
     }

@@ -243,6 +243,12 @@ pub trait ConversationService: Send + Sync {
         limit: Option<usize>,
     ) -> anyhow::Result<Option<Vec<Conversation>>>;
 
+    /// Find sub-conversations (subagent chats) for a parent conversation
+    async fn get_sub_conversations(
+        &self,
+        parent_id: &ConversationId,
+    ) -> anyhow::Result<Option<Vec<Conversation>>>;
+
     /// Find the last active conversation
     async fn last_conversation(&self) -> anyhow::Result<Option<Conversation>>;
 
@@ -614,6 +620,15 @@ impl<I: Services> ConversationService for I {
         limit: Option<usize>,
     ) -> anyhow::Result<Option<Vec<Conversation>>> {
         self.conversation_service().get_conversations(limit).await
+    }
+
+    async fn get_sub_conversations(
+        &self,
+        parent_id: &ConversationId,
+    ) -> anyhow::Result<Option<Vec<Conversation>>> {
+        self.conversation_service()
+            .get_sub_conversations(parent_id)
+            .await
     }
 
     async fn last_conversation(&self) -> anyhow::Result<Option<Conversation>> {

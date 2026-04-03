@@ -650,6 +650,11 @@ pub enum AppCommand {
         id: Option<String>,
     },
 
+    /// List subagent conversations for the current conversation
+    #[strum(props(usage = "List subagent conversations for the current conversation"))]
+    #[command(alias = "subconversations")]
+    Subchats,
+
     /// Delete a conversation permanently
     #[strum(props(usage = "Delete a conversation permanently"))]
     #[command(skip)]
@@ -739,6 +744,7 @@ impl AppCommand {
             AppCommand::WorkspaceStatus => "workspace-status",
             AppCommand::WorkspaceInfo => "workspace-info",
             AppCommand::WorkspaceInit => "workspace-init",
+            AppCommand::Subchats => "subchats",
         }
     }
 
