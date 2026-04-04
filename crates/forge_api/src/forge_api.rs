@@ -166,7 +166,10 @@ impl<A: Services, F: CommandInfra + EnvironmentInfra + SkillRepository + GrpcInf
             .unwrap_or_default())
     }
 
-    async fn get_sub_conversations(&self, parent_id: &ConversationId) -> anyhow::Result<Vec<Conversation>> {
+    async fn get_sub_conversations(
+        &self,
+        parent_id: &ConversationId,
+    ) -> anyhow::Result<Vec<Conversation>> {
         Ok(self
             .services
             .get_sub_conversations(parent_id)

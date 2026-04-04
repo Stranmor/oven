@@ -1785,7 +1785,9 @@ impl<A: API + ConsoleWriter + 'static, F: Fn() -> A + Send + Sync> UI<A, F> {
         let parent_id = match &self.state.conversation_id {
             Some(id) => id.clone(),
             None => {
-                self.writeln_title(TitleFormat::error("No active conversation to find subchats for."))?;
+                self.writeln_title(TitleFormat::error(
+                    "No active conversation to find subchats for.",
+                ))?;
                 return Ok(());
             }
         };
@@ -1892,8 +1894,12 @@ impl<A: API + ConsoleWriter + 'static, F: Fn() -> A + Send + Sync> UI<A, F> {
             SlashCommand::Paste => {
                 let img_paths = crate::image_paste::paste_image();
 
-                        if !img_paths.is_empty() {
-                            let text = img_paths.iter().map(|p| format!(" @[{}] ", p.display())).collect::<Vec<_>>().join("");
+                if !img_paths.is_empty() {
+                    let text = img_paths
+                        .iter()
+                        .map(|p| format!(" @[{}] ", p.display()))
+                        .collect::<Vec<_>>()
+                        .join("");
                     self.console.set_buffer(text);
                 }
             }

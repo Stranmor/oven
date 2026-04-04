@@ -57,7 +57,10 @@ impl<S: ConversationRepository> ConversationService for ForgeConversationService
             .await
     }
 
-    async fn get_sub_conversations(&self, parent_id: &ConversationId) -> Result<Option<Vec<Conversation>>> {
+    async fn get_sub_conversations(
+        &self,
+        parent_id: &ConversationId,
+    ) -> Result<Option<Vec<Conversation>>> {
         self.conversation_repository
             .get_sub_conversations(parent_id)
             .await

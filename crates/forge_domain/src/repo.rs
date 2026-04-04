@@ -73,7 +73,10 @@ pub trait ConversationRepository: Send + Sync {
         limit: Option<usize>,
     ) -> Result<Option<Vec<Conversation>>>;
 
-    async fn get_sub_conversations(&self, parent_id: &ConversationId) -> Result<Option<Vec<Conversation>>>;
+    async fn get_sub_conversations(
+        &self,
+        parent_id: &ConversationId,
+    ) -> Result<Option<Vec<Conversation>>>;
 
     /// Retrieves the most recent conversation
     ///

@@ -211,8 +211,8 @@ impl<S: Services> ForgeApp<S> {
             .ok_or_else(|| forge_domain::Error::ConversationNotFound(*conversation_id))?;
 
         // Get the context from the conversation
-        let context = match conversation.context.as_ref() {
-            Some(context) => context.clone(),
+        let context = match conversation.context.take() {
+            Some(context) => context,
             None => {
                 // No context to compact, return zero metrics
                 return Ok(CompactionResult::new(0, 0, 0, 0));
@@ -229,12 +229,7 @@ impl<S: Services> ForgeApp<S> {
         let agent = self.services.get_agent(&active_agent_id).await?;
 
         let Some(agent) = agent else {
-            return Ok(CompactionResult::new(
-                original_token_count,
-                0,
-                original_messages,
-                0,
-            ));
+            return Err(crate::Error::AgentNotFound(active_agent_id).into());
         };
 
         // Get compact config from the agent
