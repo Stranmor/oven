@@ -491,12 +491,15 @@ impl TryFrom<forge_domain::ToolResult> for Content {
         Ok(Content::ToolResult {
             tool_use_id: call_id.as_str().to_string(),
             cache_control: None,
-            content: value
-                .output
-                .values
-                .iter()
-                .filter_map(|item| item.as_str().map(|s| s.to_string()))
-                .next(),
+            content: Some(
+                value
+                    .output
+                    .values
+                    .iter()
+                    .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                    .next()
+                    .unwrap_or_default(),
+            ),
             is_error: Some(value.is_error()),
         })
     }

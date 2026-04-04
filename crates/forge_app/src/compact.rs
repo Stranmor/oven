@@ -150,10 +150,8 @@ impl Compactor {
             .messages
             .splice(start..=end, std::iter::once(summary_entry));
 
-        // Remove all droppable messages from the context
-        context.messages.retain(|msg| !msg.is_droppable());
-
         // Inject preserved reasoning into first assistant message (if empty)
+        // Must happen BEFORE retain() so indices (like `start`) remain accurately aligned
         if let Some(reasoning) = reasoning_details
             && let Some(ContextMessage::Text(msg)) = context
                 .messages
@@ -168,6 +166,9 @@ impl Compactor {
         {
             msg.reasoning_details = Some(reasoning);
         }
+
+        // Remove all droppable messages from the context
+        context.messages.retain(|msg| !msg.is_droppable());
 
         Ok(context)
     }

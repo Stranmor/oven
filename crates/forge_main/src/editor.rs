@@ -199,29 +199,3 @@ impl EditMode for ForgeEditMode {
         self.inner.edit_mode()
     }
 }
-
-impl From<Signal> for ReadResult {
-    fn from(signal: Signal) -> Self {
-        match signal {
-            Signal::Success(buffer) => {
-                let trimmed = buffer.trim();
-                if trimmed.is_empty() {
-                    ReadResult::Empty
-                } else {
-                    ReadResult::Success(trimmed.to_string())
-                }
-            }
-            Signal::ExternalBreak(buffer) => {
-                let trimmed = buffer.trim();
-                if trimmed.is_empty() {
-                    ReadResult::Empty
-                } else {
-                    ReadResult::Success(trimmed.to_string())
-                }
-            }
-            Signal::CtrlC => ReadResult::Continue,
-            Signal::CtrlD => ReadResult::Exit,
-            _ => ReadResult::Continue,
-        }
-    }
-}
