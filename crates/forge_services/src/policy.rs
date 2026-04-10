@@ -276,7 +276,7 @@ mod tests {
         let path = PathBuf::from("/path/to/file.rs");
         let operation = PermissionOperation::Read {
             path,
-            cwd: std::path::PathBuf::from("/test/cwd"),
+            cwd: "/test/cwd".to_string(),
             message: "Read file: /path/to/file.rs".to_string(),
         };
 
@@ -295,7 +295,7 @@ mod tests {
         let path = PathBuf::from("/path/to/file.json");
         let operation = PermissionOperation::Write {
             path,
-            cwd: std::path::PathBuf::from("/test/cwd"),
+            cwd: "/test/cwd".to_string(),
             message: "Create/overwrite file: /path/to/file.json".to_string(),
         };
 
@@ -314,7 +314,7 @@ mod tests {
         let path = PathBuf::from("/path/to/file.toml");
         let operation = PermissionOperation::Write {
             path,
-            cwd: std::path::PathBuf::from("/test/cwd"),
+            cwd: "/test/cwd".to_string(),
             message: "Modify file: /path/to/file.toml".to_string(),
         };
 
@@ -333,7 +333,7 @@ mod tests {
         let url = "https://example.com/api/data".to_string();
         let operation = PermissionOperation::Fetch {
             url,
-            cwd: std::path::PathBuf::from("/test/cwd"),
+            cwd: "/test/cwd".to_string(),
             message: "Fetch content from URL: https://example.com/api/data".to_string(),
         };
 
@@ -351,7 +351,7 @@ mod tests {
     fn test_create_policy_for_execute_operation_with_subcommand() {
         let command = "git push origin main".to_string();
         let operation =
-            PermissionOperation::Execute { command, cwd: std::path::PathBuf::from("/test/cwd") };
+            PermissionOperation::Execute { command, cwd: "/test/cwd".to_string() };
 
         let actual = create_policy_for_operation(&operation, None);
 
@@ -367,7 +367,7 @@ mod tests {
     fn test_create_policy_for_execute_operation_single_command() {
         let command = "ls".to_string();
         let operation =
-            PermissionOperation::Execute { command, cwd: std::path::PathBuf::from("/test/cwd") };
+            PermissionOperation::Execute { command, cwd: "/test/cwd".to_string() };
 
         let actual = create_policy_for_operation(&operation, None);
 
@@ -384,7 +384,7 @@ mod tests {
         let path = PathBuf::from("/path/to/file");
         let operation = PermissionOperation::Read {
             path,
-            cwd: std::path::PathBuf::from("/test/cwd"),
+            cwd: "/test/cwd".to_string(),
             message: "Read file: /path/to/file".to_string(),
         };
 
@@ -400,7 +400,7 @@ mod tests {
         let url = "not-a-valid-url".to_string();
         let operation = PermissionOperation::Fetch {
             url,
-            cwd: std::path::PathBuf::from("/test/cwd"),
+            cwd: "/test/cwd".to_string(),
             message: "Fetch content from URL: not-a-valid-url".to_string(),
         };
 
@@ -418,7 +418,7 @@ mod tests {
     fn test_create_policy_for_empty_execute_command() {
         let command = "".to_string();
         let operation =
-            PermissionOperation::Execute { command, cwd: std::path::PathBuf::from("/test/cwd") };
+            PermissionOperation::Execute { command, cwd: "/test/cwd".to_string() };
 
         let actual = create_policy_for_operation(&operation, None);
 
@@ -431,7 +431,7 @@ mod tests {
     fn test_create_policy_for_execute_operation_with_working_directory() {
         let command = "ls".to_string();
         let operation =
-            PermissionOperation::Execute { command, cwd: std::path::PathBuf::from("/test/cwd") };
+            PermissionOperation::Execute { command, cwd: "/test/cwd".to_string() };
         let working_directory = Some("/home/user/project".to_string());
 
         let actual = create_policy_for_operation(&operation, working_directory.clone());

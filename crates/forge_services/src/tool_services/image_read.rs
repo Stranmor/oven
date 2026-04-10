@@ -54,7 +54,7 @@ impl<
 > ImageReadService for ForgeImageRead<F>
 {
     async fn read_image(&self, path: String) -> anyhow::Result<Image> {
-        let path = Path::new(&path);
+        let path = Path::new(&input_path);
         assert_absolute_path(path)?;
 
         let max_image_size_bytes = self.infra.get_config()?.max_image_size_bytes;

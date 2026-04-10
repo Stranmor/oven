@@ -11,7 +11,7 @@ impl FormatContent for ToolCatalog {
 
         match self {
             ToolCatalog::Read(input) => {
-                let display_path = display_path_for(&input.file_path);
+                let display_path = display_path_for(&input.file_path.to_string_lossy());
                 let is_explicit_range = input.start_line.is_some() || input.end_line.is_some();
                 let mut subtitle = display_path;
                 if is_explicit_range {
@@ -32,7 +32,7 @@ impl FormatContent for ToolCatalog {
             }
             ToolCatalog::Write(input) => {
                 let path = PathBuf::from(&input.file_path);
-                let display_path = display_path_for(&input.file_path);
+                let display_path = display_path_for(&input.file_path.to_string_lossy());
                 let title = match (path.exists(), input.overwrite) {
                     (true, true) => "Overwrite",
                     (true, false) => {
@@ -80,11 +80,11 @@ impl FormatContent for ToolCatalog {
                 )
             }
             ToolCatalog::Remove(input) => {
-                let display_path = display_path_for(&input.path);
+                let display_path = display_path_for(&input.path.to_string_lossy());
                 Some(TitleFormat::debug("Remove").sub_title(display_path).into())
             }
             ToolCatalog::Patch(input) => {
-                let display_path = display_path_for(&input.file_path);
+                let display_path = display_path_for(&input.file_path.to_string_lossy());
                 let operation_name = if input.replace_all {
                     "Replace All"
                 } else {
@@ -97,7 +97,7 @@ impl FormatContent for ToolCatalog {
                 )
             }
             ToolCatalog::MultiPatch(input) => {
-                let display_path = display_path_for(&input.file_path);
+                let display_path = display_path_for(&input.file_path.to_string_lossy());
                 Some(
                     TitleFormat::debug("Replace")
                         .sub_title(format!("{} ({} edits)", display_path, input.edits.len()))
@@ -105,7 +105,7 @@ impl FormatContent for ToolCatalog {
                 )
             }
             ToolCatalog::Undo(input) => {
-                let display_path = display_path_for(&input.path);
+                let display_path = display_path_for(&input.path.to_string_lossy());
                 Some(TitleFormat::debug("Undo").sub_title(display_path).into())
             }
             ToolCatalog::Shell(input) => Some(
@@ -134,7 +134,7 @@ impl FormatContent for ToolCatalog {
             ),
             ToolCatalog::TodoRead(_) => Some(TitleFormat::debug("Read Todos").into()),
             ToolCatalog::Task(input) => {
-                Some(TitleFormat::debug("Task").sub_title(&input.agent_id).into())
+                Some(TitleFormat::debug("Task").sub_title(input.agent_id.to_string()).into())
             }
         }
     }

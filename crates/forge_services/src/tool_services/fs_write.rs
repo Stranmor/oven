@@ -45,11 +45,11 @@ impl<
 {
     async fn write(
         &self,
-        path: String,
+        path: std::path::PathBuf,
         content: String,
         overwrite: bool,
     ) -> anyhow::Result<FsWriteOutput> {
-        let path = Path::new(&path);
+        let path = Path::new(&input_path);
         assert_absolute_path(path)?;
 
         // Validate file syntax using remote validation API (graceful failure)
@@ -59,7 +59,7 @@ impl<
             .await
             .unwrap_or_default();
 
-        if let Some(parent) = Path::new(&path).parent() {
+        if let Some(parent) = Path::new(&input_path).parent() {
             self.infra
                 .create_dirs(parent)
                 .await

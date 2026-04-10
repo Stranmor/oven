@@ -334,7 +334,7 @@ impl<F: FileWriterInfra + SnapshotRepository + ValidationRepository + FuzzySearc
 {
     async fn patch(
         &self,
-        input_path: String,
+        input_path: std::path::PathBuf,
         search: String,
         content: String,
         replace_all: bool,
@@ -414,7 +414,7 @@ impl<F: FileWriterInfra + SnapshotRepository + ValidationRepository + FuzzySearc
 
     async fn multi_patch(
         &self,
-        input_path: String,
+        input_path: std::path::PathBuf,
         edits: Vec<forge_domain::PatchEdit>,
     ) -> anyhow::Result<PatchOutput> {
         let path = Path::new(&input_path);

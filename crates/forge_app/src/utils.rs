@@ -47,7 +47,7 @@ pub use forge_domain::truncate_key;
 
 pub fn format_match(matched: &Match, base_dir: &Path) -> String {
     match &matched.result {
-        Some(MatchResult::Error(err)) => format!("Error reading {}: {}", matched.path, err),
+        Some(MatchResult::Error(err)) => format!("Error reading {}: {}", matched.path.display(), err),
         Some(MatchResult::Found { line_number, line }) => {
             let path = format_display_path(Path::new(&matched.path), base_dir);
             match line_number {

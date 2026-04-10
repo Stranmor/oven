@@ -8,8 +8,9 @@ use uuid::Uuid;
 
 use crate::{Context, Error, Metrics, Result, TokenCount};
 
-#[derive(Debug, Default, Display, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Display, Serialize, Deserialize, Clone, PartialEq, Eq, Hash, schemars::JsonSchema)]
 #[serde(transparent)]
+#[schemars(with = "String")]
 pub struct ConversationId(Uuid);
 
 impl Copy for ConversationId {}

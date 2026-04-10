@@ -154,7 +154,7 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
 
             // Validate tool modality support before execution
             // Only resolve the current model when modality validation is needed.
-            if matches!(&tool_input, ToolCatalog::Read(input) if Self::has_image_extension(&input.file_path))
+            if matches!(&tool_input, ToolCatalog::Read(input) if Self::has_image_extension(&input.file_path.to_string_lossy()))
             {
                 let model = self.get_current_model().await;
                 Self::validate_tool_modality(&tool_input, model.as_ref())?;
@@ -347,13 +347,7 @@ impl<S> ToolRegistry<S> {
         let matches = ToolResolver::is_allowed(agent, tool_name);
         if !matches {
             tracing::error!(tool_name = %tool_name, "No tool with name");
-            let supported_tools = agent
-                .tools
-                .iter()
-                .flatten()
-                .map(|t| t.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
+            let supported_tools = agent.tools.clone().unwrap_or_default();
             return Err(Error::NotAllowed { name: tool_name.clone(), supported_tools });
         }
         Ok(())
@@ -385,7 +379,7 @@ impl<S> ToolRegistry<S> {
         // Currently, only the read tool can return image content
         if let ToolCatalog::Read(input) = tool_input {
             // Check if the file extension suggests it's an image
-            if Self::has_image_extension(&input.file_path) {
+            if Self::has_image_extension(&input.file_path.to_string_lossy()) {
                 // Check if the model supports image input
                 let supports_image = model
                     .and_then(|m| {
@@ -397,19 +391,10 @@ impl<S> ToolRegistry<S> {
 
                 if !supports_image {
                     let tool_name = ToolKind::Read.name();
-                    let required_modality = "image".to_string();
+                    let required_modality = InputModality::Image;
                     let supported_modalities = model
-                        .map(|m| {
-                            m.input_modalities
-                                .iter()
-                                .map(|im| match im {
-                                    InputModality::Text => "text".to_string(),
-                                    InputModality::Image => "image".to_string(),
-                                })
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        })
-                        .unwrap_or_else(|| "unknown".to_string());
+                        .map(|m| m.input_modalities.clone())
+                        .unwrap_or_default();
 
                     return Err(Error::UnsupportedModality {
                         tool_name,

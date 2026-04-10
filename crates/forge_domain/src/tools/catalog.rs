@@ -84,14 +84,16 @@ pub struct TaskInput {
 
     /// The ID of the specialized agent to delegate to (e.g., "sage", "forge",
     /// "muse")
-    pub agent_id: String,
+    #[eserde(compat)]
+    pub agent_id: crate::AgentId,
 
     /// Optional session ID to continue an existing agent session. If not
     /// provided, a new stateless session will be created. Use this to
     /// maintain context across multiple task invocations with the same
     /// agent.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
+    #[eserde(compat)]
+    pub session_id: Option<crate::ConversationId>,
 }
 
 fn default_true() -> bool {
@@ -193,12 +195,12 @@ impl Todo {
 pub struct FSRead {
     /// The absolute path to the file to read
     #[serde(alias = "path")]
-    pub file_path: String,
+    pub file_path: std::path::PathBuf,
 
     /// The line number to start reading from starting from 1 not 0. Only
     /// provide if the file is too large to read at once
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub start_line: Option<i32>,
+    pub start_line: Option<u32>,
 
     /// If true, prefixes each line with its line index (starting at 1).
     /// Defaults to true.
@@ -208,7 +210,7 @@ pub struct FSRead {
     /// The line number to stop reading at (inclusive). Only provide if the file
     /// is too large to read at once
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub end_line: Option<i32>,
+    pub end_line: Option<u32>,
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema, ToolDescription, PartialEq)]
@@ -216,7 +218,7 @@ pub struct FSRead {
 pub struct FSWrite {
     /// The absolute path to the file to write (must be absolute, not relative)
     #[serde(alias = "path")]
-    pub file_path: String,
+    pub file_path: std::path::PathBuf,
 
     /// The content to write to the file
     pub content: String,
@@ -536,7 +538,7 @@ impl JsonSchema for OutputMode {
 pub struct FSPatch {
     /// The absolute path to the file to modify
     #[serde(alias = "path")]
-    pub file_path: String,
+    pub file_path: std::path::PathBuf,
 
     /// The text to replace
     #[serde(alias = "search")]
@@ -571,7 +573,7 @@ pub struct PatchEdit {
 #[tool_description_file = "crates/forge_domain/src/tools/descriptions/fs_multi_patch.md"]
 pub struct FSMultiPatch {
     /// The absolute path to the file to modify
-    pub file_path: String,
+    pub file_path: std::path::PathBuf,
 
     /// Array of edit operations to perform sequentially on the file
     pub edits: Vec<PatchEdit>,
@@ -1022,7 +1024,7 @@ impl ToolCatalog {
     /// Creates a Read tool call with the specified path
     pub fn tool_call_read(path: &str) -> ToolCallFull {
         ToolCallFull::from(ToolCatalog::Read(FSRead {
-            file_path: path.to_string(),
+            file_path: path.into(),
             ..Default::default()
         }))
     }
@@ -1030,7 +1032,7 @@ impl ToolCatalog {
     /// Creates a Write tool call with the specified path and content
     pub fn tool_call_write(path: &str, content: &str) -> ToolCallFull {
         ToolCallFull::from(ToolCatalog::Write(FSWrite {
-            file_path: path.to_string(),
+            file_path: path.into(),
             content: content.to_string(),
             ..Default::default()
         }))
@@ -1044,7 +1046,7 @@ impl ToolCatalog {
         replace_all: bool,
     ) -> ToolCallFull {
         ToolCallFull::from(ToolCatalog::Patch(FSPatch {
-            file_path: path.to_string(),
+            file_path: path.into(),
             old_string: search.to_string(),
             new_string: content.to_string(),
             replace_all,
@@ -1053,7 +1055,7 @@ impl ToolCatalog {
 
     /// Creates a Remove tool call with the specified path
     pub fn tool_call_remove(path: &str) -> ToolCallFull {
-        ToolCallFull::from(ToolCatalog::Remove(FSRemove { path: path.to_string() }))
+        ToolCallFull::from(ToolCatalog::Remove(FSRemove { path: path.into() }))
     }
 
     /// Creates a Shell tool call with the specified command and working
@@ -1082,7 +1084,7 @@ impl ToolCatalog {
 
     /// Creates an Undo tool call with the specified path
     pub fn tool_call_undo(path: &str) -> ToolCallFull {
-        ToolCallFull::from(ToolCatalog::Undo(FSUndo { path: path.to_string() }))
+        ToolCallFull::from(ToolCatalog::Undo(FSUndo { path: path.into() }))
     }
 
     /// Creates a Fetch tool call with the specified url
@@ -1286,7 +1288,7 @@ mod tests {
         );
 
         if let Ok(ToolCatalog::Read(fs_read)) = actual {
-            assert_eq!(fs_read.file_path, "/test/path.rs");
+            assert_eq!(fs_read.file_path, "/test/path.rs".to_string());
             assert_eq!(fs_read.start_line, Some(10));
             assert_eq!(fs_read.end_line, Some(20));
         } else {
@@ -1316,7 +1318,7 @@ mod tests {
         );
 
         if let Ok(ToolCatalog::Read(fs_read)) = actual {
-            assert_eq!(fs_read.file_path, "/test/path.rs");
+            assert_eq!(fs_read.file_path, "/test/path.rs".to_string());
             assert_eq!(fs_read.start_line, Some(10));
             assert_eq!(fs_read.end_line, Some(20));
         } else {
@@ -1346,7 +1348,7 @@ mod tests {
         );
 
         if let Ok(ToolCatalog::Read(fs_read)) = actual {
-            assert_eq!(fs_read.file_path, "/test/path.rs");
+            assert_eq!(fs_read.file_path, "/test/path.rs".to_string());
             assert_eq!(fs_read.start_line, Some(10));
             assert_eq!(fs_read.end_line, Some(20));
         } else {
@@ -1376,7 +1378,7 @@ mod tests {
         );
 
         if let Ok(ToolCatalog::Write(fs_write)) = actual {
-            assert_eq!(fs_write.file_path, "/test/path.rs");
+            assert_eq!(fs_write.file_path, "/test/path.rs".to_string());
             assert_eq!(fs_write.content, "test content");
         } else {
             panic!("Expected FSWrite variant");
@@ -1585,7 +1587,7 @@ mod tests {
         );
 
         if let Ok(ToolCatalog::Patch(fs_patch)) = actual {
-            assert_eq!(fs_patch.file_path, "/test/file.rs");
+            assert_eq!(fs_patch.file_path, "/test/file.rs".to_string());
         } else {
             panic!("Expected FSPatch variant");
         }
@@ -1669,7 +1671,7 @@ mod tests {
         );
 
         if let Ok(ToolCatalog::Patch(fs_patch)) = actual {
-            assert_eq!(fs_patch.file_path, "/test/file.rs");
+            assert_eq!(fs_patch.file_path, "/test/file.rs".to_string());
             assert_eq!(fs_patch.old_string, "old text");
             assert_eq!(fs_patch.new_string, "new content");
         } else {
@@ -1696,7 +1698,7 @@ mod tests {
         assert!(actual.is_ok(), "Should successfully parse new field names");
 
         if let Ok(ToolCatalog::Patch(fs_patch)) = actual {
-            assert_eq!(fs_patch.file_path, "/test/file.rs");
+            assert_eq!(fs_patch.file_path, "/test/file.rs".to_string());
             assert_eq!(fs_patch.old_string, "old text");
             assert_eq!(fs_patch.new_string, "new content");
         } else {

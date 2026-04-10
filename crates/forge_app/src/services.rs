@@ -338,7 +338,7 @@ pub trait FsWriteService: Send + Sync {
     /// Create a file at the specified path with the given content.
     async fn write(
         &self,
-        path: String,
+        path: std::path::PathBuf,
         content: String,
         overwrite: bool,
     ) -> anyhow::Result<FsWriteOutput>;
@@ -360,7 +360,7 @@ pub trait FsPatchService: Send + Sync {
     /// Patches a file at the specified path with the given content.
     async fn patch(
         &self,
-        path: String,
+        path: std::path::PathBuf,
         search: String,
         content: String,
         replace_all: bool,
@@ -369,7 +369,7 @@ pub trait FsPatchService: Send + Sync {
     /// Applies multiple patches to a single file in sequence
     async fn multi_patch(
         &self,
-        path: String,
+        path: std::path::PathBuf,
         edits: Vec<forge_domain::PatchEdit>,
     ) -> anyhow::Result<PatchOutput>;
 }
@@ -379,7 +379,7 @@ pub trait FsReadService: Send + Sync {
     /// Reads a file at the specified path and returns its content.
     async fn read(
         &self,
-        path: String,
+        path: std::path::PathBuf,
         start_line: Option<u64>,
         end_line: Option<u64>,
     ) -> anyhow::Result<ReadOutput>;
@@ -394,7 +394,7 @@ pub trait ImageReadService: Send + Sync {
 #[async_trait::async_trait]
 pub trait FsRemoveService: Send + Sync {
     /// Removes a file at the specified path.
-    async fn remove(&self, path: String) -> anyhow::Result<FsRemoveOutput>;
+    async fn remove(&self, input_path: String) -> anyhow::Result<FsRemoveOutput>;
 }
 
 #[async_trait::async_trait]
@@ -429,7 +429,7 @@ pub trait FsUndoService: Send + Sync {
     /// And returns the content of the undone file.
     // TODO: We should move Snapshot service to Services from infra
     // and drop FsUndoService.
-    async fn undo(&self, path: String) -> anyhow::Result<FsUndoOutput>;
+    async fn undo(&self, path: std::path::PathBuf) -> anyhow::Result<FsUndoOutput>;
 }
 
 #[async_trait::async_trait]
@@ -746,7 +746,7 @@ impl<I: Services> FileDiscoveryService for I {
 impl<I: Services> FsWriteService for I {
     async fn write(
         &self,
-        path: String,
+        path: std::path::PathBuf,
         content: String,
         overwrite: bool,
     ) -> anyhow::Result<FsWriteOutput> {
@@ -774,7 +774,7 @@ impl<I: Services> PlanCreateService for I {
 impl<I: Services> FsPatchService for I {
     async fn patch(
         &self,
-        path: String,
+        path: std::path::PathBuf,
         search: String,
         content: String,
         replace_all: bool,
@@ -786,7 +786,7 @@ impl<I: Services> FsPatchService for I {
 
     async fn multi_patch(
         &self,
-        path: String,
+        path: std::path::PathBuf,
         edits: Vec<forge_domain::PatchEdit>,
     ) -> anyhow::Result<PatchOutput> {
         self.fs_patch_service().multi_patch(path, edits).await
@@ -797,7 +797,7 @@ impl<I: Services> FsPatchService for I {
 impl<I: Services> FsReadService for I {
     async fn read(
         &self,
-        path: String,
+        path: std::path::PathBuf,
         start_line: Option<u64>,
         end_line: Option<u64>,
     ) -> anyhow::Result<ReadOutput> {
@@ -815,7 +815,7 @@ impl<I: Services> ImageReadService for I {
 
 #[async_trait::async_trait]
 impl<I: Services> FsRemoveService for I {
-    async fn remove(&self, path: String) -> anyhow::Result<FsRemoveOutput> {
+    async fn remove(&self, input_path: String) -> anyhow::Result<FsRemoveOutput> {
         self.fs_remove_service().remove(path).await
     }
 }
@@ -843,7 +843,7 @@ impl<I: Services> FollowUpService for I {
 
 #[async_trait::async_trait]
 impl<I: Services> FsUndoService for I {
-    async fn undo(&self, path: String) -> anyhow::Result<FsUndoOutput> {
+    async fn undo(&self, path: std::path::PathBuf) -> anyhow::Result<FsUndoOutput> {
         self.fs_undo_service().undo(path).await
     }
 }

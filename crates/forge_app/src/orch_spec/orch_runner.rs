@@ -245,7 +245,7 @@ impl FileDiscoveryService for Runner {
                 .map(str::trim)
                 .filter(|line| !line.is_empty())
                 .map(|line| forge_domain::File {
-                    path: line.to_string(),
+                    path: std::path::PathBuf::from(line),
                     is_dir: false,
                 })
                 .collect();

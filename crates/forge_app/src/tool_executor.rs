@@ -46,19 +46,21 @@ impl<
     fn require_prior_read(
         &self,
         context: &ToolCallContext,
-        raw_path: &str,
+        raw_path: &std::path::Path,
         action: &str,
     ) -> anyhow::Result<()> {
-        let target_path = self.normalize_path(raw_path.to_string());
+        let target_path = self.normalize_path(raw_path.to_path_buf());
+        let target_path_str = target_path.to_string_lossy().to_string();
+        let raw_path_str = raw_path.to_string_lossy().to_string();
+        
         let has_read = context.with_metrics(|metrics| {
-            metrics.files_accessed.contains(&target_path)
-                || metrics.files_accessed.contains(raw_path)
+            metrics.files_accessed.contains(&target_path_str)
         })?;
 
         if has_read {
             Ok(())
         } else {
-            Err(crate::Error::PreconditionFailed(format!("You must read the file with the read tool before attempting to {action}.", action=action)).into())
+            Err(crate::Error::PreconditionFailed(crate::error::PreconditionReason::UnreadTarget(format!("You must read the file with the read tool before attempting to {action}.", action=action))).into())
         }
     }
 
@@ -110,14 +112,14 @@ impl<
 
     /// Converts a path to absolute by joining it with the current working
     /// directory if it's relative
-    fn normalize_path(&self, path: String) -> String {
+    fn normalize_path(&self, path: std::path::PathBuf) -> std::path::PathBuf {
         let env = self.services.get_environment();
-        let path_buf = PathBuf::from(&path);
 
-        if path_buf.is_absolute() {
+
+        if path.is_absolute() {
             path
         } else {
-            PathBuf::from(&env.cwd).join(path_buf).display().to_string()
+            std::path::PathBuf::from(&env.cwd).join(path)
         }
     }
 
@@ -135,8 +137,7 @@ impl<
             .into_temp_path()
             .to_path_buf();
         self.services
-            .write(
-                path.to_string_lossy().to_string(),
+            .write(path.clone(),
                 content.to_string(),
                 true,
             )
@@ -175,7 +176,7 @@ impl<
                 let mut params = input.clone();
                 // Normalize path if provided
                 if let Some(ref path) = params.path {
-                    params.path = Some(self.normalize_path(path.clone()));
+                    params.path = Some(self.normalize_path(path.clone().into()).to_string_lossy().to_string());
                 }
                 let output = self.services.search(params).await?;
                 (input, output).into()
@@ -258,7 +259,7 @@ impl<
                     .cwd
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| self.services.get_environment().cwd.display().to_string());
-                let normalized_cwd = self.normalize_path(cwd);
+                let normalized_cwd = self.normalize_path(cwd.into());
                 let output = self
                     .services
                     .execute(
@@ -344,7 +345,7 @@ impl<
         };
 
         if let Some(path) = file_path {
-            self.require_prior_read(context, path, "edit it")?;
+            self.require_prior_read(context, &path, "edit it")?;
         }
 
         // Enforce read-before-edit for overwrite writes

@@ -302,7 +302,7 @@ impl<W: WalkerInfra + FileReaderInfra + FileInfoInfra> ForgeFsSearch<W> {
 /// - **Final flush**: When the search completes, `into_matches()` is called to
 ///   flush the last pending match with its accumulated contexts.
 struct ContextSink {
-    path: String,
+    path: std::path::PathBuf,
     show_line_numbers: bool,
     matches: Vec<Match>,
     before_context: Vec<String>,
@@ -311,7 +311,7 @@ struct ContextSink {
 }
 
 impl ContextSink {
-    fn new(path: String, show_line_numbers: bool) -> Self {
+    fn new(path: std::path::PathBuf, show_line_numbers: bool) -> Self {
         Self {
             path,
             show_line_numbers,

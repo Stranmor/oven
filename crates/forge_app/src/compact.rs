@@ -168,7 +168,7 @@ mod tests {
     fn test_environment() -> Environment {
         use fake::{Fake, Faker};
         let env: Environment = Faker.fake();
-        env.cwd(std::path::PathBuf::from("/test/working/dir"))
+        env.cwd("/test/working/dir".to_string())
     }
 
     #[test]

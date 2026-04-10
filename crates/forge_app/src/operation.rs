@@ -247,12 +247,12 @@ impl ToolOperation {
                 if let Some(image) = output.content.as_image() {
                     // Track read operations for visual content
                     tracing::info!(
-                        path = %input.file_path,
+                        path = %input.file_path.display(),
                         tool = %tool_name,
                         "Visual content read (image/PDF)"
                     );
                     *metrics = metrics.clone().insert(
-                        input.file_path.clone(),
+                    input.file_path.to_string_lossy().to_string(),
                         FileOperation::new(tool_kind)
                             .content_hash(Some(output.info.content_hash.clone())),
                     );
@@ -270,7 +270,7 @@ impl ToolOperation {
                     content.to_string()
                 };
                 let elm = Element::new("file")
-                    .attr("path", &input.file_path)
+                    .attr("path", input.file_path.to_string_lossy())
                     .attr(
                         "display_lines",
                         format!("{}-{}", output.info.start_line, output.info.end_line),
@@ -280,12 +280,12 @@ impl ToolOperation {
 
                 // Track read operations
                 tracing::info!(
-                    path = %input.file_path,
+                    path = %input.file_path.display(),
                     tool = %tool_name,
                     "File read"
                 );
                 *metrics = metrics.clone().insert(
-                    input.file_path.clone(),
+                    input.file_path.to_string_lossy().to_string(),
                     FileOperation::new(tool_kind)
                         .content_hash(Some(output.info.content_hash.clone())),
                 );
@@ -300,7 +300,7 @@ impl ToolOperation {
                 let diff = console::strip_ansi_codes(diff_result.diff()).to_string();
 
                 *metrics = metrics.clone().insert(
-                    input.file_path.clone(),
+                    input.file_path.to_string_lossy().to_string(),
                     FileOperation::new(tool_kind)
                         .lines_added(diff_result.lines_added())
                         .lines_removed(diff_result.lines_removed())
@@ -314,11 +314,11 @@ impl ToolOperation {
                 };
 
                 elm = elm
-                    .attr("path", &input.file_path)
+                    .attr("path", input.file_path.to_string_lossy())
                     .attr("total_lines", input.content.lines().count());
 
                 if !output.errors.is_empty() {
-                    elm = elm.append(create_validation_warning(&input.file_path, &output.errors));
+                    elm = elm.append(create_validation_warning(&input.file_path.to_string_lossy(), &output.errors));
                 }
 
                 forge_domain::ToolOutput::text(elm)
@@ -328,7 +328,7 @@ impl ToolOperation {
                 let content_hash = None;
 
                 *metrics = metrics.clone().insert(
-                    input.path.clone(),
+                    input.path.to_string_lossy().to_string(),
                     FileOperation::new(tool_kind)
                         .lines_removed(output.content.lines().count() as u64)
                         .content_hash(content_hash),
@@ -463,16 +463,16 @@ impl ToolOperation {
                 let diff = console::strip_ansi_codes(diff_result.diff()).to_string();
 
                 let mut elm = Element::new("file_diff")
-                    .attr("path", &input.file_path)
+                    .attr("path", input.file_path.to_string_lossy())
                     .attr("total_lines", output.after.lines().count())
                     .cdata(diff);
 
                 if !output.errors.is_empty() {
-                    elm = elm.append(create_validation_warning(&input.file_path, &output.errors));
+                    elm = elm.append(create_validation_warning(&input.file_path.to_string_lossy(), &output.errors));
                 }
 
                 *metrics = metrics.clone().insert(
-                    input.file_path.clone(),
+                    input.file_path.to_string_lossy().to_string(),
                     FileOperation::new(tool_kind)
                         .lines_added(diff_result.lines_added())
                         .lines_removed(diff_result.lines_removed())
@@ -486,16 +486,16 @@ impl ToolOperation {
                 let diff = console::strip_ansi_codes(diff_result.diff()).to_string();
 
                 let mut elm = Element::new("file_diff")
-                    .attr("path", &input.file_path)
+                    .attr("path", input.file_path.to_string_lossy())
                     .attr("total_lines", output.after.lines().count())
                     .cdata(diff);
 
                 if !output.errors.is_empty() {
-                    elm = elm.append(create_validation_warning(&input.file_path, &output.errors));
+                    elm = elm.append(create_validation_warning(&input.file_path.to_string_lossy(), &output.errors));
                 }
 
                 *metrics = metrics.clone().insert(
-                    input.file_path.clone(),
+                    input.file_path.to_string_lossy().to_string(),
                     FileOperation::new(tool_kind)
                         .lines_added(diff_result.lines_added())
                         .lines_removed(diff_result.lines_removed())
@@ -514,7 +514,7 @@ impl ToolOperation {
                 let content_hash = output.after_undo.as_ref().map(|s| compute_hash(s));
 
                 *metrics = metrics.clone().insert(
-                    input.path.clone(),
+                    input.path.to_string_lossy().to_string(),
                     FileOperation::new(tool_kind)
                         .lines_added(diff.lines_added())
                         .lines_removed(diff.lines_removed())
@@ -524,13 +524,13 @@ impl ToolOperation {
                 match (&output.before_undo, &output.after_undo) {
                     (None, None) => {
                         let elm = Element::new("file_undo")
-                            .attr("path", input.path)
+                            .attr("path", input.path.to_string_lossy())
                             .attr("status", "no_changes");
                         forge_domain::ToolOutput::text(elm)
                     }
                     (None, Some(after)) => {
                         let elm = Element::new("file_undo")
-                            .attr("path", input.path)
+                            .attr("path", input.path.to_string_lossy())
                             .attr("status", "created")
                             .attr("total_lines", after.lines().count())
                             .cdata(after);
@@ -538,7 +538,7 @@ impl ToolOperation {
                     }
                     (Some(before), None) => {
                         let elm = Element::new("file_undo")
-                            .attr("path", input.path)
+                            .attr("path", input.path.to_string_lossy())
                             .attr("status", "removed")
                             .attr("total_lines", before.lines().count())
                             .cdata(before);
@@ -550,7 +550,7 @@ impl ToolOperation {
                         let diff = DiffFormat::format(before, after);
 
                         let elm = Element::new("file_undo")
-                            .attr("path", input.path)
+                            .attr("path", input.path.to_string_lossy())
                             .attr("status", "restored")
                             .cdata(strip_ansi_codes(diff.diff()));
 
@@ -828,7 +828,7 @@ mod tests {
             Node {
                 node_id: node_id.into(),
                 node: NodeData::FileChunk(FileChunk {
-                    file_path: file_path.to_string(),
+                    file_path: std::path::PathBuf::from(file_path),
                     content: content.to_string(),
                     start_line,
                     end_line,

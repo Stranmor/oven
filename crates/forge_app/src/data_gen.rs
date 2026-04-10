@@ -38,7 +38,7 @@ impl<A: Services> DataGenerationApp<A> {
 
         let content = self
             .services
-            .read(resolved_path.display().to_string(), None, None)
+            .read(resolved_path, None, None)
             .await?
             .content
             .file_content()

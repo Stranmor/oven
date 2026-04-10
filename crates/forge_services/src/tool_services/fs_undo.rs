@@ -22,9 +22,9 @@ impl<F> ForgeFsUndo<F> {
 
 #[async_trait::async_trait]
 impl<F: FileInfoInfra + FileReaderInfra + SnapshotRepository> FsUndoService for ForgeFsUndo<F> {
-    async fn undo(&self, path: String) -> anyhow::Result<FsUndoOutput> {
+    async fn undo(&self, path: std::path::PathBuf) -> anyhow::Result<FsUndoOutput> {
         let mut output = FsUndoOutput::default();
-        let path = Path::new(&path);
+        let path = Path::new(&input_path);
         assert_absolute_path(path)?;
         if self.infra.exists(path).await? {
             output.before_undo = Some(self.infra.read_utf8(path).await?);

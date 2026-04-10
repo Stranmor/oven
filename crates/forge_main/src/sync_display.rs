@@ -156,7 +156,7 @@ mod tests {
     fn test_discovering_files_returns_none() {
         let workspace_id = WorkspaceId::generate();
         let fixture = SyncProgress::DiscoveringFiles {
-            path: std::path::PathBuf::from("/some/path"),
+            path: "/some/path".to_string(),
             workspace_id: workspace_id.clone(),
         };
         assert!(

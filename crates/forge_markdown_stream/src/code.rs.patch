@@ -1,0 +1,175 @@
+--- crates/forge_markdown_stream/src/code.rs
++++ crates/forge_markdown_stream/src/code.rs
+@@ -2,3 +2,2 @@
+ 
+-use streamdown_render::code::code_wrap;
+ use syntect::easy::HighlightLines;
+@@ -10,2 +9,3 @@
+ use crate::utils::{ThemeMode, detect_theme_mode};
++use unicode_width::UnicodeWidthChar;
+ 
+@@ -14,2 +14,136 @@
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum AnsiState {
++    Text,
++    Esc,
++    Csi,
++    Osc,
++    OscEsc,
++}
++
++/// Wraps a line of code, respecting ANSI escape sequences and expanding tabs.
++/// Returns the leading indentation level and the wrapped lines.
++pub fn code_wrap(line: &str, width: usize, _pretty_broken: bool) -> (usize, Vec<String>) {
++    // 1. Expand tabs properly and strip ANSI for width calculation
++    let mut expanded = String::with_capacity(line.len() * 2);
++    let mut visible_col = 0;
++    
++    let mut state = AnsiState::Text;
++    
++    for c in line.chars() {
++        match state {
++            AnsiState::Text => {
++                if c == '\x1b' {
++                    state = AnsiState::Esc;
++                    expanded.push(c);
++                } else if c == '\t' {
++                    let spaces = 8 - (visible_col % 8);
++                    expanded.push_str(&" ".repeat(spaces));
++                    visible_col += spaces;
++                } else {
++                    expanded.push(c);
++                    visible_col += c.width().unwrap_or(0);
++                }
++            }
++            AnsiState::Esc => {
++                expanded.push(c);
++                if c == '[' {
++                    state = AnsiState::Csi;
++                } else if c == ']' {
++                    state = AnsiState::Osc;
++                } else {
++                    state = AnsiState::Text;
++                }
++            }
++            AnsiState::Csi => {
++                expanded.push(c);
++                if c.is_ascii_alphabetic() {
++                    state = AnsiState::Text;
++                }
++            }
++            AnsiState::Osc => {
++                expanded.push(c);
++                if c == '\x07' {
++                    state = AnsiState::Text;
++                } else if c == '\x1b' {
++                    state = AnsiState::OscEsc;
++                }
++            }
++            AnsiState::OscEsc => {
++                expanded.push(c);
++                if c == '\\' {
++                    state = AnsiState::Text;
++                } else {
++                    state = AnsiState::Osc;
++                }
++            }
++        }
++    }
++
++    let line = expanded;
++
++    // 2. Find indentation
++    let mut indent = 0;
++    let mut state = AnsiState::Text;
++    for c in line.chars() {
++        match state {
++            AnsiState::Text => {
++                if c == '\x1b' {
++                    state = AnsiState::Esc;
++                } else if c == ' ' {
++                    indent += 1;
++                } else {
++                    break;
++                }
++            }
++            AnsiState::Esc => {
++                if c == '[' { state = AnsiState::Csi; }
++                else if c == ']' { state = AnsiState::Osc; }
++                else { state = AnsiState::Text; }
++            }
++            AnsiState::Csi => {
++                if c.is_ascii_alphabetic() { state = AnsiState::Text; }
++            }
++            AnsiState::Osc => {
++                if c == '\x07' { state = AnsiState::Text; }
++                else if c == '\x1b' { state = AnsiState::OscEsc; }
++            }
++            AnsiState::OscEsc => {
++                if c == '\\' { state = AnsiState::Text; }
++                else { state = AnsiState::Osc; }
++            }
++        }
++    }
++
++    if width == 0 {
++        return (indent, vec![line]);
++    }
++
++    // 3. Wrap line using visible width
++    let mut lines = Vec::new();
++    let mut current_line = String::new();
++    let mut current_width = 0;
++    let mut state = AnsiState::Text;
++    
++    for c in line.chars() {
++        match state {
++            AnsiState::Text => {
++                if c == '\x1b' {
++                    state = AnsiState::Esc;
++                    current_line.push(c);
++                } else {
++                    let char_width = c.width().unwrap_or(0);
++                    
++                    if current_width + char_width > width && current_width > 0 {
++                        lines.push(current_line);
++                        current_line = String::new();
++                        current_width = 0;
++                    }
++                    
++                    current_line.push(c);
++                    current_width += char_width;
++                }
++            }
++            AnsiState::Esc => {
++                current_line.push(c);
++                if c == '[' { state = AnsiState::Csi; }
++                else if c == ']' { state = AnsiState::Osc; }
++                else { state = AnsiState::Text; }
++            }
++            AnsiState::Csi => {
++                current_line.push(c);
++                if c.is_ascii_alphabetic() { state = AnsiState::Text; }
++            }
++            AnsiState::Osc => {
++                current_line.push(c);
++                if c == '\x07' { state = AnsiState::Text; }
++                else if c == '\x1b' { state = AnsiState::OscEsc; }
++            }
++            AnsiState::OscEsc => {
++                current_line.push(c);
++                if c == '\\' { state = AnsiState::Text; }
++                else { state = AnsiState::Osc; }
++            }
++        }
++    }
++    
++    if !current_line.is_empty() || lines.is_empty() {
++        lines.push(current_line);
++    }
++    
++    (indent, lines)
++}
++
+ /// Code block highlighter using syntect.

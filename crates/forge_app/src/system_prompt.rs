@@ -238,7 +238,7 @@ mod tests {
             .map(str::trim)
             .filter(|line| !line.is_empty())
             .map(|line| File {
-                path: line.to_string(),
+                path: std::path::PathBuf::from(line),
                 is_dir: false,
             })
             .collect()
@@ -360,10 +360,10 @@ mod tests {
         
         let env = forge_domain::Environment {
             os: "linux".into(),
-            cwd: std::path::PathBuf::from("/tmp"),
+            cwd: "/tmp".to_string(),
             home: None,
             shell: "sh".into(),
-            base_path: std::path::PathBuf::from("/tmp"),
+            base_path: "/tmp".to_string(),
         };
         
         let mut agent = forge_domain::Agent::new("test", forge_domain::ProviderId::OPENAI, forge_domain::ModelId::from("gpt-4o"));
