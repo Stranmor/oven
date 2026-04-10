@@ -1,0 +1,14 @@
+[Unit]
+Description=Forge upstream sync and rebuild
+
+[Service]
+Type=oneshot
+ExecStart=%h/Documents/project/_mycelium/oven/scripts/sync-upstream.sh
+Environment=HOME=%h
+Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=CARGO_HOME=%h/.cargo
+Environment=RUSTUP_HOME=%h/.rustup
+WorkingDirectory=%h/Documents/project/_mycelium/oven
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=600
