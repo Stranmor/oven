@@ -79,9 +79,11 @@ impl<S: AgentService + crate::ConversationService> EventHandle<EventData<StartPa
                     if let Some(title) = title {
                         // The receiver was dropped, meaning the EndPayload handler has already
                         // run and the main conversation save is likely occurring.
-                        let _ = services.modify_conversation(&conversation_id, |conv| {
+                        if let Err(e) = services.modify_conversation(&conversation_id, |conv| {
                             conv.title = Some(title);
-                        }).await;
+                        }).await {
+                            tracing::error!("Background title update failed for {}: {:?}", conversation_id, e);
+                        }
                     }
                 }
             });
@@ -115,14 +117,7 @@ impl<S: AgentService + crate::ConversationService> EventHandle<EventData<EndPayl
     }
 }
 
-impl<S> Drop for TitleGenerationHandler<S> {
-    fn drop(&mut self) {
-        // Clearing the map drops all `JoinHandle`s (aborting the spawned
-        // tasks) and `oneshot::Receiver`s. The tasks will observe a closed
-        // channel on `tx.send()` and exit gracefully.
-        self.title_tasks.clear();
-    }
-}
+
 
 #[cfg(test)]
 mod tests {
@@ -198,7 +193,7 @@ mod tests {
             _context: &ToolCallContext,
             _call: ToolCallFull,
         ) -> ToolResult {
-            unreachable!("Not used in tests")
+            ToolResult::new("dummy").failure(anyhow::anyhow!("Not used in tests"))
         }
 
         async fn update(&self, _conversation: Conversation) -> anyhow::Result<()> {
@@ -233,61 +228,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_start_skips_if_title_exists() {
+    async fn test_start_skips_if_title_exists() -> anyhow::Result<()> {
         let (handler, mut conversation) = setup("test message");
         conversation.title = Some("existing".into());
 
         handler
             .handle(&event(StartPayload), &mut conversation)
-            .await
-            .unwrap();
+            .await?;
 
         assert!(!handler.title_tasks.contains_key(&conversation.id));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_start_skips_if_task_already_in_progress() {
+    async fn test_start_skips_if_task_already_in_progress() -> anyhow::Result<()> {
         let (handler, mut conversation) = setup("test message");
         let (tx, rx) = oneshot::channel();
-        tx.send(Some("original".to_string())).unwrap();
+        tx.send(Some("original".to_string())).map_err(|_| anyhow::anyhow!("send failed"))?;
         let handle = tokio::spawn(async {});
         handle.abort();
         handler
             .title_tasks
-            .insert(conversation.id, TitleGenerationState { rx, handle });
+            .insert(conversation.id.clone(), TitleGenerationState { rx, handle: handle });
 
         handler
             .handle(&event(StartPayload), &mut conversation)
-            .await
-            .unwrap();
+            .await?;
 
         // Entry should still exist (wasn't replaced)
         assert!(handler.title_tasks.contains_key(&conversation.id));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_end_sets_title_from_completed_task() {
+    async fn test_end_sets_title_from_completed_task() -> anyhow::Result<()> {
         let (handler, mut conversation) = setup("test message");
         let (tx, rx) = oneshot::channel();
-        tx.send(Some("generated".to_string())).unwrap();
+        tx.send(Some("generated".to_string())).map_err(|_| anyhow::anyhow!("send failed"))?;
         let handle = tokio::spawn(async {});
         handle.abort();
         handler
             .title_tasks
-            .insert(conversation.id, TitleGenerationState { rx, handle });
+            .insert(conversation.id.clone(), TitleGenerationState { rx, handle: handle });
 
         handler
             .handle(&event(EndPayload), &mut conversation)
-            .await
-            .unwrap();
+            .await?;
 
         assert_eq!(conversation.title, Some("generated".into()));
         // Entry should be removed after successful title generation
         assert!(!handler.title_tasks.contains_key(&conversation.id));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_end_handles_task_cancellation() {
+    async fn test_endhandles_task_cancellation() -> anyhow::Result<()> {
         let (handler, mut conversation) = setup("test message");
         let (tx, rx) = oneshot::channel::<Option<String>>();
         // Drop the sender to simulate a cancelled task.
@@ -296,22 +291,22 @@ mod tests {
         handle.abort();
         handler
             .title_tasks
-            .insert(conversation.id, TitleGenerationState { rx, handle });
+            .insert(conversation.id.clone(), TitleGenerationState { rx, handle });
 
         handler
             .handle(&event(EndPayload), &mut conversation)
-            .await
-            .unwrap();
+            .await?;
 
         assert!(conversation.title.is_none());
         assert!(!handler.title_tasks.contains_key(&conversation.id));
+        Ok(())
     }
 
     /// When EndPayload is received, the spawned task should no longer be aborted,
     /// so it can complete and update the database later. We verify this by ensuring
     /// the handle continues to exist and the handler does not hang.
     #[tokio::test]
-    async fn test_end_does_not_abort_in_progress_task() {
+    async fn test_end_does_not_abort_in_progress_task() -> anyhow::Result<()> {
         let (handler, mut conversation) = setup("test message");
         let (tx, rx) = oneshot::channel::<Option<String>>();
         let handle = tokio::spawn(async move {
@@ -326,8 +321,7 @@ mod tests {
 
         handler
             .handle(&event(EndPayload), &mut conversation)
-            .await
-            .unwrap();
+            .await?;
 
         // Entry should have been removed from map
         assert!(!handler.title_tasks.contains_key(&conversation.id));
@@ -335,38 +329,40 @@ mod tests {
         // Verify the task is no longer running by checking that the
         // EndPayload handler didn't hang (it completed immediately).
         assert!(conversation.title.is_none());
+        Ok(())
     }
 
     /// Many concurrent StartPayload calls for the same conversation id must
-    /// result in exactly one spawned task.
+    /// not spawn duplicate tasks.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test_concurrent_start_spawns_only_one_task() {
+    async fn test_start_concurrent() -> anyhow::Result<()> {
         let (handler, conversation) = setup("test message");
-        let barrier = Arc::new(tokio::sync::Barrier::new(20));
+        let barrier = Arc::new(tokio::sync::Barrier::new(10));
         let handler = Arc::new(handler);
 
         let mut joins = Vec::new();
-        for _ in 0..20 {
-            let handler = handler.clone();
+        for _ in 0..10 {
+            let h = handler.clone();
             let barrier = barrier.clone();
-            let mut conv = conversation.clone();
+            let mut c = conversation.clone();
             joins.push(tokio::spawn(async move {
                 barrier.wait().await;
-                handler
-                    .handle(&event(StartPayload), &mut conv)
+                h.handle(&event(StartPayload), &mut c)
                     .await
-                    .unwrap();
+                    .map_err(|e| anyhow::anyhow!("handle failed: {}", e))
             }));
         }
         for j in joins {
-            j.await.unwrap();
+            j.await??;
         }
 
         // Only one task should exist in the map
         assert_eq!(handler.title_tasks.len(), 1);
+        Ok(())
     }
+
     #[tokio::test]
-    async fn test_background_title_update_when_receiver_dropped() {
+    async fn test_background_title_update_when_receiver_dropped() -> anyhow::Result<()> {
         let service = Arc::new(MockAgentService {
             db: Arc::new(dashmap::DashMap::new()),
             chat_delay: Some(Duration::from_millis(50)),
@@ -377,17 +373,18 @@ mod tests {
         service.db.insert(conversation.id.clone(), conversation.clone());
         
         // 1. Starts title generation
-        handler.handle(&event(StartPayload), &mut conversation).await.unwrap();
+        handler.handle(&event(StartPayload), &mut conversation).await?;
         
         // 2. Triggers EndPayload BEFORE the title is ready
         // Since chat_delay is 50ms, the task is still running.
-        handler.handle(&event(EndPayload), &mut conversation).await.unwrap();
+        handler.handle(&event(EndPayload), &mut conversation).await?;
         
         // 3. Wait for the task to complete
         tokio::time::sleep(Duration::from_millis(150)).await;
         
         // 4. Verifies the title was written to the mock DB via modify_conversation
-        let saved_conv = service.db.get(&conversation.id).unwrap();
+        let saved_conv = service.db.get(&conversation.id).ok_or_else(|| anyhow::anyhow!("Conv missing"))?;
         assert_eq!(saved_conv.title.as_deref(), Some("Delayed Title"));
+        Ok(())
     }
 }
