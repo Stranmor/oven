@@ -20,6 +20,11 @@ use crate::sync::{WorkspaceSyncEngine, canonicalize_path};
 ///
 /// `F` provides infrastructure capabilities (file I/O, environment, etc.) and
 /// `D` is the file-discovery strategy used to enumerate workspace files.
+pub enum InitResult {
+    Created(forge_domain::WorkspaceId),
+    Existing(forge_domain::WorkspaceId),
+}
+
 pub struct ForgeWorkspaceService<F, D> {
     infra: Arc<F>,
     discovery: Arc<D>,
@@ -182,7 +187,7 @@ impl<
             .context("Workspace not indexed. Please run `forge workspace init` first.")
     }
 
-    async fn _init_workspace(&self, path: PathBuf) -> Result<(bool, WorkspaceId)> {
+    async fn _init_workspace(&self, path: PathBuf) -> Result<InitResult> {
         let (token, _user_id) = self.get_workspace_credentials().await?;
         let path = canonicalize_path(path)?;
 
@@ -210,7 +215,7 @@ impl<
             workspace_id
         };
 
-        Ok((is_new_workspace, workspace_id))
+        if is_new_workspace { Ok(InitResult::Created(workspace_id)) } else { Ok(InitResult::Existing(workspace_id)) }
     }
 }
 
@@ -352,7 +357,14 @@ impl<
             .await
         {
             Ok(workspace) => Ok(workspace.is_some()),
-            Err(_) => Ok(false), // Path doesn't exist or other error, so it can't be indexed
+            Err(e) => {
+                let err_str = format!("{:#}", e).to_lowercase();
+                if err_str.contains("404") || err_str.contains("not found") || err_str.contains("no such file or directory") {
+                    Ok(false)
+                } else {
+                    Err(e)
+                }
+            }
         }
     }
 
@@ -418,12 +430,11 @@ impl<
     }
 
     async fn init_workspace(&self, path: PathBuf) -> Result<WorkspaceId> {
-        let (is_new, workspace_id) = self._init_workspace(path).await?;
+        let init_result = self._init_workspace(path).await?;
 
-        if is_new {
-            Ok(workspace_id)
-        } else {
-            Err(forge_domain::Error::WorkspaceAlreadyInitialized(workspace_id).into())
+        match init_result {
+            InitResult::Created(id) => Ok(id),
+            InitResult::Existing(id) => Err(forge_domain::Error::WorkspaceAlreadyInitialized(id).into()),
         }
     }
 }
@@ -498,7 +509,9 @@ mod tests {
         async fn create_workspace(&self, _dir: &Path, _token: &ApiKey) -> Result<WorkspaceId> { Err(anyhow::anyhow!("unimplemented")) }
         async fn upload_files(&self, _u: &FileUpload, _t: &ApiKey) -> Result<FileUploadInfo> { Ok(FileUploadInfo::new(0, 0)) }
         async fn search(&self, q: &CodeSearchQuery<'_>, _t: &ApiKey) -> Result<Vec<Node>> {
-            *self.search_limit.lock().unwrap() = q.data.limit;
+            if let Ok(mut limit) = self.search_limit.lock() {
+                *limit = q.data.limit;
+            }
             Ok(vec![])
         }
         async fn list_workspaces(&self, _t: &ApiKey) -> Result<Vec<WorkspaceInfo>> {
@@ -563,19 +576,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_is_indexed_not_found() {
+    async fn test_is_indexed_not_found() -> anyhow::Result<()> {
         let infra = Arc::new(MockInfra::new(10));
         let discovery = Arc::new(MockDiscovery);
         let service = ForgeWorkspaceService::new(infra, discovery);
 
-        let result = service.is_indexed(Path::new("/definitely/does/not/exist/ever/12345")).await.unwrap();
+        let result = service.is_indexed(Path::new("/definitely/does/not/exist/ever/12345")).await?;
         assert_eq!(result, false);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_query_workspace_enforces_limit() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let canonical_path = temp_dir.path().canonicalize().unwrap();
+    async fn test_query_workspace_enforces_limit() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let canonical_path = temp_dir.path().canonicalize()?;
 
         let mut infra_val = MockInfra::new(15);
         infra_val.workspaces.push(WorkspaceInfo {
@@ -594,34 +608,36 @@ mod tests {
         // Limit > config max (20 > 15) -> clamped to 15
         let mut params = SearchParams::new("query", "use_case");
         params.limit = Some(20);
-        let _ = service.query_workspace(temp_dir.path().to_path_buf(), params.clone()).await.unwrap();
+        let _ = service.query_workspace(temp_dir.path().to_path_buf(), params.clone()).await?;
         assert_eq!(*infra.search_limit.lock().unwrap(), Some(15));
 
         // Limit < config max (10 < 15) -> kept at 10
         params.limit = Some(10);
-        let _ = service.query_workspace(temp_dir.path().to_path_buf(), params.clone()).await.unwrap();
+        let _ = service.query_workspace(temp_dir.path().to_path_buf(), params.clone()).await?;
         assert_eq!(*infra.search_limit.lock().unwrap(), Some(10));
 
         // No limit -> uses config max (15)
         params.limit = None;
-        let _ = service.query_workspace(temp_dir.path().to_path_buf(), params.clone()).await.unwrap();
+        let _ = service.query_workspace(temp_dir.path().to_path_buf(), params.clone()).await?;
         assert_eq!(*infra.search_limit.lock().unwrap(), Some(15));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_workspace_credentials_extraction() {
+    async fn test_workspace_credentials_extraction() -> anyhow::Result<()> {
         let infra = Arc::new(MockInfra::new(10));
         let discovery = Arc::new(MockDiscovery);
         let service = ForgeWorkspaceService::new(infra, discovery);
 
-        let (token, _user_id) = service.get_workspace_credentials().await.unwrap();
+        let (token, _user_id) = service.get_workspace_credentials().await?;
         assert_eq!(token, forge_domain::ApiKey::from("test-token".to_string()));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_sync_workspace_emits_starting() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let canonical_path = temp_dir.path().canonicalize().unwrap();
+    async fn test_sync_workspace_emits_starting() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let canonical_path = temp_dir.path().canonicalize()?;
 
         let mut infra_val = MockInfra::new(15);
         infra_val.workspaces.push(WorkspaceInfo {
@@ -637,13 +653,14 @@ mod tests {
         let discovery = Arc::new(MockDiscovery);
         let service = ForgeWorkspaceService::new(infra.clone(), discovery);
 
-        let mut stream = service.sync_workspace(temp_dir.path().to_path_buf()).await.unwrap();
+        let mut stream = service.sync_workspace(temp_dir.path().to_path_buf()).await?;
         
         use futures::stream::StreamExt;
         if let Some(Ok(forge_domain::SyncProgress::Starting)) = stream.next().await {
             // Expected
         } else {
-            panic!("Expected SyncProgress::Starting");
+            anyhow::bail!("Expected SyncProgress::Starting");
         }
+        Ok(())
     }
 }

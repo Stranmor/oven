@@ -1191,7 +1191,7 @@ impl ToolKind {
         FORGE_TOOL_DEFINITIONS
             .get(&self.name())
             .cloned()
-            .expect("Forge tool definition not found")
+            .unwrap_or_else(|| ToolDefinition::new("unknown"))
     }
 }
 
@@ -1207,7 +1207,7 @@ impl From<ToolCatalog> for ToolCallFull {
     fn from(tool: ToolCatalog) -> Self {
         let name = ToolName::new(tool.to_string());
         // Serialize the tool to get the tagged enum structure
-        let value = serde_json::to_value(&tool).expect("Failed to serialize tool");
+        let value = serde_json::to_value(&tool).unwrap_or(serde_json::Value::Null);
 
         // Extract just the "arguments" part from the tagged enum
         let arguments = if let Some(args) = value.get("arguments") {

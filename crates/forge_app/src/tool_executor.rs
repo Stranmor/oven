@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::anyhow;
+
 use forge_domain::{CodebaseQueryResult, ToolCallContext, ToolCatalog, ToolOutput};
 
 use crate::fmt::content::FormatContent;
@@ -58,10 +58,7 @@ impl<
         if has_read {
             Ok(())
         } else {
-            Err(anyhow!(
-                "You must read the file with the read tool before attempting to {action}.",
-                action = action
-            ))
+            Err(crate::Error::PreconditionFailed(format!("You must read the file with the read tool before attempting to {action}.", action=action)).into())
         }
     }
 
@@ -86,10 +83,9 @@ impl<
                 let config = self.services.get_config()?;
                 let stdout_lines = output.output.stdout.lines().count();
                 let stderr_lines = output.output.stderr.lines().count();
-                let stdout_truncated =
-                    stdout_lines > config.max_stdout_prefix_lines + config.max_stdout_suffix_lines;
-                let stderr_truncated =
-                    stderr_lines > config.max_stdout_prefix_lines + config.max_stdout_suffix_lines;
+                let max_total_lines = config.max_stdout_prefix_lines.saturating_add(config.max_stdout_suffix_lines);
+                let stdout_truncated = stdout_lines > max_total_lines;
+                let stderr_truncated = stderr_lines > max_total_lines;
 
                 let mut files = TempContentFiles::default();
 
@@ -160,8 +156,8 @@ impl<
                     .services
                     .read(
                         normalized_path,
-                        input.start_line.map(|i| i as u64),
-                        input.end_line.map(|i| i as u64),
+                        input.start_line.map(|i| u64::try_from(i).unwrap_or(0)),
+                        input.end_line.map(|i| u64::try_from(i).unwrap_or(0)),
                     )
                     .await?;
 

@@ -45,7 +45,7 @@ pub struct Runner {
 }
 
 impl Runner {
-    fn new(setup: &TestContext) -> Self {
+    fn new(setup: &TestContext) -> anyhow::Result<Self> {
         let mut hb = Handlebars::new();
         hb.set_strict_mode(true);
         hb.register_escape_fn(no_escape);
@@ -53,10 +53,10 @@ impl Runner {
         // Register all embedded templates from the templates directory
         forge_embed::register_templates(&mut hb, &TEMPLATE_DIR);
         for (name, tpl) in &setup.templates {
-            hb.register_template_string(name, tpl).unwrap();
+            hb.register_template_string(name, tpl)?;
         }
 
-        Self {
+        Ok(Self {
             hb,
             attachments: setup.attachments.clone(),
             config: setup.config.clone(),
@@ -65,7 +65,7 @@ impl Runner {
             test_tool_calls: Mutex::new(VecDeque::from(setup.mock_tool_call_responses.clone())),
             test_completions: Mutex::new(VecDeque::from(setup.mock_assistant_responses.clone())),
             test_shell_outputs: Mutex::new(VecDeque::from(setup.mock_shell_outputs.clone())),
-        }
+        })
     }
 
     // Returns the conversation history
@@ -91,7 +91,7 @@ impl Runner {
             responses
         });
 
-        let services = Arc::new(Runner::new(setup));
+        let services = Arc::new(Runner::new(setup)?);
         // setup the conversation
         let conversation = Conversation::new(ConversationId::generate()).title(setup.title.clone());
 
@@ -205,7 +205,7 @@ impl AgentService for Runner {
 #[async_trait::async_trait]
 impl TemplateService for Runner {
     async fn register_template(&self, _path: std::path::PathBuf) -> anyhow::Result<()> {
-        unimplemented!()
+        anyhow::bail!("unimplemented")
     }
 
     async fn render_template<V: serde::Serialize + Send + Sync>(
@@ -251,7 +251,7 @@ impl FileDiscoveryService for Runner {
                 .collect();
             Ok(files)
         } else {
-            Ok(vec![])
+            anyhow::bail!("exhausted shell output queue")
         }
     }
 
@@ -272,20 +272,7 @@ impl ShellService for Runner {
         _description: Option<String>,
     ) -> anyhow::Result<ShellOutput> {
         let mut outputs = self.test_shell_outputs.lock().await;
-        if let Some(output) = outputs.pop_front() {
-            Ok(output)
-        } else {
-            Ok(ShellOutput {
-                output: forge_domain::CommandOutput {
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    command: String::new(),
-                    exit_code: Some(1),
-                },
-                shell: "/bin/bash".to_string(),
-                description: None,
-            })
-        }
+        if let Some(output) = outputs.pop_front() { Ok(output) } else { anyhow::bail!("exhausted shell output queue") }
     }
 }
 

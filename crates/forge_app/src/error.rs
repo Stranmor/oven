@@ -48,4 +48,10 @@ pub enum Error {
 
     #[error("No active model configured")]
     NoActiveModel,
+
+    #[error("Precondition failed: {0}")]
+    PreconditionFailed(String),
+
+    #[error("Operation not permitted: {0}")]
+    OperationNotPermitted(String),
 }
