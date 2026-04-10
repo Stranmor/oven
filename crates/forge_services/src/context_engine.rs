@@ -358,12 +358,13 @@ impl<
         {
             Ok(workspace) => Ok(workspace.is_some()),
             Err(e) => {
-                let err_str = format!("{:#}", e).to_lowercase();
-                if err_str.contains("404") || err_str.contains("not found") || err_str.contains("no such file or directory") {
-                    Ok(false)
-                } else {
-                    Err(e)
+                if let Some(io_err) = e.root_cause().downcast_ref::<std::io::Error>() {
+                    if io_err.kind() == std::io::ErrorKind::NotFound {
+                        return Ok(false);
+                    }
                 }
+                
+                Err(e)
             }
         }
     }

@@ -326,6 +326,10 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                         _ = tokio::signal::ctrl_c() => {
                             self.spinner.reset();
                             tracing::info!("User interrupted operation with Ctrl+C");
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            while crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
+                                let _ = crossterm::event::read();
+                            }
                         }
                         result = self.on_command(command) => {
                             match result {
@@ -353,7 +357,16 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
 
                     match error.downcast::<ReadLineError>() {
                         Ok(error) => {
-                            return Err(error)?;
+                            if error.to_string().contains("cursor position could not be read") {
+                                tracing::warn!("Terminal state recovery after interrupt");
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                while crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
+                                    let _ = crossterm::event::read();
+                                }
+                                command = self.prompt().await;
+                                continue;
+                            }
+                            return Err(error.into());
                         }
                         Err(error) => self.writeln_to_stderr(
                             TitleFormat::error(error.to_string()).display().to_string(),
@@ -1873,7 +1886,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                 .title
                 .as_deref()
                 .map(|t| t.to_string())
-                .unwrap_or_else(|| markers::EMPTY.to_string());
+                .unwrap_or_else(|| conv.id.into_string());
 
             // Format time using humantime library (same as conversation_selector.rs)
             let duration = chrono::Utc::now().signed_duration_since(
@@ -3056,7 +3069,9 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
 
         // Print if the state is being reinitialized
         if self.state.conversation_id.is_none() {
-            self.print_conversation_status(is_new, id)?;
+            if let Some(conversation) = self.api.conversation(&id).await.ok().flatten() {
+                self.print_conversation_status(is_new, conversation)?;
+            }
         }
 
         // Always set the conversation id in state
@@ -3068,7 +3083,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
     fn print_conversation_status(
         &mut self,
         new_conversation: bool,
-        id: ConversationId,
+        conversation: forge_api::Conversation,
     ) -> Result<(), anyhow::Error> {
         let mut title = if new_conversation {
             "Initialize".to_string()
@@ -3076,7 +3091,11 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             "Continue".to_string()
         };
 
-        title.push_str(format!(" {}", id.into_string()).as_str());
+        let title_display = conversation
+            .title
+            .unwrap_or_else(|| conversation.id.into_string());
+
+        title.push_str(format!(" {}", title_display).as_str());
 
         self.writeln_title(TitleFormat::debug(title))?;
         Ok(())
@@ -3400,8 +3419,13 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                 self.writeln_title(TitleFormat::action(title))?;
                 let continued = self.should_continue().await?;
                 if !continued && let Some(conversation_id) = self.state.conversation_id {
+                    let title_display = if let Some(conv) = self.api.conversation(&conversation_id).await.ok().flatten() {
+                        conv.title.unwrap_or_else(|| conversation_id.into_string())
+                    } else {
+                        conversation_id.into_string()
+                    };
                     self.writeln_title(
-                        TitleFormat::debug("Finished").sub_title(conversation_id.into_string()),
+                        TitleFormat::debug("Finished").sub_title(title_display),
                     )?;
                 }
             }
@@ -3411,8 +3435,13 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             ChatResponse::TaskComplete => {
                 writer.finish()?;
                 if let Some(conversation_id) = self.state.conversation_id {
+                    let title_display = if let Some(conv) = self.api.conversation(&conversation_id).await.ok().flatten() {
+                        conv.title.unwrap_or_else(|| conversation_id.into_string())
+                    } else {
+                        conversation_id.into_string()
+                    };
                     self.writeln_title(
-                        TitleFormat::debug("Finished").sub_title(conversation_id.into_string()),
+                        TitleFormat::debug("Finished").sub_title(title_display),
                     )?;
                 }
                 if let Some(format) = self.config.auto_dump.clone() {

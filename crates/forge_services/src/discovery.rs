@@ -43,7 +43,7 @@ impl<F: EnvironmentInfra + WalkerInfra + DirectoryReaderInfra + Send + Sync> Fil
             .filter_map(|(path, is_dir)| {
                 path.file_name()
                     .and_then(|n| n.to_str())
-                    .map(|path| File { path: std::path::PathBuf::from(path), is_dir })
+                    .map(|path| File { path: path.to_string(), is_dir })
             })
             .collect();
 

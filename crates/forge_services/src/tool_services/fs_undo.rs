@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::sync::Arc;
 
 use forge_app::{FileInfoInfra, FileReaderInfra, FsUndoOutput, FsUndoService};
@@ -24,7 +23,7 @@ impl<F> ForgeFsUndo<F> {
 impl<F: FileInfoInfra + FileReaderInfra + SnapshotRepository> FsUndoService for ForgeFsUndo<F> {
     async fn undo(&self, path: std::path::PathBuf) -> anyhow::Result<FsUndoOutput> {
         let mut output = FsUndoOutput::default();
-        let path = Path::new(&input_path);
+        let path = path.as_path();
         assert_absolute_path(path)?;
         if self.infra.exists(path).await? {
             output.before_undo = Some(self.infra.read_utf8(path).await?);

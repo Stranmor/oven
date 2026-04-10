@@ -113,7 +113,7 @@ impl<F: FileInfoInfra + EnvironmentInfra<Config = forge_config::ForgeConfig> + I
         start_line: Option<u64>,
         end_line: Option<u64>,
     ) -> anyhow::Result<ReadOutput> {
-        let path = Path::new(&input_path);
+        let path = path.as_path();
         assert_absolute_path(path)?;
 
         let config = self.infra.get_config()?;

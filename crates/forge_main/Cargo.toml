@@ -70,6 +70,7 @@ rustls.workspace = true
 tempfile.workspace = true
 tiny_http.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
+crossterm = "0.29.0"
 
 [target.'cfg(windows)'.dependencies]
 enable-ansi-support.workspace = true

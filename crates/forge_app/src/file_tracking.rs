@@ -9,7 +9,7 @@ use crate::FsReadService;
 /// Information about a detected file change
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileChange {
-    pub path: String,
+    pub path: std::path::PathBuf,
     /// File hash if readable, None if unreadable
     pub content_hash: Option<String>,
 }

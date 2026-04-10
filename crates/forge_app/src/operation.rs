@@ -348,7 +348,7 @@ impl ToolOperation {
                         input.head_limit.unwrap_or(u32::MAX) as usize,
                     );
                     let offset = input.offset.unwrap_or(0) as usize;
-                    let search_dir = Path::new(input.path.as_deref().unwrap_or("."));
+                    let search_dir = input.path.as_deref().unwrap_or_else(|| Path::new("."));
                     let truncated_output = truncate_search_output(
                         &out.matches,
                         offset,
@@ -366,7 +366,7 @@ impl ToolOperation {
                     };
 
                     let mut elm = Element::new("search_results")
-                        .attr("path", input.path.as_deref().unwrap_or("."))
+                        .attr("path", input.path.as_deref().unwrap_or_else(|| Path::new(".")).display().to_string())
                         .attr("max_bytes_allowed", config.max_search_result_bytes)
                         .attr("total_lines", truncated_output.total)
                         .attr("display_lines", display_lines);
@@ -397,7 +397,7 @@ impl ToolOperation {
                 }
                 None => {
                     let mut elm = Element::new("search_results");
-                    elm = elm.attr_if_some("path", input.path);
+                    elm = elm.attr_if_some("path", input.path.map(|p| p.display().to_string()));
                     elm = elm.attr("pattern", &input.pattern);
                     elm = elm.attr_if_some("glob", input.glob);
                     elm = elm.attr_if_some("file_type", input.file_type.as_ref());

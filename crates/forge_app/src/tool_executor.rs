@@ -51,7 +51,6 @@ impl<
     ) -> anyhow::Result<()> {
         let target_path = self.normalize_path(raw_path.to_path_buf());
         let target_path_str = target_path.to_string_lossy().to_string();
-        let raw_path_str = raw_path.to_string_lossy().to_string();
         
         let has_read = context.with_metrics(|metrics| {
             metrics.files_accessed.contains(&target_path_str)
@@ -176,7 +175,7 @@ impl<
                 let mut params = input.clone();
                 // Normalize path if provided
                 if let Some(ref path) = params.path {
-                    params.path = Some(self.normalize_path(path.clone().into()).to_string_lossy().to_string());
+                    params.path = Some(self.normalize_path(path.clone()));
                 }
                 let output = self.services.search(params).await?;
                 (input, output).into()

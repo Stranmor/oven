@@ -238,7 +238,7 @@ mod tests {
             .map(str::trim)
             .filter(|line| !line.is_empty())
             .map(|line| File {
-                path: std::path::PathBuf::from(line),
+                path: line.to_string(),
                 is_dir: false,
             })
             .collect()

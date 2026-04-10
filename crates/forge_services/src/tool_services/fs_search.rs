@@ -29,7 +29,7 @@ impl<W: WalkerInfra + FileReaderInfra + FileInfoInfra> FsSearchService for Forge
     async fn search(&self, params: FSSearch) -> anyhow::Result<Option<SearchResult>> {
         // Determine search path (default to current directory)
         let search_path = match &params.path {
-            Some(p) if !p.is_empty() => PathBuf::from(p),
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
             _ => std::env::current_dir()
                 .with_context(|| "Failed to get current working directory")?,
         };
@@ -302,7 +302,7 @@ impl<W: WalkerInfra + FileReaderInfra + FileInfoInfra> ForgeFsSearch<W> {
 /// - **Final flush**: When the search completes, `into_matches()` is called to
 ///   flush the last pending match with its accumulated contexts.
 struct ContextSink {
-    path: std::path::PathBuf,
+    path: String,
     show_line_numbers: bool,
     matches: Vec<Match>,
     before_context: Vec<String>,
@@ -311,7 +311,7 @@ struct ContextSink {
 }
 
 impl ContextSink {
-    fn new(path: std::path::PathBuf, show_line_numbers: bool) -> Self {
+    fn new(path: String, show_line_numbers: bool) -> Self {
         Self {
             path,
             show_line_numbers,

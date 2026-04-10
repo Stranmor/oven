@@ -394,7 +394,7 @@ pub trait ImageReadService: Send + Sync {
 #[async_trait::async_trait]
 pub trait FsRemoveService: Send + Sync {
     /// Removes a file at the specified path.
-    async fn remove(&self, input_path: String) -> anyhow::Result<FsRemoveOutput>;
+    async fn remove(&self, input_path: std::path::PathBuf) -> anyhow::Result<FsRemoveOutput>;
 }
 
 #[async_trait::async_trait]
@@ -815,8 +815,8 @@ impl<I: Services> ImageReadService for I {
 
 #[async_trait::async_trait]
 impl<I: Services> FsRemoveService for I {
-    async fn remove(&self, input_path: String) -> anyhow::Result<FsRemoveOutput> {
-        self.fs_remove_service().remove(path).await
+    async fn remove(&self, input_path: std::path::PathBuf) -> anyhow::Result<FsRemoveOutput> {
+        self.fs_remove_service().remove(input_path).await
     }
 }
 

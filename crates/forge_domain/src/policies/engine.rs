@@ -133,8 +133,8 @@ mod tests {
         let fixture_workflow = fixture_workflow_with_read_policy();
         let fixture = PolicyEngine::new(&fixture_workflow);
         let operation = PermissionOperation::Read {
-            path: "src/main.rs".to_string(),
-            cwd: "/test/cwd".to_string(),
+            path: "src/main.rs".into(),
+            cwd: "/test/cwd".into(),
             message: "Read file: src/main.rs".to_string(),
         };
 
@@ -148,8 +148,8 @@ mod tests {
         let fixture_workflow = fixture_workflow_with_write_policy();
         let fixture = PolicyEngine::new(&fixture_workflow);
         let operation = PermissionOperation::Write {
-            path: "src/main.rs".to_string(),
-            cwd: "/test/cwd".to_string(),
+            path: "src/main.rs".into(),
+            cwd: "/test/cwd".into(),
             message: "Create/overwrite file: src/main.rs".to_string(),
         };
 
@@ -163,8 +163,8 @@ mod tests {
         let fixture_workflow = fixture_workflow_with_write_policy_confirm();
         let fixture = PolicyEngine::new(&fixture_workflow);
         let operation = PermissionOperation::Write {
-            path: "src/main.rs".to_string(),
-            cwd: "/test/cwd".to_string(),
+            path: "src/main.rs".into(),
+            cwd: "/test/cwd".into(),
             message: "Create/overwrite file: src/main.rs".to_string(),
         };
 
@@ -179,7 +179,7 @@ mod tests {
         let fixture = PolicyEngine::new(&fixture_workflow);
         let operation = PermissionOperation::Execute {
             command: "cargo build".to_string(),
-            cwd: "/test/cwd".to_string(),
+            cwd: "/test/cwd".into(),
         };
 
         let actual = fixture.can_perform(&operation);
@@ -193,7 +193,7 @@ mod tests {
         let fixture = PolicyEngine::new(&fixture_workflow);
         let operation = PermissionOperation::Fetch {
             url: "https://api.example.com/data".to_string(),
-            cwd: "/test/cwd".to_string(),
+            cwd: "/test/cwd".into(),
             message: "Fetch content from URL: https://api.example.com/data".to_string(),
         };
 

@@ -241,7 +241,7 @@ pub struct FSSearch {
     /// File or directory to search in (rg PATH). Defaults to current working
     /// directory.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
+    pub path: Option<std::path::PathBuf>,
 
     /// Glob pattern to filter files (e.g. "*.js", "*.{ts,tsx}") - maps to rg
     /// --glob
@@ -450,7 +450,7 @@ pub struct SemanticSearch {
 #[tool_description_file = "crates/forge_domain/src/tools/descriptions/fs_remove.md"]
 pub struct FSRemove {
     /// The path of the file to remove (absolute path required)
-    pub path: String,
+    pub path: std::path::PathBuf,
 }
 
 /// Operation types that can be performed on matched text
@@ -583,7 +583,7 @@ pub struct FSMultiPatch {
 #[tool_description_file = "crates/forge_domain/src/tools/descriptions/fs_undo.md"]
 pub struct FSUndo {
     /// The absolute path of the file to revert to its previous state.
-    pub path: String,
+    pub path: std::path::PathBuf,
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema, ToolDescription, PartialEq)]
@@ -748,7 +748,7 @@ pub struct FetchInput {
 #[derive(Default, Deserialize, JsonSchema, ToolDescription, PartialEq)]
 pub struct FSListInput {
     /// The path of the directory to list contents for (absolute path required)
-    pub path: String,
+    pub path: std::path::PathBuf,
     /// Whether to list files recursively. Use true for recursive listing, false
     /// or omit for top-level only.
     pub recursive: Option<bool>,
@@ -762,7 +762,7 @@ pub struct FSListInput {
 #[derive(Default, Deserialize, JsonSchema, ToolDescription, PartialEq)]
 pub struct FSFileInfoInput {
     /// The path of the file or directory to inspect (absolute path required)
-    pub path: String,
+    pub path: std::path::PathBuf,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -772,7 +772,7 @@ pub struct UndoInput {
     /// a Forge file operation. If the file was deleted, provide the
     /// original path it had before deletion. The system requires a prior
     /// snapshot for this path.
-    pub path: String,
+    pub path: std::path::PathBuf,
 }
 
 /// Input for the select tool
@@ -933,10 +933,10 @@ impl ToolCatalog {
         cwd: PathBuf,
     ) -> Option<crate::policies::PermissionOperation> {
         let cwd_path = cwd.clone();
-        let display_path_for = |path: &str| {
+        let display_path_for = |path: &Path| {
             format!(
                 "`{}`",
-                format_display_path(Path::new(path), cwd_path.as_path())
+                format_display_path(path, cwd_path.as_path())
             )
         };
 
@@ -955,9 +955,9 @@ impl ToolCatalog {
                 ),
             }),
             ToolCatalog::FsSearch(input) => {
-                let path_str = input.path.as_deref().unwrap_or(".");
+                let path_ref = input.path.as_deref().unwrap_or_else(|| Path::new("."));
                 let base_message =
-                    format!("Search in directory/file: {}", display_path_for(path_str));
+                    format!("Search in directory/file: {}", display_path_for(path_ref));
                 let message = match (&input.glob, &input.file_type) {
                     (Some(glob), _) => {
                         format!(
@@ -976,7 +976,7 @@ impl ToolCatalog {
                     }
                 };
                 Some(crate::policies::PermissionOperation::Read {
-                    path: std::path::PathBuf::from(path_str),
+                    path: path_ref.to_path_buf(),
                     cwd,
                     message,
                 })
@@ -1072,7 +1072,7 @@ impl ToolCatalog {
     pub fn tool_call_search(path: &str, pattern: &str) -> ToolCallFull {
         ToolCallFull::from(ToolCatalog::FsSearch(FSSearch {
             pattern: pattern.to_string(),
-            path: Some(path.to_string()),
+            path: Some(path.into()),
             ..Default::default()
         }))
     }
@@ -1459,7 +1459,7 @@ mod tests {
         use crate::policies::PermissionOperation;
 
         let search_with_regex = ToolCatalog::FsSearch(FSSearch {
-            path: Some("/home/user/project".to_string()),
+            path: Some("/home/user/project".into()),
             pattern: "fn main".to_string(),
             ..Default::default()
         });
@@ -1487,7 +1487,7 @@ mod tests {
         use crate::policies::PermissionOperation;
 
         let search_without_regex = ToolCatalog::FsSearch(FSSearch {
-            path: Some("/home/user/project".to_string()),
+            path: Some("/home/user/project".into()),
             pattern: ".*".to_string(), // Match all content
             ..Default::default()
         });
@@ -1515,7 +1515,7 @@ mod tests {
         use crate::policies::PermissionOperation;
 
         let search_with_pattern = ToolCatalog::FsSearch(FSSearch {
-            path: Some("/home/user/project".to_string()),
+            path: Some("/home/user/project".into()),
             pattern: ".*".to_string(),
             glob: Some("*.rs".to_string()),
             ..Default::default()
@@ -1544,7 +1544,7 @@ mod tests {
         use crate::policies::PermissionOperation;
 
         let search_with_both = ToolCatalog::FsSearch(FSSearch {
-            path: Some("/home/user/project".to_string()),
+            path: Some("/home/user/project".into()),
             pattern: "fn main".to_string(),
             glob: Some("*.rs".to_string()),
             ..Default::default()

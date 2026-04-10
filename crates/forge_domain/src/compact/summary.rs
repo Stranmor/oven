@@ -339,13 +339,13 @@ fn extract_tool_info(call: &ToolCallFull, current_todos: &[Todo]) -> Option<Summ
     // Try to parse as a Tools enum variant
     if let Ok(tool) = ToolCatalog::try_from(call.clone()) {
         return match tool {
-            ToolCatalog::Read(input) => Some(SummaryTool::FileRead { path: input.file_path.clone() }),
-            ToolCatalog::Write(input) => Some(SummaryTool::FileUpdate { path: input.file_path.clone() }),
-            ToolCatalog::Patch(input) => Some(SummaryTool::FileUpdate { path: input.file_path.clone() }),
+            ToolCatalog::Read(input) => Some(SummaryTool::FileRead { path: input.file_path.display().to_string() }),
+            ToolCatalog::Write(input) => Some(SummaryTool::FileUpdate { path: input.file_path.display().to_string() }),
+            ToolCatalog::Patch(input) => Some(SummaryTool::FileUpdate { path: input.file_path.display().to_string() }),
             ToolCatalog::MultiPatch(input) => {
-                Some(SummaryTool::FileUpdate { path: input.file_path.clone() })
+                Some(SummaryTool::FileUpdate { path: input.file_path.display().to_string() })
             }
-            ToolCatalog::Remove(input) => Some(SummaryTool::FileRemove { path: input.path.clone() }),
+            ToolCatalog::Remove(input) => Some(SummaryTool::FileRemove { path: input.path.display().to_string() }),
             ToolCatalog::Shell(input) => Some(SummaryTool::Shell { command: input.command }),
             ToolCatalog::FsSearch(input) => {
                 // Use glob, file_type, or pattern as the search identifier
@@ -355,7 +355,7 @@ fn extract_tool_info(call: &ToolCallFull, current_todos: &[Todo]) -> Option<Summ
             ToolCatalog::SemSearch(input) => {
                 Some(SummaryTool::SemSearch { queries: input.queries })
             }
-            ToolCatalog::Undo(input) => Some(SummaryTool::Undo { path: input.path.clone() }),
+            ToolCatalog::Undo(input) => Some(SummaryTool::Undo { path: input.path.display().to_string() }),
             ToolCatalog::Fetch(input) => Some(SummaryTool::Fetch { url: input.url }),
             ToolCatalog::Followup(input) => {
                 Some(SummaryTool::Followup { question: input.question })
@@ -406,7 +406,7 @@ fn extract_tool_info(call: &ToolCallFull, current_todos: &[Todo]) -> Option<Summ
                 Some(SummaryTool::TodoWrite { changes })
             }
             ToolCatalog::TodoRead(_) => Some(SummaryTool::TodoRead),
-            ToolCatalog::Task(input) => Some(SummaryTool::Task { agent_id: input.agent_id.clone() }),
+            ToolCatalog::Task(input) => Some(SummaryTool::Task { agent_id: input.agent_id.to_string() }),
         };
     }
 

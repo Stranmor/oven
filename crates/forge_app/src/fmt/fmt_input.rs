@@ -7,11 +7,11 @@ use crate::utils::format_display_path;
 
 impl FormatContent for ToolCatalog {
     fn to_content(&self, env: &Environment) -> Option<ChatResponseContent> {
-        let display_path_for = |path: &str| format_display_path(Path::new(path), env.cwd.as_path());
+        let display_path_for = |path: &Path| format_display_path(path, env.cwd.as_path());
 
         match self {
             ToolCatalog::Read(input) => {
-                let display_path = display_path_for(&input.file_path.to_string_lossy());
+                let display_path = display_path_for(&input.file_path);
                 let is_explicit_range = input.start_line.is_some() || input.end_line.is_some();
                 let mut subtitle = display_path;
                 if is_explicit_range {
@@ -32,7 +32,7 @@ impl FormatContent for ToolCatalog {
             }
             ToolCatalog::Write(input) => {
                 let path = PathBuf::from(&input.file_path);
-                let display_path = display_path_for(&input.file_path.to_string_lossy());
+                let display_path = display_path_for(&input.file_path);
                 let title = match (path.exists(), input.overwrite) {
                     (true, true) => "Overwrite",
                     (true, false) => {
@@ -45,8 +45,8 @@ impl FormatContent for ToolCatalog {
                 Some(TitleFormat::debug(title).sub_title(display_path).into())
             }
             ToolCatalog::FsSearch(input) => {
-                let formatted_dir = input.path.as_deref().unwrap_or(".");
-                let formatted_dir = display_path_for(formatted_dir);
+                let path_ref = input.path.as_deref().unwrap_or_else(|| Path::new("."));
+                let formatted_dir = display_path_for(path_ref);
 
                 let title = match (&input.glob, &input.file_type) {
                     (Some(glob), _) => {
@@ -80,11 +80,11 @@ impl FormatContent for ToolCatalog {
                 )
             }
             ToolCatalog::Remove(input) => {
-                let display_path = display_path_for(&input.path.to_string_lossy());
+                let display_path = display_path_for(&input.path);
                 Some(TitleFormat::debug("Remove").sub_title(display_path).into())
             }
             ToolCatalog::Patch(input) => {
-                let display_path = display_path_for(&input.file_path.to_string_lossy());
+                let display_path = display_path_for(&input.file_path);
                 let operation_name = if input.replace_all {
                     "Replace All"
                 } else {
@@ -97,7 +97,7 @@ impl FormatContent for ToolCatalog {
                 )
             }
             ToolCatalog::MultiPatch(input) => {
-                let display_path = display_path_for(&input.file_path.to_string_lossy());
+                let display_path = display_path_for(&input.file_path);
                 Some(
                     TitleFormat::debug("Replace")
                         .sub_title(format!("{} ({} edits)", display_path, input.edits.len()))
@@ -105,7 +105,7 @@ impl FormatContent for ToolCatalog {
                 )
             }
             ToolCatalog::Undo(input) => {
-                let display_path = display_path_for(&input.path.to_string_lossy());
+                let display_path = display_path_for(&input.path);
                 Some(TitleFormat::debug("Undo").sub_title(display_path).into())
             }
             ToolCatalog::Shell(input) => Some(

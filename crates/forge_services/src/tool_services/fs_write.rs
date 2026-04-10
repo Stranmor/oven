@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -49,7 +48,7 @@ impl<
         content: String,
         overwrite: bool,
     ) -> anyhow::Result<FsWriteOutput> {
-        let path = Path::new(&input_path);
+        let path = path.as_path();
         assert_absolute_path(path)?;
 
         // Validate file syntax using remote validation API (graceful failure)
@@ -59,7 +58,7 @@ impl<
             .await
             .unwrap_or_default();
 
-        if let Some(parent) = Path::new(&input_path).parent() {
+        if let Some(parent) = path.parent() {
             self.infra
                 .create_dirs(parent)
                 .await

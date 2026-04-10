@@ -6,7 +6,6 @@ use forge_domain::{
     Conversation, ConversationId, EndPayload, EventData, EventHandle, StartPayload,
 };
 use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
 
 use crate::agent::AgentService;
 use crate::title_generator::TitleGenerator;
@@ -14,7 +13,6 @@ use crate::title_generator::TitleGenerator;
 /// Per-conversation title generation state.
 struct TitleGenerationState {
     rx: oneshot::Receiver<Option<String>>,
-    handle: JoinHandle<()>,
 }
 
 /// Hook handler that generates a conversation title asynchronously.
@@ -32,7 +30,7 @@ impl<S> TitleGenerationHandler<S> {
 }
 
 #[async_trait]
-impl<S: AgentService> EventHandle<EventData<StartPayload>> for TitleGenerationHandler<S> {
+impl<S: AgentService + crate::ConversationService> EventHandle<EventData<StartPayload>> for TitleGenerationHandler<S> {
     async fn handle(
         &self,
         event: &EventData<StartPayload>,
@@ -65,16 +63,28 @@ impl<S: AgentService> EventHandle<EventData<StartPayload>> for TitleGenerationHa
         )
         .reasoning(event.agent.reasoning.clone());
 
+        let conversation_id = conversation.id.clone();
+        let services = self.services.clone();
+
         // `or_insert_with` holds the shard lock for its entire call. Any occupied
         // entry — InProgress, Awaiting, or Done — is left untouched, so at most
         // one task is ever spawned per conversation id.
-        self.title_tasks.entry(conversation.id).or_insert_with(|| {
+        self.title_tasks.entry(conversation.id.clone()).or_insert_with(|| {
             let (tx, rx) = oneshot::channel();
-            let handle = tokio::spawn(async move {
+            let _handle = tokio::spawn(async move {
                 let title = generator.generate().await.ok().flatten();
-                let _ = tx.send(title);
+                if let Err(title) = tx.send(title) {
+                    if let Some(title) = title {
+                        // The receiver was dropped, meaning the EndPayload handler has already
+                        // run and the main conversation save is likely occurring.
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        let _ = services.modify_conversation(&conversation_id, |conv| {
+                            conv.title = Some(title);
+                        }).await;
+                    }
+                }
             });
-            TitleGenerationState { rx, handle }
+            TitleGenerationState { rx }
         });
 
         Ok(())
@@ -82,20 +92,21 @@ impl<S: AgentService> EventHandle<EventData<StartPayload>> for TitleGenerationHa
 }
 
 #[async_trait]
-impl<S: AgentService> EventHandle<EventData<EndPayload>> for TitleGenerationHandler<S> {
+impl<S: AgentService + crate::ConversationService> EventHandle<EventData<EndPayload>> for TitleGenerationHandler<S> {
     async fn handle(
         &self,
         _event: &EventData<EndPayload>,
         conversation: &mut Conversation,
     ) -> anyhow::Result<()> {
-        if let Some((_, entry)) = self.title_tasks.remove(&conversation.id) {
-            let handle = &entry.handle;
-            let rx = entry.rx;
-
-            if rx.is_empty() {
-                handle.abort();
-            } else if let Some(title) = rx.await? {
-                conversation.title = Some(title);
+        if let Some((_, mut entry)) = self.title_tasks.remove(&conversation.id) {
+            match entry.rx.try_recv() {
+                Ok(Some(title)) => {
+                    conversation.title = Some(title);
+                }
+                _ => {
+                    // Task is still running or finished with None. Drop rx without aborting the handle,
+                    // allowing it to save to the database directly if it succeeds later.
+                }
             }
         }
 
@@ -127,6 +138,17 @@ mod tests {
 
     #[derive(Clone)]
     struct MockAgentService;
+
+    #[async_trait]
+    impl crate::ConversationService for MockAgentService {
+        async fn find_conversation(&self, _id: &ConversationId) -> anyhow::Result<Option<Conversation>> { Ok(None) }
+        async fn upsert_conversation(&self, _conversation: Conversation) -> anyhow::Result<()> { Ok(()) }
+        async fn modify_conversation<F, T>(&self, _id: &ConversationId, _f: F) -> anyhow::Result<T>
+        where F: FnOnce(&mut Conversation) -> T + Send, T: Send { panic!("not implemented") }
+        async fn get_conversations(&self, _limit: Option<usize>) -> anyhow::Result<Option<Vec<Conversation>>> { Ok(None) }
+        async fn last_conversation(&self) -> anyhow::Result<Option<Conversation>> { Ok(None) }
+        async fn delete_conversation(&self, _conversation_id: &ConversationId) -> anyhow::Result<()> { Ok(()) }
+    }
 
     #[async_trait]
     impl AgentService for MockAgentService {
@@ -245,10 +267,11 @@ mod tests {
         assert!(!handler.title_tasks.contains_key(&conversation.id));
     }
 
-    /// When EndPayload is received, the spawned task should be aborted so it
-    /// doesn't continue running unnecessarily.
+    /// When EndPayload is received, the spawned task should no longer be aborted,
+    /// so it can complete and update the database later. We verify this by ensuring
+    /// the handle continues to exist and the handler does not hang.
     #[tokio::test]
-    async fn test_end_aborts_in_progress_task() {
+    async fn test_end_does_not_abort_in_progress_task() {
         let (handler, mut conversation) = setup("test message");
         let (tx, rx) = oneshot::channel::<Option<String>>();
         let handle = tokio::spawn(async move {
@@ -259,7 +282,7 @@ mod tests {
 
         handler
             .title_tasks
-            .insert(conversation.id, TitleGenerationState { rx, handle });
+            .insert(conversation.id.clone(), TitleGenerationState { rx, handle });
 
         handler
             .handle(&event(EndPayload), &mut conversation)

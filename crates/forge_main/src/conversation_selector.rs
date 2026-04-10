@@ -6,7 +6,6 @@ use forge_api::Conversation;
 use forge_domain::ConversationId;
 use forge_select::ForgeWidget;
 
-use crate::display_constants::markers;
 use crate::info::Info;
 use crate::porcelain::Porcelain;
 
@@ -29,10 +28,10 @@ impl ConversationSelector {
             return Ok(None);
         }
 
-        // Filter to conversations with titles and context
+        // Filter to conversations with context
         let valid_conversations: Vec<&Conversation> = conversations
             .iter()
-            .filter(|c| c.title.is_some() && c.context.is_some())
+            .filter(|c| c.context.is_some())
             .collect();
 
         if valid_conversations.is_empty() {
@@ -48,7 +47,7 @@ impl ConversationSelector {
                 .title
                 .as_deref()
                 .map(|t| t.to_string())
-                .unwrap_or_else(|| markers::EMPTY.to_string());
+                .unwrap_or_else(|| conv.id.into_string());
 
             let duration = now.signed_duration_since(
                 conv.metadata.updated_at.unwrap_or(conv.metadata.created_at),
