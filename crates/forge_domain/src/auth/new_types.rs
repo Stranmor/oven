@@ -5,6 +5,16 @@ use serde::{Deserialize, Serialize};
 )]
 #[serde(transparent)]
 pub struct ApiKey(String);
+impl ApiKey {
+    pub fn google_adc_marker() -> Self {
+        Self("google_adc_marker".to_string())
+    }
+
+    pub fn is_google_adc_marker(&self) -> bool {
+        self.0 == "google_adc_marker"
+    }
+}
+
 
 impl std::fmt::Display for ApiKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

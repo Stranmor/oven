@@ -256,7 +256,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             home: Some(PathBuf::from("/home/test")),
             shell: "bash".to_string(),
-            base_path: PathBuf::from("/tmp/test-forge"),
+            base_path: PathBuf::from(format!("/tmp/test-forge-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos())),
         }
     }
 

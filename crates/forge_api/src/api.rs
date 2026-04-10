@@ -254,5 +254,5 @@ pub trait API: Sync + Send {
     async fn mcp_logout(&self, server_url: Option<&str>) -> Result<()>;
 
     /// Check the OAuth authentication status of an MCP server
-    async fn mcp_auth_status(&self, server_url: &str) -> Result<String>;
+    async fn mcp_auth_status(&self, server_url: &str) -> Result<forge_domain::McpAuthStatus>;
 }

@@ -168,7 +168,7 @@ mod tests {
     fn test_environment() -> Environment {
         use fake::{Fake, Faker};
         let env: Environment = Faker.fake();
-        env.cwd("/test/working/dir".to_string())
+        env.cwd("/test/working/dir".into())
     }
 
     #[test]

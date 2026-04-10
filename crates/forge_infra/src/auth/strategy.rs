@@ -440,7 +440,7 @@ impl AuthStrategy for GoogleAdcStrategy {
         Ok(AuthContextRequest::ApiKey(ApiKeyRequest {
             required_params: self.required_params.clone(),
             existing_params: None,
-            api_key: Some("google_adc_marker".to_string().into()), // Marker to indicate ADC usage
+            api_key: Some(ApiKey::google_adc_marker()), // Marker to indicate ADC usage
         }))
     }
 
@@ -480,7 +480,7 @@ impl AuthStrategy for GoogleAdcStrategy {
                 // But we still need to save the url_params (PROJECT_ID, LOCATION)
                 Ok(AuthCredential::new_google_adc(
                     self.provider_id.clone(),
-                    ApiKey::from("google_adc_marker".to_string()), /* Marker that will trigger
+                    ApiKey::google_adc_marker(), /* Marker that will trigger
                                                                     * refresh */
                 )
                 .url_params(ctx.response.url_params))

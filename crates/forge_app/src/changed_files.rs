@@ -105,12 +105,13 @@ mod tests {
     impl FsReadService for TestServices {
         async fn read(
             &self,
-            path: String,
+            path: std::path::PathBuf,
             _: Option<u64>,
             _: Option<u64>,
         ) -> anyhow::Result<ReadOutput> {
+            let path_str = path.to_string_lossy().to_string();
             self.files
-                .get(&path)
+                .get(&path_str)
                 .map(|content| {
                     let hash = compute_hash(content);
                     ReadOutput {

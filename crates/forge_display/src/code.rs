@@ -4,6 +4,7 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 use syntect::util::as_24_bit_terminal_escaped;
+#[cfg(not(test))]
 use terminal_colorsaurus::{QueryOptions, ThemeMode, theme_mode};
 use two_face::theme::EmbeddedThemeName;
 
@@ -27,9 +28,16 @@ impl Default for SyntaxHighlighter {
 impl SyntaxHighlighter {
     /// Detects whether the terminal is using a dark or light background.
     fn is_dark_theme() -> bool {
-        match theme_mode(QueryOptions::default()) {
-            Ok(ThemeMode::Light) => false,
-            Ok(ThemeMode::Dark) | Err(_) => true,
+        #[cfg(test)]
+        {
+            return true;
+        }
+        #[cfg(not(test))]
+        {
+            match theme_mode(QueryOptions::default()) {
+                Ok(ThemeMode::Light) => false,
+                Ok(ThemeMode::Dark) | Err(_) => true,
+            }
         }
     }
 

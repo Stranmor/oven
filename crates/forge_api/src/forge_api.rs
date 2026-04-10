@@ -421,7 +421,7 @@ impl<
         }
     }
 
-    async fn mcp_auth_status(&self, server_url: &str) -> Result<String> {
+    async fn mcp_auth_status(&self, server_url: &str) -> Result<forge_domain::McpAuthStatus> {
         let env = self.services.get_environment().clone();
         Ok(forge_infra::mcp_auth_status(server_url, &env).await)
     }

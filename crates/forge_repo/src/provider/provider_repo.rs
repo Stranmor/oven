@@ -383,7 +383,7 @@ impl<
         if (credential.id == forge_domain::ProviderId::VERTEX_AI
             || credential.id == forge_domain::ProviderId::VERTEX_AI_ANTHROPIC)
             && let forge_domain::AuthDetails::ApiKey(ref api_key) = credential.auth_details
-            && api_key.as_ref() == "google_adc_marker"
+            && api_key.is_google_adc_marker()
         {
             // Refresh the Google ADC credential, preserving url_params
             match self.refresh_google_adc_credential(&credential).await {

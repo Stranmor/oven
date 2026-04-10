@@ -9,6 +9,45 @@ use derive_setters::Setters;
 use merge::Merge;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpAuthStatus {
+    Authenticated,
+    Unauthenticated,
+    Expired,
+}
+
+impl std::fmt::Display for McpAuthStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Authenticated => write!(f, "authenticated"),
+            Self::Unauthenticated => write!(f, "unauthenticated"),
+            Self::Expired => write!(f, "expired"),
+        }
+    }
+}
+
+impl McpAuthStatus {
+    pub fn is_authenticated(self) -> bool {
+        self == Self::Authenticated
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpLogoutTarget {
+    All,
+    Specific(crate::ServerName),
+}
+
+impl From<String> for McpLogoutTarget {
+    fn from(name: String) -> Self {
+        if name.eq_ignore_ascii_case("all") {
+            Self::All
+        } else {
+            Self::Specific(crate::ServerName::from(name))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Scope {
     Local,

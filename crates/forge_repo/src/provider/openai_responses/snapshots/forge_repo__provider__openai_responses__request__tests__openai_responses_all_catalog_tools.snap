@@ -12,7 +12,8 @@ expression: actual.tools
         "end_line": {
           "anyOf": [
             {
-              "format": "int32",
+              "format": "uint32",
+              "minimum": 0,
               "type": "integer"
             },
             {
@@ -33,7 +34,8 @@ expression: actual.tools
         "start_line": {
           "anyOf": [
             {
-              "format": "int32",
+              "format": "uint32",
+              "minimum": 0,
               "type": "integer"
             },
             {
@@ -270,6 +272,19 @@ expression: actual.tools
     "parameters": {
       "additionalProperties": false,
       "properties": {
+        "max_results": {
+          "anyOf": [
+            {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Maximum number of search results to return per query. If not provided,\ndefaults to the system configuration limit."
+        },
         "queries": {
           "description": "List of search queries to execute in parallel. Using multiple queries\n(2-3) with varied phrasings significantly improves results - each query\ncaptures different aspects of what you're looking for. Each query pairs\na search term with a use_case for reranking. Example: for\nauthentication, try \"user login verification\", \"token generation\",\n\"OAuth flow\".",
           "items": {
@@ -295,6 +310,7 @@ expression: actual.tools
         }
       },
       "required": [
+        "max_results",
         "queries"
       ],
       "title": "SemanticSearch",

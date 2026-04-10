@@ -9,7 +9,8 @@ expression: tools
     "end_line": {
       "description": "The line number to stop reading at (inclusive). Only provide if the file\nis too large to read at once",
       "type": "integer",
-      "format": "int32",
+      "format": "uint32",
+      "minimum": 0,
       "nullable": true
     },
     "file_path": {
@@ -24,7 +25,8 @@ expression: tools
     "start_line": {
       "description": "The line number to start reading from starting from 1 not 0. Only\nprovide if the file is too large to read at once",
       "type": "integer",
-      "format": "int32",
+      "format": "uint32",
+      "minimum": 0,
       "nullable": true
     }
   },

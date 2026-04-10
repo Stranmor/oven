@@ -828,7 +828,7 @@ mod tests {
             Node {
                 node_id: node_id.into(),
                 node: NodeData::FileChunk(FileChunk {
-                    file_path: std::path::PathBuf::from(file_path),
+                    file_path: file_path.to_string(),
                     content: content.to_string(),
                     start_line,
                     end_line,
@@ -860,7 +860,7 @@ mod tests {
         let hash = crate::compute_hash(content);
         let fixture = ToolOperation::FsRead {
             input: FSRead {
-                file_path: "/home/user/test.txt".to_string(),
+                file_path: "/home/user/test.txt".into(),
                 start_line: None,
                 end_line: None,
                 show_line_numbers: true,
@@ -891,7 +891,7 @@ mod tests {
         let hash = crate::compute_hash(content);
         let fixture = ToolOperation::FsRead {
             input: FSRead {
-                file_path: "/home/user/test.txt".to_string(),
+                file_path: "/home/user/test.txt".into(),
                 start_line: None,
                 end_line: None,
                 show_line_numbers: true,
@@ -921,7 +921,7 @@ mod tests {
         let hash = crate::compute_hash(content);
         let fixture = ToolOperation::FsRead {
             input: FSRead {
-                file_path: "/home/user/test.txt".to_string(),
+                file_path: "/home/user/test.txt".into(),
                 start_line: Some(2),
                 end_line: Some(3),
                 show_line_numbers: true,
@@ -952,7 +952,7 @@ mod tests {
         let hash = crate::compute_hash(content);
         let fixture = ToolOperation::FsRead {
             input: FSRead {
-                file_path: "/home/user/large_file.txt".to_string(),
+                file_path: "/home/user/large_file.txt".into(),
                 start_line: None,
                 end_line: None,
                 show_line_numbers: true,
@@ -984,12 +984,12 @@ mod tests {
         let content = "Hello, world!";
         let fixture = ToolOperation::FsWrite {
             input: forge_domain::FSWrite {
-                file_path: "/home/user/new_file.txt".to_string(),
+                file_path: "/home/user/new_file.txt".into(),
                 content: content.to_string(),
                 overwrite: false,
             },
             output: FsWriteOutput {
-                path: "/home/user/new_file.txt".to_string(),
+                path: "/home/user/new_file.txt".into(),
                 before: None,
                 errors: vec![],
                 content_hash: compute_hash(content),
@@ -1015,12 +1015,12 @@ mod tests {
         let content = "New content for the file";
         let fixture = ToolOperation::FsWrite {
             input: forge_domain::FSWrite {
-                file_path: "/home/user/existing_file.txt".to_string(),
+                file_path: "/home/user/existing_file.txt".into(),
                 content: content.to_string(),
                 overwrite: true,
             },
             output: FsWriteOutput {
-                path: "/home/user/existing_file.txt".to_string(),
+                path: "/home/user/existing_file.txt".into(),
                 before: Some("Old content".to_string()),
                 errors: vec![],
                 content_hash: compute_hash(content),
@@ -1328,7 +1328,7 @@ mod tests {
         let total_lines = 50;
         for i in 1..=total_lines {
             matches.push(Match {
-                path: "/home/user/project/foo.txt".to_string(),
+                path: "/home/user/project/foo.txt".into(),
                 result: Some(MatchResult::Found {
                     line: format!("Match line {}: Test", i),
                     line_number: Some(i),
@@ -1338,7 +1338,7 @@ mod tests {
 
         let fixture = ToolOperation::FsSearch {
             input: forge_domain::FSSearch {
-                path: Some("/home/user/project".to_string()),
+                path: Some("/home/user/project".into()),
                 pattern: "search".to_string(),
                 glob: Some("*.txt".to_string()),
                 ..Default::default()
@@ -1367,7 +1367,7 @@ mod tests {
         let total_lines = 50; // Total lines found.
         for i in 1..=total_lines {
             matches.push(Match {
-                path: "/home/user/project/foo.txt".to_string(),
+                path: "/home/user/project/foo.txt".into(),
                 result: Some(MatchResult::Found {
                     line: format!("Match line {}: Test", i),
                     line_number: Some(i),
@@ -1377,7 +1377,7 @@ mod tests {
 
         let fixture = ToolOperation::FsSearch {
             input: forge_domain::FSSearch {
-                path: Some("/home/user/project".to_string()),
+                path: Some("/home/user/project".into()),
                 pattern: "search".to_string(),
                 glob: Some("*.txt".to_string()),
                 ..Default::default()
@@ -1408,7 +1408,7 @@ mod tests {
         let total_lines = 50; // Total lines found.
         for i in 1..=total_lines {
             matches.push(Match {
-                path: "/home/user/project/foo.txt".to_string(),
+                path: "/home/user/project/foo.txt".into(),
                 result: Some(MatchResult::Found {
                     line: format!("Match line {}: {}", i, "AB".repeat(50)),
                     line_number: Some(i),
@@ -1418,7 +1418,7 @@ mod tests {
 
         let fixture = ToolOperation::FsSearch {
             input: forge_domain::FSSearch {
-                path: Some("/home/user/project".to_string()),
+                path: Some("/home/user/project".into()),
                 pattern: "search".to_string(),
                 glob: Some("*.txt".to_string()),
                 ..Default::default()
@@ -1450,7 +1450,7 @@ mod tests {
         let total_lines = 1; // Total lines found.
         for i in 1..=total_lines {
             matches.push(Match {
-                path: "/home/user/project/foo.txt".to_string(),
+                path: "/home/user/project/foo.txt".into(),
                 result: Some(MatchResult::Found {
                     line: format!(
                         "Match line {}: {}",
@@ -1464,7 +1464,7 @@ mod tests {
 
         let fixture = ToolOperation::FsSearch {
             input: forge_domain::FSSearch {
-                path: Some("/home/user/project".to_string()),
+                path: Some("/home/user/project".into()),
                 pattern: "search".to_string(),
                 glob: Some("*.txt".to_string()),
                 ..Default::default()
@@ -1494,7 +1494,7 @@ mod tests {
     fn test_fs_search_no_matches() {
         let fixture = ToolOperation::FsSearch {
             input: forge_domain::FSSearch {
-                path: Some("/home/user/empty_project".to_string()),
+                path: Some("/home/user/empty_project".into()),
                 pattern: "nonexistent".to_string(),
                 ..Default::default()
             },
@@ -1520,12 +1520,12 @@ mod tests {
         let content = "Content with warning";
         let fixture = ToolOperation::FsWrite {
             input: forge_domain::FSWrite {
-                file_path: "/home/user/file_with_warning.txt".to_string(),
+                file_path: "/home/user/file_with_warning.txt".into(),
                 content: content.to_string(),
                 overwrite: false,
             },
             output: FsWriteOutput {
-                path: "/home/user/file_with_warning.txt".to_string(),
+                path: "/home/user/file_with_warning.txt".into(),
                 before: None,
                 errors: test_syntax_errors(vec![(10, 5, "Syntax error on line 10")]),
                 content_hash: compute_hash(content),
@@ -1551,12 +1551,12 @@ mod tests {
         let content = "Content with warning";
         let fixture = ToolOperation::FsWrite {
             input: forge_domain::FSWrite {
-                file_path: "/home/user/file_with_warning.txt".to_string(),
+                file_path: "/home/user/file_with_warning.txt".into(),
                 content: content.to_string(),
                 overwrite: false,
             },
             output: FsWriteOutput {
-                path: "/home/user/file_with_warning.txt".to_string(),
+                path: "/home/user/file_with_warning.txt".into(),
                 before: None,
                 errors: test_syntax_errors(vec![
                     (10, 5, "Syntax error on line 10"),
@@ -1583,7 +1583,7 @@ mod tests {
     #[test]
     fn test_fs_remove_success() {
         let fixture = ToolOperation::FsRemove {
-            input: forge_domain::FSRemove { path: "/home/user/file_to_delete.txt".to_string() },
+            input: forge_domain::FSRemove { path: "/home/user/file_to_delete.txt".into() },
             output: FsRemoveOutput { content: "content".to_string() },
         };
 
@@ -1605,7 +1605,7 @@ mod tests {
     fn test_fs_search_with_results() {
         let fixture = ToolOperation::FsSearch {
             input: forge_domain::FSSearch {
-                path: Some("/home/user/project".to_string()),
+                path: Some("/home/user/project".into()),
                 pattern: "Hello".to_string(),
                 glob: Some("*.txt".to_string()),
                 ..Default::default()
@@ -1613,14 +1613,14 @@ mod tests {
             output: Some(SearchResult {
                 matches: vec![
                     Match {
-                        path: "file1.txt".to_string(),
+                        path: "file1.txt".into(),
                         result: Some(MatchResult::Found {
                             line_number: Some(1),
                             line: "Hello world".to_string(),
                         }),
                     },
                     Match {
-                        path: "file2.txt".to_string(),
+                        path: "file2.txt".into(),
                         result: Some(MatchResult::Found {
                             line_number: Some(3),
                             line: "Hello universe".to_string(),
@@ -1651,7 +1651,7 @@ mod tests {
         let total_lines = 50;
         for i in 1..=total_lines {
             matches.push(Match {
-                path: "/home/user/project/foo.txt".to_string(),
+                path: "/home/user/project/foo.txt".into(),
                 result: Some(MatchResult::Found {
                     line: format!("Match line {}: Test", i),
                     line_number: Some(i),
@@ -1661,7 +1661,7 @@ mod tests {
 
         let fixture = ToolOperation::FsSearch {
             input: forge_domain::FSSearch {
-                path: Some("/home/user/project".to_string()),
+                path: Some("/home/user/project".into()),
                 pattern: "search".to_string(),
                 glob: Some("*.txt".to_string()),
                 offset: Some(10),     // Skip first 10 matches
@@ -1689,7 +1689,7 @@ mod tests {
     fn test_fs_search_files_with_matches_mode() {
         let fixture = ToolOperation::FsSearch {
             input: forge_domain::FSSearch {
-                path: Some("/home/user/project".to_string()),
+                path: Some("/home/user/project".into()),
                 pattern: "test".to_string(),
                 output_mode: Some(forge_domain::OutputMode::FilesWithMatches),
                 ..Default::default()
@@ -1697,11 +1697,11 @@ mod tests {
             output: Some(SearchResult {
                 matches: vec![
                     Match {
-                        path: "/home/user/project/file1.rs".to_string(),
+                        path: "/home/user/project/file1.rs".into(),
                         result: Some(MatchResult::FileMatch),
                     },
                     Match {
-                        path: "/home/user/project/file2.rs".to_string(),
+                        path: "/home/user/project/file2.rs".into(),
                         result: Some(MatchResult::FileMatch),
                     },
                 ],
@@ -1726,7 +1726,7 @@ mod tests {
     fn test_fs_search_count_mode() {
         let fixture = ToolOperation::FsSearch {
             input: forge_domain::FSSearch {
-                path: Some("/home/user/project".to_string()),
+                path: Some("/home/user/project".into()),
                 pattern: "test".to_string(),
                 output_mode: Some(forge_domain::OutputMode::Count),
                 ..Default::default()
@@ -1734,15 +1734,15 @@ mod tests {
             output: Some(SearchResult {
                 matches: vec![
                     Match {
-                        path: "/home/user/project/file1.rs".to_string(),
+                        path: "/home/user/project/file1.rs".into(),
                         result: Some(MatchResult::Count { count: 5 }),
                     },
                     Match {
-                        path: "/home/user/project/file2.rs".to_string(),
+                        path: "/home/user/project/file2.rs".into(),
                         result: Some(MatchResult::Count { count: 3 }),
                     },
                     Match {
-                        path: "/home/user/project/file3.rs".to_string(),
+                        path: "/home/user/project/file3.rs".into(),
                         result: Some(MatchResult::Count { count: 12 }),
                     },
                 ],
@@ -1767,14 +1767,14 @@ mod tests {
     fn test_fs_search_with_context_lines() {
         let fixture = ToolOperation::FsSearch {
             input: forge_domain::FSSearch {
-                path: Some("/home/user/project".to_string()),
+                path: Some("/home/user/project".into()),
                 pattern: "MATCH".to_string(),
                 context: Some(2), // 2 lines before and after
                 ..Default::default()
             },
             output: Some(SearchResult {
                 matches: vec![Match {
-                    path: "/home/user/project/test.txt".to_string(),
+                    path: "/home/user/project/test.txt".into(),
                     result: Some(MatchResult::ContextMatch {
                         line_number: Some(10),
                         line: "This is the MATCH line".to_string(),
@@ -1809,14 +1809,14 @@ mod tests {
     fn test_fs_search_with_before_context() {
         let fixture = ToolOperation::FsSearch {
             input: forge_domain::FSSearch {
-                path: Some("/home/user/project".to_string()),
+                path: Some("/home/user/project".into()),
                 pattern: "ERROR".to_string(),
                 before_context: Some(3), // 3 lines before
                 ..Default::default()
             },
             output: Some(SearchResult {
                 matches: vec![Match {
-                    path: "/home/user/project/log.txt".to_string(),
+                    path: "/home/user/project/log.txt".into(),
                     result: Some(MatchResult::ContextMatch {
                         line_number: Some(50),
                         line: "ERROR: Something went wrong".to_string(),
@@ -1849,14 +1849,14 @@ mod tests {
     fn test_fs_search_with_after_context() {
         let fixture = ToolOperation::FsSearch {
             input: forge_domain::FSSearch {
-                path: Some("/home/user/project".to_string()),
+                path: Some("/home/user/project".into()),
                 pattern: "TODO".to_string(),
                 after_context: Some(2), // 2 lines after
                 ..Default::default()
             },
             output: Some(SearchResult {
                 matches: vec![Match {
-                    path: "/home/user/project/src/main.rs".to_string(),
+                    path: "/home/user/project/src/main.rs".into(),
                     result: Some(MatchResult::ContextMatch {
                         line_number: Some(15),
                         line: "// TODO: Implement this feature".to_string(),
@@ -1888,7 +1888,7 @@ mod tests {
     fn test_fs_search_without_line_numbers() {
         let fixture = ToolOperation::FsSearch {
             input: forge_domain::FSSearch {
-                path: Some("/home/user/project".to_string()),
+                path: Some("/home/user/project".into()),
                 pattern: "function".to_string(),
                 show_line_numbers: Some(false),
                 ..Default::default()
@@ -1896,14 +1896,14 @@ mod tests {
             output: Some(SearchResult {
                 matches: vec![
                     Match {
-                        path: "/home/user/project/app.js".to_string(),
+                        path: "/home/user/project/app.js".into(),
                         result: Some(MatchResult::Found {
                             line_number: None, // No line number when disabled
                             line: "function doSomething() {".to_string(),
                         }),
                     },
                     Match {
-                        path: "/home/user/project/utils.js".to_string(),
+                        path: "/home/user/project/utils.js".into(),
                         result: Some(MatchResult::Found {
                             line_number: None,
                             line: "function helper() {".to_string(),
@@ -1931,7 +1931,7 @@ mod tests {
     fn test_fs_search_with_file_type() {
         let fixture = ToolOperation::FsSearch {
             input: forge_domain::FSSearch {
-                path: Some("/home/user/project".to_string()),
+                path: Some("/home/user/project".into()),
                 pattern: "class".to_string(),
                 file_type: Some("py".to_string()), // Python files only
                 ..Default::default()
@@ -1939,14 +1939,14 @@ mod tests {
             output: Some(SearchResult {
                 matches: vec![
                     Match {
-                        path: "/home/user/project/models.py".to_string(),
+                        path: "/home/user/project/models.py".into(),
                         result: Some(MatchResult::Found {
                             line_number: Some(1),
                             line: "class User:".to_string(),
                         }),
                     },
                     Match {
-                        path: "/home/user/project/views.py".to_string(),
+                        path: "/home/user/project/views.py".into(),
                         result: Some(MatchResult::Found {
                             line_number: Some(5),
                             line: "class HomeView:".to_string(),
@@ -1974,7 +1974,7 @@ mod tests {
     fn test_fs_search_case_insensitive() {
         let fixture = ToolOperation::FsSearch {
             input: forge_domain::FSSearch {
-                path: Some("/home/user/project".to_string()),
+                path: Some("/home/user/project".into()),
                 pattern: "error".to_string(),
                 case_insensitive: Some(true),
                 ..Default::default()
@@ -1982,21 +1982,21 @@ mod tests {
             output: Some(SearchResult {
                 matches: vec![
                     Match {
-                        path: "/home/user/project/log.txt".to_string(),
+                        path: "/home/user/project/log.txt".into(),
                         result: Some(MatchResult::Found {
                             line_number: Some(10),
                             line: "ERROR: Connection failed".to_string(),
                         }),
                     },
                     Match {
-                        path: "/home/user/project/log.txt".to_string(),
+                        path: "/home/user/project/log.txt".into(),
                         result: Some(MatchResult::Found {
                             line_number: Some(15),
                             line: "error in processing".to_string(),
                         }),
                     },
                     Match {
-                        path: "/home/user/project/log.txt".to_string(),
+                        path: "/home/user/project/log.txt".into(),
                         result: Some(MatchResult::Found {
                             line_number: Some(20),
                             line: "Error: Invalid input".to_string(),
@@ -2024,14 +2024,14 @@ mod tests {
     fn test_fs_search_multiline_pattern() {
         let fixture = ToolOperation::FsSearch {
             input: forge_domain::FSSearch {
-                path: Some("/home/user/project".to_string()),
+                path: Some("/home/user/project".into()),
                 pattern: "struct.*\\{.*field".to_string(),
                 multiline: Some(true),
                 ..Default::default()
             },
             output: Some(SearchResult {
                 matches: vec![Match {
-                    path: "/home/user/project/types.rs".to_string(),
+                    path: "/home/user/project/types.rs".into(),
                     result: Some(MatchResult::Found {
                         line_number: Some(10),
                         line: "struct User {\n    field: String".to_string(),
@@ -2058,7 +2058,7 @@ mod tests {
     fn test_fs_search_no_results() {
         let fixture = ToolOperation::FsSearch {
             input: forge_domain::FSSearch {
-                path: Some("/home/user/project".to_string()),
+                path: Some("/home/user/project".into()),
                 pattern: "NonExistentPattern".to_string(),
                 ..Default::default()
             },
@@ -2084,7 +2084,7 @@ mod tests {
         let after_content = "Hello universe\nThis is a test";
         let fixture = ToolOperation::FsPatch {
             input: forge_domain::FSPatch {
-                file_path: "/home/user/test.txt".to_string(),
+                file_path: "/home/user/test.txt".into(),
                 old_string: "world".to_string(),
                 new_string: "universe".to_string(),
                 replace_all: false,
@@ -2116,7 +2116,7 @@ mod tests {
         let after_content = "line1\nnew line\nline2";
         let fixture = ToolOperation::FsPatch {
             input: forge_domain::FSPatch {
-                file_path: "/home/user/large_file.txt".to_string(),
+                file_path: "/home/user/large_file.txt".into(),
                 old_string: "line1".to_string(),
                 new_string: "\nnew line".to_string(),
                 replace_all: false,
@@ -2148,7 +2148,7 @@ mod tests {
         let after_content = "line1\nnew line\nline2";
         let fixture = ToolOperation::FsPatch {
             input: forge_domain::FSPatch {
-                file_path: "/home/user/test.zsh".to_string(),
+                file_path: "/home/user/test.zsh".into(),
                 old_string: "line1".to_string(),
                 new_string: "\nnew line".to_string(),
                 replace_all: false,
@@ -2186,7 +2186,7 @@ mod tests {
     #[test]
     fn test_fs_undo_no_changes() {
         let fixture = ToolOperation::FsUndo {
-            input: forge_domain::FSUndo { path: "/home/user/unchanged_file.txt".to_string() },
+            input: forge_domain::FSUndo { path: "/home/user/unchanged_file.txt".into() },
             output: FsUndoOutput { before_undo: None, after_undo: None },
         };
 
@@ -2207,7 +2207,7 @@ mod tests {
     #[test]
     fn test_fs_undo_file_created() {
         let fixture = ToolOperation::FsUndo {
-            input: forge_domain::FSUndo { path: "/home/user/new_file.txt".to_string() },
+            input: forge_domain::FSUndo { path: "/home/user/new_file.txt".into() },
             output: FsUndoOutput {
                 before_undo: None,
                 after_undo: Some("New file content\nLine 2\nLine 3".to_string()),
@@ -2231,7 +2231,7 @@ mod tests {
     #[test]
     fn test_fs_undo_file_removed() {
         let fixture = ToolOperation::FsUndo {
-            input: forge_domain::FSUndo { path: "/home/user/deleted_file.txt".to_string() },
+            input: forge_domain::FSUndo { path: "/home/user/deleted_file.txt".into() },
             output: FsUndoOutput {
                 before_undo: Some(
                     "Original file content\nThat was deleted\nDuring undo".to_string(),
@@ -2257,7 +2257,7 @@ mod tests {
     #[test]
     fn test_fs_undo_file_restored() {
         let fixture = ToolOperation::FsUndo {
-            input: forge_domain::FSUndo { path: "/home/user/restored_file.txt".to_string() },
+            input: forge_domain::FSUndo { path: "/home/user/restored_file.txt".into() },
             output: FsUndoOutput {
                 before_undo: Some("Original content\nBefore changes".to_string()),
                 after_undo: Some("Modified content\nAfter restoration".to_string()),
@@ -2281,7 +2281,7 @@ mod tests {
     #[test]
     fn test_fs_undo_success() {
         let fixture = ToolOperation::FsUndo {
-            input: forge_domain::FSUndo { path: "/home/user/test.txt".to_string() },
+            input: forge_domain::FSUndo { path: "/home/user/test.txt".into() },
             output: FsUndoOutput {
                 before_undo: Some("ABC".to_string()),
                 after_undo: Some("PQR".to_string()),
@@ -2620,7 +2620,7 @@ mod tests {
 
         let fixture = ToolOperation::FsRead {
             input: FSRead {
-                file_path: "/home/user/test.png".to_string(),
+                file_path: "/home/user/test.png".into(),
                 start_line: None,
                 end_line: None,
                 show_line_numbers: true,

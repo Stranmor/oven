@@ -87,7 +87,7 @@ mod tests {
         let content = "Hello, world!";
         let fixture = ToolOperation::FsRead {
             input: forge_domain::FSRead {
-                file_path: "/home/user/test.txt".to_string(),
+                file_path: "/home/user/test.txt".into(),
                 start_line: None,
                 end_line: None,
                 show_line_numbers: true,
@@ -110,7 +110,7 @@ mod tests {
         let content = "Line 1\nLine 2\nLine 3";
         let fixture = ToolOperation::FsRead {
             input: forge_domain::FSRead {
-                file_path: "/home/user/test.txt".to_string(),
+                file_path: "/home/user/test.txt".into(),
                 start_line: Some(2),
                 end_line: Some(4),
                 show_line_numbers: true,
@@ -133,12 +133,12 @@ mod tests {
         let content = "New file content";
         let fixture = ToolOperation::FsWrite {
             input: forge_domain::FSWrite {
-                file_path: "/home/user/project/new_file.txt".to_string(),
+                file_path: "/home/user/project/new_file.txt".into(),
                 content: content.to_string(),
                 overwrite: false,
             },
             output: FsWriteOutput {
-                path: "/home/user/project/new_file.txt".to_string(),
+                path: "/home/user/project/new_file.txt".into(),
                 before: None,
                 errors: vec![],
                 content_hash: crate::compute_hash(content),
@@ -157,12 +157,12 @@ mod tests {
         let content = "new content";
         let fixture = ToolOperation::FsWrite {
             input: forge_domain::FSWrite {
-                file_path: "/home/user/project/existing_file.txt".to_string(),
+                file_path: "/home/user/project/existing_file.txt".into(),
                 content: content.to_string(),
                 overwrite: true,
             },
             output: FsWriteOutput {
-                path: "/home/user/project/existing_file.txt".to_string(),
+                path: "/home/user/project/existing_file.txt".into(),
                 before: Some("old content".to_string()),
                 errors: vec![],
                 content_hash: crate::compute_hash(content),
@@ -185,12 +185,12 @@ mod tests {
         let content = "File content";
         let fixture = ToolOperation::FsWrite {
             input: forge_domain::FSWrite {
-                file_path: "/home/user/project/file.txt".to_string(),
+                file_path: "/home/user/project/file.txt".into(),
                 content: content.to_string(),
                 overwrite: false,
             },
             output: FsWriteOutput {
-                path: "/home/user/project/file.txt".to_string(),
+                path: "/home/user/project/file.txt".into(),
                 before: None,
                 errors: vec![forge_domain::SyntaxError {
                     line: 5,
@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn test_fs_remove() {
         let fixture = ToolOperation::FsRemove {
-            input: forge_domain::FSRemove { path: "/home/user/project/file.txt".to_string() },
+            input: forge_domain::FSRemove { path: "/home/user/project/file.txt".into() },
             output: FsRemoveOutput { content: "".to_string() },
         };
         let env = fixture_environment();
@@ -226,21 +226,21 @@ mod tests {
     fn test_fs_search_with_matches() {
         let fixture = ToolOperation::FsSearch {
             input: forge_domain::FSSearch {
-                path: Some("/home/user/project".to_string()),
+                path: Some("/home/user/project".into()),
                 pattern: "Hello".to_string(),
                 ..Default::default()
             },
             output: Some(SearchResult {
                 matches: vec![
                     Match {
-                        path: "file1.txt".to_string(),
+                        path: "file1.txt".into(),
                         result: Some(MatchResult::Found {
                             line_number: Some(1),
                             line: "Hello world".to_string(),
                         }),
                     },
                     Match {
-                        path: "file2.txt".to_string(),
+                        path: "file2.txt".into(),
                         result: Some(MatchResult::Found {
                             line_number: Some(3),
                             line: "Hello universe".to_string(),
@@ -261,13 +261,13 @@ mod tests {
     fn test_fs_search_no_matches() {
         let fixture = ToolOperation::FsSearch {
             input: forge_domain::FSSearch {
-                path: Some("/home/user/project".to_string()),
+                path: Some("/home/user/project".into()),
                 pattern: "nonexistent".to_string(),
                 ..Default::default()
             },
             output: Some(SearchResult {
                 matches: vec![Match {
-                    path: "file1.txt".to_string(),
+                    path: "file1.txt".into(),
                     result: Some(MatchResult::Error("Permission denied".to_string())),
                 }],
             }),
@@ -284,7 +284,7 @@ mod tests {
     fn test_fs_search_none() {
         let fixture = ToolOperation::FsSearch {
             input: forge_domain::FSSearch {
-                path: Some("/home/user/project".to_string()),
+                path: Some("/home/user/project".into()),
                 pattern: "search".to_string(),
                 ..Default::default()
             },
@@ -303,7 +303,7 @@ mod tests {
         let after_content = "Hello universe\nThis is a test\nNew line";
         let fixture = ToolOperation::FsPatch {
             input: forge_domain::FSPatch {
-                file_path: "/home/user/project/test.txt".to_string(),
+                file_path: "/home/user/project/test.txt".into(),
                 old_string: "Hello world".to_string(),
                 new_string: "Hello universe".to_string(),
                 replace_all: false,
@@ -326,7 +326,7 @@ mod tests {
         let after_content = "line1\nnew line\nline2";
         let fixture = ToolOperation::FsPatch {
             input: forge_domain::FSPatch {
-                file_path: "/home/user/project/large_file.txt".to_string(),
+                file_path: "/home/user/project/large_file.txt".into(),
                 old_string: "line2".to_string(),
                 new_string: "new line\nline2".to_string(),
                 replace_all: false,
@@ -356,7 +356,7 @@ mod tests {
     #[test]
     fn test_fs_undo() {
         let fixture = ToolOperation::FsUndo {
-            input: forge_domain::FSUndo { path: "/home/user/project/test.txt".to_string() },
+            input: forge_domain::FSUndo { path: "/home/user/project/test.txt".into() },
             output: FsUndoOutput {
                 before_undo: Some("ABC".to_string()),
                 after_undo: Some("PQR".to_string()),

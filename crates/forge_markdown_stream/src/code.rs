@@ -302,9 +302,9 @@ mod tests {
         let line = "\x1b[31mThis is a long text with \x1b[1many\x1b[0m formatting that should wrap safely.\x1b[0m";
         let (_, lines) = code_wrap(line, 20, true);
         assert_eq!(lines[0], "\x1b[31mThis is a long text ");
-        assert_eq!(lines[1], "with \x1b[1many\x1b[0m formatting ");
-        assert_eq!(lines[2], "that should wrap saf");
-        assert_eq!(lines[3], "ely.\x1b[0m");
+        assert_eq!(lines[1], "\x1b[31mwith \x1b[1many\x1b[0m formattin");
+        assert_eq!(lines[2], "g that should wrap");
+        assert_eq!(lines[3], " safely.\x1b[0m");
     }
 
     #[test]

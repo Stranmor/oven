@@ -13,7 +13,6 @@ pub struct FileChange {
     /// File hash if readable, None if unreadable
     pub content_hash: Option<String>,
 }
-
 /// Detects file changes by comparing current file hashes with stored hashes
 #[derive(Clone)]
 pub struct FileChangeDetector<F> {
@@ -167,17 +166,18 @@ mod tests {
     impl FsReadService for MockFsReadService {
         async fn read(
             &self,
-            path: String,
+            path: std::path::PathBuf,
             _: Option<u64>,
             _: Option<u64>,
         ) -> anyhow::Result<crate::ReadOutput> {
-            if self.not_found_files.contains(&path) {
+            let path_str = path.to_string_lossy().to_string();
+            if self.not_found_files.contains(&path_str) {
                 return Err(anyhow::anyhow!(std::io::Error::from(
                     std::io::ErrorKind::NotFound
                 )));
             }
 
-            if let Some(file) = self.files.get(&path) {
+            if let Some(file) = self.files.get(&path_str) {
                 Ok(crate::ReadOutput {
                     content: Content::File(file.displayed_content.clone()),
                     info: forge_domain::FileInfo::new(1, 1, 1, compute_hash(&file.raw_content)),
@@ -227,7 +227,7 @@ mod tests {
 
         let actual = detector.detect(&metrics, 64).await;
         let expected = vec![FileChange {
-            path: "/test/file.txt".to_string(),
+            path: "/test/file.txt".into(),
             content_hash: Some(new_hash),
         }];
 
@@ -249,7 +249,7 @@ mod tests {
 
         let actual = detector.detect(&metrics, 64).await;
         let expected = vec![FileChange {
-            path: "/test/file.txt".to_string(),
+            path: "/test/file.txt".into(),
             content_hash: None,
         }];
 
@@ -423,7 +423,7 @@ mod tests {
         // External modification detected
         let actual = detector.detect(&metrics, 64).await;
         let expected = vec![FileChange {
-            path: "/test/file.txt".to_string(),
+            path: "/test/file.txt".into(),
             content_hash: Some(external_hash),
         }];
 
@@ -509,7 +509,7 @@ mod tests {
         // Only file B should be detected: externally modified after write.
         // A and D are unchanged. C is unchanged.
         let expected = vec![FileChange {
-            path: "/test/b.txt".to_string(),
+            path: "/test/b.txt".into(),
             content_hash: Some(compute_hash(b_external)),
         }];
 
@@ -534,7 +534,7 @@ mod tests {
 
         let actual = detector.detect(&metrics, 64).await;
         let expected = vec![FileChange {
-            path: "/test/file.txt".to_string(),
+            path: "/test/file.txt".into(),
             content_hash: Some(compute_hash(modified)),
         }];
 

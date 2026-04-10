@@ -738,7 +738,7 @@ pub async fn mcp_logout_all(env: &Environment) -> anyhow::Result<()> {
 /// # Arguments
 /// * `server_url` - The URL of the MCP server
 /// * `env` - The environment for file system paths
-pub async fn mcp_auth_status(server_url: &str, env: &Environment) -> String {
+pub async fn mcp_auth_status(server_url: &str, env: &Environment) -> forge_domain::McpAuthStatus {
     use crate::auth::McpTokenStorage;
     let storage = McpTokenStorage::new(server_url.to_string(), env.clone());
     match storage.load_credentials().await {
@@ -750,19 +750,19 @@ pub async fn mcp_auth_status(server_url: &str, env: &Environment) -> String {
                     .as_secs();
                 if expires_at <= now {
                     if entry.tokens.refresh_token.is_some() {
-                        "expired (has refresh token)".to_string()
+                        forge_domain::McpAuthStatus::Expired
                     } else {
-                        "expired".to_string()
+                        forge_domain::McpAuthStatus::Expired
                     }
                 } else {
-                    "authenticated".to_string()
+                    forge_domain::McpAuthStatus::Authenticated
                 }
             } else {
-                "authenticated".to_string()
+                forge_domain::McpAuthStatus::Authenticated
             }
         }
-        Ok(None) => "not authenticated".to_string(),
-        Err(_) => "unknown (error reading credentials)".to_string(),
+        Ok(None) => forge_domain::McpAuthStatus::Unauthenticated,
+        Err(_) => forge_domain::McpAuthStatus::Unauthenticated,
     }
 }
 

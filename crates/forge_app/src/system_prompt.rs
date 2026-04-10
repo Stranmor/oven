@@ -360,10 +360,10 @@ mod tests {
         
         let env = forge_domain::Environment {
             os: "linux".into(),
-            cwd: "/tmp".to_string(),
+            cwd: "/tmp".into(),
             home: None,
             shell: "sh".into(),
-            base_path: "/tmp".to_string(),
+            base_path: "/tmp".into(),
         };
         
         let mut agent = forge_domain::Agent::new("test", forge_domain::ProviderId::OPENAI, forge_domain::ModelId::from("gpt-4o"));

@@ -51,7 +51,7 @@ impl Runner {
         hb.register_escape_fn(no_escape);
 
         // Register all embedded templates from the templates directory
-        forge_embed::register_templates(&mut hb, &TEMPLATE_DIR);
+        forge_embed::register_templates(&mut hb, &TEMPLATE_DIR).unwrap();
         for (name, tpl) in &setup.templates {
             hb.register_template_string(name, tpl)?;
         }
@@ -245,7 +245,7 @@ impl FileDiscoveryService for Runner {
                 .map(str::trim)
                 .filter(|line| !line.is_empty())
                 .map(|line| forge_domain::File {
-                    path: std::path::PathBuf::from(line),
+                    path: line.to_string(),
                     is_dir: false,
                 })
                 .collect();

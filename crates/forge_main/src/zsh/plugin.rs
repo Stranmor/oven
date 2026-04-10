@@ -10,6 +10,7 @@ use clap_complete::shells::Zsh;
 use include_dir::{Dir, include_dir};
 
 use crate::cli::Cli;
+use crate::built_in_commands::BUILT_IN_COMMANDS;
 
 /// Embeds shell plugin files for zsh integration
 static ZSH_PLUGIN_LIB: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../shell-plugin/lib");
@@ -19,10 +20,35 @@ static ZSH_PLUGIN_LIB: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../sh
 pub fn generate_zsh_plugin() -> Result<String> {
     let mut output = String::new();
 
+    // Generate the dynamic case statement
+    let mut generated_case = String::from("case \"${user_action:l}\" in\n");
+    
+    // Add default aliases first
+    generated_case.push_str("        forge|muse|sage)\n            _forge_action_default \"$user_action\" \"$input_text\"\n        ;;\n");
+
+    for cmd in BUILT_IN_COMMANDS {
+        let mut patterns = vec![cmd.name.to_string()];
+        patterns.extend(cmd.aliases.iter().map(|s| s.to_string()));
+        generated_case.push_str(&format!("        {})\n", patterns.join("|")));
+        generated_case.push_str(&format!("            {}\n", cmd.action));
+        if cmd.ret {
+            generated_case.push_str("            # Note: action intentionally modifies BUFFER and handles its own prompt reset\n");
+            generated_case.push_str("            return\n");
+        }
+        generated_case.push_str("        ;;\n");
+    }
+    generated_case.push_str("        *)\n            _forge_action_default \"$user_action\" \"$input_text\"\n        ;;\n    esac");
+
     // Iterate through all embedded files in shell-plugin/lib, stripping comments
     // and empty lines. All files in this directory are .zsh files.
     for file in forge_embed::files(&ZSH_PLUGIN_LIB) {
-        let content = super::normalize_script(std::str::from_utf8(file.contents())?);
+        let mut content = super::normalize_script(std::str::from_utf8(file.contents())?);
+        
+        // Replace placeholder with generated case statement
+        if content.contains("# __FORGE_GENERATED_CASE__") {
+            content = content.replace("# __FORGE_GENERATED_CASE__", &generated_case);
+        }
+
         for line in content.lines() {
             let trimmed = line.trim();
             // Skip empty lines and comment lines

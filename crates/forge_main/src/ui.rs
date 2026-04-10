@@ -32,6 +32,7 @@ use url::Url;
 use crate::cli::{
     Cli, CommitCommandGroup, ConversationCommand, ListCommand, McpCommand, TopLevelCommand,
 };
+use crate::built_in_commands::BUILT_IN_COMMANDS;
 use crate::conversation_selector::ConversationSelector;
 use crate::display_constants::{CommandType, headers, markers, status};
 use crate::editor::ReadLineError;
@@ -568,7 +569,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                     self.handle_mcp_login(&args.name).await?;
                 }
                 McpCommand::Logout(args) => {
-                    self.handle_mcp_logout(&args.name).await?;
+                    self.handle_mcp_logout(forge_domain::McpLogoutTarget::from(args.name)).await?;
                 }
             },
             TopLevelCommand::Info { porcelain, conversation_id } => {
@@ -867,7 +868,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             Some(forge_domain::McpServerConfig::Http(http)) => {
                 // Check auth status first
                 let status = self.api.mcp_auth_status(&http.url).await?;
-                if status == "authenticated" {
+                if status.is_authenticated() {
                     self.writeln_title(TitleFormat::info(
                         format!("MCP server '{}' is already authenticated. Use 'mcp logout {}' first to re-authenticate.", name, name)
                     ))?;
@@ -927,36 +928,38 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
     /// Removes stored OAuth credentials for the specified MCP server
     /// or all servers if "all" is specified.
     /// Automatically reloads MCPs after logout to reflect auth state change.
-    async fn handle_mcp_logout(&mut self, name: &str) -> anyhow::Result<()> {
-        if name == "all" {
-            self.api.mcp_logout(None).await?;
-            self.writeln_title(TitleFormat::info("Removed all MCP OAuth credentials"))?;
-        } else {
-            let server_name = forge_api::ServerName::from(name.to_string());
-            let config = self.api.read_mcp_config(None).await?;
-            let server = config.mcp_servers.get(&server_name);
+    async fn handle_mcp_logout(&mut self, target: forge_domain::McpLogoutTarget) -> anyhow::Result<()> {
+        match target {
+            forge_domain::McpLogoutTarget::All => {
+                self.api.mcp_logout(None).await?;
+                self.writeln_title(TitleFormat::info("Removed all MCP OAuth credentials"))?;
+            }
+            forge_domain::McpLogoutTarget::Specific(server_name) => {
+                let config = self.api.read_mcp_config(None).await?;
+                let server = config.mcp_servers.get(&server_name);
 
-            match server {
-                Some(forge_domain::McpServerConfig::Http(http)) => {
-                    self.api.mcp_logout(Some(&http.url)).await?;
-                    self.writeln_title(TitleFormat::info(format!(
-                        "Removed OAuth credentials for MCP server '{}'",
-                        name
-                    )))?;
-                }
-                Some(_) => {
-                    self.writeln_title(TitleFormat::error(format!(
-                        "MCP server '{}' is not an HTTP server",
-                        name
-                    )))?;
-                    return Ok(());
-                }
-                None => {
-                    self.writeln_title(TitleFormat::error(format!(
-                        "MCP server '{}' not found. Use 'mcp list' to see available servers.",
-                        name
-                    )))?;
-                    return Ok(());
+                match server {
+                    Some(forge_domain::McpServerConfig::Http(http)) => {
+                        self.api.mcp_logout(Some(&http.url)).await?;
+                        self.writeln_title(TitleFormat::info(format!(
+                            "Removed OAuth credentials for MCP server '{}'",
+                            server_name
+                        )))?;
+                    }
+                    Some(_) => {
+                        self.writeln_title(TitleFormat::error(format!(
+                            "MCP server '{}' is not an HTTP server",
+                            server_name
+                        )))?;
+                        return Ok(());
+                    }
+                    None => {
+                        self.writeln_title(TitleFormat::error(format!(
+                            "MCP server '{}' not found. Use 'mcp list' to see available servers.",
+                            server_name
+                        )))?;
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -1326,23 +1329,9 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
     async fn on_show_commands(&mut self, porcelain: bool) -> anyhow::Result<()> {
         let mut info = Info::new();
 
-        // Load built-in commands from JSON
-        // NOTE: When adding a new command, update built_in_commands.json AND
-        //       shell-plugin/forge.plugin.zsh (case statement around line 745)
-        const COMMANDS_JSON: &str = include_str!("built_in_commands.json");
-
-        #[derive(serde::Deserialize)]
-        struct Command<'a> {
-            command: &'a str,
-            description: &'a str,
-        }
-
-        let built_in_commands: Vec<Command> =
-            serde_json::from_str(COMMANDS_JSON).expect("Failed to parse built_in_commands.json");
-
-        for cmd in &built_in_commands {
+        for cmd in BUILT_IN_COMMANDS {
             info = info
-                .add_title(cmd.command)
+                .add_title(cmd.name)
                 .add_key_value("type", CommandType::Command)
                 .add_key_value("description", cmd.description);
         }
@@ -2070,10 +2059,11 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                 }
 
                 let mut display_agents = Vec::new();
+                let header_line = all_lines.first().copied().unwrap_or_default();
                 // Header row (non-selectable via header_lines=1)
                 display_agents.push(Agent {
                     id: AgentId::new("__header__".to_string()),
-                    label: all_lines[0].to_string(),
+                    label: header_line.to_string(),
                 });
                 // Data rows
                 for line in all_lines.iter().skip(1) {
@@ -2311,11 +2301,12 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         }
 
         let mut rows: Vec<ModelRow> = Vec::with_capacity(all_lines.len());
+        let header_line = all_lines.first().copied().unwrap_or_default();
         // Header row (non-selectable via header_lines=1)
         rows.push(ModelRow {
             model_id: None,
             provider_id: None,
-            display: all_lines[0].to_string(),
+            display: header_line.to_string(),
         });
         // Data rows
         for (i, line) in all_lines.iter().skip(1).enumerate() {
@@ -2407,7 +2398,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             let key_str = default_key.as_ref();
 
             // Skip prompting only for Google ADC marker
-            if key_str == "google_adc_marker" {
+            if default_key.is_google_adc_marker() {
                 key_str.to_string()
             } else {
                 // For other providers, show the existing key as default (autofill)
@@ -2625,7 +2616,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
 
         // If only one auth method, use it directly
         if auth_methods.len() == 1 {
-            return Ok(Some(auth_methods[0].clone()));
+            return Ok(auth_methods.first().cloned());
         }
 
         // Multiple auth methods - ask user to choose
@@ -2806,8 +2797,9 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         }
 
         let mut rows: Vec<ProviderRow> = Vec::with_capacity(all_lines.len());
+        let header_line = all_lines.first().copied().unwrap_or_default();
         // Header row (non-selectable via header_lines=1)
-        rows.push(ProviderRow { provider: None, display: all_lines[0].to_string() });
+        rows.push(ProviderRow { provider: None, display: header_line.to_string() });
         // Data rows
         for (i, line) in all_lines.iter().skip(1).enumerate() {
             rows.push(ProviderRow { provider: sorted.get(i).cloned(), display: line.to_string() });

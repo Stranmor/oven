@@ -99,7 +99,7 @@ fn create_handlebar() -> Handlebars<'static> {
     );
 
     // Register all embedded templates from the templates directory
-    forge_embed::register_templates(&mut hb, &TEMPLATE_DIR);
+    forge_embed::register_templates(&mut hb, &TEMPLATE_DIR).unwrap();
 
     hb
 }

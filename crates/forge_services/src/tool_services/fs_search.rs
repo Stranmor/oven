@@ -624,7 +624,7 @@ mod test {
         let fixture = create_test_directory().await.unwrap();
         let params = FSSearch {
             pattern: "test".to_string(),
-            path: Some(fixture.path().to_string_lossy().to_string()),
+            path: Some(fixture.path().to_string_lossy().to_string().into()),
             output_mode: Some(OutputMode::Content),
             ..Default::default()
         };
@@ -646,7 +646,7 @@ mod test {
         let fixture = create_test_directory().await.unwrap();
         let params = FSSearch {
             pattern: "test".to_string(),
-            path: Some(fixture.path().to_string_lossy().to_string()),
+            path: Some(fixture.path().to_string_lossy().to_string().into()),
             output_mode: Some(OutputMode::FilesWithMatches),
             ..Default::default()
         };
@@ -672,7 +672,7 @@ mod test {
         let fixture = create_test_directory().await.unwrap();
         let params = FSSearch {
             pattern: "test".to_string(),
-            path: Some(fixture.path().to_string_lossy().to_string()),
+            path: Some(fixture.path().to_string_lossy().to_string().into()),
             output_mode: Some(OutputMode::Count),
             ..Default::default()
         };
@@ -698,7 +698,7 @@ mod test {
         let fixture = create_test_directory().await.unwrap();
         let params = FSSearch {
             pattern: "test".to_string(),
-            path: Some(fixture.path().to_string_lossy().to_string()),
+            path: Some(fixture.path().to_string_lossy().to_string().into()),
             file_type: Some("".to_string()),
             output_mode: Some(OutputMode::FilesWithMatches),
             ..Default::default()
@@ -721,7 +721,7 @@ mod test {
         let fixture = create_test_directory().await.unwrap();
         let params = FSSearch {
             pattern: "test".to_string(),
-            path: Some(fixture.path().to_string_lossy().to_string()),
+            path: Some(fixture.path().to_string_lossy().to_string().into()),
             glob: Some("*.rs".to_string()),
             output_mode: Some(OutputMode::FilesWithMatches),
             ..Default::default()
@@ -743,7 +743,7 @@ mod test {
         let fixture = create_test_directory().await.unwrap();
         let params = FSSearch {
             pattern: "HELLO".to_string(),
-            path: Some(fixture.path().to_string_lossy().to_string()),
+            path: Some(fixture.path().to_string_lossy().to_string().into()),
             case_insensitive: Some(true),
             output_mode: Some(OutputMode::Content),
             ..Default::default()
@@ -762,7 +762,7 @@ mod test {
         let fixture = create_test_directory().await.unwrap();
         let params = FSSearch {
             pattern: "HELLO".to_string(),
-            path: Some(fixture.path().to_string_lossy().to_string()),
+            path: Some(fixture.path().to_string_lossy().to_string().into()),
             output_mode: Some(OutputMode::Content),
             ..Default::default()
         };
@@ -781,7 +781,7 @@ mod test {
         let fixture = create_test_directory().await.unwrap();
         let params = FSSearch {
             pattern: "test".to_string(),
-            path: Some(fixture.path().to_string_lossy().to_string()),
+            path: Some(fixture.path().to_string_lossy().to_string().into()),
             output_mode: Some(OutputMode::Content),
             show_line_numbers: Some(true),
             ..Default::default()
@@ -809,7 +809,7 @@ mod test {
         let fixture = create_test_directory().await.unwrap();
         let params = FSSearch {
             pattern: "test".to_string(),
-            path: Some(fixture.path().to_string_lossy().to_string()),
+            path: Some(fixture.path().to_string_lossy().to_string().into()),
             output_mode: Some(OutputMode::Content),
             show_line_numbers: Some(false),
             ..Default::default()
@@ -854,7 +854,7 @@ mod test {
         let fixture = create_test_directory().await.unwrap();
         let params = FSSearch {
             pattern: "nonexistent_pattern_xyz".to_string(),
-            path: Some(fixture.path().to_string_lossy().to_string()),
+            path: Some(fixture.path().to_string_lossy().to_string().into()),
             ..Default::default()
         };
 
@@ -878,7 +878,7 @@ mod test {
 
         let params = FSSearch {
             pattern: "hello".to_string(),
-            path: Some(fixture.path().to_string_lossy().to_string()),
+            path: Some(fixture.path().to_string_lossy().to_string().into()),
             output_mode: Some(OutputMode::FilesWithMatches),
             ..Default::default()
         };
@@ -907,7 +907,7 @@ mod test {
 
         let params = FSSearch {
             pattern: "MATCH".to_string(),
-            path: Some(fixture.path().to_string_lossy().to_string()),
+            path: Some(fixture.path().to_string_lossy().to_string().into()),
             output_mode: Some(OutputMode::Content),
             context: Some(2), // 2 lines before and after
             ..Default::default()
@@ -955,7 +955,7 @@ mod test {
 
         let params = FSSearch {
             pattern: "MATCH".to_string(),
-            path: Some(fixture.path().to_string_lossy().to_string()),
+            path: Some(fixture.path().to_string_lossy().to_string().into()),
             output_mode: Some(OutputMode::Content),
             before_context: Some(2), // 2 lines before only
             ..Default::default()
@@ -994,7 +994,7 @@ mod test {
 
         let params = FSSearch {
             pattern: "MATCH".to_string(),
-            path: Some(fixture.path().to_string_lossy().to_string()),
+            path: Some(fixture.path().to_string_lossy().to_string().into()),
             output_mode: Some(OutputMode::Content),
             after_context: Some(2), // 2 lines after only
             ..Default::default()
@@ -1033,7 +1033,7 @@ mod test {
 
         let params = FSSearch {
             pattern: "MATCH".to_string(),
-            path: Some(fixture.path().to_string_lossy().to_string()),
+            path: Some(fixture.path().to_string_lossy().to_string().into()),
             output_mode: Some(OutputMode::Content),
             // No context specified
             ..Default::default()
