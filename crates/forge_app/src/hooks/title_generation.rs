@@ -13,6 +13,8 @@ use crate::title_generator::TitleGenerator;
 /// Per-conversation title generation state.
 struct TitleGenerationState {
     rx: oneshot::Receiver<Option<String>>,
+    #[allow(dead_code)]
+    handle: tokio::task::JoinHandle<()>,
 }
 
 /// Hook handler that generates a conversation title asynchronously.
@@ -71,20 +73,19 @@ impl<S: AgentService + crate::ConversationService> EventHandle<EventData<StartPa
         // one task is ever spawned per conversation id.
         self.title_tasks.entry(conversation.id.clone()).or_insert_with(|| {
             let (tx, rx) = oneshot::channel();
-            let _handle = tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let title = generator.generate().await.ok().flatten();
                 if let Err(title) = tx.send(title) {
                     if let Some(title) = title {
                         // The receiver was dropped, meaning the EndPayload handler has already
                         // run and the main conversation save is likely occurring.
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         let _ = services.modify_conversation(&conversation_id, |conv| {
                             conv.title = Some(title);
                         }).await;
                     }
                 }
             });
-            TitleGenerationState { rx }
+            TitleGenerationState { rx, handle }
         });
 
         Ok(())
@@ -136,15 +137,30 @@ mod tests {
 
     use super::*;
 
-    #[derive(Clone)]
-    struct MockAgentService;
+    #[derive(Clone, Default)]
+    struct MockAgentService {
+        db: Arc<dashmap::DashMap<ConversationId, Conversation>>,
+        chat_delay: Option<Duration>,
+        chat_response: Option<String>,
+    }
 
     #[async_trait]
     impl crate::ConversationService for MockAgentService {
-        async fn find_conversation(&self, _id: &ConversationId) -> anyhow::Result<Option<Conversation>> { Ok(None) }
-        async fn upsert_conversation(&self, _conversation: Conversation) -> anyhow::Result<()> { Ok(()) }
-        async fn modify_conversation<F, T>(&self, _id: &ConversationId, _f: F) -> anyhow::Result<T>
-        where F: FnOnce(&mut Conversation) -> T + Send, T: Send { panic!("not implemented") }
+        async fn find_conversation(&self, id: &ConversationId) -> anyhow::Result<Option<Conversation>> { 
+            Ok(self.db.get(id).map(|r| r.clone())) 
+        }
+        async fn upsert_conversation(&self, conversation: Conversation) -> anyhow::Result<()> { 
+            self.db.insert(conversation.id.clone(), conversation);
+            Ok(()) 
+        }
+        async fn modify_conversation<F, T>(&self, id: &ConversationId, f: F) -> anyhow::Result<T>
+        where F: FnOnce(&mut Conversation) -> T + Send, T: Send { 
+            if let Some(mut conv) = self.db.get_mut(id) {
+                Ok(f(&mut conv))
+            } else {
+                anyhow::bail!("Conversation not found")
+            }
+        }
         async fn get_conversations(&self, _limit: Option<usize>) -> anyhow::Result<Option<Vec<Conversation>>> { Ok(None) }
         async fn last_conversation(&self) -> anyhow::Result<Option<Conversation>> { Ok(None) }
         async fn delete_conversation(&self, _conversation_id: &ConversationId) -> anyhow::Result<()> { Ok(()) }
@@ -158,7 +174,22 @@ mod tests {
             _context: Context,
             _provider_id: Option<ProviderId>,
         ) -> forge_domain::ResultStream<ChatCompletionMessage, anyhow::Error> {
-            Ok(Box::pin(futures::stream::empty()))
+            let delay = self.chat_delay;
+            let response = self.chat_response.clone().unwrap_or_default();
+            
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tokio::spawn(async move {
+                if let Some(d) = delay {
+                    tokio::time::sleep(d).await;
+                }
+                if !response.is_empty() {
+                    let _ = tx.send(Ok(ChatCompletionMessage {
+                        content: Some(forge_domain::Content::full(response)),
+                        ..Default::default()
+                    })).await;
+                }
+            });
+            Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
         }
 
         async fn call(
@@ -176,7 +207,16 @@ mod tests {
     }
 
     fn setup(message: &str) -> (TitleGenerationHandler<MockAgentService>, Conversation) {
-        let handler = TitleGenerationHandler::new(Arc::new(MockAgentService));
+        let handler = TitleGenerationHandler::new(Arc::new(MockAgentService::default()));
+        let context = Context::default().add_message(ContextMessage::Text(
+            TextMessage::new(Role::User, message).raw_content(EventValue::text(message)),
+        ));
+        let conversation = Conversation::generate().context(context);
+        (handler, conversation)
+    }
+
+    fn setup_with_service(service: Arc<MockAgentService>, message: &str) -> (TitleGenerationHandler<MockAgentService>, Conversation) {
+        let handler = TitleGenerationHandler::new(service);
         let context = Context::default().add_message(ContextMessage::Text(
             TextMessage::new(Role::User, message).raw_content(EventValue::text(message)),
         ));
@@ -324,5 +364,30 @@ mod tests {
 
         // Only one task should exist in the map
         assert_eq!(handler.title_tasks.len(), 1);
+    }
+    #[tokio::test]
+    async fn test_background_title_update_when_receiver_dropped() {
+        let service = Arc::new(MockAgentService {
+            db: Arc::new(dashmap::DashMap::new()),
+            chat_delay: Some(Duration::from_millis(50)),
+            chat_response: Some("Delayed Title".to_string()),
+        });
+        
+        let (handler, mut conversation) = setup_with_service(service.clone(), "test message");
+        service.db.insert(conversation.id.clone(), conversation.clone());
+        
+        // 1. Starts title generation
+        handler.handle(&event(StartPayload), &mut conversation).await.unwrap();
+        
+        // 2. Triggers EndPayload BEFORE the title is ready
+        // Since chat_delay is 50ms, the task is still running.
+        handler.handle(&event(EndPayload), &mut conversation).await.unwrap();
+        
+        // 3. Wait for the task to complete
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        
+        // 4. Verifies the title was written to the mock DB via modify_conversation
+        let saved_conv = service.db.get(&conversation.id).unwrap();
+        assert_eq!(saved_conv.title.as_deref(), Some("Delayed Title"));
     }
 }

@@ -318,17 +318,23 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         // Prompt can fail if it doesn't have access to TTY. If it fails the first time,
         // we will stop everything and bubble up the error.
         let mut command = self.prompt().await;
+        let mut last_ctrl_c: Option<tokio::time::Instant> = None;
 
         loop {
             match command {
                 Ok(command) => {
                     tokio::select! {
                         _ = tokio::signal::ctrl_c() => {
+                            last_ctrl_c = Some(tokio::time::Instant::now());
                             self.spinner.reset();
                             tracing::info!("User interrupted operation with Ctrl+C");
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                            while crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
-                                let _ = crossterm::event::read();
+                            let start = std::time::Instant::now();
+                            while start.elapsed() < std::time::Duration::from_millis(500) {
+                                if crossterm::event::poll(std::time::Duration::from_millis(10)).unwrap_or(false) {
+                                    let _ = crossterm::event::read();
+                                } else {
+                                    break;
+                                }
                             }
                         }
                         result = self.on_command(command) => {
@@ -357,11 +363,19 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
 
                     match error.downcast::<ReadLineError>() {
                         Ok(error) => {
-                            if error.to_string().contains("cursor position could not be read") {
+                            // crossterm DSR timeout has no typed error variant; string match is the only option
+                            let is_dsr_timeout = error.to_string().contains("cursor position could not be read");
+                            let is_recovery_window = last_ctrl_c.map(|t| t.elapsed() < std::time::Duration::from_millis(200)).unwrap_or(false);
+
+                            if is_dsr_timeout || is_recovery_window {
                                 tracing::warn!("Terminal state recovery after interrupt");
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                                while crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
-                                    let _ = crossterm::event::read();
+                                let start = std::time::Instant::now();
+                                while start.elapsed() < std::time::Duration::from_millis(500) {
+                                    if crossterm::event::poll(std::time::Duration::from_millis(10)).unwrap_or(false) {
+                                        let _ = crossterm::event::read();
+                                    } else {
+                                        break;
+                                    }
                                 }
                                 command = self.prompt().await;
                                 continue;
