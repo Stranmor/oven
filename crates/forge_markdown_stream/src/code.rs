@@ -65,21 +65,18 @@ enum AnsiToken {
     Sequence(String),
 }
 
-#[allow(clippy::if_same_then_else, reason = "Pre-existing lint")]
 fn tokenize_ansi(line: &str) -> Vec<AnsiToken> {
     let mut tokens = Vec::new();
     let mut state = AnsiState::Text;
     let mut current_seq = String::new();
-    
+
     for c in line.chars() {
         let prev_state = state;
         state.advance(c);
-        
-        if prev_state == AnsiState::Text && state == AnsiState::Esc {
+
+        if state != AnsiState::Text {
             current_seq.push(c);
-        } else if state != AnsiState::Text {
-            current_seq.push(c);
-        } else if prev_state != AnsiState::Text && state == AnsiState::Text {
+        } else if prev_state != AnsiState::Text {
             current_seq.push(c);
             tokens.push(AnsiToken::Sequence(current_seq.clone()));
             current_seq.clear();
@@ -87,28 +84,27 @@ fn tokenize_ansi(line: &str) -> Vec<AnsiToken> {
             tokens.push(AnsiToken::Text(c));
         }
     }
-    
+
     if !current_seq.is_empty() {
         tokens.push(AnsiToken::Sequence(current_seq));
     }
-    
+
     tokens
 }
 
-#[allow(clippy::arithmetic_side_effects, reason = "Pre-existing lint")]
 /// Wraps a line of code, respecting ANSI escape sequences and expanding tabs.
 /// Returns the leading indentation level and the wrapped lines.
 pub fn code_wrap(line: &str, width: usize, _pretty_broken: bool) -> (usize, Vec<String>) {
     let tokens = tokenize_ansi(line);
-    
+
     // 1. Expand tabs properly
     let mut expanded_tokens = Vec::new();
-    let mut visible_col = 0;
-    
+    let mut visible_col = 0_usize;
+
     for token in tokens {
         match token {
             AnsiToken::Text('\t') => {
-                let spaces = 8_usize.saturating_sub(visible_col % 8);
+                let spaces = 8_usize.saturating_sub(visible_col.checked_rem(8).unwrap_or(0));
                 for _ in 0..spaces {
                     expanded_tokens.push(AnsiToken::Text(' '));
                 }
@@ -123,17 +119,17 @@ pub fn code_wrap(line: &str, width: usize, _pretty_broken: bool) -> (usize, Vec<
             }
         }
     }
-    
+
     // 2. Find indentation
-    let mut indent = 0;
+    let mut indent = 0_usize;
     for token in &expanded_tokens {
         match token {
-            AnsiToken::Text(' ') => indent += 1,
+            AnsiToken::Text(' ') => indent = indent.saturating_add(1),
             AnsiToken::Sequence(_) => continue,
             _ => break,
         }
     }
-    
+
     if width == 0 {
         let mut full_line = String::new();
         for t in expanded_tokens {
@@ -144,39 +140,45 @@ pub fn code_wrap(line: &str, width: usize, _pretty_broken: bool) -> (usize, Vec<
         }
         return (indent, vec![full_line]);
     }
-    
+
     // 3. Wrap line using visible width
-    let continuation_indent_width = (indent.min(4) / 2 + 1) * 2;
-    
+    let continuation_indent_width = indent
+        .min(4)
+        .checked_div(2)
+        .unwrap_or(0)
+        .saturating_add(1)
+        .saturating_mul(2);
+
     let mut lines = Vec::new();
     let mut current_line = String::new();
-    let mut current_width = 0;
+    let mut current_width = 0_usize;
     let mut active_ansi = String::new();
-    
+
     let mut current_max_width = width;
-    
+
     for token in expanded_tokens {
         match token {
             AnsiToken::Text(c) => {
                 let char_width = c.width().unwrap_or(0);
-                
-                if current_width + char_width > current_max_width && current_width > 0 {
+
+                if current_width.saturating_add(char_width) > current_max_width && current_width > 0
+                {
                     lines.push(current_line.clone());
                     current_line = String::new();
                     current_width = 0;
                     current_max_width = width.saturating_sub(continuation_indent_width);
-                    
+
                     if !active_ansi.is_empty() {
                         current_line.push_str(&active_ansi);
                     }
                 }
-                
+
                 current_line.push(c);
-                current_width += char_width;
+                current_width = current_width.saturating_add(char_width);
             }
             AnsiToken::Sequence(s) => {
                 current_line.push_str(&s);
-                
+
                 if s == "\x1b[0m" || s == "\x1b[m" {
                     active_ansi.clear();
                 } else if s.starts_with("\x1b[") && s.ends_with('m') {
@@ -185,11 +187,11 @@ pub fn code_wrap(line: &str, width: usize, _pretty_broken: bool) -> (usize, Vec<
             }
         }
     }
-    
+
     if !current_line.is_empty() || lines.is_empty() {
         lines.push(current_line);
     }
-    
+
     (indent, lines)
 }
 
@@ -237,7 +239,6 @@ impl CodeHighlighter {
         }
     }
 
-    #[allow(clippy::arithmetic_side_effects, reason = "Pre-existing lint")]
     /// Render a code line with margin, wrapping if needed.
     ///
     /// Returns multiple lines if the code exceeds the available width.
@@ -257,7 +258,7 @@ impl CodeHighlighter {
             let line_indent = if i == 0 {
                 String::new()
             } else {
-                "  ".repeat(indent.min(4) / 2 + 1)
+                "  ".repeat(indent.min(4).checked_div(2).unwrap_or(0).saturating_add(1))
             };
 
             result.push(format!("{}{}{}{}", margin, line_indent, code_line, RESET));
