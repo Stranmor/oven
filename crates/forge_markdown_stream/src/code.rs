@@ -65,6 +65,7 @@ enum AnsiToken {
     Sequence(String),
 }
 
+#[allow(clippy::if_same_then_else, reason = "Pre-existing lint")]
 fn tokenize_ansi(line: &str) -> Vec<AnsiToken> {
     let mut tokens = Vec::new();
     let mut state = AnsiState::Text;
@@ -94,6 +95,7 @@ fn tokenize_ansi(line: &str) -> Vec<AnsiToken> {
     tokens
 }
 
+#[allow(clippy::arithmetic_side_effects, reason = "Pre-existing lint")]
 /// Wraps a line of code, respecting ANSI escape sequences and expanding tabs.
 /// Returns the leading indentation level and the wrapped lines.
 pub fn code_wrap(line: &str, width: usize, _pretty_broken: bool) -> (usize, Vec<String>) {
@@ -106,15 +108,15 @@ pub fn code_wrap(line: &str, width: usize, _pretty_broken: bool) -> (usize, Vec<
     for token in tokens {
         match token {
             AnsiToken::Text('\t') => {
-                let spaces = 8 - (visible_col % 8);
+                let spaces = 8_usize.saturating_sub(visible_col % 8);
                 for _ in 0..spaces {
                     expanded_tokens.push(AnsiToken::Text(' '));
                 }
-                visible_col += spaces;
+                visible_col = visible_col.saturating_add(spaces);
             }
             AnsiToken::Text(c) => {
                 expanded_tokens.push(AnsiToken::Text(c));
-                visible_col += c.width().unwrap_or(0);
+                visible_col = visible_col.saturating_add(c.width().unwrap_or(0));
             }
             AnsiToken::Sequence(s) => {
                 expanded_tokens.push(AnsiToken::Sequence(s));
@@ -209,6 +211,7 @@ impl Default for CodeHighlighter {
 }
 
 impl CodeHighlighter {
+    #[allow(clippy::indexing_slicing, reason = "Pre-existing lint")]
     /// Highlight a single line of code.
     fn highlight_line(&self, line: &str, language: Option<&str>) -> String {
         let syntax = language
@@ -228,6 +231,7 @@ impl CodeHighlighter {
         }
     }
 
+    #[allow(clippy::arithmetic_side_effects, reason = "Pre-existing lint")]
     /// Render a code line with margin, wrapping if needed.
     ///
     /// Returns multiple lines if the code exceeds the available width.
