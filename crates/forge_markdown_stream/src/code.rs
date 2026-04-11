@@ -146,7 +146,7 @@ pub fn code_wrap(line: &str, width: usize, _pretty_broken: bool) -> (usize, Vec<
     }
     
     // 3. Wrap line using visible width
-    let continuation_indent_width = ("  ".repeat(indent.min(4) / 2 + 1)).len();
+    let continuation_indent_width = (indent.min(4) / 2 + 1) * 2;
     
     let mut lines = Vec::new();
     let mut current_line = String::new();
@@ -222,7 +222,13 @@ impl CodeHighlighter {
             ThemeMode::Dark => "base16-ocean.dark",
             ThemeMode::Light => "InspiredGitHub",
         };
-        let theme = &self.theme_set.themes[theme_name];
+        let theme = self.theme_set.themes.get(theme_name).unwrap_or_else(|| {
+            self.theme_set
+                .themes
+                .values()
+                .next()
+                .expect("ThemeSet is empty")
+        });
         let mut highlighter = HighlightLines::new(syntax, theme);
 
         match highlighter.highlight_line(line, &self.syntax_set) {
@@ -242,22 +248,19 @@ impl CodeHighlighter {
         margin: &str,
         width: usize,
     ) -> Vec<String> {
-        // Use code_wrap with pretty_broken=true for line wrapping
-        let (indent, wrapped_lines) = code_wrap(line, width, true);
+        let highlighted = self.highlight_line(line, language);
+        let (indent, wrapped_lines) = code_wrap(&highlighted, width, true);
 
         let mut result = Vec::new();
 
         for (i, code_line) in wrapped_lines.iter().enumerate() {
-            let highlighted = self.highlight_line(code_line, language);
-
-            // Add continuation indent for wrapped lines
             let line_indent = if i == 0 {
-                ""
+                String::new()
             } else {
-                &"  ".repeat(indent.min(4) / 2 + 1)
+                "  ".repeat(indent.min(4) / 2 + 1)
             };
 
-            result.push(format!("{}{}{}{}", margin, line_indent, highlighted, RESET));
+            result.push(format!("{}{}{}{}", margin, line_indent, code_line, RESET));
         }
 
         if result.is_empty() {
