@@ -75,13 +75,11 @@ impl<S: Services> AgentExecutor<S> {
 
         // Collect responses from the agent
         let mut output = String::new();
+        let mut executed_tools = 0;
         while let Some(message) = response_stream.next().await {
             let message = message?;
-            if matches!(
-                &message,
-                ChatResponse::ToolCallStart { .. } | ChatResponse::ToolCallEnd(_)
-            ) {
-                output.clear();
+            if matches!(&message, ChatResponse::ToolCallEnd(_)) {
+                executed_tools += 1;
             }
             match message {
                 ChatResponse::TaskMessage { ref content } => match content {
@@ -112,7 +110,7 @@ impl<S: Services> AgentExecutor<S> {
                 }
             }
         }
-        if !output.is_empty() {
+        if !output.is_empty() || executed_tools > 0 {
             // Create tool output
             Ok(ToolOutput::ai(
                 conversation.id,
