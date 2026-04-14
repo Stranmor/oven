@@ -1,33 +1,31 @@
-# Investigation: Auto-update Mechanism Failure & Escalation
+# Исследование: Ошибка механизма автообновления
 
-## Executive Summary
-The auto-update mechanism for the `forge` project failed because the scheduled background service (`forge-sync.service`) encountered severe `git rebase` conflicts when attempting to sync local changes with `upstream/main`. 
+**СТАТУС: ЭСКАЛИРОВАНО НА ЧЕЛОВЕКА (STRANMOR)**
+Механизм автоматического обновления для проекта `forge` завершился с ошибкой, так как фоновый сервис (`forge-sync.service`) столкнулся со сложными конфликтами `git rebase` при попытке синхронизации локальных изменений с веткой `upstream/main`.
 
-**STATUS: ESCALATED TO HUMAN (STRANMOR)**
-The merge conflicts are complex, involving core files such as `Cargo.lock`, `crates/forge_app/src/agent_executor.rs`, `crates/forge_main/src/editor.rs`, and `crates/forge_main/src/ui.rs`. I am explicitly escalating this conflict resolution to Stranmor, as these files require human domain knowledge to safely reconcile without breaking local features (specifically the image pasting functionality).
+## 1. Анализ таймеров Systemd
+При проверке пользовательских таймеров (`systemctl --user list-timers --all`) был найден активный таймер: `forge-sync.timer`.
+Этот таймер периодически запускает сервис `forge-sync.service` для синхронизации с upstream.
 
-## 1. Systemd Timers Analysis
-I investigated the auto-update triggers on the system using `systemctl --user list-timers --all`.
-- Found the active timer: `forge-sync.timer`
-- Target service: `forge-sync.service`
-- Schedule: Runs periodically to fetch and sync upstream changes.
-
-## 2. Service Logs Examination
-Checking the logs for the sync service (`journalctl --user -u forge-sync.service -n 50`) revealed exactly where and why the failure occurred:
+## 2. Проверка логов сервиса
+Логи сервиса синхронизации (`journalctl --user -u forge-sync.service -n 50`) показали следующую ошибку:
 ```
 ERROR: Rebase conflict detected! Aborting rebase...
 ```
-The sync failed while trying to apply a local commit (`5cb872183... feat: image pasting via Ctrl+V, subchats hiding and infinite loop fix`) on top of the newer `upstream/main`.
+Сбой произошел при попытке применить локальный коммит (`5cb872183... feat: image pasting via Ctrl+V, subchats hiding and infinite loop fix`) поверх новых коммитов из `upstream/main`.
 
-## 3. Auto-update Script Logic
-The `forge-sync.service` triggers the script `/home/stranmor/Documents/project/_mycelium/oven/scripts/sync-upstream.sh`. The script operates as follows:
-1. Executes `git fetch upstream`
-2. Stashes any uncommitted local changes.
-3. Attempts to execute `git rebase upstream/main`.
-4. Crucially, if a conflict is detected, the script automatically triggers `git rebase --abort` to prevent leaving the repository in a detached `interactive rebase in progress` state (which would block all future operations).
-5. It pops the stashed changes back and exits with an error.
+## 3. Логика скрипта автообновления
+Сервис `forge-sync.service` вызывает bash-скрипт `/home/stranmor/Documents/project/_mycelium/oven/scripts/sync-upstream.sh`. Скрипт работает следующим образом:
+1. Выполняет `git fetch upstream`.
+2. Прячет (stash) все незакоммиченные локальные изменения.
+3. Пытается выполнить `git rebase upstream/main`.
+4. Если возникает конфликт, скрипт выводит сообщение об ошибке и автоматически запускает `git rebase --abort`. Это предотвращает блокировку репозитория в состоянии `interactive rebase in progress`.
+5. Затем он возвращает изменения из stash и завершает работу с ошибкой.
 
-## 4. Root Cause & Action Required
-The root cause is a fundamental codebase divergence. The local `main` branch is ahead of `origin/main` and contains multiple unpushed local features (most notably the `image pasting via Ctrl+V` feature), which now heavily conflict with the updated `upstream/main` repository structure.
+## 4. Корневая причина и эскалация
+Корневая причина кроется в расхождении кодовой базы. Локальная ветка `main` содержит локальные коммиты (в частности, функцию вставки изображений), которые конфликтуют с обновленной структурой `upstream/main`.
 
-Because automatic resolution of these conflicts risks destroying the recent local features or corrupting `Cargo.lock` dependencies, **I am explicitly escalating this manual conflict resolution to you (Stranmor)**. Please manually execute `git pull --rebase upstream main` in the `oven` directory and resolve the conflicting files.
+Конфликты затрагивают ключевые файлы: `Cargo.lock`, `crates/forge_app/src/agent_executor.rs`, `crates/forge_main/src/editor.rs` и `crates/forge_main/src/ui.rs`. Ввиду сложности конфликтов и риска сломать локальный функционал, я эскалирую эту проблему вам (Stranmor). Пожалуйста, поручите агенту провести аккуратное разрешение этих git-конфликтов.
+
+**Резюме:**
+Мы исследовали причину сбоя автообновления. Были проверены таймер `forge-sync.timer`, логи `forge-sync.service` и скрипт `sync-upstream.sh`. При попытке `git rebase upstream/main` возникли сложные конфликты, и скрипт штатно прервал операцию (`git rebase --abort`). Проблема эскалирована: для безопасного слияния требуется отдельная сессия агента, которой будет поручено разрешение конфликтов.
