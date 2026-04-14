@@ -93,10 +93,18 @@ impl Tracker {
 
 #[async_trait::async_trait]
 impl Collect for Tracker {
-    // TODO: move http request to a dispatch
     async fn collect(&self, event: Event) -> Result<()> {
         let request = self.create_request(event)?;
-        self.client.execute(request).await?;
+        let client = self.client.clone();
+        
+        tokio::spawn(async move {
+            match client.execute(request).await.and_then(|r| r.error_for_status()) {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!("Failed to send analytics event: {}", e);
+                }
+            }
+        });
 
         Ok(())
     }
