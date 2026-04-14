@@ -291,7 +291,6 @@ fn reasoning_content_char_count(text_message: &TextMessage) -> usize {
         })
 }
 
-//TODO: Rename to TextMessage
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, Setters)]
 #[setters(strip_option, into)]
 #[serde(rename_all = "snake_case")]
