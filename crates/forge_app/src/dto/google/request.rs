@@ -410,7 +410,13 @@ impl From<Context> for Request {
                 reasoning.enabled.and_then(|enabled| {
                     if enabled {
                         Some(ThinkingConfig {
-                            thinking_level: None,
+                            thinking_level: reasoning.effort.map(|e| match e {
+                                forge_domain::Effort::Minimal => Level::Minimal,
+                                forge_domain::Effort::Low => Level::Low,
+                                forge_domain::Effort::Medium => Level::Medium,
+                                forge_domain::Effort::High | forge_domain::Effort::XHigh | forge_domain::Effort::Max => Level::High,
+                                forge_domain::Effort::None => Level::Minimal,
+                            }),
                             thinking_budget: reasoning.max_tokens.map(|t| t as i32),
                             include_thoughts: Some(true),
                         })
