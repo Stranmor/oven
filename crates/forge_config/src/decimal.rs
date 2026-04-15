@@ -82,7 +82,9 @@ impl fake::Dummy<fake::Faker> for Decimal {
 
 impl serde::Serialize for Decimal {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let formatted: f64 = format!("{:.2}", self.0).parse().unwrap();
+        let formatted: f64 = format!("{:.2}", self.0)
+            .parse()
+            .expect("valid float parsing");
         serializer.serialize_f64(formatted)
     }
 }

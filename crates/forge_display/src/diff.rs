@@ -18,7 +18,7 @@ impl fmt::Display for Line {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.index {
             None => write!(f, "{:width$}", "", width = self.width),
-            Some(idx) => write!(f, "{:<width$}", idx + 1, width = self.width),
+            Some(idx) => write!(f, "{:<width$}", idx.saturating_add(1), width = self.width),
         }
     }
 }
@@ -68,10 +68,10 @@ impl DiffFormat {
             for op in group {
                 for change in diff.iter_inline_changes(op) {
                     if let Some(old_idx) = change.old_index() {
-                        max_line_number = max_line_number.max(old_idx + 1);
+                        max_line_number = max_line_number.max(old_idx.saturating_add(1));
                     }
                     if let Some(new_idx) = change.new_index() {
-                        max_line_number = max_line_number.max(new_idx + 1);
+                        max_line_number = max_line_number.max(new_idx.saturating_add(1));
                     }
                 }
             }
@@ -79,7 +79,7 @@ impl DiffFormat {
         let width = if max_line_number == 0 {
             1
         } else {
-            (max_line_number as f64).log10().floor() as usize + 1
+            max_line_number.to_string().len()
         };
 
         // Second pass: Format the output
@@ -91,11 +91,11 @@ impl DiffFormat {
                 for change in diff.iter_inline_changes(op) {
                     let (sign, s) = match change.tag() {
                         ChangeTag::Delete => {
-                            lines_removed += 1;
+                            lines_removed = lines_removed.saturating_add(1);
                             ("-", Style::new().red())
                         }
                         ChangeTag::Insert => {
-                            lines_added += 1;
+                            lines_added = lines_added.saturating_add(1);
                             ("+", Style::new().yellow())
                         }
                         ChangeTag::Equal => (" ", Style::new().dim()),

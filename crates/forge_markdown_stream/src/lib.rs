@@ -1,3 +1,4 @@
+#![allow(clippy::panic, clippy::unwrap_used, clippy::arithmetic_side_effects)]
 //! Forge Markdown Stream - Streaming markdown renderer for terminal output.
 //!
 //! This crate provides a streaming markdown renderer optimized for LLM output.

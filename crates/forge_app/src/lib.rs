@@ -1,3 +1,13 @@
+#![allow(clippy::unnecessary_map_or, clippy::collapsible_if)]
+#![allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::indexing_slicing,
+    clippy::cast_possible_wrap
+)]
 mod agent;
 mod agent_executor;
 mod agent_provider_resolver;

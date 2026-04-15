@@ -1,3 +1,4 @@
+#![allow(clippy::panic, clippy::unwrap_used, clippy::arithmetic_side_effects)]
 use handlebars::Handlebars;
 use include_dir::{Dir, DirEntry, File};
 

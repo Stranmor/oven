@@ -109,7 +109,7 @@ impl Compact {
             turn_threshold: None,
             message_threshold: None,
             model: None,
-            eviction_window: Percentage::new(0.2).unwrap(),
+            eviction_window: Percentage::new(0.2).expect("0.2 is a valid percentage"),
             retention_window: 0,
             on_turn_end: None,
         }
@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn test_f64_eviction_window_round_trip() {
         let fixture = Compact {
-            eviction_window: Percentage::new(0.2).unwrap(),
+            eviction_window: Percentage::new(0.2).expect("0.2 is a valid percentage"),
             ..Compact::new()
         };
 
@@ -159,7 +159,7 @@ mod tests {
     #[test]
     fn test_f64_eviction_window_deserialize_round_trip() {
         let fixture = Compact {
-            eviction_window: Percentage::new(0.2).unwrap(),
+            eviction_window: Percentage::new(0.2).expect("0.2 is a valid percentage"),
             ..Compact::new()
         };
         let config_fixture = ForgeConfig::default().compact(fixture.clone());

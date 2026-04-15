@@ -1,3 +1,4 @@
+#![allow(clippy::panic, clippy::unwrap_used, clippy::arithmetic_side_effects)]
 use proc_macro::TokenStream;
 use quote::{ToTokens, quote};
 use syn::{DeriveInput, Expr, ExprLit, Lit, parse_macro_input};

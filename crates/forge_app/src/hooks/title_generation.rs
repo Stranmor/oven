@@ -29,6 +29,19 @@ impl<S> TitleGenerationHandler<S> {
     pub fn new(services: Arc<S>) -> Self {
         Self { services, title_tasks: Arc::new(DashMap::new()) }
     }
+
+    fn first_user_prompt(conversation: &Conversation) -> Option<&forge_domain::UserPrompt> {
+        conversation
+            .context
+            .as_ref()
+            .and_then(|c| {
+                c.messages
+                    .iter()
+                    .find(|m| m.has_role(forge_domain::Role::User))
+            })
+            .and_then(|e| e.message.as_value())
+            .and_then(|e| e.as_user_prompt())
+    }
 }
 
 #[async_trait]
@@ -42,16 +55,7 @@ impl<S: AgentService> EventHandle<EventData<StartPayload>> for TitleGenerationHa
             return Ok(());
         }
 
-        let user_prompt = conversation
-            .context
-            .as_ref()
-            .and_then(|c| {
-                c.messages
-                    .iter()
-                    .find(|m| m.has_role(forge_domain::Role::User))
-            })
-            .and_then(|e| e.message.as_value())
-            .and_then(|e| e.as_user_prompt());
+        let user_prompt = Self::first_user_prompt(conversation);
 
         let Some(user_prompt) = user_prompt else {
             return Ok(());
@@ -92,10 +96,28 @@ impl<S: AgentService> EventHandle<EventData<EndPayload>> for TitleGenerationHand
             let handle = &entry.handle;
             let rx = entry.rx;
 
-            if rx.is_empty() {
+            let mut generated = None;
+            if !rx.is_empty() {
+                generated = rx.await.unwrap_or(None);
+            } else {
                 handle.abort();
-            } else if let Some(title) = rx.await? {
+            }
+
+            if let Some(title) = generated {
                 conversation.title = Some(title);
+            } else {
+                let fallback = Self::first_user_prompt(conversation).map(|prompt| {
+                    let text = prompt.replace('\n', " ");
+                    if text.chars().count() > 60 {
+                        format!("{}...", text.chars().take(60).collect::<String>())
+                    } else {
+                        text
+                    }
+                });
+
+                if let Some(title) = fallback {
+                    conversation.title = Some(title);
+                }
             }
         }
 
@@ -230,7 +252,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_end_handles_task_cancellation() {
+    async fn test_end_handles_task_cancellation_fallbacks_to_user_prompt() {
         let (handler, mut conversation) = setup("test message");
         let (tx, rx) = oneshot::channel::<Option<String>>();
         // Drop the sender to simulate a cancelled task.
@@ -246,7 +268,28 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(conversation.title.is_none());
+        assert_eq!(conversation.title, Some("test message".into()));
+        assert!(!handler.title_tasks.contains_key(&conversation.id));
+    }
+
+    #[tokio::test]
+    async fn test_end_handles_task_returning_none_with_long_fallback() {
+        let long_message = "This is a very long message that spans multiple lines.\nIt should be truncated and newlines replaced with spaces so that it looks good.";
+        let (handler, mut conversation) = setup(long_message);
+        let (tx, rx) = oneshot::channel::<Option<String>>();
+        let handle = tokio::spawn(async {});
+        tx.send(None).unwrap();
+        handler
+            .title_tasks
+            .insert(conversation.id, TitleGenerationState { rx, handle });
+
+        handler
+            .handle(&event(EndPayload), &mut conversation)
+            .await
+            .unwrap();
+
+        let expected_fallback = "This is a very long message that spans multiple lines. It sh...";
+        assert_eq!(conversation.title, Some(expected_fallback.into()));
         assert!(!handler.title_tasks.contains_key(&conversation.id));
     }
 
@@ -276,7 +319,7 @@ mod tests {
 
         // Verify the task is no longer running by checking that the
         // EndPayload handler didn't hang (it completed immediately).
-        assert!(conversation.title.is_none());
+        assert_eq!(conversation.title, Some("test message".into()));
     }
 
     /// Many concurrent StartPayload calls for the same conversation id must

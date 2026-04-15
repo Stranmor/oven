@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -7,6 +8,7 @@ use forge_app::{
     ReadOutput, compute_hash,
 };
 use forge_domain::{FileInfo, Image};
+use regex::Regex;
 
 use crate::range::resolve_range;
 use crate::utils::assert_absolute_path;
@@ -58,6 +60,109 @@ fn detect_mime_type(path: &Path, content: &[u8]) -> String {
 /// Checks if a MIME type represents visual content (images or PDFs)
 fn is_visual_content(mime_type: &str) -> bool {
     mime_type.starts_with("image/") || mime_type == "application/pdf"
+}
+
+/// Fetches local Rust dependencies referenced by `mod` declarations and
+/// `use crate::` imports in the given file content.
+///
+/// Only processes `.rs` files. Resolves one level deep (no recursion).
+/// Silently skips files that cannot be read or do not exist.
+///
+/// # Arguments
+/// * `content` - The source file content to scan for dependency references
+/// * `file_path` - Absolute path of the source file (used to resolve
+///   relative `mod` paths and find the crate root)
+async fn fetch_local_dependencies(content: &str, file_path: &Path) -> Vec<(PathBuf, String)> {
+    if file_path.extension().and_then(|e| e.to_str()) != Some("rs") {
+        return Vec::new();
+    }
+
+    let mod_re = match Regex::new(r"(?m)^\s*(?:pub\s+)?mod\s+([a-zA-Z0-9_]+)\s*;") {
+        Ok(re) => re,
+        Err(_) => return Vec::new(),
+    };
+    let use_re = match Regex::new(r"(?m)^\s*(?:pub\s+)?use\s+crate::([a-zA-Z0-9_:]+)") {
+        Ok(re) => re,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut candidate_paths: Vec<PathBuf> = Vec::new();
+
+    // Resolve `mod name;` → sibling file or sibling directory with mod.rs
+    if let Some(parent) = file_path.parent() {
+        for cap in mod_re.captures_iter(content) {
+            if let Some(m) = cap.get(1) {
+                let mod_name = m.as_str();
+                candidate_paths.push(parent.join(format!("{mod_name}.rs")));
+                candidate_paths.push(parent.join(mod_name).join("mod.rs"));
+            }
+        }
+    }
+
+    // Find crate root (directory containing Cargo.toml) to resolve
+    // `use crate::` paths relative to `src/`.
+    let src_dir = {
+        let mut found = None;
+        let mut current = file_path.parent();
+        while let Some(dir) = current {
+            if tokio::fs::metadata(dir.join("Cargo.toml")).await.is_ok() {
+                found = Some(dir.join("src"));
+                break;
+            }
+            current = dir.parent();
+        }
+        found
+    };
+
+    if let Some(ref src) = src_dir {
+        for cap in use_re.captures_iter(content) {
+            if let Some(m) = cap.get(1) {
+                let use_path = m.as_str();
+                let parts: Vec<&str> = use_path.split("::").collect();
+
+                // Try progressively shorter prefixes: crate::a::b::c → a/b/c.rs,
+                // a/b/c/mod.rs, then a/b.rs, a/b/mod.rs, then a.rs, a/mod.rs
+                for depth in (1..=parts.len()).rev() {
+                    let sub_path = parts[..depth].join("/");
+                    candidate_paths.push(src.join(format!("{sub_path}.rs")));
+                    candidate_paths.push(src.join(&sub_path).join("mod.rs"));
+                }
+            }
+        }
+    }
+
+    // Deduplicate candidate paths while preserving order
+    let mut seen = HashSet::new();
+    let mut unique_paths: Vec<PathBuf> = Vec::new();
+    for p in candidate_paths {
+        if seen.insert(p.clone()) {
+            unique_paths.push(p);
+        }
+    }
+
+    // Read files that actually exist, collecting (path, content) pairs
+    let mut deps: Vec<(PathBuf, String)> = Vec::new();
+    let mut read_canonical: HashSet<PathBuf> = HashSet::new();
+    for p in unique_paths {
+        // Canonicalize to avoid reading the same file via different paths
+        // (e.g. foo.rs and foo/mod.rs both existing is unlikely, but
+        // we also want to skip the source file itself).
+        let canonical = match tokio::fs::canonicalize(&p).await {
+            Ok(c) => c,
+            Err(_) => continue, // file doesn't exist
+        };
+        if canonical == tokio::fs::canonicalize(file_path).await.unwrap_or_default() {
+            continue; // skip self
+        }
+        if !read_canonical.insert(canonical) {
+            continue; // already read via a different path
+        }
+        if let Ok(c) = tokio::fs::read_to_string(&p).await {
+            deps.push((p, c));
+        }
+    }
+
+    deps
 }
 
 /// Validates that file size does not exceed the maximum allowed file size.
@@ -180,7 +285,7 @@ impl<F: FileInfoInfra + EnvironmentInfra<Config = forge_config::ForgeConfig> + I
             .min(total_lines.saturating_sub(1));
 
         // Extract requested lines
-        let content = if start_pos == 0 && end_pos >= total_lines.saturating_sub(1) {
+        let mut content = if start_pos == 0 && end_pos >= total_lines.saturating_sub(1) {
             // Return full content with line truncation
             lines
                 .iter()
@@ -202,6 +307,16 @@ impl<F: FileInfoInfra + EnvironmentInfra<Config = forge_config::ForgeConfig> + I
                 })
                 .unwrap_or_default()
         };
+
+        // Append local Rust dependencies (mod declarations, use crate:: imports)
+        let deps = fetch_local_dependencies(&full_content, path).await;
+        for (dep_path, dep_content) in deps {
+            content.push_str(&format!(
+                "\n\n--- Local Dependency: {} ---\n{}",
+                dep_path.display(),
+                dep_content
+            ));
+        }
 
         let file_info = FileInfo::new(start_line, end_line, total_lines, hash);
 
@@ -425,5 +540,165 @@ mod tests {
         println!("{}", actual);
         assert_eq!(actual.len(), 50); // 12 bytes + truncation message
         assert!(actual.contains("truncated"));
+    }
+
+    // ── E2E: fetch_local_dependencies ─────────────────────────────────────────
+
+    /// Creates a minimal fake crate under `root`:
+    ///   root/
+    ///     Cargo.toml
+    ///     src/
+    ///       main.rs   ← the file we "read"
+    ///       utils.rs  ← declared via `mod utils;`
+    ///       models.rs ← imported via `use crate::models::Foo;`
+    async fn fixture_rust_crate(root: &std::path::Path) {
+        fs::create_dir_all(root.join("src")).await.unwrap();
+
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"test-crate\"\n",
+        )
+        .await
+        .unwrap();
+
+        fs::write(
+            root.join("src/main.rs"),
+            "mod utils;\nuse crate::models::Foo;\nfn main() {}\n",
+        )
+        .await
+        .unwrap();
+
+        fs::write(root.join("src/utils.rs"), "pub fn helper() {}\n")
+            .await
+            .unwrap();
+
+        fs::write(root.join("src/models.rs"), "pub struct Foo;\n")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fetch_local_dependencies_injects_mod_and_use_crate_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture_rust_crate(dir.path()).await;
+        let main_path = dir.path().join("src/main.rs");
+        let content = fs::read_to_string(&main_path).await.unwrap();
+
+        // Execute
+        let actual = fetch_local_dependencies(&content, &main_path).await;
+
+        // Both utils.rs (mod utils;) and models.rs (use crate::models) should be found
+        let actual_names: Vec<String> = actual
+            .iter()
+            .map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        let mut actual_names = actual_names;
+        actual_names.sort();
+
+        let expected = vec!["models.rs".to_string(), "utils.rs".to_string()];
+        assert_eq!(actual_names, expected);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_local_dependencies_contents_included() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture_rust_crate(dir.path()).await;
+        let main_path = dir.path().join("src/main.rs");
+        let content = fs::read_to_string(&main_path).await.unwrap();
+
+        // Execute
+        let actual = fetch_local_dependencies(&content, &main_path).await;
+
+        // Verify actual content of dependencies is correct
+        let utils_content = actual
+            .iter()
+            .find(|(p, _)| p.ends_with("utils.rs"))
+            .map(|(_, c)| c.as_str())
+            .expect("utils.rs should be present");
+
+        let models_content = actual
+            .iter()
+            .find(|(p, _)| p.ends_with("models.rs"))
+            .map(|(_, c)| c.as_str())
+            .expect("models.rs should be present");
+
+        assert_eq!(utils_content, "pub fn helper() {}\n");
+        assert_eq!(models_content, "pub struct Foo;\n");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_local_dependencies_skips_non_rs_files() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write a non-.rs file
+        let js_path = dir.path().join("script.js");
+        fs::write(&js_path, "console.log('hello');\n")
+            .await
+            .unwrap();
+
+        let content = "mod utils;\n";
+        let actual = fetch_local_dependencies(content, &js_path).await;
+
+        // Non-.rs files should return empty deps
+        assert!(
+            actual.is_empty(),
+            "Non-.rs files should have no dependencies"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_local_dependencies_does_not_include_self() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).await.unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n")
+            .await
+            .unwrap();
+
+        // lib.rs imports itself via `use crate::lib` (unlikely, but tested for safety)
+        let lib_path = dir.path().join("src/lib.rs");
+        fs::write(
+            &lib_path,
+            "use crate::lib::something;\npub fn something() {}\n",
+        )
+        .await
+        .unwrap();
+
+        let content = fs::read_to_string(&lib_path).await.unwrap();
+        let actual = fetch_local_dependencies(&content, &lib_path).await;
+
+        // lib.rs itself must not appear in its own deps
+        let contains_self = actual.iter().any(|(p, _)| {
+            p.canonicalize()
+                .ok()
+                .zip(lib_path.canonicalize().ok())
+                .map(|(a, b)| a == b)
+                .unwrap_or(false)
+        });
+        assert!(
+            !contains_self,
+            "A file must not inject itself as a dependency"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_local_dependencies_missing_files_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).await.unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n")
+            .await
+            .unwrap();
+
+        let main_path = dir.path().join("src/main.rs");
+        // References a module that doesn't exist on disk
+        let content = "mod nonexistent_module;\nfn main() {}\n";
+        fs::write(&main_path, content).await.unwrap();
+
+        let actual = fetch_local_dependencies(content, &main_path).await;
+
+        // Missing files should be silently skipped - empty result
+        assert!(
+            actual.is_empty(),
+            "Missing dependency files should be silently skipped"
+        );
     }
 }
