@@ -68,6 +68,13 @@ impl ConversationRepository for ConversationRepositoryImpl {
             .filter(conversations::workspace_id.eq(&workspace_id))
             .filter(conversations::context.is_not_null())
             .filter(conversations::parent_id.is_null())
+            // Exclude legacy sub-agent conversations that predate the parent_id
+            // migration: they have "initiator":"agent" in context JSON but no
+            // parent_id set.
+            .filter(
+                conversations::context
+                    .not_like("%\"initiator\":\"agent\"%"),
+            )
             .order(conversations::updated_at.desc())
             .into_boxed();
 
@@ -116,6 +123,11 @@ impl ConversationRepository for ConversationRepositoryImpl {
             .filter(conversations::workspace_id.eq(&workspace_id))
             .filter(conversations::context.is_not_null())
             .filter(conversations::parent_id.is_null())
+            // Exclude legacy sub-agent conversations (see get_all_conversations)
+            .filter(
+                conversations::context
+                    .not_like("%\"initiator\":\"agent\"%"),
+            )
             .order(conversations::updated_at.desc())
             .first(&mut connection)
             .optional()?;
@@ -258,6 +270,93 @@ mod tests {
         let actual = repo.get_all_conversations(None).await?;
 
         assert!(actual.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_find_all_conversations_excludes_agent_initiated() -> anyhow::Result<()> {
+        let user_context =
+            Context::default().messages(vec![ContextMessage::user("Hello", None).into()]);
+        let agent_context = Context::default()
+            .initiator("agent".to_string())
+            .messages(vec![ContextMessage::user("Agent task", None).into()]);
+
+        let user_conv = Conversation::new(ConversationId::generate())
+            .title(Some("User Chat".to_string()))
+            .context(Some(user_context));
+        let agent_conv = Conversation::new(ConversationId::generate())
+            .title(Some("Agent Sub-Chat".to_string()))
+            .context(Some(agent_context));
+
+        let repo = repository()?;
+        repo.upsert_conversation(user_conv.clone()).await?;
+        repo.upsert_conversation(agent_conv).await?;
+
+        let actual = repo.get_all_conversations(None).await?;
+
+        assert!(actual.is_some());
+        let conversations = actual.unwrap();
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].id, user_conv.id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_find_all_conversations_excludes_with_parent_id() -> anyhow::Result<()> {
+        let parent_id = ConversationId::generate();
+        let user_context =
+            Context::default().messages(vec![ContextMessage::user("Hello", None).into()]);
+        let child_context = Context::default()
+            .initiator("agent".to_string())
+            .messages(vec![ContextMessage::user("Sub task", None).into()]);
+
+        let user_conv = Conversation::new(parent_id)
+            .title(Some("Parent Chat".to_string()))
+            .context(Some(user_context));
+        let child_conv = Conversation::new(ConversationId::generate())
+            .title(Some("Child Sub-Chat".to_string()))
+            .context(Some(child_context))
+            .parent_id(Some(parent_id));
+
+        let repo = repository()?;
+        repo.upsert_conversation(user_conv.clone()).await?;
+        repo.upsert_conversation(child_conv).await?;
+
+        let actual = repo.get_all_conversations(None).await?;
+
+        assert!(actual.is_some());
+        let conversations = actual.unwrap();
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].id, user_conv.id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_find_last_conversation_excludes_agent_initiated() -> anyhow::Result<()> {
+        let user_context =
+            Context::default().messages(vec![ContextMessage::user("Hello", None).into()]);
+        let agent_context = Context::default()
+            .initiator("agent".to_string())
+            .messages(vec![ContextMessage::user("Agent task", None).into()]);
+
+        let user_conv = Conversation::new(ConversationId::generate())
+            .title(Some("User Chat".to_string()))
+            .context(Some(user_context));
+
+        let repo = repository()?;
+        repo.upsert_conversation(user_conv.clone()).await?;
+        // Insert agent conversation after the user one so it would be "last"
+        // if not filtered
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let agent_conv = Conversation::new(ConversationId::generate())
+            .title(Some("Agent Sub-Chat".to_string()))
+            .context(Some(agent_context));
+        repo.upsert_conversation(agent_conv).await?;
+
+        let actual = repo.get_last_conversation().await?;
+
+        assert!(actual.is_some());
+        assert_eq!(actual.unwrap().id, user_conv.id);
         Ok(())
     }
 
