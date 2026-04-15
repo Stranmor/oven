@@ -66,6 +66,17 @@
         "null"
       ]
     },
+    "frequency_penalty": {
+      "description": "Penalizes tokens based on how frequently they have appeared in the\ngenerated text. Helps prevent repetitive degeneration loops.\nRange: -2.0 to 2.0",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/double"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "http": {
       "description": "HTTP client settings including proxy, TLS, and timeout configuration.",
       "anyOf": [
@@ -222,6 +233,17 @@
       "format": "uint64",
       "default": 0,
       "minimum": 0
+    },
+    "presence_penalty": {
+      "description": "Penalizes tokens that have appeared at least once, encouraging the model\nto introduce new topics. Range: -2.0 to 2.0",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/double"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "providers": {
       "description": "Additional provider definitions merged with the built-in provider list.\n\nEntries with an `id` matching a built-in provider override its fields;\nentries with a new `id` are appended and become available for model\nselection.",

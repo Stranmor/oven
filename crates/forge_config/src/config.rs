@@ -263,6 +263,17 @@ pub struct ForgeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ReasoningConfig>,
 
+    /// Penalizes tokens based on how frequently they have appeared in the
+    /// generated text. Helps prevent repetitive degeneration loops.
+    /// Range: -2.0 to 2.0
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<Decimal>,
+
+    /// Penalizes tokens that have appeared at least once, encouraging the model
+    /// to introduce new topics. Range: -2.0 to 2.0
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<Decimal>,
+
     /// Additional provider definitions merged with the built-in provider list.
     ///
     /// Entries with an `id` matching a built-in provider override its fields;

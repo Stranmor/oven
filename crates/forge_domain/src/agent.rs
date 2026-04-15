@@ -166,6 +166,14 @@ pub struct Agent {
 
     /// Maximum number of requests that can be made in a single turn
     pub max_requests_per_turn: Option<usize>,
+
+    /// Penalizes tokens based on how frequently they have appeared, preventing
+    /// repetitive degeneration loops. Range: -2.0 to 2.0
+    pub frequency_penalty: Option<f64>,
+
+    /// Penalizes tokens that have appeared at least once, encouraging diversity.
+    /// Range: -2.0 to 2.0
+    pub presence_penalty: Option<f64>,
 }
 
 /// Lightweight metadata about an agent, used for listing without requiring a
@@ -206,6 +214,8 @@ impl Agent {
             reasoning: Default::default(),
             max_tool_failure_per_turn: Default::default(),
             max_requests_per_turn: Default::default(),
+            frequency_penalty: Default::default(),
+            presence_penalty: Default::default(),
             path: Default::default(),
         }
     }

@@ -745,6 +745,10 @@ pub(super) struct ContextRecord {
     reasoning: Option<ReasoningConfigRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    frequency_penalty: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    presence_penalty: Option<f64>,
 }
 
 impl From<&Context> for ContextRecord {
@@ -769,6 +773,8 @@ impl From<&Context> for ContextRecord {
             top_k: context.top_k.map(|t| t.value()),
             reasoning: context.reasoning.as_ref().map(ReasoningConfigRecord::from),
             stream: context.stream,
+            frequency_penalty: context.frequency_penalty,
+            presence_penalty: context.presence_penalty,
         }
     }
 }
@@ -819,6 +825,8 @@ impl TryFrom<ContextRecord> for Context {
             reasoning: record.reasoning.map(Into::into),
             stream: record.stream,
             response_format: None,
+            frequency_penalty: record.frequency_penalty,
+            presence_penalty: record.presence_penalty,
         })
     }
 }

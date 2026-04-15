@@ -70,8 +70,8 @@ fn is_visual_content(mime_type: &str) -> bool {
 ///
 /// # Arguments
 /// * `content` - The source file content to scan for dependency references
-/// * `file_path` - Absolute path of the source file (used to resolve
-///   relative `mod` paths and find the crate root)
+/// * `file_path` - Absolute path of the source file (used to resolve relative
+///   `mod` paths and find the crate root)
 async fn fetch_local_dependencies(content: &str, file_path: &Path) -> Vec<(PathBuf, String)> {
     if file_path.extension().and_then(|e| e.to_str()) != Some("rs") {
         return Vec::new();
