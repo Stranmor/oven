@@ -140,6 +140,8 @@ mod tests {
         Conversation {
             id: ConversationId::parse(id).unwrap(),
             title: title.map(|t| t.to_string()),
+            parent_id: None,
+            initiator: forge_domain::Initiator::User,
             context: Some(Context::default()),
             metrics: Metrics::default().started_at(now),
             metadata: MetaData { created_at: now, updated_at: Some(now) },
@@ -200,11 +202,9 @@ mod tests {
     fn test_primary_conversations_excludes_agent_chat() {
         let mut conversation =
             create_test_conversation("550e8400-e29b-41d4-a716-446655440005", Some("Agent"));
-        conversation.context = Some(
-            Context::default()
-                .initiator("agent".to_string())
-                .messages(vec![ContextMessage::user("Task", None).into()]),
-        );
+        conversation.initiator = forge_domain::Initiator::Agent;
+        conversation.context =
+            Some(Context::default().messages(vec![ContextMessage::user("Task", None).into()]));
         let conversations = [conversation];
 
         let actual = ConversationSelector::primary_conversations(&conversations);

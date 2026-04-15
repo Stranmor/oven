@@ -63,11 +63,12 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> AgentEx
                 .await?
                 .ok_or(Error::ConversationNotFound { id: conversation_id })?
         } else {
-            // Create context with agent initiator since it's spawned by a parent agent
+            // Create conversation with agent initiator since it's spawned by a parent agent
             // This is crucial for GitHub Copilot billing optimization
-            let context = forge_domain::Context::default().initiator("agent".to_string());
+            let context = forge_domain::Context::default();
             let mut conversation = Conversation::generate()
                 .title(task.clone())
+                .initiator(forge_domain::Initiator::Agent)
                 .context(context.clone());
             if let Some(parent_id) = ctx.conversation_id {
                 conversation.parent_id = Some(parent_id);

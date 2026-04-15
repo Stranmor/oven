@@ -109,7 +109,6 @@ mod tests {
             reasoning: None,
             stream: None,
             response_format: None,
-            initiator: None,
         };
 
         let request = Request::try_from(context).expect("Failed to convert context to request");
@@ -243,7 +242,6 @@ mod tests {
             reasoning: None,
             stream: None,
             response_format: None,
-            initiator: None,
         };
 
         let request = Request::try_from(fixture).expect("Failed to convert context to request");

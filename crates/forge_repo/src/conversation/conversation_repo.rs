@@ -127,23 +127,25 @@ impl ConversationRepository for ConversationRepositoryImpl {
         &self,
         parent_id: &ConversationId,
     ) -> anyhow::Result<Option<Vec<Conversation>>> {
-        let mut connection = self.pool.get_connection()?;
+        let parent_id = *parent_id;
+        self.run_with_connection(move |connection, wid| {
+            let workspace_id = wid.id() as i64;
+            let records: Vec<ConversationRecord> = conversations::table
+                .filter(conversations::workspace_id.eq(&workspace_id))
+                .filter(conversations::context.is_not_null())
+                .filter(conversations::parent_id.eq(parent_id.into_string()))
+                .order(conversations::updated_at.desc())
+                .load(connection)?;
 
-        let workspace_id = self.wid.id() as i64;
-        let records: Vec<ConversationRecord> = conversations::table
-            .filter(conversations::workspace_id.eq(&workspace_id))
-            .filter(conversations::context.is_not_null())
-            .filter(conversations::parent_id.eq(parent_id.into_string()))
-            .order(conversations::updated_at.desc())
-            .load(&mut connection)?;
+            if records.is_empty() {
+                return Ok(None);
+            }
 
-        if records.is_empty() {
-            return Ok(None);
-        }
-
-        let conversations: Result<Vec<Conversation>, _> =
-            records.into_iter().map(Conversation::try_from).collect();
-        Ok(Some(conversations?))
+            let conversations: Result<Vec<Conversation>, _> =
+                records.into_iter().map(Conversation::try_from).collect();
+            Ok(Some(conversations?))
+        })
+        .await
     }
 
     async fn get_last_conversation(&self) -> anyhow::Result<Option<Conversation>> {
@@ -172,6 +174,11 @@ impl ConversationRepository for ConversationRepositoryImpl {
             let workspace_id = wid.id() as i64;
 
             // Security: Ensure users can only delete conversations within their workspace
+            diesel::delete(conversations::table)
+                .filter(conversations::workspace_id.eq(&workspace_id))
+                .filter(conversations::parent_id.eq(conversation_id.into_string()))
+                .execute(connection)?;
+
             diesel::delete(conversations::table)
                 .filter(conversations::workspace_id.eq(&workspace_id))
                 .filter(conversations::conversation_id.eq(conversation_id.into_string()))
@@ -298,13 +305,13 @@ mod tests {
     async fn test_find_all_conversations_excludes_agent_initiated() -> anyhow::Result<()> {
         let user_context =
             Context::default().messages(vec![ContextMessage::user("User task", None).into()]);
-        let agent_context = Context::default()
-            .initiator("agent".to_string())
-            .messages(vec![ContextMessage::user("Agent task", None).into()]);
+        let agent_context =
+            Context::default().messages(vec![ContextMessage::user("Agent task", None).into()]);
         let user_conversation = Conversation::new(ConversationId::generate())
             .title(Some("User Conversation".to_string()))
             .context(Some(user_context));
         let agent_conversation = Conversation::new(ConversationId::generate())
+            .initiator(forge_domain::Initiator::Agent)
             .title(Some("Agent Conversation".to_string()))
             .context(Some(agent_context));
         let repo = repository()?;
@@ -337,14 +344,14 @@ mod tests {
         let parent_id = ConversationId::generate();
         let user_context =
             Context::default().messages(vec![ContextMessage::user("Hello", None).into()]);
-        let child_context = Context::default()
-            .initiator("agent".to_string())
-            .messages(vec![ContextMessage::user("Sub task", None).into()]);
+        let child_context =
+            Context::default().messages(vec![ContextMessage::user("Sub task", None).into()]);
 
         let user_conv = Conversation::new(parent_id)
             .title(Some("Parent Chat".to_string()))
             .context(Some(user_context));
         let child_conv = Conversation::new(ConversationId::generate())
+            .initiator(forge_domain::Initiator::Agent)
             .title(Some("Child Sub-Chat".to_string()))
             .context(Some(child_context))
             .parent_id(Some(parent_id));
@@ -366,9 +373,8 @@ mod tests {
     async fn test_find_all_conversations_excludes_agent_without_parent_id() -> anyhow::Result<()> {
         let user_context =
             Context::default().messages(vec![ContextMessage::user("Hello", None).into()]);
-        let agent_context = Context::default()
-            .initiator("agent".to_string())
-            .messages(vec![ContextMessage::user("Agent task", None).into()]);
+        let agent_context =
+            Context::default().messages(vec![ContextMessage::user("Agent task", None).into()]);
 
         let user_conv = Conversation::new(ConversationId::generate())
             .title(Some("User Chat".to_string()))
@@ -376,6 +382,7 @@ mod tests {
         // Agent-initiated conversation WITHOUT parent_id — the old LIKE filter's
         // weakness. The new dedicated `initiator` column catches it reliably.
         let agent_conv = Conversation::new(ConversationId::generate())
+            .initiator(forge_domain::Initiator::Agent)
             .title(Some("Agent No Parent".to_string()))
             .context(Some(agent_context));
 
@@ -396,9 +403,8 @@ mod tests {
     async fn test_find_last_conversation_excludes_agent_initiated() -> anyhow::Result<()> {
         let user_context =
             Context::default().messages(vec![ContextMessage::user("Hello", None).into()]);
-        let agent_context = Context::default()
-            .initiator("agent".to_string())
-            .messages(vec![ContextMessage::user("Agent task", None).into()]);
+        let agent_context =
+            Context::default().messages(vec![ContextMessage::user("Agent task", None).into()]);
 
         let user_conv = Conversation::new(ConversationId::generate())
             .title(Some("User Chat".to_string()))
@@ -410,6 +416,7 @@ mod tests {
         // if not filtered
         std::thread::sleep(std::time::Duration::from_millis(10));
         let agent_conv = Conversation::new(ConversationId::generate())
+            .initiator(forge_domain::Initiator::Agent)
             .title(Some("Agent Sub-Chat".to_string()))
             .context(Some(agent_context));
         repo.upsert_conversation(agent_conv).await?;
@@ -482,13 +489,13 @@ mod tests {
     async fn test_find_last_conversation_skips_agent_initiated() -> anyhow::Result<()> {
         let user_context =
             Context::default().messages(vec![ContextMessage::user("User task", None).into()]);
-        let agent_context = Context::default()
-            .initiator("agent".to_string())
-            .messages(vec![ContextMessage::user("Agent task", None).into()]);
+        let agent_context =
+            Context::default().messages(vec![ContextMessage::user("Agent task", None).into()]);
         let user_conversation =
             Conversation::new(ConversationId::generate()).context(Some(user_context));
-        let agent_conversation =
-            Conversation::new(ConversationId::generate()).context(Some(agent_context));
+        let agent_conversation = Conversation::new(ConversationId::generate())
+            .initiator(forge_domain::Initiator::Agent)
+            .context(Some(agent_context));
         let repo = repository()?;
 
         repo.upsert_conversation(user_conversation.clone()).await?;

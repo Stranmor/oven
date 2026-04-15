@@ -976,6 +976,8 @@ mod tests {
         let fixture = Conversation {
             id: conversation_id,
             title: Some("Test Conversation".to_string()),
+            parent_id: None,
+            initiator: forge_domain::Initiator::User,
             context: None,
             metrics,
             metadata: forge_domain::MetaData::new(Utc::now()),
@@ -1003,6 +1005,8 @@ mod tests {
         let fixture = Conversation {
             id: conversation_id,
             title: None,
+            parent_id: None,
+            initiator: forge_domain::Initiator::User,
             context: None,
             metrics,
             metadata: forge_domain::MetaData::new(Utc::now()),
@@ -1048,6 +1052,8 @@ mod tests {
         let fixture = Conversation {
             id: conversation_id,
             title: Some("Test Task".to_string()),
+            parent_id: None,
+            initiator: forge_domain::Initiator::User,
             context: Some(context),
             metrics,
             metadata: forge_domain::MetaData::new(Utc::now()),

@@ -128,9 +128,8 @@ impl<H: HttpInfra> OpenAIProvider<H> {
 
         // Add GitHub Copilot optimization headers only for github_copilot provider
         if self.provider.id == ProviderId::GITHUB_COPILOT {
-            // Determine initiator: use request.initiator if available, otherwise detect
-            // from messages
-            let initiator = request.initiator.as_deref().unwrap_or_else(|| {
+            // Determine initiator from messages
+            let initiator = {
                 // Fall back to detecting from last message role
                 let is_agent_initiated = request.messages.as_ref().is_some_and(|messages| {
                     messages.last().is_some_and(|msg| {
@@ -139,7 +138,7 @@ impl<H: HttpInfra> OpenAIProvider<H> {
                     })
                 });
                 if is_agent_initiated { "agent" } else { "user" }
-            });
+            };
 
             headers.push(("x-initiator".to_string(), initiator.to_string()));
             headers.push((
