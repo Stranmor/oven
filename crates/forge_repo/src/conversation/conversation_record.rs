@@ -950,6 +950,7 @@ pub(super) struct ConversationRecord {
     pub updated_at: Option<chrono::NaiveDateTime>,
     pub metrics: Option<String>,
     pub parent_id: Option<String>,
+    pub initiator: Option<String>,
 }
 
 impl ConversationRecord {
@@ -958,6 +959,10 @@ impl ConversationRecord {
         conversation: forge_domain::Conversation,
         workspace_id: forge_domain::WorkspaceHash,
     ) -> Self {
+        let initiator = conversation
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.initiator.clone());
         let context = conversation
             .context
             .as_ref()
@@ -977,6 +982,7 @@ impl ConversationRecord {
             workspace_id: workspace_id.id() as i64,
             metrics,
             parent_id: conversation.parent_id.map(|id| id.into_string()),
+            initiator,
         }
     }
 }

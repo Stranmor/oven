@@ -146,7 +146,8 @@ impl ContextMessage {
             }
             ContextMessage::Tool(result) => {
                 let filtered_output = filter_base64_images_from_tool_output(&result.output);
-                let serialized_output = serde_json::to_string(&filtered_output).unwrap_or_else(|_| String::new());
+                let serialized_output =
+                    serde_json::to_string(&filtered_output).unwrap_or_else(|_| String::new());
                 Element::new("message")
                     .attr("role", "tool")
                     .append(

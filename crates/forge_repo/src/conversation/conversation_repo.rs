@@ -57,6 +57,7 @@ impl ConversationRepository for ConversationRepositoryImpl {
                     conversations::updated_at.eq(record.updated_at),
                     conversations::metrics.eq(&record.metrics),
                     conversations::parent_id.eq(&record.parent_id),
+                    conversations::initiator.eq(&record.initiator),
                 ))
                 .execute(connection)?;
             Ok(())
@@ -96,7 +97,9 @@ impl ConversationRepository for ConversationRepositoryImpl {
                 .order(conversations::updated_at.desc())
                 .into_boxed();
 
-            let records: Vec<ConversationRecord> = query.load(connection)?;
+            let records: Vec<ConversationRecord> = query
+                .filter(conversations::initiator.is_null())
+                .load(connection)?;
 
             if records.is_empty() {
                 return Ok(None);
@@ -150,6 +153,7 @@ impl ConversationRepository for ConversationRepositoryImpl {
                 .filter(conversations::workspace_id.eq(&workspace_id))
                 .filter(conversations::context.is_not_null())
                 .filter(conversations::parent_id.is_null())
+                .filter(conversations::initiator.is_null())
                 .order(conversations::updated_at.desc())
                 .load::<ConversationRecord>(connection)?
                 .into_iter()
@@ -329,6 +333,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_find_all_conversations_excludes_with_parent_id() -> anyhow::Result<()> {
+        let parent_id = ConversationId::generate();
+        let user_context =
+            Context::default().messages(vec![ContextMessage::user("Hello", None).into()]);
+        let child_context = Context::default()
+            .initiator("agent".to_string())
+            .messages(vec![ContextMessage::user("Sub task", None).into()]);
+
+        let user_conv = Conversation::new(parent_id)
+            .title(Some("Parent Chat".to_string()))
+            .context(Some(user_context));
+        let child_conv = Conversation::new(ConversationId::generate())
+            .title(Some("Child Sub-Chat".to_string()))
+            .context(Some(child_context))
+            .parent_id(Some(parent_id));
+
+        let repo = repository()?;
+        repo.upsert_conversation(user_conv.clone()).await?;
+        repo.upsert_conversation(child_conv).await?;
+
+        let actual = repo.get_all_conversations(None).await?;
+
+        assert!(actual.is_some());
+        let conversations = actual.unwrap();
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].id, user_conv.id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_find_all_conversations_excludes_agent_without_parent_id() -> anyhow::Result<()> {
+        let user_context =
+            Context::default().messages(vec![ContextMessage::user("Hello", None).into()]);
+        let agent_context = Context::default()
+            .initiator("agent".to_string())
+            .messages(vec![ContextMessage::user("Agent task", None).into()]);
+
+        let user_conv = Conversation::new(ConversationId::generate())
+            .title(Some("User Chat".to_string()))
+            .context(Some(user_context));
+        // Agent-initiated conversation WITHOUT parent_id — the old LIKE filter's
+        // weakness. The new dedicated `initiator` column catches it reliably.
+        let agent_conv = Conversation::new(ConversationId::generate())
+            .title(Some("Agent No Parent".to_string()))
+            .context(Some(agent_context));
+
+        let repo = repository()?;
+        repo.upsert_conversation(user_conv.clone()).await?;
+        repo.upsert_conversation(agent_conv).await?;
+
+        let actual = repo.get_all_conversations(None).await?;
+
+        assert!(actual.is_some());
+        let conversations = actual.unwrap();
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].id, user_conv.id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_find_last_conversation_excludes_agent_initiated() -> anyhow::Result<()> {
+        let user_context =
+            Context::default().messages(vec![ContextMessage::user("Hello", None).into()]);
+        let agent_context = Context::default()
+            .initiator("agent".to_string())
+            .messages(vec![ContextMessage::user("Agent task", None).into()]);
+
+        let user_conv = Conversation::new(ConversationId::generate())
+            .title(Some("User Chat".to_string()))
+            .context(Some(user_context));
+
+        let repo = repository()?;
+        repo.upsert_conversation(user_conv.clone()).await?;
+        // Insert agent conversation after the user one so it would be "last"
+        // if not filtered
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let agent_conv = Conversation::new(ConversationId::generate())
+            .title(Some("Agent Sub-Chat".to_string()))
+            .context(Some(agent_context));
+        repo.upsert_conversation(agent_conv).await?;
+
+        let actual = repo.get_last_conversation().await?;
+
+        assert!(actual.is_some());
+        assert_eq!(actual.unwrap().id, user_conv.id);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_find_last_active_conversation_with_context() -> anyhow::Result<()> {
         let context = Context::default().messages(vec![ContextMessage::user("Hello", None).into()]);
         let conversation_with_context = Conversation::new(ConversationId::generate())
@@ -465,6 +558,7 @@ mod tests {
             updated_at: None,
             workspace_id: 0,
             metrics: None,
+            initiator: None,
         };
 
         let actual = Conversation::try_from(fixture)?;
@@ -910,6 +1004,7 @@ mod tests {
             updated_at: None,
             workspace_id: 0,
             metrics: None,
+            initiator: None,
         };
 
         let result = Conversation::try_from(fixture);
