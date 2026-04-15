@@ -21,7 +21,9 @@ impl Transformer for StripThoughtSignature {
                 // Also remove extra_content from tool_calls
                 if let Some(tool_calls) = message.tool_calls.as_mut() {
                     for tool_call in tool_calls.iter_mut() {
-                        tool_call.extra_content = None;
+                        if let crate::dto::openai::response::ToolCall::Function { extra_content, .. } = tool_call {
+                            *extra_content = None;
+                        }
                     }
                 }
             }

@@ -6,7 +6,7 @@ use forge_domain::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::tool_choice::FunctionType;
+
 use crate::dto::openai::ReasoningDetail;
 use crate::dto::openai::error::{Error, ErrorCode, ErrorResponse};
 
@@ -230,12 +230,19 @@ impl From<String> for ExtraContent {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct ToolCall {
-    pub id: Option<ToolCallId>,
-    pub r#type: FunctionType,
-    pub function: FunctionCall,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extra_content: Option<ExtraContent>,
+#[serde(tag = "type")]
+pub enum ToolCall {
+    #[serde(rename = "function")]
+    Function {
+        id: Option<ToolCallId>,
+        function: FunctionCall,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        extra_content: Option<ExtraContent>,
+    },
+    #[serde(rename = "code_interpreter")]
+    CodeInterpreter {
+        id: Option<ToolCallId>,
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -390,23 +397,23 @@ impl TryFrom<Response> for ChatCompletionMessage {
 
                             if let Some(tool_calls) = &message.tool_calls {
                                 for tool_call in tool_calls {
-                                    let thought_signature = tool_call
-                                        .extra_content
-                                        .as_ref()
-                                        .and_then(ExtraContent::thought_signature);
+                                    if let ToolCall::Function { id, function, extra_content } = tool_call {
+                                        let thought_signature = extra_content
+                                            .as_ref()
+                                            .and_then(ExtraContent::thought_signature);
 
-                                    resp = resp.add_tool_call(ToolCallFull {
-                                        call_id: tool_call.id.clone(),
-                                        name: tool_call
-                                            .function
-                                            .name
-                                            .clone()
-                                            .ok_or(forge_domain::Error::ToolCallMissingName)?,
-                                        arguments: serde_json::from_str(
-                                            &tool_call.function.arguments,
-                                        )?,
-                                        thought_signature,
-                                    });
+                                        resp = resp.add_tool_call(ToolCallFull {
+                                            call_id: id.clone(),
+                                            name: function
+                                                .name
+                                                .clone()
+                                                .ok_or(forge_domain::Error::ToolCallMissingName)?,
+                                            arguments: serde_json::from_str(
+                                                &function.arguments,
+                                            )?,
+                                            thought_signature,
+                                        });
+                                    }
                                 }
                             }
                             resp
@@ -457,17 +464,18 @@ impl TryFrom<Response> for ChatCompletionMessage {
 
                             if let Some(tool_calls) = &delta.tool_calls {
                                 for tool_call in tool_calls {
-                                    let thought_signature = tool_call
-                                        .extra_content
-                                        .as_ref()
-                                        .and_then(ExtraContent::thought_signature);
+                                    if let ToolCall::Function { id, function, extra_content } = tool_call {
+                                        let thought_signature = extra_content
+                                            .as_ref()
+                                            .and_then(ExtraContent::thought_signature);
 
-                                    resp = resp.add_tool_call(ToolCallPart {
-                                        call_id: tool_call.id.clone(),
-                                        name: tool_call.function.name.clone(),
-                                        arguments_part: tool_call.function.arguments.clone(),
-                                        thought_signature,
-                                    });
+                                        resp = resp.add_tool_call(ToolCallPart {
+                                            call_id: id.clone(),
+                                            name: function.name.clone(),
+                                            arguments_part: function.arguments.clone(),
+                                            thought_signature,
+                                        });
+                                    }
                                 }
                             }
                             resp

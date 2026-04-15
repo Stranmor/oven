@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use strum::IntoEnumIterator;
 
 use super::response::{ExtraContent, FunctionCall, ToolCall};
-use super::tool_choice::{FunctionType, ToolChoice};
+use super::tool_choice::ToolChoice;
 use crate::domain::{
     Context, ContextMessage, ModelId, ToolCallFull, ToolCallId, ToolCatalog, ToolDefinition,
     ToolName, ToolResult, ToolValue,
@@ -429,9 +429,8 @@ impl From<ToolCallFull> for ToolCall {
         let arguments = serialize_tool_call_arguments(&value);
         let extra_content = value.thought_signature.map(ExtraContent::from);
 
-        Self {
+        Self::Function {
             id: value.call_id,
-            r#type: FunctionType,
             function: FunctionCall { arguments, name: Some(value.name) },
             extra_content,
         }
@@ -831,6 +830,13 @@ mod tests {
         let tool_message = ContextMessage::Tool(tool_result);
         let router_message = Message::from(tool_message);
         assert_json_snapshot!(router_message);
+    }
+
+    #[test]
+    fn test_tool_call_supports_code_interpreter() {
+        let json = r#"{"id":"call_123","type":"code_interpreter","function":{"name":"python","arguments":"{}"}}"#;
+        let result: Result<super::ToolCall, _> = serde_json::from_str(json);
+        assert!(result.is_ok(), "ToolCall should support code_interpreter type: {:?}", result.unwrap_err());
     }
 
     #[test]

@@ -2741,21 +2741,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "forge_snaps"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "fnv_rs",
- "forge_domain",
- "forge_fs",
- "serde",
- "tempfile",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "forge_spinner"
 version = "0.1.0"
 dependencies = [

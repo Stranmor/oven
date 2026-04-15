@@ -849,7 +849,7 @@ static TOOL_DEFINITIONS: LazyLock<HashMap<ToolKind, ToolDefinition>> = LazyLock:
     ToolCatalog::iter()
         .map(|tool| {
             let kind: ToolKind = tool.clone().into();
-            (kind, tool.definition())
+            (kind, tool.build_definition())
         })
         .collect()
 });
@@ -904,10 +904,14 @@ impl ToolCatalog {
         schema
     }
 
-    pub fn definition(&self) -> ToolDefinition {
+    pub fn build_definition(&self) -> ToolDefinition {
         ToolDefinition::new(self)
             .description(self.description())
             .input_schema(self.schema())
+    }
+
+    pub fn definition(&self) -> ToolDefinition {
+        self.kind().definition()
     }
     pub fn contains(tool_name: &ToolName) -> bool {
         let normalized = normalize_tool_name(tool_name);
@@ -1253,6 +1257,17 @@ mod tests {
     fn test_requires_stdout_for_non_shell() {
         let fixture = ToolName::new("read");
         assert!(!ToolCatalog::requires_stdout(&fixture));
+    }
+
+    #[test]
+    fn test_tool_catalog_definition_caches_schema() {
+        let tool = crate::ToolCatalog::Read(Default::default());
+        let start = std::time::Instant::now();
+        for _ in 0..1000 {
+            let _ = tool.definition();
+        }
+        let elapsed = start.elapsed();
+        assert!(elapsed.as_millis() < 5, "Schema generation is not cached! Took {:?}", elapsed);
     }
 
     #[test]

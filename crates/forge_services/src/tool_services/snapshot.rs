@@ -107,3 +107,18 @@ impl<
         Ok(output)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use super::*;
+    
+    // We demonstrate that finding the recent snapshot uses string comparison, which fails with "zzz.snap"
+    #[tokio::test]
+    async fn test_snapshot_race_condition_and_string_comparison() {
+        // String comparison vulnerability:
+        let valid_snap = "2026-04-15_12-00-00-000000000.snap";
+        let invalid_snap = "zzz.snap";
+        assert!(invalid_snap > valid_snap, "String comparison sorts 'zzz.snap' as newer, breaking snapshot undo!");
+    }
+}

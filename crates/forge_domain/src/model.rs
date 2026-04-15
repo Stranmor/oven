@@ -86,3 +86,15 @@ impl std::str::FromStr for ModelId {
         Ok(ModelId(s.to_string()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_model_provider_id_default() {
+        let json = r#"{"id": "test-model"}"#;
+        let model: Model = serde_json::from_str(json).unwrap();
+        assert!(!model.provider_id.as_ref().is_empty(), "ProviderId defaulted to empty string, which is invalid!");
+    }
+}

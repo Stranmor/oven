@@ -22,10 +22,21 @@ impl Transformer for TrimToolCallIds {
                 // Trim tool call IDs in assistant messages
                 if let Some(ref mut id) = message.tool_calls {
                     for tool_call in id.iter_mut() {
-                        if let Some(ref mut tool_call_id) = tool_call.id {
-                            let trimmed_id =
-                                tool_call_id.as_str().chars().take(40).collect::<String>();
-                            *tool_call_id = forge_domain::ToolCallId::new(trimmed_id);
+                        match tool_call {
+                            crate::dto::openai::response::ToolCall::Function { id: tool_call_id, .. } => {
+                                if let Some(tool_call_id) = tool_call_id {
+                                    let trimmed_id =
+                                        tool_call_id.as_str().chars().take(40).collect::<String>();
+                                    *tool_call_id = forge_domain::ToolCallId::new(trimmed_id);
+                                }
+                            }
+                            crate::dto::openai::response::ToolCall::CodeInterpreter { id: tool_call_id } => {
+                                if let Some(tool_call_id) = tool_call_id {
+                                    let trimmed_id =
+                                        tool_call_id.as_str().chars().take(40).collect::<String>();
+                                    *tool_call_id = forge_domain::ToolCallId::new(trimmed_id);
+                                }
+                            }
                         }
                     }
                 }
@@ -86,9 +97,8 @@ mod tests {
             content: None,
             name: None,
             tool_call_id: None,
-            tool_calls: Some(vec![ResponseToolCall {
+            tool_calls: Some(vec![ResponseToolCall::Function {
                 id: Some(forge_domain::ToolCallId::new(long_id)),
-                r#type: FunctionType,
                 function: FunctionCall {
                     name: Some(forge_domain::ToolName::new("test_tool")),
                     arguments: "{}".to_string(),
@@ -131,18 +141,16 @@ mod tests {
             name: None,
             tool_call_id: None,
             tool_calls: Some(vec![
-                ResponseToolCall {
+                ResponseToolCall::Function {
                     id: Some(forge_domain::ToolCallId::new(long_id_1)),
-                    r#type: FunctionType,
                     function: FunctionCall {
                         name: Some(forge_domain::ToolName::new("tool_1")),
                         arguments: "{}".to_string(),
                     },
                     extra_content: None,
                 },
-                ResponseToolCall {
+                ResponseToolCall::Function {
                     id: Some(forge_domain::ToolCallId::new(long_id_2)),
-                    r#type: FunctionType,
                     function: FunctionCall {
                         name: Some(forge_domain::ToolName::new("tool_2")),
                         arguments: "{}".to_string(),
