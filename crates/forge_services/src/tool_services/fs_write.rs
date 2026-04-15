@@ -7,7 +7,7 @@ use forge_app::{
     FileDirectoryInfra, FileInfoInfra, FileReaderInfra, FileWriterInfra, FsWriteOutput,
     FsWriteService, compute_hash,
 };
-use forge_domain::{SnapshotRepository, ValidationRepository};
+use forge_domain::ValidationRepository;
 
 use crate::utils::assert_absolute_path;
 
@@ -37,7 +37,6 @@ impl<
         + FileInfoInfra
         + FileReaderInfra
         + FileWriterInfra
-        + SnapshotRepository
         + ValidationRepository
         + Send
         + Sync,
@@ -94,11 +93,6 @@ impl<
             let default_ending = "\n";
             (None, default_ending)
         };
-
-        // SNAPSHOT COORDINATION: Capture snapshot before writing if file exists
-        if file_exists {
-            self.infra.insert_snapshot(path).await?;
-        }
 
         // Normalize line endings to match the target style before writing
         let normalized_content = content

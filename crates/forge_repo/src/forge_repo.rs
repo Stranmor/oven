@@ -14,7 +14,6 @@ use forge_domain::{
     Conversation, ConversationId, ConversationRepository, Environment, FileInfo,
     FuzzySearchRepository, McpServerConfig, MigrationResult, Model, ModelId, Provider, ProviderId,
     ProviderRepository, ResultStream, SearchMatch, Skill, SkillRepository, Snapshot,
-    SnapshotRepository,
 };
 // Re-export CacacheStorage from forge_infra
 pub use forge_infra::CacacheStorage;
@@ -27,7 +26,6 @@ use crate::agent::ForgeAgentRepository;
 use crate::context_engine::ForgeContextEngineRepository;
 use crate::conversation::ConversationRepositoryImpl;
 use crate::database::{DatabasePool, PoolConfig};
-use crate::fs_snap::ForgeFileSnapshotService;
 use crate::fuzzy_search::ForgeFuzzySearchRepository;
 use crate::provider::{ForgeChatRepository, ForgeProviderRepository};
 use crate::skill::ForgeSkillRepository;
@@ -40,7 +38,6 @@ use crate::validation::ForgeValidationRepository;
 #[derive(Clone)]
 pub struct ForgeRepo<F> {
     infra: Arc<F>,
-    file_snapshot_service: Arc<ForgeFileSnapshotService>,
     conversation_repository: Arc<ConversationRepositoryImpl>,
     mcp_cache_repository: Arc<CacacheStorage>,
     provider_repository: Arc<ForgeProviderRepository<F>>,
@@ -62,7 +59,6 @@ impl<
 {
     pub fn new(infra: Arc<F>) -> Self {
         let env = infra.get_environment();
-        let file_snapshot_service = Arc::new(ForgeFileSnapshotService::new(env.clone()));
         let db_pool =
             Arc::new(DatabasePool::try_from(PoolConfig::new(env.database_path())).unwrap());
         let conversation_repository = Arc::new(ConversationRepositoryImpl::new(
@@ -85,7 +81,6 @@ impl<
         let fuzzy_search_repository = Arc::new(ForgeFuzzySearchRepository::new(infra.clone()));
         Self {
             infra,
-            file_snapshot_service,
             conversation_repository,
             mcp_cache_repository,
             provider_repository,
@@ -99,16 +94,6 @@ impl<
     }
 }
 
-#[async_trait::async_trait]
-impl<F: Send + Sync> SnapshotRepository for ForgeRepo<F> {
-    async fn insert_snapshot(&self, file_path: &Path) -> anyhow::Result<Snapshot> {
-        self.file_snapshot_service.insert_snapshot(file_path).await
-    }
-
-    async fn undo_snapshot(&self, file_path: &Path) -> anyhow::Result<()> {
-        self.file_snapshot_service.undo_snapshot(file_path).await
-    }
-}
 
 #[async_trait::async_trait]
 impl<F: Send + Sync> ConversationRepository for ForgeRepo<F> {

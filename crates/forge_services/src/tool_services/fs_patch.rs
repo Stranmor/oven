@@ -4,7 +4,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use forge_app::domain::PatchOperation;
 use forge_app::{FileWriterInfra, FsPatchService, PatchOutput, compute_hash};
-use forge_domain::{FuzzySearchRepository, SearchMatch, SnapshotRepository, ValidationRepository};
+use forge_domain::{FuzzySearchRepository, SearchMatch, ValidationRepository};
 use thiserror::Error;
 use tokio::fs;
 
@@ -371,7 +371,7 @@ impl<F> ForgeFsPatch<F> {
 }
 
 #[async_trait::async_trait]
-impl<F: FileWriterInfra + SnapshotRepository + ValidationRepository + FuzzySearchRepository>
+impl<F: FileWriterInfra + ValidationRepository + FuzzySearchRepository>
     FsPatchService for ForgeFsPatch<F>
 {
     async fn patch(
@@ -429,9 +429,6 @@ impl<F: FileWriterInfra + SnapshotRepository + ValidationRepository + FuzzySearc
 
         // Apply the replacement
         current_content = apply_replacement(current_content, range, &operation, &content)?;
-
-        // SNAPSHOT COORDINATION: Always capture snapshot before modifying
-        self.infra.insert_snapshot(path).await?;
 
         // Write final content to file after all patches are applied
         self.infra
@@ -511,9 +508,6 @@ impl<F: FileWriterInfra + SnapshotRepository + ValidationRepository + FuzzySearc
             current_content =
                 apply_replacement(current_content, range, &operation, &edit.new_string)?;
         }
-
-        // SNAPSHOT COORDINATION: Always capture snapshot before modifying
-        self.infra.insert_snapshot(path).await?;
 
         // Write final content to file after all patches are applied
         self.infra
