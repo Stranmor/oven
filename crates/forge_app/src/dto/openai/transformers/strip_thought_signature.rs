@@ -65,7 +65,9 @@ mod tests {
         let mut transformer = StripThoughtSignature;
         let actual = transformer.transform(fixture);
 
-        assert!(actual.messages.context("Missing")?[0].extra_content.is_none());
+        let msgs = actual.messages.context("Missing msgs")?;
+        let first_msg = msgs.first().context("No first msg")?;
+        assert!(first_msg.extra_content.is_none());
         Ok(())
     }
 
@@ -93,9 +95,9 @@ mod tests {
         let mut transformer = StripThoughtSignature;
         let actual = transformer.transform(fixture);
 
-        let messages = actual.messages.context("Missing")?;
-        let tool_calls = messages[0].tool_calls.as_ref().context("Missing")?;
-        if let ToolCall::Function { extra_content, .. } = &tool_calls[0] {
+        let messages = actual.messages.context("No messages")?;
+        let tool_calls = messages.first().context("No first message")?.tool_calls.as_ref().context("No tool calls")?;
+        if let ToolCall::Function { extra_content, .. } = tool_calls.first().context("No first tool call")? {
             assert!(extra_content.is_none());
         } else {
             anyhow::bail!("Expected Function tool call");
@@ -136,8 +138,9 @@ mod tests {
         let actual = transformer.transform(fixture);
 
         let messages = actual.messages.context("Missing")?;
-        assert!(messages[0].extra_content.is_none());
-        assert_eq!(messages[0].reasoning_text, Some("reasoning".to_string()));
+        let first_msg = messages.first().context("No first msg")?;
+        assert!(first_msg.extra_content.is_none());
+        assert_eq!(first_msg.reasoning_text, Some("reasoning".to_string()));
         assert_eq!(actual.model, Some(ModelId::new("gpt-4")));
         Ok(())
     }
