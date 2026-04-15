@@ -37,6 +37,8 @@ convert_case.workspace = true
 forge_json_repair.workspace = true
 glob.workspace = true
 fake = { version = "5.1.0", features = ["derive"] }
+sha2.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 forge_test_kit = { workspace = true, features = ["json"] }

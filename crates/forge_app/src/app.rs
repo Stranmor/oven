@@ -194,7 +194,11 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ForgeAp
                     // Send any error to the stream (prioritize dispatch error over save error)
                     let final_err = if let Err(save_err) = &save_result {
                         if let Err(dispatch_err) = &dispatch_result {
-                            Some(anyhow::anyhow!("Dispatch error: {}. Also failed to save: {}", dispatch_err, save_err))
+                            Some(anyhow::anyhow!(
+                                "Dispatch error: {}. Also failed to save: {}",
+                                dispatch_err,
+                                save_err
+                            ))
                         } else {
                             Some(anyhow::anyhow!("Failed to save conversation: {}", save_err))
                         }
@@ -203,7 +207,7 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ForgeAp
                     } else {
                         None
                     };
-                    
+
                     if let Some(err) = final_err {
                         if let Err(e) = tx.send(Err(err)).await {
                             tracing::error!("Failed to send error to stream: {}", e);
@@ -333,21 +337,26 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ForgeAp
 
         // Execute all provider fetches concurrently.
         {
-        let results = futures::future::join_all(futures).await;
-        let mut successes = Vec::new();
-        let mut first_error = None;
-        for res in results {
-            match res {
-                Ok(models) => successes.push(models),
-                Err(e) => if first_error.is_none() { first_error = Some(e); }
+            let results = futures::future::join_all(futures).await;
+            let mut successes = Vec::new();
+            let mut first_error = None;
+            for res in results {
+                match res {
+                    Ok(models) => successes.push(models),
+                    Err(e) => {
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                    }
+                }
             }
-        }
-        if successes.is_empty() && first_error.is_some() {
-            Err(first_error.unwrap())
-        } else {
+            if successes.is_empty() {
+                if let Some(err) = first_error {
+                    return Err(err);
+                }
+            }
             Ok(successes)
         }
-    }
     }
 }
 

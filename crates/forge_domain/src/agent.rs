@@ -316,11 +316,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
-    use crate::{InputModality, Model};
+    use crate::{InputModality, Model, ProviderId};
 
     fn model_fixture(id: &str, context_length: Option<u64>) -> Model {
         Model {
             id: ModelId::new(id),
+            provider_id: ProviderId::FORGE,
             name: Some(id.to_string()),
             description: None,
             context_length,

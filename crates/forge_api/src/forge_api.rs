@@ -250,13 +250,13 @@ impl<
         let needs_agent_reload = ops
             .iter()
             .any(|op| matches!(op, forge_domain::ConfigOperation::SetSessionConfig(_)));
-        
+
         self.services.update_config(ops).await?;
-        
+
         if needs_agent_reload {
             self.services.reload_agents().await?;
         }
-        
+
         Ok(())
     }
 

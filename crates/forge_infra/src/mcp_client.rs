@@ -777,7 +777,10 @@ pub async fn mcp_logout_all(env: &Environment) -> anyhow::Result<()> {
 /// # Arguments
 /// * `server_url` - The URL of the MCP server
 /// * `env` - The environment for file system paths
-pub async fn mcp_auth_status(server_url: &url::Url, env: &Environment) -> forge_domain::McpAuthStatus {
+pub async fn mcp_auth_status(
+    server_url: &url::Url,
+    env: &Environment,
+) -> forge_domain::McpAuthStatus {
     use crate::auth::McpTokenStorage;
     let storage = McpTokenStorage::new(server_url.to_string(), env.clone());
     match storage.load_credentials().await {

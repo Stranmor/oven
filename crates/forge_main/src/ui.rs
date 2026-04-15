@@ -3655,7 +3655,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             // The current model is compatible with the new provider — write both
             // atomically so the session always stores a consistent pair.
             let model =
-                compatible_model.expect("compatible_model is Some when !needs_model_selection");
+                compatible_model.context("compatible_model is Some when !needs_model_selection")?;
             self.api
                 .update_config(vec![ConfigOperation::SetSessionConfig(
                     forge_domain::ModelConfig::new(provider.id.clone(), model),

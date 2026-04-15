@@ -26,7 +26,7 @@ fn generate_mcp_tool_name(server_name: &ServerName, tool_name: &ToolName) -> Too
 pub struct ForgeMcpService<M, I, C> {
     tools: Arc<RwLock<HashMap<ToolName, ToolHolder<McpExecutor<C>>>>>,
     failed_servers: Arc<RwLock<HashMap<ServerName, String>>>,
-    previous_config_hash: Arc<Mutex<u64>>,
+    previous_config_hash: Arc<Mutex<String>>,
     init_lock: Arc<Mutex<()>>,
     manager: Arc<M>,
     infra: Arc<I>,
