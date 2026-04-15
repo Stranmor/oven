@@ -1,4 +1,3 @@
-use anyhow::Context;
 use forge_domain::Transformer;
 
 use crate::dto::openai::Request;
@@ -7,14 +6,17 @@ const MAX_TOOL_CALL_ID_LEN: usize = 40;
 
 fn trim_id(id: &mut Option<forge_domain::ToolCallId>) {
     if let Some(tool_call_id) = id {
-        if tool_call_id.as_str().len() > MAX_TOOL_CALL_ID_LEN {
-            use std::hash::{DefaultHasher, Hash, Hasher};
-            let mut hasher = DefaultHasher::new();
-            tool_call_id.as_str().hash(&mut hasher);
-            let hash = hasher.finish();
+        if tool_call_id.as_str().chars().count() > MAX_TOOL_CALL_ID_LEN {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(tool_call_id.as_str().as_bytes());
+            let hash = hasher.finalize();
+            // Take first 8 bytes and format as 16 hex chars
+            let hash_bytes: [u8; 8] = hash[0..8].try_into().unwrap();
+            let hash_val = u64::from_be_bytes(hash_bytes);
             let prefix_len = MAX_TOOL_CALL_ID_LEN.saturating_sub(17);
             let prefix: String = tool_call_id.as_str().chars().take(prefix_len).collect();
-            let trimmed_id = format!("{}_{:016x}", prefix, hash);
+            let trimmed_id = format!("{}_{:016x}", prefix, hash_val);
             *tool_call_id = forge_domain::ToolCallId::new(trimmed_id);
         }
     }
@@ -34,8 +36,8 @@ impl Transformer for TrimToolCallIds {
                 trim_id(&mut message.tool_call_id);
 
                 // Trim tool call IDs in assistant messages
-                if let Some(ref mut id) = message.tool_calls {
-                    for tool_call in id.iter_mut() {
+                if let Some(ref mut tool_calls) = message.tool_calls {
+                    for tool_call in tool_calls.iter_mut() {
                         match tool_call {
                             crate::dto::openai::response::ToolCall::Function { id, .. } => {
                                 trim_id(id);
@@ -54,11 +56,11 @@ impl Transformer for TrimToolCallIds {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context;
     use pretty_assertions::assert_eq;
 
     use super::*;
     use crate::dto::openai::response::{FunctionCall, ToolCall as ResponseToolCall};
-    use crate::dto::openai::tool_choice::FunctionType;
     use crate::dto::openai::{Message, Role};
 
     #[test]
@@ -175,12 +177,12 @@ mod tests {
         if let ResponseToolCall::Function { id, .. } = tool_calls.first().context("No 1")? {
             let id_str = id.as_ref().context("id")?.as_str();
             assert_eq!(id_str.len(), 40);
-            assert!(id_str.starts_with("call_11111111111111111111"));
+            assert!(id_str.starts_with("call_111111111111111111"));
         }
         if let ResponseToolCall::Function { id, .. } = tool_calls.get(1).context("No 2")? {
             let id_str = id.as_ref().context("id")?.as_str();
             assert_eq!(id_str.len(), 40);
-            assert!(id_str.starts_with("call_22222222222222222222"));
+            assert!(id_str.starts_with("call_222222222222222222"));
         }
         Ok(())
     }

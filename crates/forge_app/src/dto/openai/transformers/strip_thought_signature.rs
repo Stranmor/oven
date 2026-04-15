@@ -1,4 +1,3 @@
-use anyhow::Context;
 use forge_domain::Transformer;
 
 use crate::dto::openai::Request;
@@ -36,12 +35,13 @@ impl Transformer for StripThoughtSignature {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context;
     use forge_domain::{ModelId, Transformer};
     use pretty_assertions::assert_eq;
 
     use super::*;
     use crate::dto::openai::{
-        ExtraContent, FunctionCall, FunctionType, GoogleMetadata, Message, MessageContent, Role,
+        ExtraContent, FunctionCall, GoogleMetadata, Message, MessageContent, Role,
         ToolCall,
     };
 
