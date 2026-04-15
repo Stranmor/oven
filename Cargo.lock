@@ -2418,7 +2418,6 @@ dependencies = [
  "indexmap 2.14.0",
  "insta",
  "is_ci",
- "lazy_static",
  "merge",
  "nom 8.0.0",
  "pretty_assertions",

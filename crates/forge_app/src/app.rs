@@ -32,9 +32,9 @@ use crate::{
 /// expected by [`SystemContext`] for tool description template rendering.
 pub(crate) fn build_template_config(config: &ForgeConfig) -> forge_domain::TemplateConfig {
     forge_domain::TemplateConfig {
-        max_read_size: config.max_read_lines as usize,
+        max_read_size: config.max_read_lines.try_into().unwrap_or(usize::MAX),
         max_line_length: config.max_line_chars,
-        max_image_size: config.max_image_size_bytes as usize,
+        max_image_size: config.max_image_size_bytes.try_into().unwrap_or(usize::MAX),
         stdout_max_prefix_length: config.max_stdout_prefix_lines,
         stdout_max_suffix_length: config.max_stdout_suffix_lines,
         stdout_max_line_length: config.max_stdout_line_chars,
@@ -192,20 +192,13 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ForgeAp
                     let save_result = services.upsert_conversation(conversation).await;
 
                     // Send any error to the stream (prioritize dispatch error over save error)
-                    let final_err = if let Err(save_err) = &save_result {
-                        if let Err(dispatch_err) = &dispatch_result {
-                            Some(anyhow::anyhow!(
-                                "Dispatch error: {}. Also failed to save: {}",
-                                dispatch_err,
-                                save_err
-                            ))
-                        } else {
-                            Some(anyhow::anyhow!("Failed to save conversation: {}", save_err))
+                    let final_err = match (dispatch_result, save_result) {
+                        (Err(d), Err(s)) => {
+                            Some(d.context(format!("Also failed to save conversation: {}", s)))
                         }
-                    } else if let Err(err) = dispatch_result {
-                        Some(err)
-                    } else {
-                        None
+                        (Ok(_), Err(s)) => Some(s.context("Failed to save conversation")),
+                        (Err(d), Ok(_)) => Some(d),
+                        (Ok(_), Ok(_)) => None,
                     };
 
                     if let Some(err) = final_err {
@@ -336,27 +329,26 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ForgeAp
             .collect();
 
         // Execute all provider fetches concurrently.
-        {
-            let results = futures::future::join_all(futures).await;
-            let mut successes = Vec::new();
-            let mut first_error = None;
-            for res in results {
-                match res {
-                    Ok(models) => successes.push(models),
-                    Err(e) => {
-                        if first_error.is_none() {
-                            first_error = Some(e);
-                        }
+        let results = futures::future::join_all(futures).await;
+        let mut successes = Vec::new();
+        let mut first_error = None;
+        for res in results {
+            match res {
+                Ok(models) => successes.push(models),
+                Err(e) => {
+                    tracing::warn!("Failed to fetch models from provider: {}", e);
+                    if first_error.is_none() {
+                        first_error = Some(e);
                     }
                 }
             }
-            if successes.is_empty() {
-                if let Some(err) = first_error {
-                    return Err(err);
-                }
-            }
-            Ok(successes)
         }
+        if successes.is_empty() {
+            if let Some(err) = first_error {
+                return Err(err);
+            }
+        }
+        Ok(successes)
     }
 }
 

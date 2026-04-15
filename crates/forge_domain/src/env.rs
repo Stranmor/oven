@@ -43,7 +43,8 @@ const VERSION: &str = match option_env!("APP_VERSION") {
 /// `os`, `cwd`, `home`, `shell`, and `base_path`. All configuration
 /// values previously carried here are now accessed through
 /// `EnvironmentInfra::get_config()`.
-#[derive(Debug, Setters, Clone, PartialEq, Serialize, Deserialize, fake::Dummy)]
+#[derive(Debug, Setters, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "test-utils", derive(fake::Dummy))]
 #[serde(rename_all = "camelCase")]
 #[setters(strip_option)]
 pub struct Environment {

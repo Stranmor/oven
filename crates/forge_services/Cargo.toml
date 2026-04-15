@@ -60,5 +60,5 @@ pretty_assertions.workspace = true
 tempfile.workspace = true
 fake = { version = "5.1.0", features = ["derive"] }
 forge_test_kit.workspace = true
-
+forge_domain = { workspace = true, features = ["test-utils"] }
 
