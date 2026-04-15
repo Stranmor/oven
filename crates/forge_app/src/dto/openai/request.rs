@@ -320,7 +320,8 @@ impl From<ToolDefinition> for Tool {
                 description: Some(value.description),
                 name: value.name.to_string(),
                 parameters: {
-                    let mut params = serde_json::to_value(value.input_schema).unwrap();
+                    let mut params = serde_json::to_value(value.input_schema)
+                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
                     // Ensure OpenAI compatibility by adding properties field if missing
                     if let Some(obj) = params.as_object_mut()
                         && obj.get("type") == Some(&serde_json::Value::String("object".to_string()))
@@ -370,7 +371,7 @@ impl From<Context> for Request {
                         .and_then(|obj| obj.get("title"))
                         .and_then(|t| t.as_str())
                         .map(String::from)
-                        .expect("Schema must have a title");
+                        .unwrap_or_else(|| "schema".to_string());
 
                     ResponseFormat::JsonSchema { name, schema }
                 }
@@ -410,7 +411,7 @@ impl From<Context> for Request {
 }
 
 fn serialize_tool_call_arguments(tool_call: &ToolCallFull) -> String {
-    let serialized_arguments = || serde_json::to_string(&tool_call.arguments).unwrap();
+    let serialized_arguments = || serde_json::to_string(&tool_call.arguments).unwrap_or_else(|_| "{}".to_string());
 
     let Ok(parsed_arguments) = tool_call.arguments.parse() else {
         return serialized_arguments();

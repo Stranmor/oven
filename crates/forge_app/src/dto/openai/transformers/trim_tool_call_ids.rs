@@ -2,6 +2,15 @@ use forge_domain::Transformer;
 
 use crate::dto::openai::Request;
 
+const MAX_TOOL_CALL_ID_LEN: usize = 40;
+
+fn trim_id(id: &mut Option<forge_domain::ToolCallId>) {
+    if let Some(tool_call_id) = id {
+        let trimmed_id = tool_call_id.as_str().chars().take(MAX_TOOL_CALL_ID_LEN).collect::<String>();
+        *tool_call_id = forge_domain::ToolCallId::new(trimmed_id);
+    }
+}
+
 /// Trims tool call IDs to a maximum of 40 characters for OpenAI compatibility.
 /// OpenAI requires tool call IDs to be max 40 characters.
 pub struct TrimToolCallIds;
@@ -13,29 +22,17 @@ impl Transformer for TrimToolCallIds {
         if let Some(messages) = request.messages.as_mut() {
             for message in messages.iter_mut() {
                 // Trim tool_call_id in tool role messages
-                if let Some(ref mut tool_call_id) = message.tool_call_id {
-                    *tool_call_id = forge_domain::ToolCallId::new(
-                        tool_call_id.as_str().chars().take(40).collect::<String>(),
-                    );
-                }
+                trim_id(&mut message.tool_call_id);
 
                 // Trim tool call IDs in assistant messages
                 if let Some(ref mut id) = message.tool_calls {
                     for tool_call in id.iter_mut() {
                         match tool_call {
-                            crate::dto::openai::response::ToolCall::Function { id: tool_call_id, .. } => {
-                                if let Some(tool_call_id) = tool_call_id {
-                                    let trimmed_id =
-                                        tool_call_id.as_str().chars().take(40).collect::<String>();
-                                    *tool_call_id = forge_domain::ToolCallId::new(trimmed_id);
-                                }
+                            crate::dto::openai::response::ToolCall::Function { id, .. } => {
+                                trim_id(id);
                             }
-                            crate::dto::openai::response::ToolCall::CodeInterpreter { id: tool_call_id } => {
-                                if let Some(tool_call_id) = tool_call_id {
-                                    let trimmed_id =
-                                        tool_call_id.as_str().chars().take(40).collect::<String>();
-                                    *tool_call_id = forge_domain::ToolCallId::new(trimmed_id);
-                                }
+                            crate::dto::openai::response::ToolCall::CodeInterpreter { id } => {
+                                trim_id(id);
                             }
                         }
                     }
@@ -118,14 +115,12 @@ mod tests {
         assert_eq!(expected_id.len(), 40);
 
         let messages = actual.messages.unwrap();
-        assert_eq!(
-            messages[0].tool_calls.as_ref().unwrap()[0]
-                .id
-                .as_ref()
-                .unwrap()
-                .as_str(),
-            expected_id
-        );
+        let tool_calls = messages[0].tool_calls.as_ref().unwrap();
+        if let ResponseToolCall::Function { id, .. } = &tool_calls[0] {
+            assert_eq!(id.as_ref().unwrap().as_str(), expected_id);
+        } else {
+            panic!("Expected Function tool call");
+        }
     }
 
     #[test]
@@ -174,8 +169,12 @@ mod tests {
 
         let messages = actual.messages.unwrap();
         let tool_calls = messages[0].tool_calls.as_ref().unwrap();
-        assert_eq!(tool_calls[0].id.as_ref().unwrap().as_str(), expected_id_1);
-        assert_eq!(tool_calls[1].id.as_ref().unwrap().as_str(), expected_id_2);
+        if let ResponseToolCall::Function { id, .. } = &tool_calls[0] {
+            assert_eq!(id.as_ref().unwrap().as_str(), expected_id_1);
+        }
+        if let ResponseToolCall::Function { id, .. } = &tool_calls[1] {
+            assert_eq!(id.as_ref().unwrap().as_str(), expected_id_2);
+        }
     }
 
     #[test]

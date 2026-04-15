@@ -331,6 +331,9 @@ impl TryFrom<Response> for ChatCompletionMessage {
     fn try_from(res: Response) -> Result<Self, Self::Error> {
         match res {
             Response::Success { choices, usage, prompt_filter_results, .. } => {
+                if choices.len() > 1 {
+                    return Err(anyhow::anyhow!("Multiple choices are not supported").into());
+                }
                 if let Some(choice) = choices.first() {
                     // Check if the choice has an error first
                     let error = match choice {
@@ -397,22 +400,25 @@ impl TryFrom<Response> for ChatCompletionMessage {
 
                             if let Some(tool_calls) = &message.tool_calls {
                                 for tool_call in tool_calls {
-                                    if let ToolCall::Function { id, function, extra_content } = tool_call {
-                                        let thought_signature = extra_content
-                                            .as_ref()
-                                            .and_then(ExtraContent::thought_signature);
+                                    match tool_call {
+                                        ToolCall::Function { id, function, extra_content } => {
+                                            let thought_signature = extra_content
+                                                .as_ref()
+                                                .and_then(ExtraContent::thought_signature);
 
-                                        resp = resp.add_tool_call(ToolCallFull {
-                                            call_id: id.clone(),
-                                            name: function
-                                                .name
-                                                .clone()
-                                                .ok_or(forge_domain::Error::ToolCallMissingName)?,
-                                            arguments: serde_json::from_str(
-                                                &function.arguments,
-                                            )?,
-                                            thought_signature,
-                                        });
+                                            resp = resp.add_tool_call(ToolCallFull {
+                                                call_id: id.clone(),
+                                                name: function
+                                                    .name
+                                                    .clone()
+                                                    .ok_or(forge_domain::Error::ToolCallMissingName)?,
+                                                arguments: serde_json::from_str(
+                                                    &function.arguments,
+                                                )?,
+                                                thought_signature,
+                                            });
+                                        }
+                                        ToolCall::CodeInterpreter { .. } => return Err(anyhow::anyhow!("Code interpreter tool call not supported").into()),
                                     }
                                 }
                             }
@@ -464,17 +470,20 @@ impl TryFrom<Response> for ChatCompletionMessage {
 
                             if let Some(tool_calls) = &delta.tool_calls {
                                 for tool_call in tool_calls {
-                                    if let ToolCall::Function { id, function, extra_content } = tool_call {
-                                        let thought_signature = extra_content
-                                            .as_ref()
-                                            .and_then(ExtraContent::thought_signature);
+                                    match tool_call {
+                                        ToolCall::Function { id, function, extra_content } => {
+                                            let thought_signature = extra_content
+                                                .as_ref()
+                                                .and_then(ExtraContent::thought_signature);
 
-                                        resp = resp.add_tool_call(ToolCallPart {
-                                            call_id: id.clone(),
-                                            name: function.name.clone(),
-                                            arguments_part: function.arguments.clone(),
-                                            thought_signature,
-                                        });
+                                            resp = resp.add_tool_call(ToolCallPart {
+                                                call_id: id.clone(),
+                                                name: function.name.clone(),
+                                                arguments_part: function.arguments.clone(),
+                                                thought_signature,
+                                            });
+                                        }
+                                        ToolCall::CodeInterpreter { .. } => return Err(anyhow::anyhow!("Code interpreter tool call not supported").into()),
                                     }
                                 }
                             }
@@ -547,7 +556,7 @@ impl TryFrom<Response> for ChatCompletionMessage {
                 if let Some(c) = cost {
                     let cost_value = match c {
                         StringOrF64::Number(n) => n,
-                        StringOrF64::String(s) => s.parse().unwrap_or(0.0),
+                        StringOrF64::String(s) => s.parse().map_err(|_| anyhow::anyhow!("Invalid cost string: {}", s))?,
                     };
                     msg.usage = Some(Usage {
                         prompt_tokens: TokenCount::Actual(0),

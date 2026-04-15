@@ -22,7 +22,7 @@ impl<F: DirectoryReaderInfra + Send + Sync> ForgeSnapshotService<F> {
         snapshot_dir: &Path,
     ) -> Result<Option<PathBuf>> {
         let mut latest_path = None;
-        let mut latest_filename = None;
+        let mut latest_time = None;
 
         let entries = infra.list_directory_entries(snapshot_dir).await?;
         for (path, is_dir) in entries {
@@ -30,11 +30,14 @@ impl<F: DirectoryReaderInfra + Send + Sync> ForgeSnapshotService<F> {
                 continue;
             }
             let filename = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
-            if filename.ends_with(".snap")
-                && (latest_filename.is_none() || filename > latest_filename.clone().unwrap())
-            {
-                latest_filename = Some(filename);
-                latest_path = Some(path);
+            if filename.ends_with(".snap") {
+                let time_str = filename.trim_end_matches(".snap");
+                if let Ok(time) = chrono::NaiveDateTime::parse_from_str(time_str, "%Y-%m-%d_%H-%M-%S-%f") {
+                    if latest_time.is_none() || time > latest_time.unwrap() {
+                        latest_time = Some(time);
+                        latest_path = Some(path);
+                    }
+                }
             }
         }
 

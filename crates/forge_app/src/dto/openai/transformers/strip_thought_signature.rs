@@ -74,9 +74,8 @@ mod tests {
             content: Some(MessageContent::Text("Using tool".to_string())),
             name: None,
             tool_call_id: None,
-            tool_calls: Some(vec![ToolCall {
+            tool_calls: Some(vec![ToolCall::Function {
                 id: None,
-                r#type: FunctionType,
                 function: FunctionCall { name: None, arguments: "{}".to_string() },
                 extra_content: Some(ExtraContent {
                     google: Some(GoogleMetadata { thought_signature: Some("sig456".to_string()) }),
@@ -94,7 +93,11 @@ mod tests {
 
         let messages = actual.messages.unwrap();
         let tool_calls = messages[0].tool_calls.as_ref().unwrap();
-        assert!(tool_calls[0].extra_content.is_none());
+        if let ToolCall::Function { extra_content, .. } = &tool_calls[0] {
+            assert!(extra_content.is_none());
+        } else {
+            panic!("Expected Function tool call");
+        }
     }
 
     #[test]

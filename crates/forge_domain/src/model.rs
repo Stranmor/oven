@@ -25,7 +25,6 @@ fn default_input_modalities() -> Vec<InputModality> {
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Setters)]
 pub struct Model {
     pub id: ModelId,
-    #[serde(default)]
     pub provider_id: ProviderId,
     pub name: Option<String>,
     pub description: Option<String>,
@@ -94,7 +93,7 @@ mod tests {
     #[test]
     fn test_model_provider_id_default() {
         let json = r#"{"id": "test-model"}"#;
-        let model: Model = serde_json::from_str(json).unwrap();
-        assert!(!model.provider_id.as_ref().is_empty(), "ProviderId defaulted to empty string, which is invalid!");
+        let result: Result<Model, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "Model parsing should fail when provider_id is missing");
     }
 }
