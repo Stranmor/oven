@@ -173,16 +173,25 @@ impl ConversationRepository for ConversationRepositoryImpl {
         self.run_with_connection(move |connection, wid| {
             let workspace_id = wid.id() as i64;
 
-            // Security: Ensure users can only delete conversations within their workspace
-            diesel::delete(conversations::table)
-                .filter(conversations::workspace_id.eq(&workspace_id))
-                .filter(conversations::parent_id.eq(conversation_id.into_string()))
-                .execute(connection)?;
-
-            diesel::delete(conversations::table)
-                .filter(conversations::workspace_id.eq(&workspace_id))
-                .filter(conversations::conversation_id.eq(conversation_id.into_string()))
-                .execute(connection)?;
+            diesel::sql_query(
+                "WITH RECURSIVE descendants(id) AS (
+                SELECT conversation_id FROM conversations
+                WHERE parent_id = ? AND workspace_id = ?
+                UNION ALL
+                SELECT c.conversation_id FROM conversations c
+                JOIN descendants d ON c.parent_id = d.id
+                WHERE c.workspace_id = ?
+            )
+            DELETE FROM conversations
+            WHERE workspace_id = ?
+            AND (conversation_id IN (SELECT id FROM descendants) OR conversation_id = ?)",
+            )
+            .bind::<diesel::sql_types::Text, _>(conversation_id.into_string())
+            .bind::<diesel::sql_types::BigInt, _>(workspace_id)
+            .bind::<diesel::sql_types::BigInt, _>(workspace_id)
+            .bind::<diesel::sql_types::BigInt, _>(workspace_id)
+            .bind::<diesel::sql_types::Text, _>(conversation_id.into_string())
+            .execute(connection)?;
 
             Ok(())
         })
@@ -1345,5 +1354,45 @@ mod tests {
             actual.values[0],
             forge_domain::ToolValue::Text("[File diff: /src/main.rs]".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn test_delete_conversation_recursive_depth() -> anyhow::Result<()> {
+        let repo = repository()?;
+
+        let parent_id = forge_domain::ConversationId::generate();
+        let child_id = forge_domain::ConversationId::generate();
+        let grandchild_id = forge_domain::ConversationId::generate();
+
+        // Parent
+        let parent = forge_domain::Conversation::new(parent_id);
+        repo.upsert_conversation(parent).await?;
+
+        // Child
+        let child = forge_domain::Conversation::new(child_id).parent_id(Some(parent_id));
+        repo.upsert_conversation(child).await?;
+
+        // Grandchild
+        let grandchild = forge_domain::Conversation::new(grandchild_id).parent_id(Some(child_id));
+        repo.upsert_conversation(grandchild).await?;
+
+        // Delete parent
+        repo.delete_conversation(&parent_id).await?;
+
+        // Verify all are gone
+        assert!(
+            repo.get_conversation(&parent_id).await?.is_none(),
+            "Parent should be deleted"
+        );
+        assert!(
+            repo.get_conversation(&child_id).await?.is_none(),
+            "Child should be deleted"
+        );
+        assert!(
+            repo.get_conversation(&grandchild_id).await?.is_none(),
+            "Grandchild should be deleted"
+        );
+
+        Ok(())
     }
 }
