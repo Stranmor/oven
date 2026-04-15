@@ -1,3 +1,4 @@
+use anyhow::Context;
 use forge_domain::Transformer;
 
 use crate::dto::openai::Request;
@@ -45,7 +46,7 @@ mod tests {
     };
 
     #[test]
-    fn test_strip_thought_signature_removes_extra_content() {
+    fn test_strip_thought_signature_removes_extra_content() -> anyhow::Result<()> {
         let fixture = Request::default().messages(vec![Message {
             role: Role::Assistant,
             content: Some(MessageContent::Text("Hello".to_string())),
@@ -64,11 +65,12 @@ mod tests {
         let mut transformer = StripThoughtSignature;
         let actual = transformer.transform(fixture);
 
-        assert!(actual.messages.unwrap()[0].extra_content.is_none());
+        assert!(actual.messages.context("Missing")?[0].extra_content.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_strip_thought_signature_removes_from_tool_calls() {
+    fn test_strip_thought_signature_removes_from_tool_calls() -> anyhow::Result<()> {
         let fixture = Request::default().messages(vec![Message {
             role: Role::Assistant,
             content: Some(MessageContent::Text("Using tool".to_string())),
@@ -91,13 +93,14 @@ mod tests {
         let mut transformer = StripThoughtSignature;
         let actual = transformer.transform(fixture);
 
-        let messages = actual.messages.unwrap();
-        let tool_calls = messages[0].tool_calls.as_ref().unwrap();
+        let messages = actual.messages.context("Missing")?;
+        let tool_calls = messages[0].tool_calls.as_ref().context("Missing")?;
         if let ToolCall::Function { extra_content, .. } = &tool_calls[0] {
             assert!(extra_content.is_none());
         } else {
-            panic!("Expected Function tool call");
+            anyhow::bail!("Expected Function tool call");
         }
+        Ok(())
     }
 
     #[test]
@@ -111,7 +114,7 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_thought_signature_preserves_other_fields() {
+    fn test_strip_thought_signature_preserves_other_fields() -> anyhow::Result<()> {
         let fixture = Request::default()
             .model(ModelId::new("gpt-4"))
             .messages(vec![Message {
@@ -132,9 +135,10 @@ mod tests {
         let mut transformer = StripThoughtSignature;
         let actual = transformer.transform(fixture);
 
-        let messages = actual.messages.unwrap();
+        let messages = actual.messages.context("Missing")?;
         assert!(messages[0].extra_content.is_none());
         assert_eq!(messages[0].reasoning_text, Some("reasoning".to_string()));
         assert_eq!(actual.model, Some(ModelId::new("gpt-4")));
+        Ok(())
     }
 }

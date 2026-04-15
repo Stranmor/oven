@@ -1,3 +1,4 @@
+use anyhow::Context;
 use forge_domain::Transformer;
 
 use crate::dto::openai::Request;
@@ -53,7 +54,7 @@ mod tests {
     use crate::dto::openai::{Message, Role};
 
     #[test]
-    fn test_trim_tool_call_id_in_tool_message() {
+    fn test_trim_tool_call_id_in_tool_message() -> anyhow::Result<()> {
         // Create a tool call ID that's longer than 40 characters
         let long_id = "call_12345678901234567890123456789012345678901234567890";
         assert!(long_id.len() > 40);
@@ -76,15 +77,16 @@ mod tests {
         let expected_id = "call_12345678901234567890123456789012345";
         assert_eq!(expected_id.len(), 40);
 
-        let messages = actual.messages.unwrap();
+        let messages = actual.messages.context("Missing")?;
         assert_eq!(
-            messages[0].tool_call_id.as_ref().unwrap().as_str(),
+            messages[0].tool_call_id.as_ref().context("Missing")?.as_str(),
             expected_id
         );
+        Ok(())
     }
 
     #[test]
-    fn test_trim_tool_call_id_in_assistant_message() {
+    fn test_trim_tool_call_id_in_assistant_message() -> anyhow::Result<()> {
         // Create tool calls with IDs longer than 40 characters
         let long_id = "call_12345678901234567890123456789012345678901234567890";
         assert!(long_id.len() > 40);
@@ -114,17 +116,18 @@ mod tests {
         let expected_id = "call_12345678901234567890123456789012345";
         assert_eq!(expected_id.len(), 40);
 
-        let messages = actual.messages.unwrap();
-        let tool_calls = messages[0].tool_calls.as_ref().unwrap();
+        let messages = actual.messages.context("Missing")?;
+        let tool_calls = messages[0].tool_calls.as_ref().context("Missing")?;
         if let ResponseToolCall::Function { id, .. } = &tool_calls[0] {
-            assert_eq!(id.as_ref().unwrap().as_str(), expected_id);
+            assert_eq!(id.as_ref().context("Missing")?.as_str(), expected_id);
         } else {
-            panic!("Expected Function tool call");
+            anyhow::bail!("Expected Function tool call");
         }
+        Ok(())
     }
 
     #[test]
-    fn test_trim_multiple_tool_calls_in_assistant_message() {
+    fn test_trim_multiple_tool_calls_in_assistant_message() -> anyhow::Result<()> {
         let long_id_1 = "call_11111111111111111111111111111111111111111111111111";
         let long_id_2 = "call_22222222222222222222222222222222222222222222222222";
         assert!(long_id_1.len() > 40);
@@ -167,18 +170,19 @@ mod tests {
         assert_eq!(expected_id_1.len(), 40);
         assert_eq!(expected_id_2.len(), 40);
 
-        let messages = actual.messages.unwrap();
-        let tool_calls = messages[0].tool_calls.as_ref().unwrap();
+        let messages = actual.messages.context("Missing")?;
+        let tool_calls = messages[0].tool_calls.as_ref().context("Missing")?;
         if let ResponseToolCall::Function { id, .. } = &tool_calls[0] {
-            assert_eq!(id.as_ref().unwrap().as_str(), expected_id_1);
+            assert_eq!(id.as_ref().context("Missing")?.as_str(), expected_id_1);
         }
         if let ResponseToolCall::Function { id, .. } = &tool_calls[1] {
-            assert_eq!(id.as_ref().unwrap().as_str(), expected_id_2);
+            assert_eq!(id.as_ref().context("Missing")?.as_str(), expected_id_2);
         }
+        Ok(())
     }
 
     #[test]
-    fn test_trim_does_not_affect_short_ids() {
+    fn test_trim_does_not_affect_short_ids() -> anyhow::Result<()> {
         // Create a tool call ID that's already under 40 characters
         let short_id = "call_123";
         assert!(short_id.len() < 40);
@@ -198,15 +202,16 @@ mod tests {
 
         let actual = TrimToolCallIds.transform(fixture);
 
-        let messages = actual.messages.unwrap();
+        let messages = actual.messages.context("Missing")?;
         assert_eq!(
-            messages[0].tool_call_id.as_ref().unwrap().as_str(),
+            messages[0].tool_call_id.as_ref().context("Missing")?.as_str(),
             short_id
         );
+        Ok(())
     }
 
     #[test]
-    fn test_trim_exactly_40_chars_id() {
+    fn test_trim_exactly_40_chars_id() -> anyhow::Result<()> {
         // Create a tool call ID that's exactly 40 characters
         let exact_id = "call_12345678901234567890123456789012345";
         assert_eq!(exact_id.len(), 40);
@@ -226,15 +231,16 @@ mod tests {
 
         let actual = TrimToolCallIds.transform(fixture);
 
-        let messages = actual.messages.unwrap();
+        let messages = actual.messages.context("Missing")?;
         assert_eq!(
-            messages[0].tool_call_id.as_ref().unwrap().as_str(),
+            messages[0].tool_call_id.as_ref().context("Missing")?.as_str(),
             exact_id
         );
+        Ok(())
     }
 
     #[test]
-    fn test_trim_handles_multiple_messages() {
+    fn test_trim_handles_multiple_messages() -> anyhow::Result<()> {
         let long_id = "call_12345678901234567890123456789012345678901234567890";
         let short_id = "call_abc";
 
@@ -267,14 +273,15 @@ mod tests {
 
         let actual = TrimToolCallIds.transform(fixture);
 
-        let messages = actual.messages.unwrap();
+        let messages = actual.messages.context("Missing")?;
         assert_eq!(
-            messages[0].tool_call_id.as_ref().unwrap().as_str().len(),
+            messages[0].tool_call_id.as_ref().context("Missing")?.as_str().len(),
             40
         );
         assert_eq!(
-            messages[1].tool_call_id.as_ref().unwrap().as_str().len(),
+            messages[1].tool_call_id.as_ref().context("Missing")?.as_str().len(),
             short_id.len()
         );
+        Ok(())
     }
 }
