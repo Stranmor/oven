@@ -44,7 +44,7 @@ const VERSION: &str = match option_env!("APP_VERSION") {
 /// values previously carried here are now accessed through
 /// `EnvironmentInfra::get_config()`.
 #[derive(Debug, Setters, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "test-utils", derive(fake::Dummy))]
+#[cfg_attr(any(test, feature = "test-utils"), derive(fake::Dummy))]
 #[serde(rename_all = "camelCase")]
 #[setters(strip_option)]
 pub struct Environment {

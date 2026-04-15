@@ -117,7 +117,7 @@ impl Model {
 
         forge_domain::Model {
             id: self.id,
-            provider_id,
+            provider_id: Some(provider_id),
             name: self.name,
             description: self.description,
             context_length: self.context_length,

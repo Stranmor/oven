@@ -12,11 +12,13 @@ pub struct ForgeSnapshotService<F> {
     infra: Arc<F>,
 }
 
-impl<F: DirectoryReaderInfra + Send + Sync> ForgeSnapshotService<F> {
+impl<F> ForgeSnapshotService<F> {
     pub fn new(infra: Arc<F>) -> Self {
         Self { infra }
     }
+}
 
+impl<F: DirectoryReaderInfra + Send + Sync> ForgeSnapshotService<F> {
     async fn find_recent_snapshot(infra: &Arc<F>, snapshot_dir: &Path) -> Result<Option<PathBuf>> {
         let mut latest_path = None;
         let mut latest_time = None;

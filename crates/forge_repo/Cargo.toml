@@ -7,7 +7,7 @@ rust-version.workspace = true
 [dependencies]
 forge_app.workspace = true
 forge_config.workspace = true
-forge_domain.workspace = true
+forge_domain = { workspace = true, features = ["test-utils"] }
 forge_infra.workspace = true
 forge_fs.workspace = true
 forge_template.workspace = true

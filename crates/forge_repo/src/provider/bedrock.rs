@@ -1337,7 +1337,7 @@ mod tests {
         let fixture_models = vec![
             Model {
                 id: ModelId::from("claude-3-opus".to_string()),
-                provider_id: forge_domain::ProviderId::BEDROCK,
+                provider_id: Some(forge_domain::ProviderId::BEDROCK),
                 name: Some("Claude 3 Opus".to_string()),
                 description: None,
                 context_length: None,
@@ -1348,7 +1348,7 @@ mod tests {
             },
             Model {
                 id: ModelId::from("claude-3-sonnet".to_string()),
-                provider_id: forge_domain::ProviderId::BEDROCK,
+                provider_id: Some(forge_domain::ProviderId::BEDROCK),
                 name: Some("Claude 3 Sonnet".to_string()),
                 description: None,
                 context_length: None,

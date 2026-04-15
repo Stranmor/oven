@@ -40,6 +40,7 @@ sha2.workspace = true
 hex.workspace = true
 
 [dev-dependencies]
+fake = { version = "5.1.0", features = ["derive"] }
 forge_test_kit = { workspace = true, features = ["json"] }
 insta = { workspace = true, features = ["yaml"] }
 pretty_assertions.workspace = true

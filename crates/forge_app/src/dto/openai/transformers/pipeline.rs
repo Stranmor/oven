@@ -471,7 +471,7 @@ mod tests {
         let mut pipeline = ProviderPipeline::new(&provider);
         let actual = pipeline.transform(fixture);
 
-        let expected_id = "call_12345678901234567890123456789012345";
+        let expected_id = "call_123456789012345678_79a9957747d56681";
         assert_eq!(expected_id.len(), 40);
 
         let messages = actual.messages.unwrap();

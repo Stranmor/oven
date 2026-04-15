@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 /// data in various contexts. It provides control over the amount of data to
 /// generate, formatting options, and other generation-specific settings.
 #[derive(Debug, Clone, Serialize, Deserialize, Setters, PartialEq)]
-#[cfg_attr(feature = "test-utils", derive(fake::Dummy))]
+#[cfg_attr(any(test, feature = "test-utils"), derive(fake::Dummy))]
 #[setters(into, strip_option)]
 pub struct DataGenerationParameters {
     /// Path to input JSONL file for data generation

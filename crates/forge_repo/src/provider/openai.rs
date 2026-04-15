@@ -319,7 +319,7 @@ impl<H: HttpInfra> OpenAIProvider<H> {
                 .into_iter()
                 .map(|m| forge_domain::Model {
                     id: forge_domain::ModelId::new(m.id),
-                    provider_id: forge_domain::ProviderId::VERTEX_AI,
+                    provider_id: Some(forge_domain::ProviderId::VERTEX_AI),
                     name: m.name,
                     description: m.description,
                     context_length: m.context_length,

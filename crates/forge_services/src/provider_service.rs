@@ -253,7 +253,7 @@ mod tests {
     fn test_model(id: &str) -> Model {
         Model {
             id: ModelId::from(id),
-            provider_id: forge_domain::ProviderId::OPENAI,
+            provider_id: Some(forge_domain::ProviderId::OPENAI),
             name: Some(id.to_string()),
             description: None,
             context_length: Some(4096),

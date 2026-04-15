@@ -7,8 +7,8 @@ expression: router_message
   "content": "Using tool",
   "tool_calls": [
     {
-      "id": "123",
       "type": "function",
+      "id": "123",
       "function": {
         "name": "test_tool",
         "arguments": "{\"key\":\"value\"}"
