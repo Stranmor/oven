@@ -4,6 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use strum_macros::EnumString;
 
+use crate::ProviderId;
+
 /// Represents input modalities that a model can accept
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, EnumString)]
 #[serde(rename_all = "lowercase")]
@@ -23,10 +25,11 @@ fn default_input_modalities() -> Vec<InputModality> {
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Setters)]
 pub struct Model {
     pub id: ModelId,
+    #[serde(default)]
+    pub provider_id: ProviderId,
     pub name: Option<String>,
     pub description: Option<String>,
     pub context_length: Option<u64>,
-    // TODO: add provider information to the model
     pub tools_supported: Option<bool>,
     /// Whether the model supports parallel tool calls
     pub supports_parallel_tool_calls: Option<bool>,

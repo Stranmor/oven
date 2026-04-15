@@ -157,10 +157,12 @@ pub struct FunctionDescription {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
-pub struct Tool {
-    // TODO: should be an enum
-    pub r#type: FunctionType,
-    pub function: FunctionDescription,
+#[serde(tag = "type")]
+pub enum Tool {
+    #[serde(rename = "function")]
+    Function { function: FunctionDescription },
+    #[serde(rename = "code_interpreter")]
+    CodeInterpreter,
 }
 
 /// Response format configuration for OpenAI API
@@ -313,8 +315,7 @@ pub enum Transform {
 
 impl From<ToolDefinition> for Tool {
     fn from(value: ToolDefinition) -> Self {
-        Tool {
-            r#type: FunctionType,
+        Tool::Function {
             function: FunctionDescription {
                 description: Some(value.description),
                 name: value.name.to_string(),
@@ -859,8 +860,7 @@ mod tests {
 
         let actual = Tool::from(fixture);
 
-        let expected = Tool {
-            r#type: FunctionType,
+        let expected = Tool::Function {
             function: FunctionDescription {
                 description: Some("Test tool".to_string()),
                 name: "test_tool".to_string(),

@@ -729,8 +729,7 @@ mod tests {
     #[test]
     fn test_opencode_zen_provider_enforces_strict_tool_schema() {
         let provider = opencode_zen("opencode-zen");
-        let fixture = Request::default().tools(vec![crate::dto::openai::Tool {
-            r#type: crate::dto::openai::FunctionType,
+        let fixture = Request::default().tools(vec![crate::dto::openai::Tool::Function {
             function: crate::dto::openai::FunctionDescription {
                 name: "fs_search".to_string(),
                 description: Some("Search files".to_string()),
@@ -766,15 +765,17 @@ mod tests {
             "required": ["output_mode"]
         });
 
-        assert_eq!(actual.tools.unwrap()[0].function.parameters, expected);
+        let crate::dto::openai::Tool::Function { function } = &actual.tools.unwrap()[0] else {
+            panic!()
+        };
+        assert_eq!(function.parameters, expected);
     }
 
     #[test]
     fn test_fireworks_provider_enforces_strict_tool_and_response_format_schemas() {
         let provider = fireworks_ai("fireworks-ai");
         let fixture = Request::default()
-            .tools(vec![crate::dto::openai::Tool {
-                r#type: crate::dto::openai::FunctionType,
+            .tools(vec![crate::dto::openai::Tool::Function {
                 function: crate::dto::openai::FunctionDescription {
                     name: "fs_search".to_string(),
                     description: Some("Search files".to_string()),
@@ -826,10 +827,11 @@ mod tests {
             "additionalProperties": false,
             "required": ["output_mode"]
         });
-        assert_eq!(
-            actual.tools.as_ref().unwrap()[0].function.parameters,
-            expected_tool_schema
-        );
+        let crate::dto::openai::Tool::Function { function } = &actual.tools.as_ref().unwrap()[0]
+        else {
+            panic!()
+        };
+        assert_eq!(function.parameters, expected_tool_schema);
 
         let actual_response_schema = match actual.response_format {
             Some(crate::dto::openai::ResponseFormat::JsonSchema { schema, .. }) => {
@@ -1096,8 +1098,7 @@ mod tests {
     #[test]
     fn test_openai_provider_does_not_enforce_strict_tool_schema() {
         let provider = openai("openai");
-        let fixture = Request::default().tools(vec![crate::dto::openai::Tool {
-            r#type: crate::dto::openai::FunctionType,
+        let fixture = Request::default().tools(vec![crate::dto::openai::Tool::Function {
             function: crate::dto::openai::FunctionDescription {
                 name: "fs_search".to_string(),
                 description: Some("Search files".to_string()),
@@ -1130,6 +1131,9 @@ mod tests {
             }
         });
 
-        assert_eq!(actual.tools.unwrap()[0].function.parameters, expected);
+        let crate::dto::openai::Tool::Function { function } = &actual.tools.unwrap()[0] else {
+            panic!()
+        };
+        assert_eq!(function.parameters, expected);
     }
 }

@@ -116,6 +116,7 @@ mod tests {
                         url_params: vec![],
                         models: Some(ModelSource::Hardcoded(vec![Model {
                             id: "gpt-4".to_string().into(),
+                            provider_id: ProviderId::OPENAI,
                             name: Some("GPT-4".to_string()),
                             description: None,
                             context_length: Some(8192),
@@ -142,6 +143,7 @@ mod tests {
                         }),
                         models: Some(ModelSource::Hardcoded(vec![Model {
                             id: "claude-3".to_string().into(),
+                            provider_id: ProviderId::ANTHROPIC,
                             name: Some("Claude 3".to_string()),
                             description: None,
                             context_length: Some(200000),

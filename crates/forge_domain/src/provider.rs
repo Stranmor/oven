@@ -38,6 +38,7 @@ pub enum ProviderType {
     Deref,
     Serialize,
     Deserialize,
+    Default,
 )]
 #[schemars(with = "String")]
 #[serde(from = "String")]

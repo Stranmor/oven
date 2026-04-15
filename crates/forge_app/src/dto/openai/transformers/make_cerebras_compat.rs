@@ -23,11 +23,10 @@ mod tests {
 
     #[test]
     fn test_parallel_tool_calls_dropped() {
-        use crate::dto::openai::{FunctionDescription, FunctionType, Request, Tool};
+        use crate::dto::openai::{FunctionDescription, Request, Tool};
 
         let fixture = Request::default()
-            .tools(vec![Tool {
-                r#type: FunctionType,
+            .tools(vec![Tool::Function {
                 function: FunctionDescription {
                     description: Some("test".to_string()),
                     name: "test".to_string(),

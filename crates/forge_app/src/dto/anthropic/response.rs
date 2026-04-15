@@ -29,16 +29,14 @@ pub struct Model {
     pub context_length: Option<u64>,
 }
 
-impl From<Model> for forge_domain::Model {
-    fn from(value: Model) -> Self {
-        let context_length = value
-            .context_length
-            .or_else(|| get_context_length(&value.id));
-        let input_modalities = if value.id.contains("claude-3")
-            || value.id.contains("claude-4")
-            || value.id.contains("claude-sonnet")
-            || value.id.contains("claude-opus")
-            || value.id.contains("claude-haiku")
+impl Model {
+    pub fn into_domain(self, provider_id: forge_domain::ProviderId) -> forge_domain::Model {
+        let context_length = self.context_length.or_else(|| get_context_length(&self.id));
+        let input_modalities = if self.id.contains("claude-3")
+            || self.id.contains("claude-4")
+            || self.id.contains("claude-sonnet")
+            || self.id.contains("claude-opus")
+            || self.id.contains("claude-haiku")
         {
             vec![
                 forge_domain::InputModality::Text,
@@ -48,9 +46,10 @@ impl From<Model> for forge_domain::Model {
             vec![forge_domain::InputModality::Text]
         };
 
-        Self {
-            id: ModelId::new(value.id),
-            name: value.display_name,
+        forge_domain::Model {
+            id: ModelId::new(self.id),
+            provider_id,
+            name: self.display_name,
             description: None,
             context_length,
             tools_supported: Some(true),
@@ -776,7 +775,7 @@ mod tests {
             context_length: None,
         };
 
-        let actual: forge_domain::Model = fixture.into();
+        let actual: forge_domain::Model = fixture.into_domain(forge_domain::ProviderId::ANTHROPIC);
 
         assert_eq!(actual.context_length, Some(200_000));
         assert_eq!(actual.id.as_str(), "claude-sonnet-4-5-20250929");
@@ -791,7 +790,7 @@ mod tests {
             context_length: None,
         };
 
-        let actual: forge_domain::Model = fixture.into();
+        let actual: forge_domain::Model = fixture.into_domain(forge_domain::ProviderId::ANTHROPIC);
 
         assert_eq!(actual.context_length, None);
         assert_eq!(actual.id.as_str(), "unknown-claude-model");
@@ -807,7 +806,7 @@ mod tests {
             context_length: Some(1_048_576),
         };
 
-        let actual: forge_domain::Model = fixture.into();
+        let actual: forge_domain::Model = fixture.into_domain(forge_domain::ProviderId::ANTHROPIC);
 
         assert_eq!(actual.context_length, Some(1_048_576));
     }

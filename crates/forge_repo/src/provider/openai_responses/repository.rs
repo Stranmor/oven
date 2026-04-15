@@ -422,6 +422,7 @@ impl<F: HttpInfra + EnvironmentInfra<Config = forge_config::ForgeConfig> + 'stat
         match provider.models().cloned() {
             Some(forge_domain::ModelSource::Hardcoded(models)) => Ok(models),
             Some(forge_domain::ModelSource::Url(url)) => {
+                let provider_id = provider.id.clone();
                 let provider_client = OpenAIResponsesProvider::new(provider, self.infra.clone());
                 let headers = create_headers(provider_client.get_headers());
                 let response = self
@@ -449,7 +450,11 @@ impl<F: HttpInfra + EnvironmentInfra<Config = forge_config::ForgeConfig> + 'stat
                     serde_json::from_str(&response_text)
                         .with_context(|| format_http_context(None, "GET", &url))
                         .with_context(|| "Failed to deserialize models response")?;
-                Ok(data.data.into_iter().map(Into::into).collect())
+                Ok(data
+                    .data
+                    .into_iter()
+                    .map(|m| m.into_domain(provider_id.clone()))
+                    .collect())
             }
             None => Ok(vec![]),
         }

@@ -90,7 +90,10 @@ impl<T: HttpInfra> Google<T> {
         Ok(Box::pin(stream))
     }
 
-    pub async fn models(&self) -> anyhow::Result<Vec<Model>> {
+    pub async fn models(
+        &self,
+        provider_id: forge_domain::ProviderId,
+    ) -> anyhow::Result<Vec<Model>> {
         match &self.models {
             forge_domain::ModelSource::Url(url) => {
                 debug!(url = %url, "Fetching models");
@@ -120,7 +123,11 @@ impl<T: HttpInfra> Google<T> {
                     let response: ModelsResponse = serde_json::from_str(&text)
                         .with_context(|| ctx_msg)
                         .with_context(|| "Failed to deserialize models response")?;
-                    Ok(response.models.into_iter().map(Into::into).collect())
+                    Ok(response
+                        .models
+                        .into_iter()
+                        .map(|m| m.into_domain(provider_id.clone()))
+                        .collect())
                 } else {
                     // treat non 200 response as error.
                     Err(anyhow::anyhow!(text))
@@ -216,7 +223,7 @@ impl<F: HttpInfra + EnvironmentInfra<Config = forge_config::ForgeConfig> + 'stat
         let provider_client = self.create_client(&provider)?;
 
         provider_client
-            .models()
+            .models(provider.id.clone())
             .await
             .map_err(|e| into_retry(e, &retry_config))
             .context("Failed to fetch models from Google provider")
@@ -416,7 +423,9 @@ mod tests {
             .mock_models(create_mock_models_response(), 200)
             .await;
         let google = create_google(&fixture.url())?;
-        let actual = google.models().await?;
+        let actual = google
+            .models(forge_domain::ProviderId::from("google".to_string()))
+            .await?;
 
         mock.assert_async().await;
 
@@ -434,7 +443,9 @@ mod tests {
             .await;
 
         let google = create_google(&fixture.url())?;
-        let actual = google.models().await;
+        let actual = google
+            .models(forge_domain::ProviderId::from("google".to_string()))
+            .await;
 
         mock.assert_async().await;
 

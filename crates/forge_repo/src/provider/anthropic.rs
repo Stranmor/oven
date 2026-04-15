@@ -270,7 +270,11 @@ impl<T: HttpInfra> Anthropic<T> {
                     let response: ListModelResponse = serde_json::from_str(&text)
                         .with_context(|| ctx_msg)
                         .with_context(|| "Failed to deserialize models response")?;
-                    Ok(response.data.into_iter().map(Into::into).collect())
+                    Ok(response
+                        .data
+                        .into_iter()
+                        .map(|m| m.into_domain(self.provider.id.clone()))
+                        .collect())
                 } else {
                     // treat non 200 response as error.
                     Err(anyhow::anyhow!(text))

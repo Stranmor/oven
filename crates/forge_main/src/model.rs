@@ -1217,6 +1217,7 @@ mod tests {
     ) -> Model {
         Model {
             id: ModelId::new(id),
+            provider_id: forge_domain::ProviderId::OPENAI,
             name: None,
             description: None,
             context_length,

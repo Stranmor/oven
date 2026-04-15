@@ -804,6 +804,7 @@ fn create_test_model(
 
     Model {
         id: ModelId::new(id),
+        provider_id: forge_domain::ProviderId::OPENAI,
         name: Some(format!("Test {}", id)),
         description: None,
         context_length: Some(128000),
