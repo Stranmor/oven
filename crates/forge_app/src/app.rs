@@ -192,8 +192,19 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ForgeAp
                     let save_result = services.upsert_conversation(conversation).await;
 
                     // Send any error to the stream (prioritize dispatch error over save error)
-                    #[allow(clippy::collapsible_if)]
-                    if let Some(err) = dispatch_result.err().or(save_result.err()) {
+                    let final_err = if let Err(save_err) = &save_result {
+                        if let Err(dispatch_err) = &dispatch_result {
+                            Some(anyhow::anyhow!("Dispatch error: {}. Also failed to save: {}", dispatch_err, save_err))
+                        } else {
+                            Some(anyhow::anyhow!("Failed to save conversation: {}", save_err))
+                        }
+                    } else if let Err(err) = dispatch_result {
+                        Some(err)
+                    } else {
+                        None
+                    };
+                    
+                    if let Some(err) = final_err {
                         if let Err(e) = tx.send(Err(err)).await {
                             tracing::error!("Failed to send error to stream: {}", e);
                         }
@@ -321,10 +332,22 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ForgeAp
             .collect();
 
         // Execute all provider fetches concurrently.
-        futures::future::join_all(futures)
-            .await
-            .into_iter()
-            .collect::<anyhow::Result<Vec<_>>>()
+        {
+        let results = futures::future::join_all(futures).await;
+        let mut successes = Vec::new();
+        let mut first_error = None;
+        for res in results {
+            match res {
+                Ok(models) => successes.push(models),
+                Err(e) => if first_error.is_none() { first_error = Some(e); }
+            }
+        }
+        if successes.is_empty() && first_error.is_some() {
+            Err(first_error.unwrap())
+        } else {
+            Ok(successes)
+        }
+    }
     }
 }
 

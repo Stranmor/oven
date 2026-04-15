@@ -256,11 +256,11 @@ pub trait API: Sync + Send {
     ) -> Result<BoxStream<'static, Result<serde_json::Value, anyhow::Error>>>;
 
     /// Authenticate with an MCP server via OAuth flow
-    async fn mcp_auth(&self, server_url: &str) -> Result<()>;
+    async fn mcp_auth(&self, server_url: &Url) -> Result<()>;
 
     /// Remove stored OAuth credentials for an MCP server (or all servers)
-    async fn mcp_logout(&self, server_url: Option<&str>) -> Result<()>;
+    async fn mcp_logout(&self, server_url: Option<&Url>) -> Result<()>;
 
     /// Check the OAuth authentication status of an MCP server
-    async fn mcp_auth_status(&self, server_url: &str) -> Result<String>;
+    async fn mcp_auth_status(&self, server_url: &Url) -> Result<forge_domain::McpAuthStatus>;
 }

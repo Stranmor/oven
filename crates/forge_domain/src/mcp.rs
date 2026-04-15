@@ -9,6 +9,14 @@ use derive_setters::Setters;
 use merge::Merge;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum McpAuthStatus {
+    Authenticated,
+    NotAuthenticated,
+    Unsupported,
+    Expired { has_refresh_token: bool },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Scope {
     Local,

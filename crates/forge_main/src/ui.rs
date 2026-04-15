@@ -883,8 +883,9 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         match server {
             Some(forge_domain::McpServerConfig::Http(http)) => {
                 // Check auth status first
-                let status = self.api.mcp_auth_status(&http.url).await?;
-                if status == "authenticated" {
+                let parsed_url = url::Url::parse(&http.url)?;
+                let status = self.api.mcp_auth_status(&parsed_url).await?;
+                if matches!(status, forge_domain::McpAuthStatus::Authenticated) {
                     self.writeln_title(TitleFormat::info(
                         format!("MCP server '{}' is already authenticated. Use 'mcp logout {}' first to re-authenticate.", name, name)
                     ))?;
@@ -892,10 +893,10 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                 }
 
                 // Force re-auth by removing any stale credentials
-                let _ = self.api.mcp_logout(Some(&http.url)).await;
+                let _ = self.api.mcp_logout(Some(&parsed_url)).await;
 
                 // Run the OAuth flow (opens browser, waits for callback)
-                match self.api.mcp_auth(&http.url).await {
+                match self.api.mcp_auth(&parsed_url).await {
                     Ok(()) => {
                         self.writeln_title(TitleFormat::info(format!(
                             "Successfully authenticated with MCP server '{}'",
@@ -955,7 +956,8 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
 
             match server {
                 Some(forge_domain::McpServerConfig::Http(http)) => {
-                    self.api.mcp_logout(Some(&http.url)).await?;
+                    let parsed_url = url::Url::parse(&http.url)?;
+                    self.api.mcp_logout(Some(&parsed_url)).await?;
                     self.writeln_title(TitleFormat::info(format!(
                         "Removed OAuth credentials for MCP server '{}'",
                         name

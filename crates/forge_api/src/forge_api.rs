@@ -100,6 +100,7 @@ impl<
         Ok(self.services.get_all_providers().await?)
     }
 
+    #[tracing::instrument(skip(self, diff, additional_context))]
     async fn commit(
         &self,
         preview: bool,
@@ -143,7 +144,7 @@ impl<
             .services
             .get_active_agent_id()
             .await?
-            .unwrap_or_default();
+            .ok_or_else(|| anyhow::anyhow!("No active agent configured"))?;
         self.app().chat(agent_id, chat).await
     }
 
@@ -159,7 +160,7 @@ impl<
             .services
             .get_active_agent_id()
             .await?
-            .unwrap_or_default();
+            .ok_or_else(|| anyhow::anyhow!("No active agent configured"))?;
         self.app()
             .compact_conversation(agent_id, conversation_id)
             .await
@@ -207,6 +208,7 @@ impl<
             .await
     }
 
+    #[tracing::instrument(skip(self))]
     async fn execute_shell_command(
         &self,
         command: &str,
@@ -243,17 +245,19 @@ impl<
         agent_provider_resolver.get_provider(Some(agent_id)).await
     }
 
+    #[tracing::instrument(skip(self))]
     async fn update_config(&self, ops: Vec<forge_domain::ConfigOperation>) -> anyhow::Result<()> {
-        // Determine whether any op affects provider/model resolution before writing,
-        // so we can invalidate the agent cache afterwards.
         let needs_agent_reload = ops
             .iter()
             .any(|op| matches!(op, forge_domain::ConfigOperation::SetSessionConfig(_)));
-        let result = self.services.update_config(ops).await;
+        
+        self.services.update_config(ops).await?;
+        
         if needs_agent_reload {
-            let _ = self.services.reload_agents().await;
+            self.services.reload_agents().await?;
         }
-        result
+        
+        Ok(())
     }
 
     async fn get_commit_config(&self) -> anyhow::Result<Option<ModelConfig>> {
@@ -420,12 +424,13 @@ impl<
         self.services.get_provider(model_config.provider).await
     }
 
-    async fn mcp_auth(&self, server_url: &str) -> Result<()> {
+    #[tracing::instrument(skip(self))]
+    async fn mcp_auth(&self, server_url: &url::Url) -> Result<()> {
         let env = self.services.get_environment().clone();
         forge_infra::mcp_auth(server_url, &env).await
     }
 
-    async fn mcp_logout(&self, server_url: Option<&str>) -> Result<()> {
+    async fn mcp_logout(&self, server_url: Option<&url::Url>) -> Result<()> {
         let env = self.services.get_environment().clone();
         match server_url {
             Some(url) => forge_infra::mcp_logout(url, &env).await,
@@ -433,7 +438,7 @@ impl<
         }
     }
 
-    async fn mcp_auth_status(&self, server_url: &str) -> Result<String> {
+    async fn mcp_auth_status(&self, server_url: &url::Url) -> Result<forge_domain::McpAuthStatus> {
         let env = self.services.get_environment().clone();
         Ok(forge_infra::mcp_auth_status(server_url, &env).await)
     }

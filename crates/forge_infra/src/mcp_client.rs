@@ -635,13 +635,13 @@ fn resolve_http_templates(
 /// # Arguments
 /// * `server_url` - The URL of the MCP server to authenticate with
 /// * `env` - The environment for file system paths
-pub async fn mcp_auth(server_url: &str, env: &Environment) -> anyhow::Result<()> {
+pub async fn mcp_auth(server_url: &url::Url, env: &Environment) -> anyhow::Result<()> {
     use rmcp::transport::auth::{CredentialStore, OAuthState};
 
     use crate::auth::McpTokenStorage;
 
     // Start fresh OAuth flow via OAuthState
-    let mut oauth_state = OAuthState::new(server_url, None)
+    let mut oauth_state = OAuthState::new(server_url.as_str(), None)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to initialize OAuth state: {}", e))?;
 
@@ -751,7 +751,7 @@ pub async fn mcp_auth(server_url: &str, env: &Environment) -> anyhow::Result<()>
 /// # Arguments
 /// * `server_url` - The URL of the MCP server to remove credentials for
 /// * `env` - The environment for file system paths
-pub async fn mcp_logout(server_url: &str, env: &Environment) -> anyhow::Result<()> {
+pub async fn mcp_logout(server_url: &url::Url, env: &Environment) -> anyhow::Result<()> {
     use crate::auth::McpTokenStorage;
     let storage = McpTokenStorage::new(server_url.to_string(), env.clone());
     storage.remove_credentials().await
@@ -777,7 +777,7 @@ pub async fn mcp_logout_all(env: &Environment) -> anyhow::Result<()> {
 /// # Arguments
 /// * `server_url` - The URL of the MCP server
 /// * `env` - The environment for file system paths
-pub async fn mcp_auth_status(server_url: &str, env: &Environment) -> String {
+pub async fn mcp_auth_status(server_url: &url::Url, env: &Environment) -> forge_domain::McpAuthStatus {
     use crate::auth::McpTokenStorage;
     let storage = McpTokenStorage::new(server_url.to_string(), env.clone());
     match storage.load_credentials().await {
@@ -789,19 +789,19 @@ pub async fn mcp_auth_status(server_url: &str, env: &Environment) -> String {
                     .as_secs();
                 if expires_at <= now {
                     if entry.tokens.refresh_token.is_some() {
-                        "expired (has refresh token)".to_string()
+                        forge_domain::McpAuthStatus::Expired { has_refresh_token: true }
                     } else {
-                        "expired".to_string()
+                        forge_domain::McpAuthStatus::Expired { has_refresh_token: false }
                     }
                 } else {
-                    "authenticated".to_string()
+                    forge_domain::McpAuthStatus::Authenticated
                 }
             } else {
-                "authenticated".to_string()
+                forge_domain::McpAuthStatus::Authenticated
             }
         }
-        Ok(None) => "not authenticated".to_string(),
-        Err(_) => "unknown (error reading credentials)".to_string(),
+        Ok(None) => forge_domain::McpAuthStatus::NotAuthenticated,
+        Err(_) => forge_domain::McpAuthStatus::NotAuthenticated,
     }
 }
 
