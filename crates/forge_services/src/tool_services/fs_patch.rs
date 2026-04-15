@@ -371,8 +371,8 @@ impl<F> ForgeFsPatch<F> {
 }
 
 #[async_trait::async_trait]
-impl<F: FileWriterInfra + ValidationRepository + FuzzySearchRepository>
-    FsPatchService for ForgeFsPatch<F>
+impl<F: FileWriterInfra + ValidationRepository + FuzzySearchRepository> FsPatchService
+    for ForgeFsPatch<F>
 {
     async fn patch(
         &self,
@@ -412,7 +412,11 @@ impl<F: FileWriterInfra + ValidationRepository + FuzzySearchRepository>
                 // Try fuzzy search as fallback
                 match self
                     .infra
-                    .fuzzy_search(&search_text, &current_content, false)
+                    .fuzzy_search(
+                        &search_text,
+                        &current_content,
+                        forge_domain::SearchMode::FirstMatch,
+                    )
                     .await
                 {
                     Ok(matches) if !matches.is_empty() => {
@@ -489,7 +493,11 @@ impl<F: FileWriterInfra + ValidationRepository + FuzzySearchRepository>
                     // Try fuzzy search as fallback
                     match self
                         .infra
-                        .fuzzy_search(&search_text, &current_content, false)
+                        .fuzzy_search(
+                            &search_text,
+                            &current_content,
+                            forge_domain::SearchMode::FirstMatch,
+                        )
                         .await
                     {
                         Ok(matches) if !matches.is_empty() => {

@@ -17,10 +17,7 @@ impl<F: DirectoryReaderInfra + Send + Sync> ForgeSnapshotService<F> {
         Self { infra }
     }
 
-    async fn find_recent_snapshot(
-        infra: &Arc<F>,
-        snapshot_dir: &Path,
-    ) -> Result<Option<PathBuf>> {
+    async fn find_recent_snapshot(infra: &Arc<F>, snapshot_dir: &Path) -> Result<Option<PathBuf>> {
         let mut latest_path = None;
         let mut latest_time = None;
 
@@ -29,11 +26,18 @@ impl<F: DirectoryReaderInfra + Send + Sync> ForgeSnapshotService<F> {
             if is_dir {
                 continue;
             }
-            let filename = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+
+            let filename = match path.file_name().and_then(|f| f.to_str()) {
+                Some(name) => name,
+                None => continue,
+            };
+
             if filename.ends_with(".snap") {
                 let time_str = filename.trim_end_matches(".snap");
-                if let Ok(time) = chrono::NaiveDateTime::parse_from_str(time_str, "%Y-%m-%d_%H-%M-%S-%f") {
-                    if latest_time.is_none() || time > latest_time.unwrap() {
+                if let Ok(time) =
+                    chrono::NaiveDateTime::parse_from_str(time_str, "%Y-%m-%d_%H-%M-%S-%f")
+                {
+                    if latest_time.map_or(true, |lt| time > lt) {
                         latest_time = Some(time);
                         latest_path = Some(path);
                     }
@@ -47,16 +51,16 @@ impl<F: DirectoryReaderInfra + Send + Sync> ForgeSnapshotService<F> {
 
 #[async_trait::async_trait]
 impl<
-        F: FileDirectoryInfra
-            + FileInfoInfra
-            + FileReaderInfra
-            + FileWriterInfra
-            + FileRemoverInfra
-            + DirectoryReaderInfra
-            + EnvironmentInfra
-            + Send
-            + Sync,
-    > SnapshotService for ForgeSnapshotService<F>
+    F: FileDirectoryInfra
+        + FileInfoInfra
+        + FileReaderInfra
+        + FileWriterInfra
+        + FileRemoverInfra
+        + DirectoryReaderInfra
+        + EnvironmentInfra
+        + Send
+        + Sync,
+> SnapshotService for ForgeSnapshotService<F>
 {
     async fn create_snapshot(&self, path: PathBuf) -> Result<Option<Snapshot>> {
         if !self.infra.exists(&path).await? {
@@ -74,7 +78,9 @@ impl<
         }
 
         let content = self.infra.read(Path::new(&snapshot.path)).await?;
-        self.infra.write(&snapshot_path, bytes::Bytes::from(content)).await?;
+        self.infra
+            .write(&snapshot_path, bytes::Bytes::from(content))
+            .await?;
         Ok(Some(snapshot))
     }
 
@@ -108,20 +114,5 @@ impl<
         self.infra.remove(&snapshot_path).await?;
 
         Ok(output)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    
-    
-    
-    // We demonstrate that finding the recent snapshot uses string comparison, which fails with "zzz.snap"
-    #[tokio::test]
-    async fn test_snapshot_race_condition_and_string_comparison() {
-        // String comparison vulnerability:
-        let valid_snap = "2026-04-15_12-00-00-000000000.snap";
-        let invalid_snap = "zzz.snap";
-        assert!(invalid_snap > valid_snap, "String comparison sorts 'zzz.snap' as newer, breaking snapshot undo!");
     }
 }

@@ -48,11 +48,11 @@ impl ForgeAPI<ForgeServices<ForgeRepo<ForgeInfra>>, ForgeRepo<ForgeInfra>> {
     /// * `cwd` - The working directory path for environment and file resolution
     /// * `config` - Pre-read application configuration (from startup)
     /// * `services_url` - Pre-validated URL for the gRPC workspace server
-    pub fn init(cwd: PathBuf, config: ForgeConfig) -> Self {
+    pub fn init(cwd: PathBuf, config: ForgeConfig) -> anyhow::Result<Self> {
         let infra = Arc::new(ForgeInfra::new(cwd, config));
-        let repo = Arc::new(ForgeRepo::new(infra.clone()));
+        let repo = Arc::new(ForgeRepo::new(infra.clone())?);
         let app = Arc::new(ForgeServices::new(repo.clone()));
-        ForgeAPI::new(app, repo)
+        Ok(ForgeAPI::new(app, repo))
     }
 
     pub async fn get_skills_internal(&self) -> Result<Vec<Skill>> {
@@ -176,23 +176,15 @@ impl<
         self.services.find_conversation(conversation_id).await
     }
 
-    async fn get_conversations(&self, limit: Option<usize>) -> anyhow::Result<Vec<Conversation>> {
-        Ok(self
-            .services
-            .get_conversations(limit)
-            .await?
-            .unwrap_or_default())
+    async fn get_conversations(&self) -> anyhow::Result<Vec<Conversation>> {
+        Ok(self.services.get_conversations().await?)
     }
 
     async fn get_sub_conversations(
         &self,
         parent_id: &ConversationId,
     ) -> anyhow::Result<Vec<Conversation>> {
-        Ok(self
-            .services
-            .get_sub_conversations(parent_id)
-            .await?
-            .unwrap_or_default())
+        Ok(self.services.get_sub_conversations(parent_id).await?)
     }
 
     async fn last_conversation(&self) -> anyhow::Result<Option<Conversation>> {

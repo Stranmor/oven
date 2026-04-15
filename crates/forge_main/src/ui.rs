@@ -1895,8 +1895,8 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
 
     async fn list_conversations(&mut self) -> anyhow::Result<()> {
         self.spinner.start(Some("Loading Conversations"))?;
-        let max_conversations = self.config.max_conversations;
-        let conversations = self.api.get_conversations(Some(max_conversations)).await?;
+
+        let conversations = self.api.get_conversations().await?;
         self.spinner.stop(None)?;
 
         if conversations.is_empty() {
@@ -1973,8 +1973,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
     }
 
     async fn on_show_conversations(&mut self, porcelain: bool) -> anyhow::Result<()> {
-        let max_conversations = self.config.max_conversations;
-        let conversations = self.api.get_conversations(Some(max_conversations)).await?;
+        let conversations = self.api.get_conversations().await?;
 
         if conversations.is_empty() {
             return Ok(());
@@ -2601,10 +2600,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                 .map_err(|_| anyhow::anyhow!("Invalid conversation ID: {id_str}"))?
         } else {
             // Show conversation picker
-            let conversations = self
-                .api
-                .get_conversations(Some(self.config.max_conversations))
-                .await?;
+            let conversations = self.api.get_conversations().await?;
 
             if conversations.is_empty() {
                 self.writeln_title(TitleFormat::error(
@@ -2679,10 +2675,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             )))?;
         } else {
             // Interactive: show picker then prompt for new name
-            let conversations = self
-                .api
-                .get_conversations(Some(self.config.max_conversations))
-                .await?;
+            let conversations = self.api.get_conversations().await?;
 
             if conversations.is_empty() {
                 self.writeln_title(TitleFormat::error("No conversations found."))?;

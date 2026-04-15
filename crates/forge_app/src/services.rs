@@ -237,17 +237,14 @@ pub trait ConversationService: Send + Sync {
         F: FnOnce(&mut Conversation) -> T + Send,
         T: Send;
 
-    /// Find conversations with optional limit
-    async fn get_conversations(
-        &self,
-        limit: Option<usize>,
-    ) -> anyhow::Result<Option<Vec<Conversation>>>;
+    /// Find conversations
+    async fn get_conversations(&self) -> anyhow::Result<Vec<Conversation>>;
 
     /// Find sub-conversations (subagent chats) for a parent conversation
     async fn get_sub_conversations(
         &self,
         parent_id: &ConversationId,
-    ) -> anyhow::Result<Option<Vec<Conversation>>>;
+    ) -> anyhow::Result<Vec<Conversation>>;
 
     /// Find the last active conversation
     async fn last_conversation(&self) -> anyhow::Result<Option<Conversation>>;
@@ -422,7 +419,10 @@ pub trait FollowUpService: Send + Sync {
 #[async_trait::async_trait]
 pub trait SnapshotService: Send + Sync {
     /// Creates a snapshot of the file at the specified path before modification.
-    async fn create_snapshot(&self, path: PathBuf) -> anyhow::Result<Option<forge_domain::Snapshot>>;
+    async fn create_snapshot(
+        &self,
+        path: PathBuf,
+    ) -> anyhow::Result<Option<forge_domain::Snapshot>>;
     /// Undoes the last file operation at the specified path.
     /// And returns the content of the undone file.
     async fn undo_snapshot(&self, path: PathBuf) -> anyhow::Result<SnapshotUndoOutput>;
@@ -615,17 +615,14 @@ impl<I: Services> ConversationService for I {
         self.conversation_service().modify_conversation(id, f).await
     }
 
-    async fn get_conversations(
-        &self,
-        limit: Option<usize>,
-    ) -> anyhow::Result<Option<Vec<Conversation>>> {
-        self.conversation_service().get_conversations(limit).await
+    async fn get_conversations(&self) -> anyhow::Result<Vec<Conversation>> {
+        self.conversation_service().get_conversations().await
     }
 
     async fn get_sub_conversations(
         &self,
         parent_id: &ConversationId,
-    ) -> anyhow::Result<Option<Vec<Conversation>>> {
+    ) -> anyhow::Result<Vec<Conversation>> {
         self.conversation_service()
             .get_sub_conversations(parent_id)
             .await
@@ -848,7 +845,10 @@ impl<I: Services> FollowUpService for I {
 
 #[async_trait::async_trait]
 impl<I: Services> SnapshotService for I {
-    async fn create_snapshot(&self, path: PathBuf) -> anyhow::Result<Option<forge_domain::Snapshot>> {
+    async fn create_snapshot(
+        &self,
+        path: PathBuf,
+    ) -> anyhow::Result<Option<forge_domain::Snapshot>> {
         self.snapshot_service().create_snapshot(path).await
     }
     async fn undo_snapshot(&self, path: PathBuf) -> anyhow::Result<SnapshotUndoOutput> {

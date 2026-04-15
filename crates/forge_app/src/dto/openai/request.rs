@@ -411,7 +411,8 @@ impl From<Context> for Request {
 }
 
 fn serialize_tool_call_arguments(tool_call: &ToolCallFull) -> String {
-    let serialized_arguments = || serde_json::to_string(&tool_call.arguments).unwrap_or_else(|_| "{}".to_string());
+    let serialized_arguments =
+        || serde_json::to_string(&tool_call.arguments).unwrap_or_else(|_| "{}".to_string());
 
     let Ok(parsed_arguments) = tool_call.arguments.parse() else {
         return serialized_arguments();
@@ -837,7 +838,11 @@ mod tests {
     fn test_tool_call_supports_code_interpreter() {
         let json = r#"{"id":"call_123","type":"code_interpreter","function":{"name":"python","arguments":"{}"}}"#;
         let result: Result<super::ToolCall, _> = serde_json::from_str(json);
-        assert!(result.is_ok(), "ToolCall should support code_interpreter type: {:?}", result.unwrap_err());
+        assert!(
+            result.is_ok(),
+            "ToolCall should support code_interpreter type: {:?}",
+            result.unwrap_err()
+        );
     }
 
     #[test]

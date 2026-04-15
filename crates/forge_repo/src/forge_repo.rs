@@ -57,10 +57,11 @@ impl<
         + HttpInfra,
 > ForgeRepo<F>
 {
-    pub fn new(infra: Arc<F>) -> Self {
+    pub fn new(infra: Arc<F>) -> anyhow::Result<Self> {
         let env = infra.get_environment();
-        let db_pool =
-            Arc::new(DatabasePool::try_from(PoolConfig::new(env.database_path())).unwrap());
+        let db_pool = Arc::new(DatabasePool::try_from(PoolConfig::new(
+            env.database_path(),
+        ))?);
         let conversation_repository = Arc::new(ConversationRepositoryImpl::new(
             db_pool.clone(),
             env.workspace_hash(),
@@ -68,7 +69,7 @@ impl<
 
         let mcp_cache_repository = Arc::new(CacacheStorage::new(
             env.cache_dir().join("mcp_cache"),
-            Some(3600),
+            Some(std::time::Duration::from_secs(3600)),
         )); // 1 hour TTL
 
         let provider_repository = Arc::new(ForgeProviderRepository::new(infra.clone()));
@@ -79,7 +80,7 @@ impl<
         let skill_repository = Arc::new(ForgeSkillRepository::new(infra.clone()));
         let validation_repository = Arc::new(ForgeValidationRepository::new(infra.clone()));
         let fuzzy_search_repository = Arc::new(ForgeFuzzySearchRepository::new(infra.clone()));
-        Self {
+        Ok(Self {
             infra,
             conversation_repository,
             mcp_cache_repository,
@@ -90,10 +91,9 @@ impl<
             skill_repository,
             validation_repository,
             fuzzy_search_repository,
-        }
+        })
     }
 }
-
 
 #[async_trait::async_trait]
 impl<F: Send + Sync> ConversationRepository for ForgeRepo<F> {
@@ -112,19 +112,14 @@ impl<F: Send + Sync> ConversationRepository for ForgeRepo<F> {
             .await
     }
 
-    async fn get_all_conversations(
-        &self,
-        limit: Option<usize>,
-    ) -> anyhow::Result<Option<Vec<Conversation>>> {
-        self.conversation_repository
-            .get_all_conversations(limit)
-            .await
+    async fn get_all_conversations(&self) -> anyhow::Result<Vec<Conversation>> {
+        self.conversation_repository.get_all_conversations().await
     }
 
     async fn get_sub_conversations(
         &self,
         parent_id: &ConversationId,
-    ) -> anyhow::Result<Option<Vec<Conversation>>> {
+    ) -> anyhow::Result<Vec<Conversation>> {
         self.conversation_repository
             .get_sub_conversations(parent_id)
             .await
@@ -614,10 +609,10 @@ impl<F: GrpcInfra + Send + Sync> FuzzySearchRepository for ForgeRepo<F> {
         &self,
         needle: &str,
         haystack: &str,
-        search_all: bool,
+        mode: forge_domain::SearchMode,
     ) -> anyhow::Result<Vec<SearchMatch>> {
         self.fuzzy_search_repository
-            .fuzzy_search(needle, haystack, search_all)
+            .fuzzy_search(needle, haystack, mode)
             .await
     }
 }

@@ -6,7 +6,6 @@ use forge_domain::{
 };
 use serde::{Deserialize, Serialize};
 
-
 use crate::dto::openai::ReasoningDetail;
 use crate::dto::openai::error::{Error, ErrorCode, ErrorResponse};
 
@@ -240,9 +239,7 @@ pub enum ToolCall {
         extra_content: Option<ExtraContent>,
     },
     #[serde(rename = "code_interpreter")]
-    CodeInterpreter {
-        id: Option<ToolCallId>,
-    }
+    CodeInterpreter { id: Option<ToolCallId> },
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -332,7 +329,7 @@ impl TryFrom<Response> for ChatCompletionMessage {
         match res {
             Response::Success { choices, usage, prompt_filter_results, .. } => {
                 if choices.len() > 1 {
-                    return Err(anyhow::anyhow!("Multiple choices are not supported").into());
+                    return Err(anyhow::anyhow!("Multiple choices are not supported"));
                 }
                 if let Some(choice) = choices.first() {
                     // Check if the choice has an error first
@@ -408,17 +405,20 @@ impl TryFrom<Response> for ChatCompletionMessage {
 
                                             resp = resp.add_tool_call(ToolCallFull {
                                                 call_id: id.clone(),
-                                                name: function
-                                                    .name
-                                                    .clone()
-                                                    .ok_or(forge_domain::Error::ToolCallMissingName)?,
+                                                name: function.name.clone().ok_or(
+                                                    forge_domain::Error::ToolCallMissingName,
+                                                )?,
                                                 arguments: serde_json::from_str(
                                                     &function.arguments,
                                                 )?,
                                                 thought_signature,
                                             });
                                         }
-                                        ToolCall::CodeInterpreter { .. } => return Err(anyhow::anyhow!("Code interpreter tool call not supported").into()),
+                                        ToolCall::CodeInterpreter { .. } => {
+                                            return Err(anyhow::anyhow!(
+                                                "Code interpreter tool call not supported"
+                                            ));
+                                        }
                                     }
                                 }
                             }
@@ -483,7 +483,11 @@ impl TryFrom<Response> for ChatCompletionMessage {
                                                 thought_signature,
                                             });
                                         }
-                                        ToolCall::CodeInterpreter { .. } => return Err(anyhow::anyhow!("Code interpreter tool call not supported").into()),
+                                        ToolCall::CodeInterpreter { .. } => {
+                                            return Err(anyhow::anyhow!(
+                                                "Code interpreter tool call not supported"
+                                            ));
+                                        }
                                     }
                                 }
                             }
@@ -556,7 +560,9 @@ impl TryFrom<Response> for ChatCompletionMessage {
                 if let Some(c) = cost {
                     let cost_value = match c {
                         StringOrF64::Number(n) => n,
-                        StringOrF64::String(s) => s.parse().map_err(|_| anyhow::anyhow!("Invalid cost string: {}", s))?,
+                        StringOrF64::String(s) => s
+                            .parse()
+                            .map_err(|_| anyhow::anyhow!("Invalid cost string: {}", s))?,
                     };
                     msg.usage = Some(Usage {
                         prompt_tokens: TokenCount::Actual(0),

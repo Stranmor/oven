@@ -21,7 +21,9 @@ impl Transformer for StripThoughtSignature {
                 // Also remove extra_content from tool_calls
                 if let Some(tool_calls) = message.tool_calls.as_mut() {
                     for tool_call in tool_calls.iter_mut() {
-                        if let crate::dto::openai::response::ToolCall::Function { extra_content, .. } = tool_call {
+                        if let crate::dto::openai::ToolCall::Function { extra_content, .. } =
+                            tool_call
+                        {
                             *extra_content = None;
                         }
                     }
@@ -41,8 +43,7 @@ mod tests {
 
     use super::*;
     use crate::dto::openai::{
-        ExtraContent, FunctionCall, GoogleMetadata, Message, MessageContent, Role,
-        ToolCall,
+        ExtraContent, FunctionCall, GoogleMetadata, Message, MessageContent, Role, ToolCall,
     };
 
     #[test]
@@ -96,8 +97,15 @@ mod tests {
         let actual = transformer.transform(fixture);
 
         let messages = actual.messages.context("No messages")?;
-        let tool_calls = messages.first().context("No first message")?.tool_calls.as_ref().context("No tool calls")?;
-        if let ToolCall::Function { extra_content, .. } = tool_calls.first().context("No first tool call")? {
+        let tool_calls = messages
+            .first()
+            .context("No first message")?
+            .tool_calls
+            .as_ref()
+            .context("No tool calls")?;
+        if let ToolCall::Function { extra_content, .. } =
+            tool_calls.first().context("No first tool call")?
+        {
             assert!(extra_content.is_none());
         } else {
             anyhow::bail!("Expected Function tool call");

@@ -71,8 +71,8 @@ mod tests {
     // ContentFormat is now ChatResponseContent
     use crate::operation::ToolOperation;
     use crate::{
-        Content, FsRemoveOutput, SnapshotUndoOutput, FsWriteOutput, HttpResponse, Match, MatchResult,
-        PatchOutput, ReadOutput, ResponseContext, SearchResult, ShellOutput,
+        Content, FsRemoveOutput, FsWriteOutput, HttpResponse, Match, MatchResult, PatchOutput,
+        ReadOutput, ResponseContext, SearchResult, ShellOutput, SnapshotUndoOutput,
     };
 
     // ContentFormat methods are now implemented in ChatResponseContent

@@ -1267,7 +1267,11 @@ mod tests {
             let _ = tool.definition();
         }
         let elapsed = start.elapsed();
-        assert!(elapsed.as_millis() < 5, "Schema generation is not cached! Took {:?}", elapsed);
+        assert!(
+            elapsed.as_millis() < 5,
+            "Schema generation is not cached! Took {:?}",
+            elapsed
+        );
     }
 
     #[test]

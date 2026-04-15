@@ -94,6 +94,9 @@ mod tests {
     fn test_model_provider_id_default() {
         let json = r#"{"id": "test-model"}"#;
         let result: Result<Model, _> = serde_json::from_str(json);
-        assert!(result.is_err(), "Model parsing should fail when provider_id is missing");
+        assert!(
+            result.is_err(),
+            "Model parsing should fail when provider_id is missing"
+        );
     }
 }

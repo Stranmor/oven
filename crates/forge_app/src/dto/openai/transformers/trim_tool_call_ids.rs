@@ -12,7 +12,11 @@ fn trim_id(id: &mut Option<forge_domain::ToolCallId>) {
             hasher.update(tool_call_id.as_str().as_bytes());
             let hash = hasher.finalize();
             // Take first 8 bytes and format as 16 hex chars
-            let hash_bytes: [u8; 8] = hash[0..8].try_into().unwrap();
+            let hash_bytes: [u8; 8] = hash
+                .get(0..8)
+                .unwrap_or(&[0; 8])
+                .try_into()
+                .unwrap_or([0; 8]);
             let hash_val = u64::from_be_bytes(hash_bytes);
             let prefix_len = MAX_TOOL_CALL_ID_LEN.saturating_sub(17);
             let prefix: String = tool_call_id.as_str().chars().take(prefix_len).collect();
@@ -121,7 +125,12 @@ mod tests {
         let actual = TrimToolCallIds.transform(fixture);
 
         let messages = actual.messages.context("Missing")?;
-        let tool_calls = messages.first().context("No msg")?.tool_calls.as_ref().context("No calls")?;
+        let tool_calls = messages
+            .first()
+            .context("No msg")?
+            .tool_calls
+            .as_ref()
+            .context("No calls")?;
         if let ResponseToolCall::Function { id, .. } = tool_calls.first().context("No tool")? {
             let id_str = id.as_ref().context("No id")?.as_str();
             assert_eq!(id_str.len(), 40);
@@ -172,8 +181,13 @@ mod tests {
         let actual = TrimToolCallIds.transform(fixture);
 
         let messages = actual.messages.context("Missing")?;
-        let tool_calls = messages.first().context("No msg")?.tool_calls.as_ref().context("No calls")?;
-        
+        let tool_calls = messages
+            .first()
+            .context("No msg")?
+            .tool_calls
+            .as_ref()
+            .context("No calls")?;
+
         if let ResponseToolCall::Function { id, .. } = tool_calls.first().context("No 1")? {
             let id_str = id.as_ref().context("id")?.as_str();
             assert_eq!(id_str.len(), 40);
@@ -209,11 +223,13 @@ mod tests {
         let actual = TrimToolCallIds.transform(fixture);
 
         let messages = actual.messages.context("Missing")?;
-        let tool_call_id = messages.first().context("No msg")?.tool_call_id.as_ref().context("No id")?;
-        assert_eq!(
-            tool_call_id.as_str(),
-            short_id
-        );
+        let tool_call_id = messages
+            .first()
+            .context("No msg")?
+            .tool_call_id
+            .as_ref()
+            .context("No id")?;
+        assert_eq!(tool_call_id.as_str(), short_id);
         Ok(())
     }
 
@@ -239,11 +255,13 @@ mod tests {
         let actual = TrimToolCallIds.transform(fixture);
 
         let messages = actual.messages.context("Missing")?;
-        let tool_call_id = messages.first().context("No msg")?.tool_call_id.as_ref().context("No id")?;
-        assert_eq!(
-            tool_call_id.as_str(),
-            exact_id
-        );
+        let tool_call_id = messages
+            .first()
+            .context("No msg")?
+            .tool_call_id
+            .as_ref()
+            .context("No id")?;
+        assert_eq!(tool_call_id.as_str(), exact_id);
         Ok(())
     }
 
@@ -286,11 +304,21 @@ mod tests {
         let second_msg = messages.get(1).context("No second msg")?;
 
         assert_eq!(
-            first_msg.tool_call_id.as_ref().context("Missing")?.as_str().len(),
+            first_msg
+                .tool_call_id
+                .as_ref()
+                .context("Missing")?
+                .as_str()
+                .len(),
             40
         );
         assert_eq!(
-            second_msg.tool_call_id.as_ref().context("Missing")?.as_str().len(),
+            second_msg
+                .tool_call_id
+                .as_ref()
+                .context("Missing")?
+                .as_str()
+                .len(),
             short_id.len()
         );
         Ok(())

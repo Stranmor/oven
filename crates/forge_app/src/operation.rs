@@ -18,8 +18,8 @@ use crate::truncation::{
 };
 use crate::utils::{compute_hash, format_display_path};
 use crate::{
-    FsRemoveOutput, FsWriteOutput, HttpResponse, PatchOutput, PlanCreateOutput,
-    ReadOutput, ResponseContext, SearchResult, ShellOutput, SnapshotUndoOutput,
+    FsRemoveOutput, FsWriteOutput, HttpResponse, PatchOutput, PlanCreateOutput, ReadOutput,
+    ResponseContext, SearchResult, ShellOutput, SnapshotUndoOutput,
 };
 
 #[derive(Debug, Default, Setters)]

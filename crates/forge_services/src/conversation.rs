@@ -51,16 +51,11 @@ impl<S: ConversationRepository> ConversationService for ForgeConversationService
         Ok(())
     }
 
-    async fn get_conversations(&self, limit: Option<usize>) -> Result<Option<Vec<Conversation>>> {
-        self.conversation_repository
-            .get_all_conversations(limit)
-            .await
+    async fn get_conversations(&self) -> Result<Vec<Conversation>> {
+        self.conversation_repository.get_all_conversations().await
     }
 
-    async fn get_sub_conversations(
-        &self,
-        parent_id: &ConversationId,
-    ) -> Result<Option<Vec<Conversation>>> {
+    async fn get_sub_conversations(&self, parent_id: &ConversationId) -> Result<Vec<Conversation>> {
         self.conversation_repository
             .get_sub_conversations(parent_id)
             .await

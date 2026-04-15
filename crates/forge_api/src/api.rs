@@ -65,7 +65,7 @@ pub trait API: Sync + Send {
     async fn conversation(&self, conversation_id: &ConversationId) -> Result<Option<Conversation>>;
 
     /// Lists all conversations for the active workspace
-    async fn get_conversations(&self, limit: Option<usize>) -> Result<Vec<Conversation>>;
+    async fn get_conversations(&self) -> Result<Vec<Conversation>>;
 
     /// Lists sub-conversations (subagent chats) for a parent conversation
     async fn get_sub_conversations(&self, parent_id: &ConversationId) -> Result<Vec<Conversation>>;

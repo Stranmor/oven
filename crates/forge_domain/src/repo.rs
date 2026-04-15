@@ -1,4 +1,3 @@
-
 use anyhow::Result;
 use url::Url;
 
@@ -35,22 +34,13 @@ pub trait ConversationRepository: Send + Sync {
         conversation_id: &ConversationId,
     ) -> Result<Option<Conversation>>;
 
-    /// Retrieves all conversations with an optional limit
-    ///
-    /// # Arguments
-    /// * `limit` - Optional maximum number of conversations to retrieve
+    /// Retrieves all conversations
     ///
     /// # Errors
     /// Returns an error if the operation fails
-    async fn get_all_conversations(
-        &self,
-        limit: Option<usize>,
-    ) -> Result<Option<Vec<Conversation>>>;
+    async fn get_all_conversations(&self) -> Result<Vec<Conversation>>;
 
-    async fn get_sub_conversations(
-        &self,
-        parent_id: &ConversationId,
-    ) -> Result<Option<Vec<Conversation>>>;
+    async fn get_sub_conversations(&self, parent_id: &ConversationId) -> Result<Vec<Conversation>>;
 
     /// Retrieves the most recent conversation
     ///
@@ -188,10 +178,17 @@ pub trait ValidationRepository: Send + Sync {
     ) -> Result<Vec<crate::SyntaxError>>;
 }
 
+/// Mode for fuzzy searching
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchMode {
+    FirstMatch,
+    AllMatches,
+}
+
 /// Repository for fuzzy searching text
 ///
 /// This repository provides fuzzy search functionality for searching
-/// needle in haystack with optional search_all flag.
+/// needle in haystack.
 #[async_trait::async_trait]
 pub trait FuzzySearchRepository: Send + Sync {
     /// Performs a fuzzy search for a needle in a haystack
@@ -199,7 +196,7 @@ pub trait FuzzySearchRepository: Send + Sync {
     /// # Arguments
     /// * `needle` - The string to search for
     /// * `haystack` - The text to search in
-    /// * `search_all` - Whether to search all matches or just the first
+    /// * `mode` - Whether to search all matches or just the first
     ///
     /// # Returns
     /// * `Ok(Vec<SearchMatch>)` - List of matches with line ranges
@@ -208,6 +205,6 @@ pub trait FuzzySearchRepository: Send + Sync {
         &self,
         needle: &str,
         haystack: &str,
-        search_all: bool,
+        mode: SearchMode,
     ) -> Result<Vec<SearchMatch>>;
 }

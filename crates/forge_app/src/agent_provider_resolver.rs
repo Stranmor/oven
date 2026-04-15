@@ -49,11 +49,13 @@ where
     /// agent is provided. Automatically refreshes OAuth credentials if they're
     /// about to expire.
     pub async fn get_provider(&self, agent_id: Option<AgentId>) -> Result<Provider<url::Url>> {
-        let provider_id = self.resolve_agent_or_session_config(
-            agent_id,
-            |agent| agent.provider,
-            |config| config.provider,
-        ).await?;
+        let provider_id = self
+            .resolve_agent_or_session_config(
+                agent_id,
+                |agent| agent.provider,
+                |config| config.provider,
+            )
+            .await?;
 
         let provider = self.0.get_provider(provider_id).await?;
         Ok(provider)
@@ -62,12 +64,7 @@ where
     /// Gets the model for the specified agent, or the default model if no agent
     /// is provided
     pub async fn get_model(&self, agent_id: Option<AgentId>) -> Result<ModelId> {
-        self.resolve_agent_or_session_config(
-            agent_id,
-            |agent| agent.model,
-            |config| config.model,
-        ).await
+        self.resolve_agent_or_session_config(agent_id, |agent| agent.model, |config| config.model)
+            .await
     }
 }
-
-

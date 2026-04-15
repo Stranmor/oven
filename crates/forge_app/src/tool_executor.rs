@@ -9,8 +9,8 @@ use crate::operation::{TempContentFiles, ToolOperation};
 use crate::services::{Services, ShellService};
 use crate::{
     AgentRegistry, ConversationService, EnvironmentInfra, FollowUpService, FsPatchService,
-    FsReadService, FsRemoveService, FsSearchService, SnapshotService, FsWriteService,
-    ImageReadService, NetFetchService, PlanCreateService, ProviderService, SkillFetchService,
+    FsReadService, FsRemoveService, FsSearchService, FsWriteService, ImageReadService,
+    NetFetchService, PlanCreateService, ProviderService, SkillFetchService, SnapshotService,
     WorkspaceService,
 };
 
@@ -177,7 +177,10 @@ impl<
             }
             ToolCatalog::Write(input) => {
                 let normalized_path = self.normalize_path(input.file_path.clone());
-                self.services.snapshot_service().create_snapshot(std::path::PathBuf::from(&normalized_path)).await?;
+                self.services
+                    .snapshot_service()
+                    .create_snapshot(std::path::PathBuf::from(&normalized_path))
+                    .await?;
                 let output = self
                     .services
                     .write(normalized_path, input.content.clone(), input.overwrite)
@@ -237,13 +240,19 @@ impl<
             }
             ToolCatalog::Remove(input) => {
                 let normalized_path = self.normalize_path(input.path.clone());
-                self.services.snapshot_service().create_snapshot(std::path::PathBuf::from(&normalized_path)).await?;
+                self.services
+                    .snapshot_service()
+                    .create_snapshot(std::path::PathBuf::from(&normalized_path))
+                    .await?;
                 let output = self.services.remove(normalized_path).await?;
                 (input, output).into()
             }
             ToolCatalog::Patch(input) => {
                 let normalized_path = self.normalize_path(input.file_path.clone());
-                self.services.snapshot_service().create_snapshot(std::path::PathBuf::from(&normalized_path)).await?;
+                self.services
+                    .snapshot_service()
+                    .create_snapshot(std::path::PathBuf::from(&normalized_path))
+                    .await?;
                 let output = self
                     .services
                     .patch(
@@ -257,7 +266,10 @@ impl<
             }
             ToolCatalog::MultiPatch(input) => {
                 let normalized_path = self.normalize_path(input.file_path.clone());
-                self.services.snapshot_service().create_snapshot(std::path::PathBuf::from(&normalized_path)).await?;
+                self.services
+                    .snapshot_service()
+                    .create_snapshot(std::path::PathBuf::from(&normalized_path))
+                    .await?;
                 let output = self
                     .services
                     .multi_patch(normalized_path, input.edits.clone())
@@ -266,7 +278,11 @@ impl<
             }
             ToolCatalog::Undo(input) => {
                 let normalized_path = self.normalize_path(input.path.clone());
-                let output = self.services.snapshot_service().undo_snapshot(std::path::PathBuf::from(&normalized_path)).await?;
+                let output = self
+                    .services
+                    .snapshot_service()
+                    .undo_snapshot(std::path::PathBuf::from(&normalized_path))
+                    .await?;
                 (input, output).into()
             }
             ToolCatalog::Shell(input) => {

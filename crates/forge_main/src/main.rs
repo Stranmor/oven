@@ -121,7 +121,7 @@ async fn run() -> Result<()> {
     };
 
     let mut ui = UI::init(cli, config, move |config| {
-        ForgeAPI::init(cwd.clone(), config)
+        ForgeAPI::init(cwd.clone(), config).expect("Failed to initialize Forge API")
     })?;
     ui.run().await;
 

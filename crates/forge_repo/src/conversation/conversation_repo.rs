@@ -84,10 +84,7 @@ impl ConversationRepository for ConversationRepositoryImpl {
         .await
     }
 
-    async fn get_all_conversations(
-        &self,
-        limit: Option<usize>,
-    ) -> anyhow::Result<Option<Vec<Conversation>>> {
+    async fn get_all_conversations(&self) -> anyhow::Result<Vec<Conversation>> {
         self.run_with_connection(move |connection, wid| {
             let workspace_id = wid.id() as i64;
             let query = conversations::table
@@ -101,24 +98,14 @@ impl ConversationRepository for ConversationRepositoryImpl {
                 .filter(conversations::initiator.is_null())
                 .load(connection)?;
 
-            if records.is_empty() {
-                return Ok(None);
-            }
-
-            let mut conversations: Vec<Conversation> = records
+            let conversations: Vec<Conversation> = records
                 .into_iter()
                 .map(Conversation::try_from)
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .filter(|conv| !conv.is_agent_initiated())
                 .collect();
-            if let Some(limit_value) = limit {
-                conversations.truncate(limit_value);
-            }
-            if conversations.is_empty() {
-                return Ok(None);
-            }
-            Ok(Some(conversations))
+            Ok(conversations)
         })
         .await
     }
@@ -126,7 +113,7 @@ impl ConversationRepository for ConversationRepositoryImpl {
     async fn get_sub_conversations(
         &self,
         parent_id: &ConversationId,
-    ) -> anyhow::Result<Option<Vec<Conversation>>> {
+    ) -> anyhow::Result<Vec<Conversation>> {
         let parent_id = *parent_id;
         self.run_with_connection(move |connection, wid| {
             let workspace_id = wid.id() as i64;
@@ -137,13 +124,9 @@ impl ConversationRepository for ConversationRepositoryImpl {
                 .order(conversations::updated_at.desc())
                 .load(connection)?;
 
-            if records.is_empty() {
-                return Ok(None);
-            }
-
             let conversations: Result<Vec<Conversation>, _> =
                 records.into_iter().map(Conversation::try_from).collect();
-            Ok(Some(conversations?))
+            Ok(conversations?)
         })
         .await
     }
@@ -280,33 +263,9 @@ mod tests {
         repo.upsert_conversation(conversation1.clone()).await?;
         repo.upsert_conversation(conversation2.clone()).await?;
 
-        let actual = repo.get_all_conversations(None).await?;
+        let actual = repo.get_all_conversations().await?;
 
-        assert!(actual.is_some());
-        let conversations = actual.unwrap();
-        assert_eq!(conversations.len(), 2);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_find_all_conversations_with_limit() -> anyhow::Result<()> {
-        let context1 =
-            Context::default().messages(vec![ContextMessage::user("Hello", None).into()]);
-        let context2 =
-            Context::default().messages(vec![ContextMessage::user("World", None).into()]);
-        let conversation1 = Conversation::new(ConversationId::generate())
-            .title(Some("Test Conversation".to_string()))
-            .context(Some(context1));
-        let conversation2 = Conversation::new(ConversationId::generate()).context(Some(context2));
-        let repo = repository()?;
-
-        repo.upsert_conversation(conversation1).await?;
-        repo.upsert_conversation(conversation2).await?;
-
-        let actual = repo.get_all_conversations(Some(1)).await?;
-
-        assert!(actual.is_some());
-        assert_eq!(actual.unwrap().len(), 1);
+        assert_eq!(actual.len(), 2);
         Ok(())
     }
 
@@ -328,7 +287,7 @@ mod tests {
         repo.upsert_conversation(agent_conversation).await?;
         repo.upsert_conversation(user_conversation.clone()).await?;
 
-        let actual = repo.get_all_conversations(None).await?.unwrap();
+        let actual = repo.get_all_conversations().await?;
         let expected = vec![user_conversation.id];
 
         assert_eq!(
@@ -342,9 +301,9 @@ mod tests {
     async fn test_find_all_conversations_empty() -> anyhow::Result<()> {
         let repo = repository()?;
 
-        let actual = repo.get_all_conversations(None).await?;
+        let actual = repo.get_all_conversations().await?;
 
-        assert!(actual.is_none());
+        assert!(actual.is_empty());
         Ok(())
     }
 
@@ -369,12 +328,10 @@ mod tests {
         repo.upsert_conversation(user_conv.clone()).await?;
         repo.upsert_conversation(child_conv).await?;
 
-        let actual = repo.get_all_conversations(None).await?;
+        let actual = repo.get_all_conversations().await?;
 
-        assert!(actual.is_some());
-        let conversations = actual.unwrap();
-        assert_eq!(conversations.len(), 1);
-        assert_eq!(conversations[0].id, user_conv.id);
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0].id, user_conv.id);
         Ok(())
     }
 
@@ -399,12 +356,10 @@ mod tests {
         repo.upsert_conversation(user_conv.clone()).await?;
         repo.upsert_conversation(agent_conv).await?;
 
-        let actual = repo.get_all_conversations(None).await?;
+        let actual = repo.get_all_conversations().await?;
 
-        assert!(actual.is_some());
-        let conversations = actual.unwrap();
-        assert_eq!(conversations.len(), 1);
-        assert_eq!(conversations[0].id, user_conv.id);
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0].id, user_conv.id);
         Ok(())
     }
 
@@ -1321,7 +1276,7 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 for _ in 0..10 {
                     // Read all conversations
-                    let _ = repo.get_all_conversations(Some(50)).await?;
+                    let _ = repo.get_all_conversations().await?;
                     tokio::task::yield_now().await;
                 }
                 anyhow::Result::<()>::Ok(())
