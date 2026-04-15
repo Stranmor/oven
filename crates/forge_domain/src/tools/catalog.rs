@@ -844,6 +844,16 @@ static FORGE_TOOLS_LOWER: LazyLock<HashMap<String, ToolName>> = LazyLock::new(||
         .collect()
 });
 
+// Cache of all tool definitions
+static TOOL_DEFINITIONS: LazyLock<HashMap<ToolKind, ToolDefinition>> = LazyLock::new(|| {
+    ToolCatalog::iter()
+        .map(|tool| {
+            let kind: ToolKind = tool.clone().into();
+            (kind, tool.definition())
+        })
+        .collect()
+});
+
 /// Normalizes a tool name received in a response before catalog matching.
 /// Trims surrounding whitespace and performs a case-insensitive lookup
 /// against all known catalog tool names, returning the canonical form when
@@ -1183,12 +1193,11 @@ impl ToolKind {
         ToolName::new(self.to_string().to_case(Case::Snake))
     }
 
-    // TODO: This is an extremely slow operation
     pub fn definition(&self) -> ToolDefinition {
-        ToolCatalog::iter()
-            .find(|tool| tool.definition().name == self.name())
-            .map(|tool| tool.definition())
-            .expect("Forge tool definition not found")
+        TOOL_DEFINITIONS
+            .get(self)
+            .cloned()
+            .expect("Forge tool definition not found in cache")
     }
 }
 

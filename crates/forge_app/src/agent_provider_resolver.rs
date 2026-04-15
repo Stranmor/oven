@@ -31,13 +31,7 @@ where
                 // If the agent definition has a provider, use it; otherwise use default
                 agent.provider
             } else {
-                // TODO: Needs review, should we throw an err here?
-                // we can throw crate::Error::AgentNotFound
-                self.0
-                    .get_session_config()
-                    .await
-                    .map(|c| c.provider)
-                    .ok_or_else(|| forge_domain::Error::NoDefaultSession)?
+                return Err(crate::Error::AgentNotFound(agent_id).into());
             }
         } else {
             self.0
@@ -58,13 +52,7 @@ where
             if let Some(agent) = self.0.get_agent(&agent_id).await? {
                 Ok(agent.model)
             } else {
-                // TODO: Needs review, should we throw an err here?
-                // we can throw crate::Error::AgentNotFound
-                self.0
-                    .get_session_config()
-                    .await
-                    .map(|c| c.model)
-                    .ok_or_else(|| forge_domain::Error::NoDefaultSession.into())
+                Err(crate::Error::AgentNotFound(agent_id).into())
             }
         } else {
             self.0
