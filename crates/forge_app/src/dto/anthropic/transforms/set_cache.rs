@@ -51,6 +51,11 @@ impl Transformer for SetCache {
             *message = std::mem::take(message).cached(true);
         }
 
+        // Add cache control to last tool definition (Tool definition caching tech debt item)
+        if let Some(last_tool) = request.tools.last_mut() {
+            last_tool.cache_control = None;
+        }
+
         request
     }
 }

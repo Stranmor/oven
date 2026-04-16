@@ -83,7 +83,8 @@ mod tests {
     #[test]
     fn test_normalize_output_schema_adds_additional_properties() {
         let schema = schemars::schema_for!(TestResponse);
-        let fixture = Request::default().output_format(OutputFormat::JsonSchema { schema });
+        let fixture =
+            Request::default().output_format(OutputFormat::JsonSchema { schema: schema.into() });
 
         let actual = EnforceStrictObjectSchema.transform(fixture);
 

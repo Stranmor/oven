@@ -752,6 +752,11 @@ impl<I: Services> FsWriteService for I {
         content: String,
         overwrite: bool,
     ) -> anyhow::Result<FsWriteOutput> {
+        self.snapshot_service()
+            .create_snapshot(std::path::PathBuf::from(&path))
+            .await
+            .ok(); // Ignore snapshot errors to not fail the write
+
         self.fs_create_service()
             .write(path, content, overwrite)
             .await
@@ -781,6 +786,11 @@ impl<I: Services> FsPatchService for I {
         content: String,
         replace_all: bool,
     ) -> anyhow::Result<PatchOutput> {
+        self.snapshot_service()
+            .create_snapshot(std::path::PathBuf::from(&path))
+            .await
+            .ok();
+
         self.fs_patch_service()
             .patch(path, search, content, replace_all)
             .await
@@ -791,6 +801,11 @@ impl<I: Services> FsPatchService for I {
         path: String,
         edits: Vec<forge_domain::PatchEdit>,
     ) -> anyhow::Result<PatchOutput> {
+        self.snapshot_service()
+            .create_snapshot(std::path::PathBuf::from(&path))
+            .await
+            .ok();
+
         self.fs_patch_service().multi_patch(path, edits).await
     }
 }
@@ -818,6 +833,11 @@ impl<I: Services> ImageReadService for I {
 #[async_trait::async_trait]
 impl<I: Services> FsRemoveService for I {
     async fn remove(&self, path: String) -> anyhow::Result<FsRemoveOutput> {
+        self.snapshot_service()
+            .create_snapshot(std::path::PathBuf::from(&path))
+            .await
+            .ok();
+
         self.fs_remove_service().remove(path).await
     }
 }

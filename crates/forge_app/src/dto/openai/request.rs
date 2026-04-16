@@ -320,7 +320,8 @@ impl From<ToolDefinition> for Tool {
                 description: Some(value.description),
                 name: value.name.to_string(),
                 parameters: {
-                    let mut params = serde_json::to_value(value.input_schema)
+                    // Ensure OpenAI compatibility by adding properties field if missing
+                    let mut params = serde_json::to_value(&value.input_schema)
                         .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
                     // Ensure OpenAI compatibility by adding properties field if missing
                     if let Some(obj) = params.as_object_mut()

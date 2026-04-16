@@ -8,7 +8,7 @@ use forge_app::domain::{
 use forge_app::dto::anthropic::{
     AuthSystemMessage, CapitalizeToolNames, DropInvalidToolUse, EnforceStrictObjectSchema,
     EventData, ListModelResponse, McpToolNames, ReasoningTransform, RemoveOutputFormat, Request,
-    SanitizeToolIds, SetCache,
+    SanitizeToolIds,
 };
 use forge_app::{EnvironmentInfra, HttpInfra};
 use forge_domain::{ChatRepository, Provider, ProviderId};
@@ -117,7 +117,7 @@ impl<T: HttpInfra> Anthropic<T> {
         // transform the context to match the request format
         let context = ReasoningTransform.transform(context);
 
-        let mut request = Request::try_from(context)?.max_tokens(max_tokens as u64);
+        let mut request = Request::try_from(context)?.max_tokens(max_tokens.min(8192) as u64);
 
         // For Vertex AI Anthropic, model is in the URL path, not the request body
         if self.provider.id == ProviderId::VERTEX_AI_ANTHROPIC {
@@ -136,15 +136,9 @@ impl<T: HttpInfra> Anthropic<T> {
         // Vertex AI does not support output_format, so we skip schema enforcement
         // and remove any output_format field
         let request = if self.provider.id == ProviderId::VERTEX_AI_ANTHROPIC {
-            pipeline
-                .pipe(RemoveOutputFormat)
-                .pipe(SetCache)
-                .transform(request)
+            pipeline.pipe(RemoveOutputFormat).transform(request)
         } else {
-            pipeline
-                .pipe(EnforceStrictObjectSchema)
-                .pipe(SetCache)
-                .transform(request)
+            pipeline.pipe(EnforceStrictObjectSchema).transform(request)
         };
 
         let url = if self.provider.id == ProviderId::VERTEX_AI_ANTHROPIC {
@@ -970,10 +964,7 @@ mod tests {
             .pipe(DropInvalidToolUse)
             .pipe(SanitizeToolIds);
 
-        let request = pipeline
-            .pipe(RemoveOutputFormat)
-            .pipe(SetCache)
-            .transform(request);
+        let request = pipeline.pipe(RemoveOutputFormat).transform(request);
 
         // Verify output_format is None for Vertex AI
         assert_eq!(

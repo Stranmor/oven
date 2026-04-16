@@ -236,6 +236,49 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
             .await
     }
 
+    async fn execute_chat_turn_vetted(
+        &self,
+        model_id: &ModelId,
+        context: Context,
+        reasoning_supported: bool,
+    ) -> anyhow::Result<ChatCompletionMessageFull> {
+        let msg = self
+            .execute_chat_turn(model_id, context, reasoning_supported)
+            .await?;
+
+        let trimmed = msg.content.trim();
+
+        if msg.tool_calls.is_empty() {
+            // 1. Completely empty response
+            let is_empty = trimmed.is_empty();
+
+            // 2. Short generative garbage / parsing artifacts
+            let is_short_garbage = matches!(
+                trimmed,
+                "}" | "{" | "]" | "[" | "```" | "```json" | "```json\n```"
+            );
+
+            // 3. Raw JSON/Markdown hallucination (model output tool call syntax as raw text)
+            let has_tool_keywords = trimmed.contains("\"name\"")
+                && (trimmed.contains("\"arguments\"")
+                    || trimmed.contains("\"tool_calls\"")
+                    || trimmed.contains("\"function_call\""));
+            let is_json_hallucination =
+                (trimmed.starts_with('{') || trimmed.starts_with("```json")) && has_tool_keywords;
+
+            if is_empty || is_short_garbage || is_json_hallucination {
+                return Err(anyhow::anyhow!(forge_domain::Error::Retryable(
+                    anyhow::anyhow!(
+                        "Model hallucination detected (empty, garbage, or unparsed JSON). Triggering retry. Output: {:?}",
+                        trimmed
+                    )
+                )));
+            }
+        }
+
+        Ok(msg)
+    }
+
     // Create a helper method with the core functionality
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let model_id = self.get_model();
@@ -283,7 +326,7 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
             let message = crate::retry::retry_with_config(
                 &self.config.clone().retry.unwrap_or_default(),
                 || {
-                    self.execute_chat_turn(
+                    self.execute_chat_turn_vetted(
                         &model_id,
                         context.clone(),
                         context.is_reasoning_supported(),

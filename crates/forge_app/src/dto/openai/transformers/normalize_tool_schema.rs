@@ -26,10 +26,14 @@ impl Transformer for NormalizeToolSchema {
         if let Some(tools) = request.tools.as_mut() {
             for tool in tools.iter_mut() {
                 if let crate::dto::openai::Tool::Function { function } = tool {
-                    if let Some(obj) = function.parameters.as_object_mut() {
-                        // Remove tool usage description and title from parameters property
-                        obj.remove("description");
-                        obj.remove("title");
+                    if let Ok(mut schema_value) = serde_json::to_value(&function.parameters) {
+                        if let Some(obj) = schema_value.as_object_mut() {
+                            obj.remove("description");
+                            obj.remove("title");
+                        }
+                        if let Ok(new_schema) = serde_json::from_value(schema_value) {
+                            function.parameters = new_schema;
+                        }
                     }
                 }
             }
@@ -45,7 +49,12 @@ impl Transformer for EnforceStrictToolSchema {
         if let Some(tools) = request.tools.as_mut() {
             for tool in tools.iter_mut() {
                 if let crate::dto::openai::Tool::Function { function } = tool {
-                    enforce_strict_schema(&mut function.parameters, true);
+                    if let Ok(mut schema_value) = serde_json::to_value(&function.parameters) {
+                        enforce_strict_schema(&mut schema_value, true);
+                        if let Ok(new_schema) = serde_json::from_value(schema_value) {
+                            function.parameters = new_schema;
+                        }
+                    }
                 }
             }
         }

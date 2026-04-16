@@ -37,6 +37,10 @@ pub struct Request {
     pub output_format: Option<OutputFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anthropic_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
 }
 
 #[derive(Serialize, Default)]
@@ -106,7 +110,7 @@ pub struct OutputConfig {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OutputFormat {
     #[serde(rename = "json_schema")]
-    JsonSchema { schema: schemars::Schema },
+    JsonSchema { schema: serde_json::Value },
 }
 
 impl TryFrom<forge_domain::Context> for Request {
@@ -186,7 +190,8 @@ impl TryFrom<forge_domain::Context> for Request {
             Some(Thinking::Adaptive { .. }) | Some(Thinking::Disabled) | None => request
                 .max_tokens
                 .map(|v| v as u64)
-                .unwrap_or(default_max_tokens),
+                .unwrap_or(default_max_tokens)
+                .min(8192),
         };
 
         let (temperature, top_p, top_k) = if thinking.is_some() {
@@ -233,9 +238,17 @@ impl TryFrom<forge_domain::Context> for Request {
                     None
                 }
                 forge_domain::ResponseFormat::JsonSchema(schema) => {
-                    Some(OutputFormat::JsonSchema { schema: *schema })
+                    let mut schema_val = serde_json::to_value(&*schema).unwrap_or_default();
+                    if let Some(obj) = schema_val.as_object_mut() {
+                        obj.remove("$schema");
+                        obj.remove("title");
+                        obj.remove("description");
+                    }
+                    Some(OutputFormat::JsonSchema { schema: schema_val })
                 }
             }),
+            frequency_penalty: request.frequency_penalty.map(|f| f as f32),
+            presence_penalty: request.presence_penalty.map(|f| f as f32),
             ..Default::default()
         })
     }
@@ -565,11 +578,28 @@ pub struct ToolDefinition {
 impl TryFrom<forge_domain::ToolDefinition> for ToolDefinition {
     type Error = anyhow::Error;
     fn try_from(value: forge_domain::ToolDefinition) -> std::result::Result<Self, Self::Error> {
+        let mut params = serde_json::to_value(value.input_schema)?;
+
+        // Ensure Anthropic strict compatibility by adding properties field if missing
+        if let Some(obj) = params.as_object_mut() {
+            if obj.get("type") == Some(&serde_json::Value::String("object".to_string()))
+                && !obj.contains_key("properties")
+            {
+                obj.insert(
+                    "properties".to_string(),
+                    serde_json::Value::Object(serde_json::Map::new()),
+                );
+            }
+            obj.remove("$schema");
+            obj.remove("title");
+            obj.remove("description");
+        }
+
         Ok(ToolDefinition {
             name: value.name.to_string(),
             description: Some(value.description),
             cache_control: None,
-            input_schema: serde_json::to_value(value.input_schema)?,
+            input_schema: params,
         })
     }
 }
@@ -939,7 +969,8 @@ mod tests {
         });
         let actual = Request::try_from(fixture).unwrap();
 
-        // Default budget is 10000, max_tokens should be 10000 + 4096 = 14096
-        assert_eq!(actual.max_tokens, 14096);
+        // Adaptive/non-budget thinking is capped for Anthropic-compatible proxy
+        // compatibility.
+        assert_eq!(actual.max_tokens, 8192);
     }
 }
