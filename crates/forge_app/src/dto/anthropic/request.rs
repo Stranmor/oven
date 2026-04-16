@@ -428,7 +428,7 @@ pub enum Content {
     ToolResult {
         tool_use_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        content: Option<String>,
+        content: Option<Vec<ToolResultContent>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -440,6 +440,15 @@ pub enum Content {
         #[serde(skip_serializing_if = "Option::is_none")]
         thinking: Option<String>,
     },
+}
+
+/// Structured content block inside a `tool_result`.
+/// The Anthropic API accepts both plain strings and arrays of content blocks,
+/// but some proxies (e.g. Gemini-compatible) strictly require the array form.
+#[derive(Serialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolResultContent {
+    Text { text: String },
 }
 
 impl Default for Content {
@@ -501,18 +510,17 @@ impl TryFrom<forge_domain::ToolResult> for Content {
             .call_id
             .as_ref()
             .ok_or(forge_domain::Error::ToolCallMissingId)?;
+        let text = value
+            .output
+            .values
+            .iter()
+            .filter_map(|item| item.as_str().map(|s| s.to_string()))
+            .next()
+            .unwrap_or_default();
         Ok(Content::ToolResult {
             tool_use_id: call_id.as_str().to_string(),
             cache_control: None,
-            content: Some(
-                value
-                    .output
-                    .values
-                    .iter()
-                    .filter_map(|item| item.as_str().map(|s| s.to_string()))
-                    .next()
-                    .unwrap_or_default(),
-            ),
+            content: Some(vec![ToolResultContent::Text { text }]),
             is_error: Some(value.is_error()),
         })
     }
