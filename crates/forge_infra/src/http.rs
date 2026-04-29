@@ -11,6 +11,7 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use reqwest::redirect::Policy;
 use reqwest::{Certificate, Client, Response, StatusCode, Url};
 use reqwest_eventsource::{EventSource, RequestBuilderExt};
+use serde_json::Value;
 use tracing::{debug, warn};
 
 const VERSION: &str = match option_env!("APP_VERSION") {
@@ -231,6 +232,94 @@ pub fn sanitize_headers(headers: &HeaderMap) -> HeaderMap {
         .collect()
 }
 
+const REDACTED_VALUE: &str = "[REDACTED]";
+const REDACTED_PAYLOAD: &str = "[REDACTED_PAYLOAD]";
+const REDACTED_NON_JSON_BODY: &[u8] = br#"{"debug_request":"[REDACTED_NON_JSON_BODY]"}"#;
+
+/// Sanitizes request bodies before writing debug logs. Debug logs are useful for
+/// transport diagnostics, but raw model payloads and credentials must never be
+/// persisted to disk.
+pub fn sanitize_debug_body(body: &Bytes) -> Bytes {
+    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
+        return Bytes::from_static(REDACTED_NON_JSON_BODY);
+    };
+
+    redact_json_value(&mut value);
+
+    match serde_json::to_vec(&value) {
+        Ok(serialized) => Bytes::from(serialized),
+        Err(error) => {
+            warn!(%error, "Failed to serialize sanitized debug request body");
+            Bytes::from_static(REDACTED_NON_JSON_BODY)
+        }
+    }
+}
+
+fn redact_json_value(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, nested) in map.iter_mut() {
+                if is_secret_key(key) {
+                    *nested = Value::String(REDACTED_VALUE.to_string());
+                } else if is_payload_key(key) {
+                    *nested = Value::String(REDACTED_PAYLOAD.to_string());
+                } else {
+                    redact_json_value(nested);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_json_value(item);
+            }
+        }
+        Value::String(text) if is_sensitive_string(text) => {
+            *text = REDACTED_VALUE.to_string();
+        }
+        _ => {}
+    }
+}
+
+fn is_secret_key(key: &str) -> bool {
+    let normalized = key.replace(['-', '_'], "").to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "authorization"
+            | "apikey"
+            | "xapikey"
+            | "xgoogapikey"
+            | "accesstoken"
+            | "refreshtoken"
+            | "idtoken"
+            | "clientsecret"
+            | "password"
+            | "secret"
+            | "cookie"
+            | "setcookie"
+            | "sessiontoken"
+            | "proxyurl"
+            | "httpproxy"
+            | "httpsproxy"
+            | "socksproxy"
+    )
+}
+
+fn is_payload_key(key: &str) -> bool {
+    let normalized = key.replace(['-', '_'], "").to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "messages" | "prompt" | "input" | "content" | "text" | "system" | "instructions" | "tools"
+    )
+}
+
+fn is_sensitive_string(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.starts_with("bearer ")
+        || lower.starts_with("sk-")
+        || lower.starts_with("sk_ag")
+        || (lower.contains("://") && lower.contains('@'))
+}
+
 impl<F: forge_app::FileWriterInfra + 'static> ForgeHttpInfra<F> {
     fn write_debug_request(&self, body: &Bytes) {
         if let Some(debug_path) = &self.debug_requests {
@@ -238,7 +327,7 @@ impl<F: forge_app::FileWriterInfra + 'static> ForgeHttpInfra<F> {
             let body_clone = body.clone();
             let debug_path = debug_path.clone();
             tokio::spawn(async move {
-                let mut data = body_clone.to_vec();
+                let mut data = sanitize_debug_body(&body_clone).to_vec();
                 data.push(b'\n');
                 let _ = file_writer.append(&debug_path, Bytes::from(data)).await;
             });
@@ -363,6 +452,10 @@ mod tests {
         ForgeConfig { debug_requests, ..Default::default() }
     }
 
+    fn redacted_non_json_line() -> Bytes {
+        Bytes::from_static(b"{\"debug_request\":\"[REDACTED_NON_JSON_BODY]\"}\n")
+    }
+
     #[tokio::test]
     async fn test_debug_requests_none_does_not_write() {
         let file_writer = MockFileWriter::new();
@@ -404,9 +497,7 @@ mod tests {
         let writes = file_writer.get_writes().await;
         assert_eq!(writes.len(), 1, "Should write one file");
         assert_eq!(writes[0].0, debug_path);
-        let mut expected = body.to_vec();
-        expected.push(b'\n');
-        assert_eq!(writes[0].1, Bytes::from(expected));
+        assert_eq!(writes[0].1, redacted_non_json_line());
     }
 
     #[tokio::test]
@@ -427,9 +518,7 @@ mod tests {
         let writes = file_writer.get_writes().await;
         assert_eq!(writes.len(), 1, "Should write one file");
         assert_eq!(writes[0].0, debug_path);
-        let mut expected = body.to_vec();
-        expected.push(b'\n');
-        assert_eq!(writes[0].1, Bytes::from(expected));
+        assert_eq!(writes[0].1, redacted_non_json_line());
     }
 
     #[tokio::test]
@@ -476,9 +565,7 @@ mod tests {
             "Should write one file for POST when debug_requests is set"
         );
         assert_eq!(writes[0].0, debug_path);
-        let mut expected = body.to_vec();
-        expected.push(b'\n');
-        assert_eq!(writes[0].1, Bytes::from(expected));
+        assert_eq!(writes[0].1, redacted_non_json_line());
     }
 
     #[tokio::test]
@@ -502,9 +589,55 @@ mod tests {
         // Should write to debug_path (no parent dir needed)
         assert_eq!(writes.len(), 1, "Should write one file");
         assert_eq!(writes[0].0, debug_path);
-        let mut expected = body.to_vec();
-        expected.push(b'\n');
-        assert_eq!(writes[0].1, Bytes::from(expected));
+        assert_eq!(writes[0].1, redacted_non_json_line());
+    }
+
+    #[test]
+    fn test_sanitize_debug_body_redacts_model_payloads_and_secrets() {
+        let body = Bytes::from(
+            r#"{
+                "model": "gemini-3.1-pro-high",
+                "messages": [{"role": "user", "content": "secret prompt"}],
+                "max_tokens": 4096,
+                "api_key": "sk-secret",
+                "refresh_token": "refresh-secret",
+                "proxy_url": "socks5://user:pass@127.0.0.1:1080",
+                "metadata": {
+                    "authorization": "Bearer nested-secret",
+                    "request_id": "safe-request-id"
+                }
+            }"#,
+        );
+
+        let sanitized = sanitize_debug_body(&body);
+        let parsed_result = serde_json::from_slice::<Value>(&sanitized);
+        assert!(
+            parsed_result.is_ok(),
+            "sanitized debug body must remain JSON: {:?}",
+            parsed_result.as_ref().err()
+        );
+        let Ok(parsed) = parsed_result else {
+            return;
+        };
+
+        assert_eq!(parsed["model"], "gemini-3.1-pro-high");
+        assert_eq!(parsed["max_tokens"], 4096);
+        assert_eq!(parsed["messages"], REDACTED_PAYLOAD);
+        assert_eq!(parsed["api_key"], REDACTED_VALUE);
+        assert_eq!(parsed["refresh_token"], REDACTED_VALUE);
+        assert_eq!(parsed["proxy_url"], REDACTED_VALUE);
+        assert_eq!(parsed["metadata"]["authorization"], REDACTED_VALUE);
+        assert_eq!(parsed["metadata"]["request_id"], "safe-request-id");
+    }
+
+    #[test]
+    fn test_sanitize_debug_body_redacts_non_json() {
+        let sanitized = sanitize_debug_body(&Bytes::from("raw prompt text"));
+
+        assert_eq!(
+            sanitized,
+            Bytes::from_static(b"{\"debug_request\":\"[REDACTED_NON_JSON_BODY]\"}")
+        );
     }
 
     #[test]
