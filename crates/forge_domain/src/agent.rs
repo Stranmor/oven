@@ -231,16 +231,18 @@ impl Agent {
         self
     }
 
-    /// Applies a safe `token_threshold` by taking the minimum of an absolute
-    /// token cap and a percentage-based context-window cap.
+    /// Applies a safe `token_threshold` based on the model's context window.
     ///
-    /// The absolute cap comes from `compact.token_threshold`, or falls back to
-    /// a default of 100,000 tokens. The context-window cap comes from
-    /// `compact.token_threshold_percentage`, or falls back to 70%
-    /// of the selected model's context window. If model metadata is
-    /// unavailable, a default 128K context window is used. The lower of
-    /// these two values is used to preserve headroom for tool outputs and
-    /// follow-up messages.
+    /// When the model's `context_length` is **known**, the threshold is capped
+    /// to the lower of the configured absolute threshold and a percentage of
+    /// the context window (default 70%). This preserves headroom for tool
+    /// outputs and follow-up messages.
+    ///
+    /// When the model's `context_length` is **unknown** (model not found in
+    /// the provider's list, or the provider doesn't report context length),
+    /// the configured threshold is used as-is without clamping. Applying a
+    /// percentage cap against a guessed default would silently override
+    /// explicit user configuration.
     ///
     /// # Arguments
     /// * `selected_model` - The model that will be used for this agent
@@ -248,27 +250,32 @@ impl Agent {
     /// # Returns
     /// The agent with a safe token_threshold configured
     pub fn compaction_threshold(mut self, selected_model: Option<&Model>) -> Self {
-        const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
         const DEFAULT_TOKEN_THRESHOLD: usize = 100_000;
         const DEFAULT_CONTEXT_WINDOW_PERCENTAGE: f64 = 0.7;
-
-        let context_window = selected_model
-            .and_then(|model| model.context_length)
-            .and_then(|context_window| usize::try_from(context_window).ok())
-            .unwrap_or(DEFAULT_CONTEXT_WINDOW);
 
         let configured_threshold = self
             .compact
             .token_threshold
             .unwrap_or(DEFAULT_TOKEN_THRESHOLD);
-        let context_window_percentage = self
-            .compact
-            .token_threshold_percentage
-            .unwrap_or(DEFAULT_CONTEXT_WINDOW_PERCENTAGE);
-        let context_window_threshold =
-            ((context_window as f64) * context_window_percentage).floor() as usize;
 
-        self.compact.token_threshold = Some(configured_threshold.min(context_window_threshold));
+        let known_context_window = selected_model
+            .and_then(|model| model.context_length)
+            .and_then(|cl| usize::try_from(cl).ok());
+
+        let final_threshold = if let Some(context_window) = known_context_window {
+            // Model context window is known — clamp to a safe percentage.
+            let percentage = self
+                .compact
+                .token_threshold_percentage
+                .unwrap_or(DEFAULT_CONTEXT_WINDOW_PERCENTAGE);
+            let context_window_threshold = ((context_window as f64) * percentage).floor() as usize;
+            configured_threshold.min(context_window_threshold)
+        } else {
+            // Model context window is unknown — trust the configured threshold.
+            configured_threshold
+        };
+
+        self.compact.token_threshold = Some(final_threshold);
 
         self
     }
@@ -390,9 +397,9 @@ mod tests {
     }
 
     #[test]
-    fn test_cap_compact_token_threshold_uses_default_when_selected_model_is_missing() {
-        // With the fix, even without model info, we set a safe default threshold
-        // based on a default context window of 128K (70% = 89.6K)
+    fn test_cap_compact_token_threshold_uses_configured_when_selected_model_is_missing() {
+        // When the model is not found, the configured threshold is trusted as-is.
+        // We can't meaningfully clamp against an unknown context window.
         let fixture = Agent::new(
             AgentId::new("test"),
             ProviderId::OPENAI,
@@ -401,16 +408,14 @@ mod tests {
         .compact(Compact::new().token_threshold(100_000_usize));
 
         let actual = fixture.compaction_threshold(None);
-        // 100K gets capped to 70% of default 128K = 89.6K
-        let expected = Some(89_600);
+        let expected = Some(100_000);
 
         assert_eq!(actual.compact.token_threshold, expected);
     }
 
-    /// BUG 1: compaction_threshold returns early when token_threshold is None,
-    /// failing to set a default threshold based on the model's context window.
-    /// This causes agents to never trigger compaction, leading to
-    /// context_length_exceeded errors.
+    /// When no token_threshold is configured, the default (100K) is used.
+    /// If the model's context window is known, that default is capped to
+    /// 70% of the context window.
     #[test]
     fn test_compaction_threshold_should_set_default_when_token_threshold_is_none() {
         // Agent with NO token_threshold set (default Compact)
@@ -426,14 +431,9 @@ mod tests {
 
         let actual = fixture.compaction_threshold(Some(&selected_model));
 
-        // EXPECTED: Should set default threshold to 70% of context window (128000 * 0.7
-        // = 89600) ACTUAL BUG: Returns early with token_threshold still as None
+        // default 100K capped to 70% of 128K = 89.6K
         let expected_threshold = Some(89_600);
-        assert_eq!(
-            actual.compact.token_threshold, expected_threshold,
-            "BUG: compaction_threshold should set default to 70% of model context window when token_threshold is None, \
-             but it returns early leaving it as None. This causes context_length_exceeded errors with codex-spark."
-        );
+        assert_eq!(actual.compact.token_threshold, expected_threshold);
     }
 
     /// BUG 2: With default token_threshold of 100000 and codex-spark's 128000
@@ -475,11 +475,10 @@ mod tests {
         );
     }
 
-    /// BUG 3: Agent with no compact config and no model info should still work,
-    /// but currently compaction_threshold does nothing and context grows
-    /// unbounded.
+    /// When model is found but has no context_length, the default threshold
+    /// (100K) is used without clamping.
     #[test]
-    fn test_compaction_threshold_no_model_context_length_should_still_set_default() {
+    fn test_compaction_threshold_no_model_context_length_uses_default() {
         // Agent with no compact config
         let fixture = Agent::new(
             AgentId::new("test"),
@@ -492,13 +491,26 @@ mod tests {
 
         let actual = fixture.compaction_threshold(Some(&selected_model));
 
-        // EXPECTED: Should set a reasonable default threshold (e.g., 64000 for 128K
-        // default window) or at least set SOME threshold to prevent unbounded
-        // growth ACTUAL BUG: Returns early with token_threshold still as None
-        assert!(
-            actual.compact.token_threshold.is_some(),
-            "BUG: compaction_threshold should set a default threshold even when model context_length is unknown. \
-             Currently returns early with None, causing unbounded context growth."
-        );
+        // No context_length → no clamping, default 100K is used as-is
+        assert_eq!(actual.compact.token_threshold, Some(100_000));
+    }
+
+    /// When user explicitly sets a large threshold and model has no
+    /// context_length, the user's threshold is preserved.
+    #[test]
+    fn test_compaction_threshold_preserves_user_config_when_context_unknown() {
+        let fixture = Agent::new(
+            AgentId::new("test"),
+            ProviderId::OPENAI,
+            ModelId::new("gpt-5.4"),
+        )
+        .compact(Compact::new().token_threshold(400_000_usize));
+
+        // Model not found at all
+        let actual = fixture.compaction_threshold(None);
+
+        // User's 400K threshold must be preserved — no clamping against
+        // an unknown context window.
+        assert_eq!(actual.compact.token_threshold, Some(400_000));
     }
 }

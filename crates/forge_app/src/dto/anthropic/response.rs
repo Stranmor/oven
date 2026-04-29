@@ -24,11 +24,16 @@ pub struct ListModelResponse {
 pub struct Model {
     pub id: String,
     pub display_name: Option<String>,
+    /// Context window size returned by the API (e.g. from Antigravity proxy).
+    /// Falls back to hardcoded `get_context_length()` when absent.
+    pub context_length: Option<u64>,
 }
 
 impl From<Model> for forge_domain::Model {
     fn from(value: Model) -> Self {
-        let context_length = get_context_length(&value.id);
+        let context_length = value
+            .context_length
+            .or_else(|| get_context_length(&value.id));
         let input_modalities = if value.id.contains("claude-3")
             || value.id.contains("claude-4")
             || value.id.contains("claude-sonnet")
@@ -768,6 +773,7 @@ mod tests {
         let fixture = Model {
             id: "claude-sonnet-4-5-20250929".to_string(),
             display_name: Some("Claude 3.5 Sonnet (New)".to_string()),
+            context_length: None,
         };
 
         let actual: forge_domain::Model = fixture.into();
@@ -782,12 +788,28 @@ mod tests {
         let fixture = Model {
             id: "unknown-claude-model".to_string(),
             display_name: Some("Unknown Model".to_string()),
+            context_length: None,
         };
 
         let actual: forge_domain::Model = fixture.into();
 
         assert_eq!(actual.context_length, None);
         assert_eq!(actual.id.as_str(), "unknown-claude-model");
+    }
+
+    #[test]
+    fn test_model_conversion_api_provided_context_length() {
+        // When the API returns context_length (e.g. Antigravity proxy), use it
+        // instead of the hardcoded fallback — enables non-Claude models like gpt-5.4
+        let fixture = Model {
+            id: "gpt-5.4".to_string(),
+            display_name: None,
+            context_length: Some(1_048_576),
+        };
+
+        let actual: forge_domain::Model = fixture.into();
+
+        assert_eq!(actual.context_length, Some(1_048_576));
     }
 
     #[test]

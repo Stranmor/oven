@@ -29,11 +29,7 @@ impl ConversationSelector {
             return Ok(None);
         }
 
-        // Filter to conversations with titles and context
-        let valid_conversations: Vec<&Conversation> = conversations
-            .iter()
-            .filter(|c| c.title.is_some() && c.context.is_some())
-            .collect();
+        let valid_conversations = Self::primary_conversations(conversations);
 
         if valid_conversations.is_empty() {
             return Ok(None);
@@ -121,13 +117,20 @@ impl ConversationSelector {
             Ok(None)
         }
     }
+
+    fn primary_conversations(conversations: &[Conversation]) -> Vec<&Conversation> {
+        conversations
+            .iter()
+            .filter(|conv| conv.context.is_some() && !conv.is_agent_initiated())
+            .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
     use forge_api::Conversation;
-    use forge_domain::{ConversationId, MetaData, Metrics};
+    use forge_domain::{Context, ContextMessage, ConversationId, MetaData, Metrics};
     use pretty_assertions::assert_eq;
 
     use super::*;
@@ -137,7 +140,7 @@ mod tests {
         Conversation {
             id: ConversationId::parse(id).unwrap(),
             title: title.map(|t| t.to_string()),
-            context: None,
+            context: Some(Context::default()),
             metrics: Metrics::default().started_at(now),
             metadata: MetaData { created_at: now, updated_at: Some(now) },
         }
@@ -178,5 +181,35 @@ mod tests {
         ];
 
         assert_eq!(conversations.len(), 2);
+    }
+
+    #[test]
+    fn test_primary_conversations_keeps_untitled_main_chat() {
+        let conversations = [create_test_conversation(
+            "550e8400-e29b-41d4-a716-446655440004",
+            None,
+        )];
+
+        let actual = ConversationSelector::primary_conversations(&conversations);
+        let expected = 1;
+
+        assert_eq!(actual.len(), expected);
+    }
+
+    #[test]
+    fn test_primary_conversations_excludes_agent_chat() {
+        let mut conversation =
+            create_test_conversation("550e8400-e29b-41d4-a716-446655440005", Some("Agent"));
+        conversation.context = Some(
+            Context::default()
+                .initiator("agent".to_string())
+                .messages(vec![ContextMessage::user("Task", None).into()]),
+        );
+        let conversations = [conversation];
+
+        let actual = ConversationSelector::primary_conversations(&conversations);
+        let expected = 0;
+
+        assert_eq!(actual.len(), expected);
     }
 }

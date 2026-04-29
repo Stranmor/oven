@@ -200,6 +200,14 @@ impl Conversation {
             })
             .unwrap_or_default()
     }
+
+    /// Returns whether the conversation was spawned by another agent.
+    pub fn is_agent_initiated(&self) -> bool {
+        self.context
+            .as_ref()
+            .and_then(|ctx| ctx.initiator.as_deref())
+            == Some("agent")
+    }
 }
 
 #[cfg(test)]
@@ -279,6 +287,27 @@ mod tests {
         let actual = conversation.related_conversation_ids();
 
         assert_eq!(actual, vec![agent_conv_id]);
+    }
+
+    #[test]
+    fn test_is_agent_initiated() {
+        let setup =
+            Conversation::generate().context(Context::default().initiator("agent".to_string()));
+
+        let actual = setup.is_agent_initiated();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_is_agent_initiated_defaults_to_false() {
+        let setup = Conversation::generate().context(Context::default());
+
+        let actual = setup.is_agent_initiated();
+        let expected = false;
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
