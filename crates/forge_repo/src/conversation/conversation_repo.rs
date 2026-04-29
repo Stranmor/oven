@@ -64,16 +64,12 @@ impl ConversationRepository for ConversationRepositoryImpl {
         let mut connection = self.pool.get_connection()?;
 
         let workspace_id = self.wid.id() as i64;
-        let mut query = conversations::table
+        let query = conversations::table
             .filter(conversations::workspace_id.eq(&workspace_id))
             .filter(conversations::context.is_not_null())
             .filter(conversations::parent_id.is_null())
             .order(conversations::updated_at.desc())
             .into_boxed();
-
-        if let Some(limit_value) = limit {
-            query = query.limit(limit_value as i64);
-        }
 
         let records: Vec<ConversationRecord> = query.load(&mut connection)?;
 
@@ -81,9 +77,20 @@ impl ConversationRepository for ConversationRepositoryImpl {
             return Ok(None);
         }
 
-        let conversations: Result<Vec<Conversation>, _> =
-            records.into_iter().map(Conversation::try_from).collect();
-        Ok(Some(conversations?))
+        let mut conversations: Vec<Conversation> = records
+            .into_iter()
+            .map(Conversation::try_from)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|conv| !conv.is_agent_initiated())
+            .collect();
+        if let Some(limit_value) = limit {
+            conversations.truncate(limit_value);
+        }
+        if conversations.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(conversations))
     }
 
     async fn get_sub_conversations(
@@ -112,17 +119,17 @@ impl ConversationRepository for ConversationRepositoryImpl {
     async fn get_last_conversation(&self) -> anyhow::Result<Option<Conversation>> {
         let mut connection = self.pool.get_connection()?;
         let workspace_id = self.wid.id() as i64;
-        let record: Option<ConversationRecord> = conversations::table
+        let conversation: Option<Conversation> = conversations::table
             .filter(conversations::workspace_id.eq(&workspace_id))
             .filter(conversations::context.is_not_null())
             .filter(conversations::parent_id.is_null())
             .order(conversations::updated_at.desc())
-            .first(&mut connection)
-            .optional()?;
-        let conversation = match record {
-            Some(record) => Some(Conversation::try_from(record)?),
-            None => None,
-        };
+            .load::<ConversationRecord>(&mut connection)?
+            .into_iter()
+            .map(Conversation::try_from)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .find(|conv| !conv.is_agent_initiated());
         Ok(conversation)
     }
 
@@ -252,6 +259,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_find_all_conversations_excludes_agent_initiated() -> anyhow::Result<()> {
+        let user_context =
+            Context::default().messages(vec![ContextMessage::user("User task", None).into()]);
+        let agent_context = Context::default()
+            .initiator("agent".to_string())
+            .messages(vec![ContextMessage::user("Agent task", None).into()]);
+        let user_conversation = Conversation::new(ConversationId::generate())
+            .title(Some("User Conversation".to_string()))
+            .context(Some(user_context));
+        let agent_conversation = Conversation::new(ConversationId::generate())
+            .title(Some("Agent Conversation".to_string()))
+            .context(Some(agent_context));
+        let repo = repository()?;
+
+        repo.upsert_conversation(agent_conversation).await?;
+        repo.upsert_conversation(user_conversation.clone()).await?;
+
+        let actual = repo.get_all_conversations(None).await?.unwrap();
+        let expected = vec![user_conversation.id];
+
+        assert_eq!(
+            actual.iter().map(|conv| conv.id).collect::<Vec<_>>(),
+            expected
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_find_all_conversations_empty() -> anyhow::Result<()> {
         let repo = repository()?;
 
@@ -315,6 +350,28 @@ mod tests {
         let actual = repo.get_last_conversation().await?;
 
         assert!(actual.is_none()); // Should not find conversations with empty contexts
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_find_last_conversation_skips_agent_initiated() -> anyhow::Result<()> {
+        let user_context =
+            Context::default().messages(vec![ContextMessage::user("User task", None).into()]);
+        let agent_context = Context::default()
+            .initiator("agent".to_string())
+            .messages(vec![ContextMessage::user("Agent task", None).into()]);
+        let user_conversation =
+            Conversation::new(ConversationId::generate()).context(Some(user_context));
+        let agent_conversation =
+            Conversation::new(ConversationId::generate()).context(Some(agent_context));
+        let repo = repository()?;
+
+        repo.upsert_conversation(user_conversation.clone()).await?;
+        repo.upsert_conversation(agent_conversation).await?;
+
+        let actual = repo.get_last_conversation().await?;
+
+        assert_eq!(actual.unwrap().id, user_conversation.id);
         Ok(())
     }
 
