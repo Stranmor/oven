@@ -21,7 +21,7 @@ struct CachedEntry<V> {
 /// using serde_json for maximum compatibility.
 pub struct CacacheStorage {
     cache_dir: PathBuf,
-    ttl_seconds: Option<u128>,
+    ttl: Option<std::time::Duration>,
 }
 
 impl CacacheStorage {
@@ -33,10 +33,10 @@ impl CacacheStorage {
     ///
     /// # Arguments
     /// * `cache_dir` - Directory where cache data will be stored
-    /// * `ttl_seconds` - Optional TTL in seconds. If provided, entries older
+    /// * `ttl` - Optional TTL duration. If provided, entries older
     ///   than this will be considered expired.
-    pub fn new(cache_dir: PathBuf, ttl_seconds: Option<u128>) -> Self {
-        Self { cache_dir, ttl_seconds }
+    pub fn new(cache_dir: PathBuf, ttl: Option<std::time::Duration>) -> Self {
+        Self { cache_dir, ttl }
     }
 
     /// Converts a key to a deterministic cache key string using its hash value.
@@ -62,9 +62,9 @@ impl CacacheStorage {
 
     /// Checks if a cached entry has expired based on TTL
     fn is_expired(&self, timestamp: u128) -> bool {
-        if let Some(ttl) = self.ttl_seconds {
+        if let Some(ttl) = self.ttl {
             let current = Self::get_current_timestamp();
-            current.saturating_sub(timestamp) > ttl
+            current.saturating_sub(timestamp) > (ttl.as_secs() as u128)
         } else {
             false
         }
@@ -211,7 +211,7 @@ mod tests {
     #[tokio::test]
     async fn test_ttl_not_expired() {
         let cache_dir = test_cache_dir();
-        let cache = CacacheStorage::new(cache_dir, Some(60)); // 60 seconds TTL
+        let cache = CacacheStorage::new(cache_dir, Some(std::time::Duration::from_secs(60))); // 60 seconds TTL
 
         let key = TestKey { id: "test".to_string() };
         let value = TestValue { data: "hello".to_string(), count: 42 };
@@ -227,7 +227,7 @@ mod tests {
     #[tokio::test]
     async fn test_ttl_expired() {
         let cache_dir = test_cache_dir();
-        let cache = CacacheStorage::new(cache_dir, Some(1)); // 1 second TTL
+        let cache = CacacheStorage::new(cache_dir, Some(std::time::Duration::from_secs(1))); // 1 second TTL
 
         let key = TestKey { id: "test".to_string() };
         let value = TestValue { data: "hello".to_string(), count: 42 };

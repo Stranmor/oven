@@ -15,35 +15,39 @@ pub struct Model {
     pub description: Option<String>,
 }
 
-impl From<Model> for forge_domain::Model {
-    fn from(value: Model) -> Self {
+impl Model {
+    pub fn into_domain(self, provider_id: forge_domain::ProviderId) -> forge_domain::Model {
         // Extract model ID from name (format: "models/gemini-2.0-flash")
-        let id = value
+        let id = self
             .name
             .strip_prefix("models/")
-            .unwrap_or(&value.name)
+            .unwrap_or(&self.name)
             .to_string();
 
         // Determine context length based on model name
-        let context_length = if id.contains("gemini-2.0") || id.contains("gemini-1.5") {
-            2_000_000 // 2M tokens for Gemini 2.0 and 1.5
-        } else {
-            32_000 // Default for older models
-        };
+        let context_length =
+            if id.contains("gemini-2.0") || id.contains("gemini-1.5") || id.contains("gemini-3") {
+                2_000_000 // 2M tokens for Gemini 2.0 and 1.5
+            } else {
+                32_000 // Default for older models
+            };
 
         forge_domain::Model {
             id: forge_domain::ModelId::new(id),
-            name: Some(value.display_name.unwrap_or(value.name)),
-            description: value.description,
+            provider_id: Some(provider_id),
+            name: Some(self.display_name.unwrap_or(self.name)),
+            description: self.description,
             context_length: Some(context_length),
             tools_supported: Some(true), // Google models support function calling
             supports_parallel_tool_calls: Some(true),
-            supports_reasoning: Some(true), // Gemini 2.0+ supports thinking
-            input_modalities: vec![],       // Google supports text, images, audio, video
+            supports_reasoning: None,
+            input_modalities: vec![
+                forge_domain::InputModality::Text,
+                forge_domain::InputModality::Image,
+            ],
         }
     }
 }
-
 /// EventData for Google streaming responses
 /// Google returns chunks directly without event wrappers
 #[derive(Deserialize, PartialEq, Clone, Debug)]
@@ -595,7 +599,8 @@ mod tests {
             display_name: Some("Gemini Pro".to_string()),
             description: Some("A model".to_string()),
         };
-        let domain_model: forge_domain::Model = model.into();
+        let domain_model: forge_domain::Model =
+            model.into_domain(forge_domain::ProviderId::from("google".to_string()));
         assert_eq!(domain_model.id.as_str(), "gemini-pro");
         assert_eq!(domain_model.name.unwrap(), "Gemini Pro");
         assert_eq!(domain_model.context_length.unwrap(), 32_000);
@@ -605,7 +610,9 @@ mod tests {
             display_name: None,
             description: None,
         };
-        let domain_model_v2: forge_domain::Model = model_v2.clone().into();
+        let domain_model_v2: forge_domain::Model = model_v2
+            .clone()
+            .into_domain(forge_domain::ProviderId::from("google".to_string()));
         assert_eq!(domain_model_v2.id.as_str(), "gemini-2.0-flash");
         assert_eq!(domain_model_v2.name.unwrap(), "models/gemini-2.0-flash");
         assert_eq!(domain_model_v2.context_length.unwrap(), 2_000_000);

@@ -4,8 +4,8 @@ use diesel::prelude::*;
 use forge_domain::{Conversation, ConversationId, ConversationRepository, WorkspaceHash};
 
 use crate::conversation::conversation_record::ConversationRecord;
-use crate::database::DatabasePool;
 use crate::database::schema::conversations;
+use crate::database::{DatabasePool, PooledSqliteConnection};
 
 pub struct ConversationRepositoryImpl {
     pool: Arc<DatabasePool>,
@@ -16,146 +16,169 @@ impl ConversationRepositoryImpl {
     pub fn new(pool: Arc<DatabasePool>, workspace_id: WorkspaceHash) -> Self {
         Self { pool, wid: workspace_id }
     }
+
+    async fn run_blocking<F, T>(&self, operation: F) -> anyhow::Result<T>
+    where
+        F: FnOnce(Arc<DatabasePool>, WorkspaceHash) -> anyhow::Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let pool = self.pool.clone();
+        let wid = self.wid;
+        tokio::task::spawn_blocking(move || operation(pool, wid))
+            .await
+            .map_err(|e| anyhow::anyhow!("Conversation repository task failed: {e}"))?
+    }
+
+    async fn run_with_connection<F, T>(&self, operation: F) -> anyhow::Result<T>
+    where
+        F: FnOnce(&mut PooledSqliteConnection, WorkspaceHash) -> anyhow::Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.run_blocking(move |pool, wid| {
+            let mut connection = pool.get_connection()?;
+            operation(&mut connection, wid)
+        })
+        .await
+    }
 }
 
 #[async_trait::async_trait]
 impl ConversationRepository for ConversationRepositoryImpl {
     async fn upsert_conversation(&self, conversation: Conversation) -> anyhow::Result<()> {
-        let mut connection = self.pool.get_connection()?;
-
-        let wid = self.wid;
-        let record = ConversationRecord::new(conversation, wid);
-        diesel::insert_into(conversations::table)
-            .values(&record)
-            .on_conflict(conversations::conversation_id)
-            .do_update()
-            .set((
-                conversations::title.eq(&record.title),
-                conversations::context.eq(&record.context),
-                conversations::updated_at.eq(record.updated_at),
-                conversations::metrics.eq(&record.metrics),
-                conversations::parent_id.eq(&record.parent_id),
-            ))
-            .execute(&mut connection)?;
-        Ok(())
+        self.run_with_connection(move |connection, wid| {
+            let record = ConversationRecord::new(conversation, wid);
+            diesel::insert_into(conversations::table)
+                .values(&record)
+                .on_conflict(conversations::conversation_id)
+                .do_update()
+                .set((
+                    conversations::title.eq(&record.title),
+                    conversations::context.eq(&record.context),
+                    conversations::updated_at.eq(record.updated_at),
+                    conversations::metrics.eq(&record.metrics),
+                    conversations::parent_id.eq(&record.parent_id),
+                    conversations::initiator.eq(&record.initiator),
+                ))
+                .execute(connection)?;
+            Ok(())
+        })
+        .await
     }
 
     async fn get_conversation(
         &self,
         conversation_id: &ConversationId,
     ) -> anyhow::Result<Option<Conversation>> {
-        let mut connection = self.pool.get_connection()?;
+        let conversation_id = *conversation_id;
+        self.run_with_connection(move |connection, _wid| {
+            let record: Option<ConversationRecord> = conversations::table
+                .filter(conversations::conversation_id.eq(conversation_id.into_string()))
+                .first(connection)
+                .optional()?;
 
-        let record: Option<ConversationRecord> = conversations::table
-            .filter(conversations::conversation_id.eq(conversation_id.into_string()))
-            .first(&mut connection)
-            .optional()?;
-
-        match record {
-            Some(record) => Ok(Some(Conversation::try_from(record)?)),
-            None => Ok(None),
-        }
+            match record {
+                Some(record) => Ok(Some(Conversation::try_from(record)?)),
+                None => Ok(None),
+            }
+        })
+        .await
     }
 
-    async fn get_all_conversations(
-        &self,
-        limit: Option<usize>,
-    ) -> anyhow::Result<Option<Vec<Conversation>>> {
-        let mut connection = self.pool.get_connection()?;
+    async fn get_all_conversations(&self) -> anyhow::Result<Vec<Conversation>> {
+        self.run_with_connection(move |connection, wid| {
+            let workspace_id = wid.id() as i64;
+            let query = conversations::table
+                .filter(conversations::workspace_id.eq(&workspace_id))
+                .filter(conversations::context.is_not_null())
+                .filter(conversations::parent_id.is_null())
+                .order(conversations::updated_at.desc())
+                .into_boxed();
 
-        let workspace_id = self.wid.id() as i64;
-        let query = conversations::table
-            .filter(conversations::workspace_id.eq(&workspace_id))
-            .filter(conversations::context.is_not_null())
-            .filter(conversations::parent_id.is_null())
-            // Exclude legacy sub-agent conversations that predate the parent_id
-            // migration: they have "initiator":"agent" in context JSON but no
-            // parent_id set.
-            .filter(
-                conversations::context
-                    .not_like("%\"initiator\":\"agent\"%"),
-            )
-            .order(conversations::updated_at.desc())
-            .into_boxed();
+            let records: Vec<ConversationRecord> = query
+                .filter(conversations::initiator.is_null())
+                .load(connection)?;
 
-        let records: Vec<ConversationRecord> = query.load(&mut connection)?;
-
-        if records.is_empty() {
-            return Ok(None);
-        }
-
-        let mut conversations: Vec<Conversation> = records
-            .into_iter()
-            .map(Conversation::try_from)
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .filter(|conv| !conv.is_agent_initiated())
-            .collect();
-        if let Some(limit_value) = limit {
-            conversations.truncate(limit_value);
-        }
-        if conversations.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(conversations))
+            let conversations: Vec<Conversation> = records
+                .into_iter()
+                .map(Conversation::try_from)
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|conv| !conv.is_agent_initiated())
+                .collect();
+            Ok(conversations)
+        })
+        .await
     }
 
     async fn get_sub_conversations(
         &self,
         parent_id: &ConversationId,
-    ) -> anyhow::Result<Option<Vec<Conversation>>> {
-        let mut connection = self.pool.get_connection()?;
+    ) -> anyhow::Result<Vec<Conversation>> {
+        let parent_id = *parent_id;
+        self.run_with_connection(move |connection, wid| {
+            let workspace_id = wid.id() as i64;
+            let records: Vec<ConversationRecord> = conversations::table
+                .filter(conversations::workspace_id.eq(&workspace_id))
+                .filter(conversations::context.is_not_null())
+                .filter(conversations::parent_id.eq(parent_id.into_string()))
+                .order(conversations::updated_at.desc())
+                .load(connection)?;
 
-        let workspace_id = self.wid.id() as i64;
-        let records: Vec<ConversationRecord> = conversations::table
-            .filter(conversations::workspace_id.eq(&workspace_id))
-            .filter(conversations::context.is_not_null())
-            .filter(conversations::parent_id.eq(parent_id.into_string()))
-            .order(conversations::updated_at.desc())
-            .load(&mut connection)?;
-
-        if records.is_empty() {
-            return Ok(None);
-        }
-
-        let conversations: Result<Vec<Conversation>, _> =
-            records.into_iter().map(Conversation::try_from).collect();
-        Ok(Some(conversations?))
+            let conversations: Result<Vec<Conversation>, _> =
+                records.into_iter().map(Conversation::try_from).collect();
+            Ok(conversations?)
+        })
+        .await
     }
 
     async fn get_last_conversation(&self) -> anyhow::Result<Option<Conversation>> {
-        let mut connection = self.pool.get_connection()?;
-        let workspace_id = self.wid.id() as i64;
-        let conversation: Option<Conversation> = conversations::table
-            .filter(conversations::workspace_id.eq(&workspace_id))
-            .filter(conversations::context.is_not_null())
-            .filter(conversations::parent_id.is_null())
-            // Exclude legacy sub-agent conversations (see get_all_conversations)
-            .filter(
-                conversations::context
-                    .not_like("%\"initiator\":\"agent\"%"),
-            )
-            .order(conversations::updated_at.desc())
-            .load::<ConversationRecord>(&mut connection)?
-            .into_iter()
-            .map(Conversation::try_from)
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .find(|conv| !conv.is_agent_initiated());
-        Ok(conversation)
+        self.run_with_connection(move |connection, wid| {
+            let workspace_id = wid.id() as i64;
+            let conversation: Option<Conversation> = conversations::table
+                .filter(conversations::workspace_id.eq(&workspace_id))
+                .filter(conversations::context.is_not_null())
+                .filter(conversations::parent_id.is_null())
+                .filter(conversations::initiator.is_null())
+                .order(conversations::updated_at.desc())
+                .load::<ConversationRecord>(connection)?
+                .into_iter()
+                .map(Conversation::try_from)
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .find(|conv| !conv.is_agent_initiated());
+            Ok(conversation)
+        })
+        .await
     }
 
     async fn delete_conversation(&self, conversation_id: &ConversationId) -> anyhow::Result<()> {
-        let mut connection = self.pool.get_connection()?;
-        let workspace_id = self.wid.id() as i64;
+        let conversation_id = *conversation_id;
+        self.run_with_connection(move |connection, wid| {
+            let workspace_id = wid.id() as i64;
 
-        // Security: Ensure users can only delete conversations within their workspace
-        diesel::delete(conversations::table)
-            .filter(conversations::workspace_id.eq(&workspace_id))
-            .filter(conversations::conversation_id.eq(conversation_id.into_string()))
-            .execute(&mut connection)?;
+            diesel::sql_query(
+                "WITH RECURSIVE descendants(id) AS (
+                SELECT conversation_id FROM conversations
+                WHERE parent_id = ? AND workspace_id = ?
+                UNION ALL
+                SELECT c.conversation_id FROM conversations c
+                JOIN descendants d ON c.parent_id = d.id
+                WHERE c.workspace_id = ?
+            )
+            DELETE FROM conversations
+            WHERE workspace_id = ?
+            AND (conversation_id IN (SELECT id FROM descendants) OR conversation_id = ?)",
+            )
+            .bind::<diesel::sql_types::Text, _>(conversation_id.into_string())
+            .bind::<diesel::sql_types::BigInt, _>(workspace_id)
+            .bind::<diesel::sql_types::BigInt, _>(workspace_id)
+            .bind::<diesel::sql_types::BigInt, _>(workspace_id)
+            .bind::<diesel::sql_types::Text, _>(conversation_id.into_string())
+            .execute(connection)?;
 
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -240,33 +263,9 @@ mod tests {
         repo.upsert_conversation(conversation1.clone()).await?;
         repo.upsert_conversation(conversation2.clone()).await?;
 
-        let actual = repo.get_all_conversations(None).await?;
+        let actual = repo.get_all_conversations().await?;
 
-        assert!(actual.is_some());
-        let conversations = actual.unwrap();
-        assert_eq!(conversations.len(), 2);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_find_all_conversations_with_limit() -> anyhow::Result<()> {
-        let context1 =
-            Context::default().messages(vec![ContextMessage::user("Hello", None).into()]);
-        let context2 =
-            Context::default().messages(vec![ContextMessage::user("World", None).into()]);
-        let conversation1 = Conversation::new(ConversationId::generate())
-            .title(Some("Test Conversation".to_string()))
-            .context(Some(context1));
-        let conversation2 = Conversation::new(ConversationId::generate()).context(Some(context2));
-        let repo = repository()?;
-
-        repo.upsert_conversation(conversation1).await?;
-        repo.upsert_conversation(conversation2).await?;
-
-        let actual = repo.get_all_conversations(Some(1)).await?;
-
-        assert!(actual.is_some());
-        assert_eq!(actual.unwrap().len(), 1);
+        assert_eq!(actual.len(), 2);
         Ok(())
     }
 
@@ -274,13 +273,13 @@ mod tests {
     async fn test_find_all_conversations_excludes_agent_initiated() -> anyhow::Result<()> {
         let user_context =
             Context::default().messages(vec![ContextMessage::user("User task", None).into()]);
-        let agent_context = Context::default()
-            .initiator("agent".to_string())
-            .messages(vec![ContextMessage::user("Agent task", None).into()]);
+        let agent_context =
+            Context::default().messages(vec![ContextMessage::user("Agent task", None).into()]);
         let user_conversation = Conversation::new(ConversationId::generate())
             .title(Some("User Conversation".to_string()))
             .context(Some(user_context));
         let agent_conversation = Conversation::new(ConversationId::generate())
+            .initiator(forge_domain::Initiator::Agent)
             .title(Some("Agent Conversation".to_string()))
             .context(Some(agent_context));
         let repo = repository()?;
@@ -288,7 +287,7 @@ mod tests {
         repo.upsert_conversation(agent_conversation).await?;
         repo.upsert_conversation(user_conversation.clone()).await?;
 
-        let actual = repo.get_all_conversations(None).await?.unwrap();
+        let actual = repo.get_all_conversations().await?;
         let expected = vec![user_conversation.id];
 
         assert_eq!(
@@ -302,37 +301,9 @@ mod tests {
     async fn test_find_all_conversations_empty() -> anyhow::Result<()> {
         let repo = repository()?;
 
-        let actual = repo.get_all_conversations(None).await?;
+        let actual = repo.get_all_conversations().await?;
 
-        assert!(actual.is_none());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_find_all_conversations_excludes_agent_initiated() -> anyhow::Result<()> {
-        let user_context =
-            Context::default().messages(vec![ContextMessage::user("Hello", None).into()]);
-        let agent_context = Context::default()
-            .initiator("agent".to_string())
-            .messages(vec![ContextMessage::user("Agent task", None).into()]);
-
-        let user_conv = Conversation::new(ConversationId::generate())
-            .title(Some("User Chat".to_string()))
-            .context(Some(user_context));
-        let agent_conv = Conversation::new(ConversationId::generate())
-            .title(Some("Agent Sub-Chat".to_string()))
-            .context(Some(agent_context));
-
-        let repo = repository()?;
-        repo.upsert_conversation(user_conv.clone()).await?;
-        repo.upsert_conversation(agent_conv).await?;
-
-        let actual = repo.get_all_conversations(None).await?;
-
-        assert!(actual.is_some());
-        let conversations = actual.unwrap();
-        assert_eq!(conversations.len(), 1);
-        assert_eq!(conversations[0].id, user_conv.id);
+        assert!(actual.is_empty());
         Ok(())
     }
 
@@ -341,14 +312,14 @@ mod tests {
         let parent_id = ConversationId::generate();
         let user_context =
             Context::default().messages(vec![ContextMessage::user("Hello", None).into()]);
-        let child_context = Context::default()
-            .initiator("agent".to_string())
-            .messages(vec![ContextMessage::user("Sub task", None).into()]);
+        let child_context =
+            Context::default().messages(vec![ContextMessage::user("Sub task", None).into()]);
 
         let user_conv = Conversation::new(parent_id)
             .title(Some("Parent Chat".to_string()))
             .context(Some(user_context));
         let child_conv = Conversation::new(ConversationId::generate())
+            .initiator(forge_domain::Initiator::Agent)
             .title(Some("Child Sub-Chat".to_string()))
             .context(Some(child_context))
             .parent_id(Some(parent_id));
@@ -357,12 +328,38 @@ mod tests {
         repo.upsert_conversation(user_conv.clone()).await?;
         repo.upsert_conversation(child_conv).await?;
 
-        let actual = repo.get_all_conversations(None).await?;
+        let actual = repo.get_all_conversations().await?;
 
-        assert!(actual.is_some());
-        let conversations = actual.unwrap();
-        assert_eq!(conversations.len(), 1);
-        assert_eq!(conversations[0].id, user_conv.id);
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0].id, user_conv.id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_find_all_conversations_excludes_agent_without_parent_id() -> anyhow::Result<()> {
+        let user_context =
+            Context::default().messages(vec![ContextMessage::user("Hello", None).into()]);
+        let agent_context =
+            Context::default().messages(vec![ContextMessage::user("Agent task", None).into()]);
+
+        let user_conv = Conversation::new(ConversationId::generate())
+            .title(Some("User Chat".to_string()))
+            .context(Some(user_context));
+        // Agent-initiated conversation WITHOUT parent_id — the old LIKE filter's
+        // weakness. The new dedicated `initiator` column catches it reliably.
+        let agent_conv = Conversation::new(ConversationId::generate())
+            .initiator(forge_domain::Initiator::Agent)
+            .title(Some("Agent No Parent".to_string()))
+            .context(Some(agent_context));
+
+        let repo = repository()?;
+        repo.upsert_conversation(user_conv.clone()).await?;
+        repo.upsert_conversation(agent_conv).await?;
+
+        let actual = repo.get_all_conversations().await?;
+
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0].id, user_conv.id);
         Ok(())
     }
 
@@ -370,9 +367,8 @@ mod tests {
     async fn test_find_last_conversation_excludes_agent_initiated() -> anyhow::Result<()> {
         let user_context =
             Context::default().messages(vec![ContextMessage::user("Hello", None).into()]);
-        let agent_context = Context::default()
-            .initiator("agent".to_string())
-            .messages(vec![ContextMessage::user("Agent task", None).into()]);
+        let agent_context =
+            Context::default().messages(vec![ContextMessage::user("Agent task", None).into()]);
 
         let user_conv = Conversation::new(ConversationId::generate())
             .title(Some("User Chat".to_string()))
@@ -384,6 +380,7 @@ mod tests {
         // if not filtered
         std::thread::sleep(std::time::Duration::from_millis(10));
         let agent_conv = Conversation::new(ConversationId::generate())
+            .initiator(forge_domain::Initiator::Agent)
             .title(Some("Agent Sub-Chat".to_string()))
             .context(Some(agent_context));
         repo.upsert_conversation(agent_conv).await?;
@@ -456,13 +453,13 @@ mod tests {
     async fn test_find_last_conversation_skips_agent_initiated() -> anyhow::Result<()> {
         let user_context =
             Context::default().messages(vec![ContextMessage::user("User task", None).into()]);
-        let agent_context = Context::default()
-            .initiator("agent".to_string())
-            .messages(vec![ContextMessage::user("Agent task", None).into()]);
+        let agent_context =
+            Context::default().messages(vec![ContextMessage::user("Agent task", None).into()]);
         let user_conversation =
             Conversation::new(ConversationId::generate()).context(Some(user_context));
-        let agent_conversation =
-            Conversation::new(ConversationId::generate()).context(Some(agent_context));
+        let agent_conversation = Conversation::new(ConversationId::generate())
+            .initiator(forge_domain::Initiator::Agent)
+            .context(Some(agent_context));
         let repo = repository()?;
 
         repo.upsert_conversation(user_conversation.clone()).await?;
@@ -532,6 +529,7 @@ mod tests {
             updated_at: None,
             workspace_id: 0,
             metrics: None,
+            initiator: None,
         };
 
         let actual = Conversation::try_from(fixture)?;
@@ -977,6 +975,7 @@ mod tests {
             updated_at: None,
             workspace_id: 0,
             metrics: None,
+            initiator: None,
         };
 
         let result = Conversation::try_from(fixture);
@@ -1164,6 +1163,134 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_concurrent_operations_dont_block_runtime() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        // Heartbeat fires every `TICK`; we require a measurement window of at
+        // least `MIN_WINDOW` so the assertion is meaningful even when the DB
+        // workload finishes very quickly (e.g. on fast machines with the
+        // in-memory SQLite pool).
+        const TICK: Duration = Duration::from_millis(10);
+        const MIN_WINDOW: Duration = Duration::from_millis(200);
+
+        let repo = Arc::new(repository()?);
+        let heartbeat = Arc::new(AtomicUsize::new(0));
+
+        // Heartbeat task - if runtime is blocked, this won't increment.
+        let heartbeat_clone = heartbeat.clone();
+        let heartbeat_handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(TICK).await;
+                heartbeat_clone.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        // Warm up: let the heartbeat task get scheduled and complete its first
+        // tick before we start measuring, then reset the counter so timing
+        // begins from a clean state.
+        tokio::time::sleep(TICK * 3).await;
+        heartbeat.store(0, Ordering::Relaxed);
+
+        // Spawn many concurrent DB operations.
+        let mut handles = vec![];
+        let start = Instant::now();
+
+        for i in 0..20 {
+            let repo = repo.clone();
+            let handle = tokio::spawn(async move {
+                for j in 0..10 {
+                    let conversation = Conversation::new(ConversationId::generate())
+                        .title(Some(format!("Task {} - Write {}", i, j)));
+                    repo.upsert_conversation(conversation).await?;
+                }
+                anyhow::Result::<()>::Ok(())
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all operations.
+        for handle in handles {
+            handle.await??;
+        }
+
+        // Ensure the measurement window is long enough for heartbeat math to
+        // be meaningful regardless of how fast the DB workload completed.
+        let work_elapsed = start.elapsed();
+        if work_elapsed < MIN_WINDOW {
+            tokio::time::sleep(MIN_WINDOW - work_elapsed).await;
+        }
+        let elapsed = start.elapsed();
+
+        // Stop heartbeat.
+        heartbeat_handle.abort();
+
+        // Verify runtime wasn't blocked: heartbeat should have fired at least
+        // 80% of the theoretical max for the elapsed window. The threshold is
+        // clamped to at least 1 to keep the assertion well-defined.
+        let heartbeat_count = heartbeat.load(Ordering::Relaxed);
+        let expected_heartbeats = (elapsed.as_millis() as usize) / (TICK.as_millis() as usize);
+        let threshold = (expected_heartbeats * 8 / 10).max(1);
+
+        assert!(
+            heartbeat_count >= threshold,
+            "Runtime was blocked! Expected at least {} heartbeats (~{} theoretical) in {:?}, got {}",
+            threshold,
+            expected_heartbeats,
+            elapsed,
+            heartbeat_count
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mixed_read_write_contention() -> anyhow::Result<()> {
+        let repo = Arc::new(repository()?);
+        let mut handles = vec![];
+
+        // Pre-populate some data
+        for i in 0..10 {
+            let conv =
+                Conversation::new(ConversationId::generate()).title(Some(format!("Initial {}", i)));
+            repo.upsert_conversation(conv).await?;
+        }
+
+        // Spawn writers
+        for i in 0..10 {
+            let repo = repo.clone();
+            handles.push(tokio::spawn(async move {
+                for j in 0..10 {
+                    let conv = Conversation::new(ConversationId::generate())
+                        .title(Some(format!("Writer {} - {}", i, j)));
+                    repo.upsert_conversation(conv).await?;
+                }
+                anyhow::Result::<()>::Ok(())
+            }));
+        }
+
+        // Spawn readers (interleave with writers)
+        for _ in 0..10 {
+            let repo = repo.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..10 {
+                    // Read all conversations
+                    let _ = repo.get_all_conversations().await?;
+                    tokio::task::yield_now().await;
+                }
+                anyhow::Result::<()>::Ok(())
+            }));
+        }
+
+        // All should complete without timeout
+        for handle in handles {
+            handle.await??;
+        }
+
+        Ok(())
+    }
+
     #[test]
     fn test_legacy_tool_value_file_diff_deserialization() {
         use crate::conversation::conversation_record::ToolOutputRecord;
@@ -1182,5 +1309,45 @@ mod tests {
             actual.values[0],
             forge_domain::ToolValue::Text("[File diff: /src/main.rs]".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn test_delete_conversation_recursive_depth() -> anyhow::Result<()> {
+        let repo = repository()?;
+
+        let parent_id = forge_domain::ConversationId::generate();
+        let child_id = forge_domain::ConversationId::generate();
+        let grandchild_id = forge_domain::ConversationId::generate();
+
+        // Parent
+        let parent = forge_domain::Conversation::new(parent_id);
+        repo.upsert_conversation(parent).await?;
+
+        // Child
+        let child = forge_domain::Conversation::new(child_id).parent_id(Some(parent_id));
+        repo.upsert_conversation(child).await?;
+
+        // Grandchild
+        let grandchild = forge_domain::Conversation::new(grandchild_id).parent_id(Some(child_id));
+        repo.upsert_conversation(grandchild).await?;
+
+        // Delete parent
+        repo.delete_conversation(&parent_id).await?;
+
+        // Verify all are gone
+        assert!(
+            repo.get_conversation(&parent_id).await?.is_none(),
+            "Parent should be deleted"
+        );
+        assert!(
+            repo.get_conversation(&child_id).await?.is_none(),
+            "Child should be deleted"
+        );
+        assert!(
+            repo.get_conversation(&grandchild_id).await?.is_none(),
+            "Grandchild should be deleted"
+        );
+
+        Ok(())
     }
 }

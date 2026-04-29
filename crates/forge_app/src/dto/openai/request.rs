@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use strum::IntoEnumIterator;
 
 use super::response::{ExtraContent, FunctionCall, ToolCall};
-use super::tool_choice::{FunctionType, ToolChoice};
+use super::tool_choice::ToolChoice;
 use crate::domain::{
     Context, ContextMessage, ModelId, ToolCallFull, ToolCallId, ToolCatalog, ToolDefinition,
     ToolName, ToolResult, ToolValue,
@@ -157,10 +157,12 @@ pub struct FunctionDescription {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
-pub struct Tool {
-    // TODO: should be an enum
-    pub r#type: FunctionType,
-    pub function: FunctionDescription,
+#[serde(tag = "type")]
+pub enum Tool {
+    #[serde(rename = "function")]
+    Function { function: FunctionDescription },
+    #[serde(rename = "code_interpreter")]
+    CodeInterpreter,
 }
 
 /// Response format configuration for OpenAI API
@@ -266,10 +268,6 @@ pub struct Request {
     pub parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
-    /// Indicates who initiated the conversation: "user" or "agent".
-    /// Used for GitHub Copilot billing optimization. Not serialized to API.
-    #[serde(skip_serializing)]
-    pub initiator: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<StreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -317,13 +315,14 @@ pub enum Transform {
 
 impl From<ToolDefinition> for Tool {
     fn from(value: ToolDefinition) -> Self {
-        Tool {
-            r#type: FunctionType,
+        Tool::Function {
             function: FunctionDescription {
                 description: Some(value.description),
                 name: value.name.to_string(),
                 parameters: {
-                    let mut params = serde_json::to_value(value.input_schema).unwrap();
+                    // Ensure OpenAI compatibility by adding properties field if missing
+                    let mut params = serde_json::to_value(&value.input_schema)
+                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
                     // Ensure OpenAI compatibility by adding properties field if missing
                     if let Some(obj) = params.as_object_mut()
                         && obj.get("type") == Some(&serde_json::Value::String("object".to_string()))
@@ -373,7 +372,7 @@ impl From<Context> for Request {
                         .and_then(|obj| obj.get("title"))
                         .and_then(|t| t.as_str())
                         .map(String::from)
-                        .expect("Schema must have a title");
+                        .unwrap_or_else(|| "schema".to_string());
 
                     ResponseFormat::JsonSchema { name, schema }
                 }
@@ -404,7 +403,6 @@ impl From<Context> for Request {
                                               * on model capabilities */
             stream_options: Some(StreamOptions { include_usage: Some(true) }),
             session_id: context.conversation_id.map(|id| id.to_string()),
-            initiator: context.initiator,
             reasoning: context.reasoning,
             reasoning_effort: Default::default(),
             max_completion_tokens: Default::default(),
@@ -414,7 +412,8 @@ impl From<Context> for Request {
 }
 
 fn serialize_tool_call_arguments(tool_call: &ToolCallFull) -> String {
-    let serialized_arguments = || serde_json::to_string(&tool_call.arguments).unwrap();
+    let serialized_arguments =
+        || serde_json::to_string(&tool_call.arguments).unwrap_or_else(|_| "{}".to_string());
 
     let Ok(parsed_arguments) = tool_call.arguments.parse() else {
         return serialized_arguments();
@@ -433,9 +432,8 @@ impl From<ToolCallFull> for ToolCall {
         let arguments = serialize_tool_call_arguments(&value);
         let extra_content = value.thought_signature.map(ExtraContent::from);
 
-        Self {
+        Self::Function {
             id: value.call_id,
-            r#type: FunctionType,
             function: FunctionCall { arguments, name: Some(value.name) },
             extra_content,
         }
@@ -838,6 +836,17 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_call_supports_code_interpreter() {
+        let json = r#"{"id":"call_123","type":"code_interpreter","function":{"name":"python","arguments":"{}"}}"#;
+        let result: Result<super::ToolCall, _> = serde_json::from_str(json);
+        assert!(
+            result.is_ok(),
+            "ToolCall should support code_interpreter type: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
     fn test_transform_display() {
         assert_eq!(
             serde_json::to_string(&Transform::MiddleOut).unwrap(),
@@ -864,8 +873,7 @@ mod tests {
 
         let actual = Tool::from(fixture);
 
-        let expected = Tool {
-            r#type: FunctionType,
+        let expected = Tool::Function {
             function: FunctionDescription {
                 description: Some("Test tool".to_string()),
                 name: "test_tool".to_string(),

@@ -195,6 +195,11 @@ pub struct ForgeConfig {
     /// Model and provider configuration used for commit message generation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<ModelConfig>,
+    /// Whether `forge commit` should override `GIT_COMMITTER_NAME` and
+    /// `GIT_COMMITTER_EMAIL` with the Forge identity. Defaults to `true` via
+    /// the embedded `.forge.toml` defaults.
+    #[serde(default)]
+    pub use_forge_committer: bool,
     /// Maximum number of recent commits included as context for commit message
     /// generation.
     #[serde(default)]
@@ -258,6 +263,17 @@ pub struct ForgeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ReasoningConfig>,
 
+    /// Penalizes tokens based on how frequently they have appeared in the
+    /// generated text. Helps prevent repetitive degeneration loops.
+    /// Range: -2.0 to 2.0
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<Decimal>,
+
+    /// Penalizes tokens that have appeared at least once, encouraging the model
+    /// to introduce new topics. Range: -2.0 to 2.0
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<Decimal>,
+
     /// Additional provider definitions merged with the built-in provider list.
     ///
     /// Entries with an `id` matching a built-in provider override its fields;
@@ -281,6 +297,20 @@ pub struct ForgeConfig {
     /// when a task ends and reminds the LLM about them.
     #[serde(default)]
     pub verify_todos: bool,
+
+    /// Whether the deep research agent is available.
+    ///
+    /// When set to `true`, the Sage agent is added to the agent list and
+    /// the `:sage` app command is enabled. Defaults to `false`.
+    #[serde(default)]
+    pub research_subagent: bool,
+
+    /// Enables subagent support via the task tool; when true the forge agent
+    /// gains access to the `task` tool for delegating work to specialised
+    /// sub-agents, and the `sage` research-only agent tool is removed.
+    /// When false the `task` tool is disabled and `sage` is available instead.
+    #[serde(default)]
+    pub subagents: bool,
 }
 
 impl ForgeConfig {

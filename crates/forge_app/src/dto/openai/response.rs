@@ -6,7 +6,6 @@ use forge_domain::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::tool_choice::FunctionType;
 use crate::dto::openai::ReasoningDetail;
 use crate::dto::openai::error::{Error, ErrorCode, ErrorResponse};
 
@@ -230,12 +229,17 @@ impl From<String> for ExtraContent {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct ToolCall {
-    pub id: Option<ToolCallId>,
-    pub r#type: FunctionType,
-    pub function: FunctionCall,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extra_content: Option<ExtraContent>,
+#[serde(tag = "type")]
+pub enum ToolCall {
+    #[serde(rename = "function")]
+    Function {
+        id: Option<ToolCallId>,
+        function: FunctionCall,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        extra_content: Option<ExtraContent>,
+    },
+    #[serde(rename = "code_interpreter")]
+    CodeInterpreter { id: Option<ToolCallId> },
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -324,6 +328,9 @@ impl TryFrom<Response> for ChatCompletionMessage {
     fn try_from(res: Response) -> Result<Self, Self::Error> {
         match res {
             Response::Success { choices, usage, prompt_filter_results, .. } => {
+                if choices.len() > 1 {
+                    return Err(anyhow::anyhow!("Multiple choices are not supported"));
+                }
                 if let Some(choice) = choices.first() {
                     // Check if the choice has an error first
                     let error = match choice {
@@ -390,23 +397,29 @@ impl TryFrom<Response> for ChatCompletionMessage {
 
                             if let Some(tool_calls) = &message.tool_calls {
                                 for tool_call in tool_calls {
-                                    let thought_signature = tool_call
-                                        .extra_content
-                                        .as_ref()
-                                        .and_then(ExtraContent::thought_signature);
+                                    match tool_call {
+                                        ToolCall::Function { id, function, extra_content } => {
+                                            let thought_signature = extra_content
+                                                .as_ref()
+                                                .and_then(ExtraContent::thought_signature);
 
-                                    resp = resp.add_tool_call(ToolCallFull {
-                                        call_id: tool_call.id.clone(),
-                                        name: tool_call
-                                            .function
-                                            .name
-                                            .clone()
-                                            .ok_or(forge_domain::Error::ToolCallMissingName)?,
-                                        arguments: serde_json::from_str(
-                                            &tool_call.function.arguments,
-                                        )?,
-                                        thought_signature,
-                                    });
+                                            resp = resp.add_tool_call(ToolCallFull {
+                                                call_id: id.clone(),
+                                                name: function.name.clone().ok_or(
+                                                    forge_domain::Error::ToolCallMissingName,
+                                                )?,
+                                                arguments: serde_json::from_str(
+                                                    &function.arguments,
+                                                )?,
+                                                thought_signature,
+                                            });
+                                        }
+                                        ToolCall::CodeInterpreter { .. } => {
+                                            return Err(anyhow::anyhow!(
+                                                "Code interpreter tool call not supported"
+                                            ));
+                                        }
+                                    }
                                 }
                             }
                             resp
@@ -457,17 +470,25 @@ impl TryFrom<Response> for ChatCompletionMessage {
 
                             if let Some(tool_calls) = &delta.tool_calls {
                                 for tool_call in tool_calls {
-                                    let thought_signature = tool_call
-                                        .extra_content
-                                        .as_ref()
-                                        .and_then(ExtraContent::thought_signature);
+                                    match tool_call {
+                                        ToolCall::Function { id, function, extra_content } => {
+                                            let thought_signature = extra_content
+                                                .as_ref()
+                                                .and_then(ExtraContent::thought_signature);
 
-                                    resp = resp.add_tool_call(ToolCallPart {
-                                        call_id: tool_call.id.clone(),
-                                        name: tool_call.function.name.clone(),
-                                        arguments_part: tool_call.function.arguments.clone(),
-                                        thought_signature,
-                                    });
+                                            resp = resp.add_tool_call(ToolCallPart {
+                                                call_id: id.clone(),
+                                                name: function.name.clone(),
+                                                arguments_part: function.arguments.clone(),
+                                                thought_signature,
+                                            });
+                                        }
+                                        ToolCall::CodeInterpreter { .. } => {
+                                            return Err(anyhow::anyhow!(
+                                                "Code interpreter tool call not supported"
+                                            ));
+                                        }
+                                    }
                                 }
                             }
                             resp
@@ -539,7 +560,9 @@ impl TryFrom<Response> for ChatCompletionMessage {
                 if let Some(c) = cost {
                     let cost_value = match c {
                         StringOrF64::Number(n) => n,
-                        StringOrF64::String(s) => s.parse().unwrap_or(0.0),
+                        StringOrF64::String(s) => s
+                            .parse()
+                            .map_err(|_| anyhow::anyhow!("Invalid cost string: {}", s))?,
                     };
                     msg.usage = Some(Usage {
                         prompt_tokens: TokenCount::Actual(0),
@@ -1070,5 +1093,51 @@ mod tests {
         let error_string = format!("{:?}", error);
         assert!(error_string.contains("Content was filtered"));
         assert!(error_string.contains("hate"));
+    }
+
+    #[test]
+    fn test_nvidia_tool_call_streaming_chunk() {
+        let response_json = r#"{"id":"chatcmpl-994182aa3bf1d873","object":"chat.completion.chunk","created":1775363363,"model":"qwen/qwen3.5-397b-a17b","choices":[{"index":0,"delta":{"content":null,"reasoning":null,"reasoning_content":null,"tool_calls":[{"index":1,"function":{"arguments":"}"}}]},"logprobs":null,"finish_reason":"tool_calls","stop_reason":null,"token_ids":null}]}"#;
+
+        let actual = serde_json::from_str::<Response>(response_json);
+        assert!(
+            actual.is_ok(),
+            "Should parse NVIDIA tool call streaming chunk: {:?}",
+            actual.err()
+        );
+    }
+
+    #[test]
+    fn test_nvidia_tool_call_deserialization() {
+        // NVIDIA sends tool calls without "id" and "type" fields
+        let tool_call_json = r#"{"index":1,"function":{"arguments":"}"}}"#;
+        let actual = serde_json::from_str::<ToolCall>(tool_call_json);
+        assert!(
+            actual.is_ok(),
+            "Should parse NVIDIA tool call: {:?}",
+            actual.err()
+        );
+    }
+
+    #[test]
+    fn test_nvidia_response_message_deserialization() {
+        let msg_json = r#"{"content":null,"reasoning":null,"reasoning_content":null,"tool_calls":[{"index":1,"function":{"arguments":"}"}}]}"#;
+        let actual = serde_json::from_str::<ResponseMessage>(msg_json);
+        assert!(
+            actual.is_ok(),
+            "Should parse NVIDIA response message: {:?}",
+            actual.err()
+        );
+    }
+
+    #[test]
+    fn test_nvidia_choice_deserialization() {
+        let choice_json = r#"{"index":0,"delta":{"content":null,"reasoning":null,"reasoning_content":null,"tool_calls":[{"index":1,"function":{"arguments":"}"}}]},"logprobs":null,"finish_reason":"tool_calls","stop_reason":null,"token_ids":null}"#;
+        let actual = serde_json::from_str::<Choice>(choice_json);
+        assert!(
+            actual.is_ok(),
+            "Should parse NVIDIA choice: {:?}",
+            actual.err()
+        );
     }
 }

@@ -724,7 +724,8 @@ impl From<ReasoningConfigRecord> for forge_domain::ReasoningConfig {
 pub(super) struct ContextRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     conversation_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
     initiator: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     messages: Vec<ContextMessageRecord>,
@@ -744,13 +745,17 @@ pub(super) struct ContextRecord {
     reasoning: Option<ReasoningConfigRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    frequency_penalty: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    presence_penalty: Option<f64>,
 }
 
 impl From<&Context> for ContextRecord {
     fn from(context: &Context) -> Self {
         Self {
             conversation_id: context.conversation_id.as_ref().map(|id| id.into_string()),
-            initiator: context.initiator.clone(),
+            initiator: None,
             messages: context
                 .messages
                 .iter()
@@ -768,6 +773,8 @@ impl From<&Context> for ContextRecord {
             top_k: context.top_k.map(|t| t.value()),
             reasoning: context.reasoning.as_ref().map(ReasoningConfigRecord::from),
             stream: context.stream,
+            frequency_penalty: context.frequency_penalty,
+            presence_penalty: context.presence_penalty,
         }
     }
 }
@@ -806,7 +813,6 @@ impl TryFrom<ContextRecord> for Context {
 
         Ok(Context {
             conversation_id,
-            initiator: record.initiator,
             messages: messages?,
             tools: tools?,
             tool_choice: record.tool_choice.map(Into::into),
@@ -819,6 +825,8 @@ impl TryFrom<ContextRecord> for Context {
             reasoning: record.reasoning.map(Into::into),
             stream: record.stream,
             response_format: None,
+            frequency_penalty: record.frequency_penalty,
+            presence_penalty: record.presence_penalty,
         })
     }
 }
@@ -950,6 +958,7 @@ pub(super) struct ConversationRecord {
     pub updated_at: Option<chrono::NaiveDateTime>,
     pub metrics: Option<String>,
     pub parent_id: Option<String>,
+    pub initiator: Option<String>,
 }
 
 impl ConversationRecord {
@@ -958,10 +967,14 @@ impl ConversationRecord {
         conversation: forge_domain::Conversation,
         workspace_id: forge_domain::WorkspaceHash,
     ) -> Self {
+        let initiator = match conversation.initiator {
+            forge_domain::Initiator::User => None, // NULL in DB = user
+            forge_domain::Initiator::Agent => Some("agent".to_string()),
+        };
         let context = conversation
             .context
             .as_ref()
-            .filter(|ctx| !ctx.messages.is_empty() || ctx.initiator.is_some())
+            .filter(|ctx| !ctx.messages.is_empty())
             .map(ContextRecord::from)
             .and_then(|ctx_record| serde_json::to_string(&ctx_record).ok());
         let updated_at = context.as_ref().map(|_| chrono::Utc::now().naive_utc());
@@ -977,6 +990,7 @@ impl ConversationRecord {
             workspace_id: workspace_id.id() as i64,
             metrics,
             parent_id: conversation.parent_id.map(|id| id.into_string()),
+            initiator,
         }
     }
 }
@@ -1019,9 +1033,15 @@ impl TryFrom<ConversationRecord> for forge_domain::Conversation {
                 forge_domain::Metrics::default().started_at(record.created_at.and_utc())
             });
 
+        let initiator = match record.initiator.as_deref() {
+            Some("agent") => forge_domain::Initiator::Agent,
+            _ => forge_domain::Initiator::User,
+        };
+
         let mut conv = forge_domain::Conversation::new(id)
             .context(context)
             .title(record.title)
+            .initiator(initiator)
             .metrics(metrics)
             .metadata(
                 forge_domain::MetaData::new(record.created_at.and_utc())

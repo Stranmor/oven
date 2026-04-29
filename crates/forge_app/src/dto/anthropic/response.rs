@@ -24,16 +24,19 @@ pub struct ListModelResponse {
 pub struct Model {
     pub id: String,
     pub display_name: Option<String>,
+    /// Context window size returned by the API (e.g. from Antigravity proxy).
+    /// Falls back to hardcoded `get_context_length()` when absent.
+    pub context_length: Option<u64>,
 }
 
-impl From<Model> for forge_domain::Model {
-    fn from(value: Model) -> Self {
-        let context_length = get_context_length(&value.id);
-        let input_modalities = if value.id.contains("claude-3")
-            || value.id.contains("claude-4")
-            || value.id.contains("claude-sonnet")
-            || value.id.contains("claude-opus")
-            || value.id.contains("claude-haiku")
+impl Model {
+    pub fn into_domain(self, provider_id: forge_domain::ProviderId) -> forge_domain::Model {
+        let context_length = self.context_length.or_else(|| get_context_length(&self.id));
+        let input_modalities = if self.id.contains("claude-3")
+            || self.id.contains("claude-4")
+            || self.id.contains("claude-sonnet")
+            || self.id.contains("claude-opus")
+            || self.id.contains("claude-haiku")
         {
             vec![
                 forge_domain::InputModality::Text,
@@ -43,9 +46,10 @@ impl From<Model> for forge_domain::Model {
             vec![forge_domain::InputModality::Text]
         };
 
-        Self {
-            id: ModelId::new(value.id),
-            name: value.display_name,
+        forge_domain::Model {
+            id: ModelId::new(self.id),
+            provider_id: Some(provider_id),
+            name: self.display_name,
             description: None,
             context_length,
             tools_supported: Some(true),
@@ -768,9 +772,10 @@ mod tests {
         let fixture = Model {
             id: "claude-sonnet-4-5-20250929".to_string(),
             display_name: Some("Claude 3.5 Sonnet (New)".to_string()),
+            context_length: None,
         };
 
-        let actual: forge_domain::Model = fixture.into();
+        let actual: forge_domain::Model = fixture.into_domain(forge_domain::ProviderId::ANTHROPIC);
 
         assert_eq!(actual.context_length, Some(200_000));
         assert_eq!(actual.id.as_str(), "claude-sonnet-4-5-20250929");
@@ -782,12 +787,28 @@ mod tests {
         let fixture = Model {
             id: "unknown-claude-model".to_string(),
             display_name: Some("Unknown Model".to_string()),
+            context_length: None,
         };
 
-        let actual: forge_domain::Model = fixture.into();
+        let actual: forge_domain::Model = fixture.into_domain(forge_domain::ProviderId::ANTHROPIC);
 
         assert_eq!(actual.context_length, None);
         assert_eq!(actual.id.as_str(), "unknown-claude-model");
+    }
+
+    #[test]
+    fn test_model_conversion_api_provided_context_length() {
+        // When the API returns context_length (e.g. Antigravity proxy), use it
+        // instead of the hardcoded fallback — enables non-Claude models like gpt-5.4
+        let fixture = Model {
+            id: "gpt-5.4".to_string(),
+            display_name: None,
+            context_length: Some(1_048_576),
+        };
+
+        let actual: forge_domain::Model = fixture.into_domain(forge_domain::ProviderId::ANTHROPIC);
+
+        assert_eq!(actual.context_length, Some(1_048_576));
     }
 
     #[test]

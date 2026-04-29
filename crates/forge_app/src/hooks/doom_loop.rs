@@ -282,11 +282,12 @@ mod tests {
 
         Conversation {
             id: ConversationId::generate(),
+            parent_id: None,
             title: None,
             context: Some(context),
+            initiator: forge_domain::Initiator::User,
             metrics: Default::default(),
             metadata: forge_domain::MetaData::new(chrono::Utc::now()),
-            parent_id: None,
         }
     }
 

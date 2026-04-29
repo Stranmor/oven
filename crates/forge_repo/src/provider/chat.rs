@@ -45,7 +45,7 @@ impl<F: EnvironmentInfra<Config = forge_config::ForgeConfig> + HttpInfra> ForgeC
 
         let model_cache = Arc::new(CacacheStorage::new(
             env.cache_dir().join("model_cache"),
-            Some(model_cache_ttl_secs as u128),
+            Some(std::time::Duration::from_secs(model_cache_ttl_secs)),
         ));
 
         Self {

@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::panic;
 use std::path::PathBuf;
 
@@ -91,7 +91,7 @@ async fn run() -> Result<()> {
     let mut cli = Cli::parse();
 
     // Check if there's piped input
-    if !atty::is(atty::Stream::Stdin) {
+    if !std::io::stdin().is_terminal() {
         let mut stdin_content = String::new();
         std::io::stdin().read_to_string(&mut stdin_content)?;
         let trimmed_content = stdin_content.trim();
@@ -121,7 +121,7 @@ async fn run() -> Result<()> {
     };
 
     let mut ui = UI::init(cli, config, move |config| {
-        ForgeAPI::init(cwd.clone(), config)
+        ForgeAPI::init(cwd.clone(), config).expect("Failed to initialize Forge API")
     })?;
     ui.run().await;
 

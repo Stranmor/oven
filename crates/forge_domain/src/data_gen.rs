@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 /// This struct encapsulates the configuration parameters needed for generating
 /// data in various contexts. It provides control over the amount of data to
 /// generate, formatting options, and other generation-specific settings.
-#[derive(Debug, Clone, Serialize, Deserialize, Setters, PartialEq, fake::Dummy)]
+#[derive(Debug, Clone, Serialize, Deserialize, Setters, PartialEq)]
+#[cfg_attr(any(test, feature = "test-utils"), derive(fake::Dummy))]
 #[setters(into, strip_option)]
 pub struct DataGenerationParameters {
     /// Path to input JSONL file for data generation

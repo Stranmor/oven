@@ -1,3 +1,4 @@
+#![allow(clippy::panic, clippy::unwrap_used, clippy::arithmetic_side_effects)]
 mod confirm;
 mod input;
 mod multi;

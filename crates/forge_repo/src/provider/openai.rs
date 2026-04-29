@@ -53,16 +53,21 @@ impl<H: HttpInfra> OpenAIProvider<H> {
     // - `X-Title`: Sets/modifies your app's title
     fn get_headers(&self) -> Vec<(String, String)> {
         let mut headers = Vec::new();
-        if let Some(api_key) = self
-            .provider
-            .credential
-            .as_ref()
-            .map(|c| match &c.auth_details {
-                forge_domain::AuthDetails::ApiKey(key) => key.as_str(),
-                forge_domain::AuthDetails::OAuthWithApiKey { api_key, .. } => api_key.as_str(),
-                forge_domain::AuthDetails::OAuth { tokens, .. } => tokens.access_token.as_str(),
-                forge_domain::AuthDetails::GoogleAdc(token) => token.as_str(),
-            })
+        if let Some(api_key) =
+            self.provider
+                .credential
+                .as_ref()
+                .and_then(|c| match &c.auth_details {
+                    forge_domain::AuthDetails::ApiKey(key) => Some(key.as_str()),
+                    forge_domain::AuthDetails::OAuthWithApiKey { api_key, .. } => {
+                        Some(api_key.as_str())
+                    }
+                    forge_domain::AuthDetails::OAuth { tokens, .. } => {
+                        Some(tokens.access_token.as_str())
+                    }
+                    forge_domain::AuthDetails::GoogleAdc(token) => Some(token.as_str()),
+                    forge_domain::AuthDetails::AwsProfile(_) => None,
+                })
         {
             headers.push((AUTHORIZATION.to_string(), format!("Bearer {api_key}")));
         }
@@ -93,6 +98,7 @@ impl<H: HttpInfra> OpenAIProvider<H> {
                     }
                 }
                 forge_domain::AuthMethod::GoogleAdc => {}
+                forge_domain::AuthMethod::AwsProfile => {}
             });
         // Append provider-level custom headers (from provider.json config)
         if let Some(custom_headers) = &self.provider.custom_headers {
@@ -122,9 +128,8 @@ impl<H: HttpInfra> OpenAIProvider<H> {
 
         // Add GitHub Copilot optimization headers only for github_copilot provider
         if self.provider.id == ProviderId::GITHUB_COPILOT {
-            // Determine initiator: use request.initiator if available, otherwise detect
-            // from messages
-            let initiator = request.initiator.as_deref().unwrap_or_else(|| {
+            // Determine initiator from messages
+            let initiator = {
                 // Fall back to detecting from last message role
                 let is_agent_initiated = request.messages.as_ref().is_some_and(|messages| {
                     messages.last().is_some_and(|msg| {
@@ -133,7 +138,7 @@ impl<H: HttpInfra> OpenAIProvider<H> {
                     })
                 });
                 if is_agent_initiated { "agent" } else { "user" }
-            });
+            };
 
             headers.push(("x-initiator".to_string(), initiator.to_string()));
             headers.push((
@@ -243,7 +248,11 @@ impl<H: HttpInfra> OpenAIProvider<H> {
                             let data: ListModelResponse = serde_json::from_str(&response)
                                 .with_context(|| format_http_context(None, "GET", url))
                                 .with_context(|| "Failed to deserialize models response")?;
-                            Ok(data.data.into_iter().map(Into::into).collect())
+                            Ok(data
+                                .data
+                                .into_iter()
+                                .map(|m| m.into_domain(self.provider.id.clone()))
+                                .collect())
                         }
                     }
                 }
@@ -289,7 +298,37 @@ impl<H: HttpInfra> OpenAIProvider<H> {
     fn inner_vertex_models(&self) -> Vec<forge_app::domain::Model> {
         static VERTEX_MODELS: LazyLock<Vec<forge_app::domain::Model>> = LazyLock::new(|| {
             let models = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../vertex.json"));
-            serde_json::from_str(models).unwrap()
+            // We deserialize into serde_json::Value first, then add provider_id, or just
+            // deserialize into something without provider_id?
+            // Actually, Model derives Deserialize. If we add `#[serde(default)]` or just map.
+            // Let's create a temporary struct.
+            #[derive(serde::Deserialize)]
+            struct VertexModel {
+                id: String,
+                name: Option<String>,
+                description: Option<String>,
+                context_length: Option<u64>,
+                tools_supported: Option<bool>,
+                supports_parallel_tool_calls: Option<bool>,
+                supports_reasoning: Option<bool>,
+                #[serde(default)]
+                input_modalities: Vec<forge_domain::InputModality>,
+            }
+            let parsed: Vec<VertexModel> = serde_json::from_str(models).unwrap();
+            parsed
+                .into_iter()
+                .map(|m| forge_domain::Model {
+                    id: forge_domain::ModelId::new(m.id),
+                    provider_id: Some(forge_domain::ProviderId::VERTEX_AI),
+                    name: m.name,
+                    description: m.description,
+                    context_length: m.context_length,
+                    tools_supported: m.tools_supported,
+                    supports_parallel_tool_calls: m.supports_parallel_tool_calls,
+                    supports_reasoning: m.supports_reasoning,
+                    input_modalities: m.input_modalities,
+                })
+                .collect()
         });
         VERTEX_MODELS.clone()
     }

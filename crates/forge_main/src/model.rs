@@ -481,7 +481,7 @@ pub enum AppCommand {
     #[command(alias = "s")]
     Suggest {
         /// Natural language description of the shell command
-        #[arg(trailing_var_arg = true, num_args = 0..)]
+        #[arg(trailing_var_arg = true, num_args = 0.., allow_hyphen_values = true)]
         description: Vec<String>,
     },
 
@@ -652,6 +652,7 @@ pub enum AppCommand {
 
     /// List subagent conversations for the current conversation
     #[strum(props(usage = "List subagent conversations for the current conversation"))]
+    #[command(alias = "subconversations")]
     Subchats,
 
     /// Delete a conversation permanently
@@ -1216,6 +1217,7 @@ mod tests {
     ) -> Model {
         Model {
             id: ModelId::new(id),
+            provider_id: Some(forge_domain::ProviderId::OPENAI),
             name: None,
             description: None,
             context_length,
@@ -1632,5 +1634,52 @@ mod tests {
     fn test_rename_command_name() {
         let cmd = AppCommand::Rename { name: vec!["test".to_string()] };
         assert_eq!(cmd.name(), "rename");
+    }
+
+    #[test]
+    fn test_parse_suggest_with_dash_prefixed_tokens() {
+        // Setup
+        let cmd_manager = ForgeCommandManager::default();
+
+        // Execute
+        let result = cmd_manager.parse(":suggest --- date").unwrap();
+
+        // Verify
+        assert_eq!(
+            result,
+            AppCommand::Suggest { description: vec!["---".to_string(), "date".to_string()] }
+        );
+    }
+
+    #[test]
+    fn test_parse_suggest_with_double_dash_flags() {
+        // Setup
+        let cmd_manager = ForgeCommandManager::default();
+
+        // Execute
+        let result = cmd_manager.parse(":suggest --date tomorrow").unwrap();
+
+        // Verify
+        assert_eq!(
+            result,
+            AppCommand::Suggest {
+                description: vec!["--date".to_string(), "tomorrow".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_suggest_with_single_dash() {
+        // Setup
+        let cmd_manager = ForgeCommandManager::default();
+
+        // Execute
+        let result = cmd_manager.parse(":suggest -v file.txt").unwrap();
+
+        // Verify
+        assert_eq!(
+            result,
+            AppCommand::Suggest { description: vec!["-v".to_string(), "file.txt".to_string()] }
+        );
     }
 }

@@ -119,18 +119,9 @@ impl ForgeEditor {
             let signal = signal.map_err(|e| anyhow::anyhow!(ReadLineError(e)))?;
 
             match signal {
-                Signal::Success(buffer) => {
+                Signal::Success(buffer) | Signal::ExternalBreak(buffer) => {
                     if buffer == "!forge_internal_paste_image" {
-                        if let Ok(mut f) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("/tmp/forge_paste.log")
-                        {
-                            let _ = writeln!(&mut f, "Received !forge_internal_paste_image");
-                            use std::io::Write;
-                        }
                         let img_paths = crate::image_paste::paste_image();
-
                         if !img_paths.is_empty() {
                             let text = img_paths
                                 .iter()
@@ -151,6 +142,7 @@ impl ForgeEditor {
                 }
                 Signal::CtrlC => return Ok(ReadResult::Continue),
                 Signal::CtrlD => return Ok(ReadResult::Exit),
+                _ => return Ok(ReadResult::Continue),
             }
         }
     }
@@ -205,22 +197,5 @@ impl EditMode for ForgeEditMode {
 
     fn edit_mode(&self) -> PromptEditMode {
         self.inner.edit_mode()
-    }
-}
-
-impl From<Signal> for ReadResult {
-    fn from(signal: Signal) -> Self {
-        match signal {
-            Signal::Success(buffer) => {
-                let trimmed = buffer.trim();
-                if trimmed.is_empty() {
-                    ReadResult::Empty
-                } else {
-                    ReadResult::Success(trimmed.to_string())
-                }
-            }
-            Signal::CtrlC => ReadResult::Continue,
-            Signal::CtrlD => ReadResult::Exit,
-        }
     }
 }

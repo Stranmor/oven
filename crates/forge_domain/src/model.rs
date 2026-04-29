@@ -4,6 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use strum_macros::EnumString;
 
+use crate::ProviderId;
+
 /// Represents input modalities that a model can accept
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, EnumString)]
 #[serde(rename_all = "lowercase")]
@@ -23,10 +25,11 @@ fn default_input_modalities() -> Vec<InputModality> {
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Setters)]
 pub struct Model {
     pub id: ModelId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<ProviderId>,
     pub name: Option<String>,
     pub description: Option<String>,
     pub context_length: Option<u64>,
-    // TODO: add provider information to the model
     pub tools_supported: Option<bool>,
     /// Whether the model supports parallel tool calls
     pub supports_parallel_tool_calls: Option<bool>,
@@ -81,5 +84,20 @@ impl std::str::FromStr for ModelId {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(ModelId(s.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_model_provider_id_default() {
+        let json = r#"{"id": "test-model"}"#;
+        let result: Model = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            result.provider_id, None,
+            "provider_id should be None when missing"
+        );
     }
 }

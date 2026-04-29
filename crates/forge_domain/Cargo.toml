@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+fake = { version = "5.1.0", features = ["derive"], optional = true }
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
@@ -32,15 +33,18 @@ base64.workspace = true
 derive-getters = "0.5.0"
 regex.workspace = true
 forge_tool_macros.workspace = true
-lazy_static = "1.5.0"
 convert_case.workspace = true
 forge_json_repair.workspace = true
 glob.workspace = true
-fake = { version = "5.1.0", features = ["derive"] }
+sha2.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
+fake = { version = "5.1.0", features = ["derive"] }
 forge_test_kit = { workspace = true, features = ["json"] }
 insta = { workspace = true, features = ["yaml"] }
 pretty_assertions.workspace = true
 is_ci.workspace = true
-fake = { version = "5.1.0", features = ["derive"] }
+
+[features]
+test-utils = ["dep:fake"]

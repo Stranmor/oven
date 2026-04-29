@@ -90,7 +90,8 @@ mod tests {
             reasoning: None,
             stream: None,
             response_format: None,
-            initiator: None,
+            frequency_penalty: None,
+            presence_penalty: None,
         };
 
         Request::try_from(context).unwrap()

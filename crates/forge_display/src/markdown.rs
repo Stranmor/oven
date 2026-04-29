@@ -65,10 +65,13 @@ impl MarkdownFormat {
         if content.is_empty() {
             return String::new();
         }
-        Regex::new(&format!(r"\n{{{},}}", self.max_consecutive_newlines + 1))
-            .unwrap()
-            .replace_all(content, "\n".repeat(self.max_consecutive_newlines))
-            .into()
+        Regex::new(&format!(
+            r"\n{{{},}}",
+            self.max_consecutive_newlines.saturating_add(1)
+        ))
+        .expect("Regex string format is valid")
+        .replace_all(content, "\n".repeat(self.max_consecutive_newlines))
+        .into()
     }
 }
 

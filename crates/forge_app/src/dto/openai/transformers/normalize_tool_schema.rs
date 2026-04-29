@@ -25,10 +25,16 @@ impl Transformer for NormalizeToolSchema {
     fn transform(&mut self, mut request: Self::Value) -> Self::Value {
         if let Some(tools) = request.tools.as_mut() {
             for tool in tools.iter_mut() {
-                if let Some(obj) = tool.function.parameters.as_object_mut() {
-                    // Remove tool usage description and title from parameters property
-                    obj.remove("description");
-                    obj.remove("title");
+                if let crate::dto::openai::Tool::Function { function } = tool {
+                    if let Ok(mut schema_value) = serde_json::to_value(&function.parameters) {
+                        if let Some(obj) = schema_value.as_object_mut() {
+                            obj.remove("description");
+                            obj.remove("title");
+                        }
+                        if let Ok(new_schema) = serde_json::from_value(schema_value) {
+                            function.parameters = new_schema;
+                        }
+                    }
                 }
             }
         }
@@ -42,7 +48,14 @@ impl Transformer for EnforceStrictToolSchema {
     fn transform(&mut self, mut request: Self::Value) -> Self::Value {
         if let Some(tools) = request.tools.as_mut() {
             for tool in tools.iter_mut() {
-                enforce_strict_schema(&mut tool.function.parameters, true);
+                if let crate::dto::openai::Tool::Function { function } = tool {
+                    if let Ok(mut schema_value) = serde_json::to_value(&function.parameters) {
+                        enforce_strict_schema(&mut schema_value, true);
+                        if let Ok(new_schema) = serde_json::from_value(schema_value) {
+                            function.parameters = new_schema;
+                        }
+                    }
+                }
             }
         }
         request
@@ -89,11 +102,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::dto::openai::{FunctionDescription, FunctionType, Tool};
+    use crate::dto::openai::{FunctionDescription, Tool};
 
     fn tool_fixture(parameters: serde_json::Value) -> Tool {
-        Tool {
-            r#type: FunctionType,
+        Tool::Function {
             function: FunctionDescription {
                 name: "test_tool".to_string(),
                 description: Some("Test tool description".to_string()),
@@ -122,7 +134,10 @@ mod tests {
             }
         });
 
-        assert_eq!(actual.tools.unwrap()[0].function.parameters, expected);
+        let Tool::Function { function } = &actual.tools.unwrap()[0] else {
+            panic!()
+        };
+        assert_eq!(function.parameters, expected);
     }
 
     #[test]
@@ -143,7 +158,10 @@ mod tests {
             }
         });
 
-        assert_eq!(actual.tools.unwrap()[0].function.parameters, expected);
+        let Tool::Function { function } = &actual.tools.unwrap()[0] else {
+            panic!()
+        };
+        assert_eq!(function.parameters, expected);
     }
 
     #[test]
@@ -177,7 +195,10 @@ mod tests {
             "required": ["output_mode"]
         });
 
-        assert_eq!(actual.tools.unwrap()[0].function.parameters, expected);
+        let Tool::Function { function } = &actual.tools.unwrap()[0] else {
+            panic!()
+        };
+        assert_eq!(function.parameters, expected);
     }
 
     #[test]

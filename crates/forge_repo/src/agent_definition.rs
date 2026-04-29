@@ -129,6 +129,18 @@ pub(crate) struct AgentDefinition {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_requests_per_turn: Option<usize>,
+
+    /// Penalizes tokens based on how frequently they have appeared, preventing
+    /// repetitive degeneration loops. Range: -2.0 to 2.0
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f64>,
+
+    /// Penalizes tokens that have appeared at least once, encouraging diversity.
+    /// Range: -2.0 to 2.0
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f64>,
 }
 
 impl AgentDefinition {
@@ -161,6 +173,8 @@ impl AgentDefinition {
             custom_rules: self.custom_rules,
             max_tool_failure_per_turn: self.max_tool_failure_per_turn,
             max_requests_per_turn: self.max_requests_per_turn,
+            frequency_penalty: self.frequency_penalty,
+            presence_penalty: self.presence_penalty,
             path: self.path,
         }
     }

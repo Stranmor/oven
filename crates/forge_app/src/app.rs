@@ -22,8 +22,8 @@ use crate::tool_registry::ToolRegistry;
 use crate::tool_resolver::ToolResolver;
 use crate::user_prompt::UserPromptGenerator;
 use crate::{
-    AgentExt, AgentProviderResolver, ConversationService, EnvironmentInfra, FileDiscoveryService,
-    ProviderService, Services,
+    AgentExt, AgentProviderResolver, ConversationService, EnvironmentInfra, ProviderService,
+    Services,
 };
 
 /// Builds a [`TemplateConfig`] from a [`ForgeConfig`].
@@ -32,9 +32,9 @@ use crate::{
 /// expected by [`SystemContext`] for tool description template rendering.
 pub(crate) fn build_template_config(config: &ForgeConfig) -> forge_domain::TemplateConfig {
     forge_domain::TemplateConfig {
-        max_read_size: config.max_read_lines as usize,
+        max_read_size: config.max_read_lines.try_into().unwrap_or(usize::MAX),
         max_line_length: config.max_line_chars,
-        max_image_size: config.max_image_size_bytes as usize,
+        max_image_size: config.max_image_size_bytes.try_into().unwrap_or(usize::MAX),
         stdout_max_prefix_length: config.max_stdout_prefix_lines,
         stdout_max_suffix_length: config.max_stdout_suffix_lines,
         stdout_max_line_length: config.max_stdout_line_chars,
@@ -74,8 +74,6 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ForgeAp
         let forge_config = self.services.get_config()?;
         let environment = services.get_environment();
 
-        let files = services.list_current_directory().await?;
-
         let custom_instructions = services.get_custom_instructions().await;
 
         // Prepare agents with user configuration
@@ -100,6 +98,8 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ForgeAp
             .await?;
 
         let models = services.models(agent_provider).await?;
+        let selected_model = models.iter().find(|model| model.id == agent.model);
+        let agent = agent.compaction_threshold(selected_model);
 
         // Get system and mcp tool definitions and resolve them for the agent
         let all_tool_definitions = self.tool_registry.list().await?;
@@ -116,7 +116,6 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ForgeAp
                 .custom_instructions(custom_instructions.clone())
                 .tool_definitions(tool_definitions.clone())
                 .models(models.clone())
-                .files(files.clone())
                 .max_extensions(forge_config.max_extensions)
                 .template_config(build_template_config(&forge_config))
                 .add_system_message(conversation)
@@ -193,8 +192,16 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ForgeAp
                     let save_result = services.upsert_conversation(conversation).await;
 
                     // Send any error to the stream (prioritize dispatch error over save error)
-                    #[allow(clippy::collapsible_if)]
-                    if let Some(err) = dispatch_result.err().or(save_result.err()) {
+                    let final_err = match (dispatch_result, save_result) {
+                        (Err(d), Err(s)) => {
+                            Some(d.context(format!("Also failed to save conversation: {}", s)))
+                        }
+                        (Ok(_), Err(s)) => Some(s.context("Failed to save conversation")),
+                        (Err(d), Ok(_)) => Some(d),
+                        (Ok(_), Ok(_)) => None,
+                    };
+
+                    if let Some(err) = final_err {
                         if let Err(e) = tx.send(Err(err)).await {
                             tracing::error!("Failed to send error to stream: {}", e);
                         }
@@ -322,10 +329,26 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ForgeAp
             .collect();
 
         // Execute all provider fetches concurrently.
-        futures::future::join_all(futures)
-            .await
-            .into_iter()
-            .collect::<anyhow::Result<Vec<_>>>()
+        let results = futures::future::join_all(futures).await;
+        let mut successes = Vec::new();
+        let mut first_error = None;
+        for res in results {
+            match res {
+                Ok(models) => successes.push(models),
+                Err(e) => {
+                    tracing::warn!("Failed to fetch models from provider: {}", e);
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+            }
+        }
+        if successes.is_empty() {
+            if let Some(err) = first_error {
+                return Err(err);
+            }
+        }
+        Ok(successes)
     }
 }
 

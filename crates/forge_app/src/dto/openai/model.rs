@@ -90,17 +90,16 @@ pub struct ListModelResponse {
     pub data: Vec<Model>,
 }
 
-impl From<Model> for forge_domain::Model {
-    fn from(value: Model) -> Self {
+impl Model {
+    pub fn into_domain(self, provider_id: forge_domain::ProviderId) -> forge_domain::Model {
         let has_param = |name: &str| {
-            value
-                .supported_parameters
+            self.supported_parameters
                 .as_ref()
                 .map(|params| params.iter().any(|p| p == name))
         };
 
         // Parse input modalities from OpenRouter's input_modalities field
-        let input_modalities = value
+        let input_modalities = self
             .architecture
             .as_ref()
             .and_then(|arch| arch.input_modalities.as_ref())
@@ -117,10 +116,11 @@ impl From<Model> for forge_domain::Model {
         let supports_reasoning = has_param("reasoning");
 
         forge_domain::Model {
-            id: value.id,
-            name: value.name,
-            description: value.description,
-            context_length: value.context_length,
+            id: self.id,
+            provider_id: Some(provider_id),
+            name: self.name,
+            description: self.description,
+            context_length: self.context_length,
             tools_supported,
             supports_parallel_tool_calls,
             supports_reasoning,
@@ -279,7 +279,7 @@ mod tests {
             supported_parameters: None, // No supported_parameters field
         };
 
-        let domain_model: forge_domain::Model = model.into();
+        let domain_model: forge_domain::Model = model.into_domain(forge_domain::ProviderId::OPENAI);
 
         // When supported_parameters is None, capabilities should be None (unknown)
         assert_eq!(domain_model.tools_supported, None);
@@ -306,7 +306,7 @@ mod tests {
             ]),
         };
 
-        let domain_model: forge_domain::Model = model.into();
+        let domain_model: forge_domain::Model = model.into_domain(forge_domain::ProviderId::OPENAI);
 
         // Should reflect what's actually in supported_parameters
         assert_eq!(domain_model.tools_supported, Some(true));

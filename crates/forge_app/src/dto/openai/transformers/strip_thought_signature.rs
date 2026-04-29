@@ -21,7 +21,11 @@ impl Transformer for StripThoughtSignature {
                 // Also remove extra_content from tool_calls
                 if let Some(tool_calls) = message.tool_calls.as_mut() {
                     for tool_call in tool_calls.iter_mut() {
-                        tool_call.extra_content = None;
+                        if let crate::dto::openai::ToolCall::Function { extra_content, .. } =
+                            tool_call
+                        {
+                            *extra_content = None;
+                        }
                     }
                 }
             }
@@ -33,17 +37,17 @@ impl Transformer for StripThoughtSignature {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context;
     use forge_domain::{ModelId, Transformer};
     use pretty_assertions::assert_eq;
 
     use super::*;
     use crate::dto::openai::{
-        ExtraContent, FunctionCall, FunctionType, GoogleMetadata, Message, MessageContent, Role,
-        ToolCall,
+        ExtraContent, FunctionCall, GoogleMetadata, Message, MessageContent, Role, ToolCall,
     };
 
     #[test]
-    fn test_strip_thought_signature_removes_extra_content() {
+    fn test_strip_thought_signature_removes_extra_content() -> anyhow::Result<()> {
         let fixture = Request::default().messages(vec![Message {
             role: Role::Assistant,
             content: Some(MessageContent::Text("Hello".to_string())),
@@ -62,19 +66,21 @@ mod tests {
         let mut transformer = StripThoughtSignature;
         let actual = transformer.transform(fixture);
 
-        assert!(actual.messages.unwrap()[0].extra_content.is_none());
+        let msgs = actual.messages.context("Missing msgs")?;
+        let first_msg = msgs.first().context("No first msg")?;
+        assert!(first_msg.extra_content.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_strip_thought_signature_removes_from_tool_calls() {
+    fn test_strip_thought_signature_removes_from_tool_calls() -> anyhow::Result<()> {
         let fixture = Request::default().messages(vec![Message {
             role: Role::Assistant,
             content: Some(MessageContent::Text("Using tool".to_string())),
             name: None,
             tool_call_id: None,
-            tool_calls: Some(vec![ToolCall {
+            tool_calls: Some(vec![ToolCall::Function {
                 id: None,
-                r#type: FunctionType,
                 function: FunctionCall { name: None, arguments: "{}".to_string() },
                 extra_content: Some(ExtraContent {
                     google: Some(GoogleMetadata { thought_signature: Some("sig456".to_string()) }),
@@ -90,9 +96,21 @@ mod tests {
         let mut transformer = StripThoughtSignature;
         let actual = transformer.transform(fixture);
 
-        let messages = actual.messages.unwrap();
-        let tool_calls = messages[0].tool_calls.as_ref().unwrap();
-        assert!(tool_calls[0].extra_content.is_none());
+        let messages = actual.messages.context("No messages")?;
+        let tool_calls = messages
+            .first()
+            .context("No first message")?
+            .tool_calls
+            .as_ref()
+            .context("No tool calls")?;
+        if let ToolCall::Function { extra_content, .. } =
+            tool_calls.first().context("No first tool call")?
+        {
+            assert!(extra_content.is_none());
+        } else {
+            anyhow::bail!("Expected Function tool call");
+        }
+        Ok(())
     }
 
     #[test]
@@ -106,7 +124,7 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_thought_signature_preserves_other_fields() {
+    fn test_strip_thought_signature_preserves_other_fields() -> anyhow::Result<()> {
         let fixture = Request::default()
             .model(ModelId::new("gpt-4"))
             .messages(vec![Message {
@@ -127,9 +145,11 @@ mod tests {
         let mut transformer = StripThoughtSignature;
         let actual = transformer.transform(fixture);
 
-        let messages = actual.messages.unwrap();
-        assert!(messages[0].extra_content.is_none());
-        assert_eq!(messages[0].reasoning_text, Some("reasoning".to_string()));
+        let messages = actual.messages.context("Missing")?;
+        let first_msg = messages.first().context("No first msg")?;
+        assert!(first_msg.extra_content.is_none());
+        assert_eq!(first_msg.reasoning_text, Some("reasoning".to_string()));
         assert_eq!(actual.model, Some(ModelId::new("gpt-4")));
+        Ok(())
     }
 }

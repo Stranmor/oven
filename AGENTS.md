@@ -244,3 +244,7 @@ impl<R: UserRepository, C: Cache, L: Logger> BadUserService<R, C, L> {
 // BAD: Usage becomes cumbersome
 let service = BadUserService::<PostgresRepo, RedisCache, FileLogger>::new(...);
 ```
+
+## TARGET GOAL
+
+Resolve 5 immediate tech debt items: Tool definition caching, OpenAI Tool DTO type safety, Agent provider resolver strict fallback, Snapshot service promotion, and Provider association in Model.

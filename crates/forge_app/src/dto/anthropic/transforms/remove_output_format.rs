@@ -57,7 +57,8 @@ mod tests {
     #[test]
     fn test_removes_output_format() {
         let schema = schemars::schema_for!(TestResponse);
-        let fixture = Request::default().output_format(OutputFormat::JsonSchema { schema });
+        let fixture =
+            Request::default().output_format(OutputFormat::JsonSchema { schema: schema.into() });
 
         let actual = RemoveOutputFormat.transform(fixture);
 

@@ -13,8 +13,7 @@ use forge_domain::{
     AnyProvider, AuthCredential, ChatCompletionMessage, ChatRepository, CommandOutput, Context,
     Conversation, ConversationId, ConversationRepository, Environment, FileInfo,
     FuzzySearchRepository, McpServerConfig, MigrationResult, Model, ModelId, Provider, ProviderId,
-    ProviderRepository, ResultStream, SearchMatch, Skill, SkillRepository, Snapshot,
-    SnapshotRepository,
+    ProviderRepository, ResultStream, SearchMatch, Skill, SkillRepository,
 };
 // Re-export CacacheStorage from forge_infra
 pub use forge_infra::CacacheStorage;
@@ -27,7 +26,6 @@ use crate::agent::ForgeAgentRepository;
 use crate::context_engine::ForgeContextEngineRepository;
 use crate::conversation::ConversationRepositoryImpl;
 use crate::database::{DatabasePool, PoolConfig};
-use crate::fs_snap::ForgeFileSnapshotService;
 use crate::fuzzy_search::ForgeFuzzySearchRepository;
 use crate::provider::{ForgeChatRepository, ForgeProviderRepository};
 use crate::skill::ForgeSkillRepository;
@@ -40,7 +38,6 @@ use crate::validation::ForgeValidationRepository;
 #[derive(Clone)]
 pub struct ForgeRepo<F> {
     infra: Arc<F>,
-    file_snapshot_service: Arc<ForgeFileSnapshotService>,
     conversation_repository: Arc<ConversationRepositoryImpl>,
     mcp_cache_repository: Arc<CacacheStorage>,
     provider_repository: Arc<ForgeProviderRepository<F>>,
@@ -60,11 +57,11 @@ impl<
         + HttpInfra,
 > ForgeRepo<F>
 {
-    pub fn new(infra: Arc<F>) -> Self {
+    pub fn new(infra: Arc<F>) -> anyhow::Result<Self> {
         let env = infra.get_environment();
-        let file_snapshot_service = Arc::new(ForgeFileSnapshotService::new(env.clone()));
-        let db_pool =
-            Arc::new(DatabasePool::try_from(PoolConfig::new(env.database_path())).unwrap());
+        let db_pool = Arc::new(DatabasePool::try_from(PoolConfig::new(
+            env.database_path(),
+        ))?);
         let conversation_repository = Arc::new(ConversationRepositoryImpl::new(
             db_pool.clone(),
             env.workspace_hash(),
@@ -72,7 +69,7 @@ impl<
 
         let mcp_cache_repository = Arc::new(CacacheStorage::new(
             env.cache_dir().join("mcp_cache"),
-            Some(3600),
+            Some(std::time::Duration::from_secs(3600)),
         )); // 1 hour TTL
 
         let provider_repository = Arc::new(ForgeProviderRepository::new(infra.clone()));
@@ -83,9 +80,8 @@ impl<
         let skill_repository = Arc::new(ForgeSkillRepository::new(infra.clone()));
         let validation_repository = Arc::new(ForgeValidationRepository::new(infra.clone()));
         let fuzzy_search_repository = Arc::new(ForgeFuzzySearchRepository::new(infra.clone()));
-        Self {
+        Ok(Self {
             infra,
-            file_snapshot_service,
             conversation_repository,
             mcp_cache_repository,
             provider_repository,
@@ -95,18 +91,7 @@ impl<
             skill_repository,
             validation_repository,
             fuzzy_search_repository,
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl<F: Send + Sync> SnapshotRepository for ForgeRepo<F> {
-    async fn insert_snapshot(&self, file_path: &Path) -> anyhow::Result<Snapshot> {
-        self.file_snapshot_service.insert_snapshot(file_path).await
-    }
-
-    async fn undo_snapshot(&self, file_path: &Path) -> anyhow::Result<()> {
-        self.file_snapshot_service.undo_snapshot(file_path).await
+        })
     }
 }
 
@@ -127,19 +112,14 @@ impl<F: Send + Sync> ConversationRepository for ForgeRepo<F> {
             .await
     }
 
-    async fn get_all_conversations(
-        &self,
-        limit: Option<usize>,
-    ) -> anyhow::Result<Option<Vec<Conversation>>> {
-        self.conversation_repository
-            .get_all_conversations(limit)
-            .await
+    async fn get_all_conversations(&self) -> anyhow::Result<Vec<Conversation>> {
+        self.conversation_repository.get_all_conversations().await
     }
 
     async fn get_sub_conversations(
         &self,
         parent_id: &ConversationId,
-    ) -> anyhow::Result<Option<Vec<Conversation>>> {
+    ) -> anyhow::Result<Vec<Conversation>> {
         self.conversation_repository
             .get_sub_conversations(parent_id)
             .await
@@ -629,10 +609,10 @@ impl<F: GrpcInfra + Send + Sync> FuzzySearchRepository for ForgeRepo<F> {
         &self,
         needle: &str,
         haystack: &str,
-        search_all: bool,
+        mode: forge_domain::SearchMode,
     ) -> anyhow::Result<Vec<SearchMatch>> {
         self.fuzzy_search_repository
-            .fuzzy_search(needle, haystack, search_all)
+            .fuzzy_search(needle, haystack, mode)
             .await
     }
 }

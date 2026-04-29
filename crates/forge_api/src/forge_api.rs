@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use forge_app::dto::ToolsOverview;
 use forge_app::{
     AgentProviderResolver, AgentRegistry, AppConfigService, AuthService, CommandInfra,
@@ -48,11 +48,11 @@ impl ForgeAPI<ForgeServices<ForgeRepo<ForgeInfra>>, ForgeRepo<ForgeInfra>> {
     /// * `cwd` - The working directory path for environment and file resolution
     /// * `config` - Pre-read application configuration (from startup)
     /// * `services_url` - Pre-validated URL for the gRPC workspace server
-    pub fn init(cwd: PathBuf, config: ForgeConfig) -> Self {
+    pub fn init(cwd: PathBuf, config: ForgeConfig) -> anyhow::Result<Self> {
         let infra = Arc::new(ForgeInfra::new(cwd, config));
-        let repo = Arc::new(ForgeRepo::new(infra.clone()));
+        let repo = Arc::new(ForgeRepo::new(infra.clone())?);
         let app = Arc::new(ForgeServices::new(repo.clone()));
-        ForgeAPI::new(app, repo)
+        Ok(ForgeAPI::new(app, repo))
     }
 
     pub async fn get_skills_internal(&self) -> Result<Vec<Skill>> {
@@ -100,6 +100,7 @@ impl<
         Ok(self.services.get_all_providers().await?)
     }
 
+    #[tracing::instrument(skip(self, diff, additional_context))]
     async fn commit(
         &self,
         preview: bool,
@@ -107,6 +108,12 @@ impl<
         diff: Option<String>,
         additional_context: Option<String>,
     ) -> Result<forge_app::CommitResult> {
+        let use_forge_committer = self
+            .services
+            .get_config()
+            .context("Failed to read forge config for commit settings")?
+            .use_forge_committer;
+
         let git_app = GitApp::new(self.services.clone());
         let result = git_app
             .commit_message(max_diff_size, diff, additional_context)
@@ -116,7 +123,7 @@ impl<
             Ok(result)
         } else {
             git_app
-                .commit(result.message, result.has_staged_files)
+                .commit(result.message, result.has_staged_files, use_forge_committer)
                 .await
         }
     }
@@ -137,7 +144,7 @@ impl<
             .services
             .get_active_agent_id()
             .await?
-            .unwrap_or_default();
+            .ok_or_else(|| anyhow::anyhow!("No active agent configured"))?;
         self.app().chat(agent_id, chat).await
     }
 
@@ -153,7 +160,7 @@ impl<
             .services
             .get_active_agent_id()
             .await?
-            .unwrap_or_default();
+            .ok_or_else(|| anyhow::anyhow!("No active agent configured"))?;
         self.app()
             .compact_conversation(agent_id, conversation_id)
             .await
@@ -170,23 +177,15 @@ impl<
         self.services.find_conversation(conversation_id).await
     }
 
-    async fn get_conversations(&self, limit: Option<usize>) -> anyhow::Result<Vec<Conversation>> {
-        Ok(self
-            .services
-            .get_conversations(limit)
-            .await?
-            .unwrap_or_default())
+    async fn get_conversations(&self) -> anyhow::Result<Vec<Conversation>> {
+        Ok(self.services.get_conversations().await?)
     }
 
     async fn get_sub_conversations(
         &self,
         parent_id: &ConversationId,
     ) -> anyhow::Result<Vec<Conversation>> {
-        Ok(self
-            .services
-            .get_sub_conversations(parent_id)
-            .await?
-            .unwrap_or_default())
+        Ok(self.services.get_sub_conversations(parent_id).await?)
     }
 
     async fn last_conversation(&self) -> anyhow::Result<Option<Conversation>> {
@@ -209,6 +208,7 @@ impl<
             .await
     }
 
+    #[tracing::instrument(skip(self))]
     async fn execute_shell_command(
         &self,
         command: &str,
@@ -245,17 +245,19 @@ impl<
         agent_provider_resolver.get_provider(Some(agent_id)).await
     }
 
+    #[tracing::instrument(skip(self))]
     async fn update_config(&self, ops: Vec<forge_domain::ConfigOperation>) -> anyhow::Result<()> {
-        // Determine whether any op affects provider/model resolution before writing,
-        // so we can invalidate the agent cache afterwards.
         let needs_agent_reload = ops
             .iter()
             .any(|op| matches!(op, forge_domain::ConfigOperation::SetSessionConfig(_)));
-        let result = self.services.update_config(ops).await;
+
+        self.services.update_config(ops).await?;
+
         if needs_agent_reload {
-            let _ = self.services.reload_agents().await;
+            self.services.reload_agents().await?;
         }
-        result
+
+        Ok(())
     }
 
     async fn get_commit_config(&self) -> anyhow::Result<Option<ModelConfig>> {
@@ -422,12 +424,13 @@ impl<
         self.services.get_provider(model_config.provider).await
     }
 
-    async fn mcp_auth(&self, server_url: &str) -> Result<()> {
+    #[tracing::instrument(skip(self))]
+    async fn mcp_auth(&self, server_url: &url::Url) -> Result<()> {
         let env = self.services.get_environment().clone();
         forge_infra::mcp_auth(server_url, &env).await
     }
 
-    async fn mcp_logout(&self, server_url: Option<&str>) -> Result<()> {
+    async fn mcp_logout(&self, server_url: Option<&url::Url>) -> Result<()> {
         let env = self.services.get_environment().clone();
         match server_url {
             Some(url) => forge_infra::mcp_logout(url, &env).await,
@@ -435,7 +438,7 @@ impl<
         }
     }
 
-    async fn mcp_auth_status(&self, server_url: &str) -> Result<String> {
+    async fn mcp_auth_status(&self, server_url: &url::Url) -> Result<forge_domain::McpAuthStatus> {
         let env = self.services.get_environment().clone();
         Ok(forge_infra::mcp_auth_status(server_url, &env).await)
     }

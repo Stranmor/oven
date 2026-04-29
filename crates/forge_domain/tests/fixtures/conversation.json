@@ -1,6 +1,7 @@
 {
   "id": "d0e2b1f5-6405-4e52-9c1e-6410279de630",
   "title": null,
+  "initiator": "user",
   "context": {
     "conversation_id": "d0e2b1f5-6405-4e52-9c1e-6410279de630",
     "messages": [

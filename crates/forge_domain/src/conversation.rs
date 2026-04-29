@@ -38,6 +38,15 @@ impl FromStr for ConversationId {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Initiator {
+    /// Started by a human user
+    User,
+    /// Spawned by a parent agent as a sub-conversation
+    Agent,
+}
+
 #[derive(Debug, Setters, Serialize, Deserialize, Clone)]
 #[setters(into)]
 pub struct Conversation {
@@ -45,6 +54,7 @@ pub struct Conversation {
     pub parent_id: Option<ConversationId>,
     pub title: Option<String>,
     pub context: Option<Context>,
+    pub initiator: Initiator,
     pub metrics: Metrics,
     pub metadata: MetaData,
 }
@@ -70,6 +80,7 @@ impl Conversation {
             id,
             parent_id: None,
             metrics,
+            initiator: Initiator::User,
             metadata: MetaData::new(created_at),
             title: None,
             context: None,
@@ -205,10 +216,7 @@ impl Conversation {
 
     /// Returns whether the conversation was spawned by another agent.
     pub fn is_agent_initiated(&self) -> bool {
-        self.context
-            .as_ref()
-            .and_then(|ctx| ctx.initiator.as_deref())
-            == Some("agent")
+        self.initiator == Initiator::Agent
     }
 }
 
@@ -293,8 +301,7 @@ mod tests {
 
     #[test]
     fn test_is_agent_initiated() {
-        let setup =
-            Conversation::generate().context(Context::default().initiator("agent".to_string()));
+        let setup = Conversation::generate().initiator(Initiator::Agent);
 
         let actual = setup.is_agent_initiated();
         let expected = true;

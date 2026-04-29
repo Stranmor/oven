@@ -71,8 +71,8 @@ mod tests {
     // ContentFormat is now ChatResponseContent
     use crate::operation::ToolOperation;
     use crate::{
-        Content, FsRemoveOutput, FsUndoOutput, FsWriteOutput, HttpResponse, Match, MatchResult,
-        PatchOutput, ReadOutput, ResponseContext, SearchResult, ShellOutput,
+        Content, FsRemoveOutput, FsWriteOutput, HttpResponse, Match, MatchResult, PatchOutput,
+        ReadOutput, ResponseContext, SearchResult, ShellOutput, SnapshotUndoOutput,
     };
 
     // ContentFormat methods are now implemented in ChatResponseContent
@@ -88,8 +88,7 @@ mod tests {
         let fixture = ToolOperation::FsRead {
             input: forge_domain::FSRead {
                 file_path: "/home/user/test.txt".to_string(),
-                start_line: None,
-                end_line: None,
+                range: None,
                 show_line_numbers: true,
             },
             output: ReadOutput {
@@ -111,8 +110,7 @@ mod tests {
         let fixture = ToolOperation::FsRead {
             input: forge_domain::FSRead {
                 file_path: "/home/user/test.txt".to_string(),
-                start_line: Some(2),
-                end_line: Some(4),
+                range: Some(forge_domain::FSReadRange { start_line: Some(2), end_line: Some(4) }),
                 show_line_numbers: true,
             },
             output: ReadOutput {
@@ -357,7 +355,7 @@ mod tests {
     fn test_fs_undo() {
         let fixture = ToolOperation::FsUndo {
             input: forge_domain::FSUndo { path: "/home/user/project/test.txt".to_string() },
-            output: FsUndoOutput {
+            output: SnapshotUndoOutput {
                 before_undo: Some("ABC".to_string()),
                 after_undo: Some("PQR".to_string()),
             },

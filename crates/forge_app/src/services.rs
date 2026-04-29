@@ -137,7 +137,7 @@ pub struct PlanCreateOutput {
 }
 
 #[derive(Default, Debug, derive_more::From)]
-pub struct FsUndoOutput {
+pub struct SnapshotUndoOutput {
     pub before_undo: Option<String>,
     pub after_undo: Option<String>,
 }
@@ -237,17 +237,14 @@ pub trait ConversationService: Send + Sync {
         F: FnOnce(&mut Conversation) -> T + Send,
         T: Send;
 
-    /// Find conversations with optional limit
-    async fn get_conversations(
-        &self,
-        limit: Option<usize>,
-    ) -> anyhow::Result<Option<Vec<Conversation>>>;
+    /// Find conversations
+    async fn get_conversations(&self) -> anyhow::Result<Vec<Conversation>>;
 
     /// Find sub-conversations (subagent chats) for a parent conversation
     async fn get_sub_conversations(
         &self,
         parent_id: &ConversationId,
-    ) -> anyhow::Result<Option<Vec<Conversation>>>;
+    ) -> anyhow::Result<Vec<Conversation>>;
 
     /// Find the last active conversation
     async fn last_conversation(&self) -> anyhow::Result<Option<Conversation>>;
@@ -420,12 +417,15 @@ pub trait FollowUpService: Send + Sync {
 }
 
 #[async_trait::async_trait]
-pub trait FsUndoService: Send + Sync {
+pub trait SnapshotService: Send + Sync {
+    /// Creates a snapshot of the file at the specified path before modification.
+    async fn create_snapshot(
+        &self,
+        path: PathBuf,
+    ) -> anyhow::Result<Option<forge_domain::Snapshot>>;
     /// Undoes the last file operation at the specified path.
     /// And returns the content of the undone file.
-    // TODO: We should move Snapshot service to Services from infra
-    // and drop FsUndoService.
-    async fn undo(&self, path: String) -> anyhow::Result<FsUndoOutput>;
+    async fn undo_snapshot(&self, path: PathBuf) -> anyhow::Result<SnapshotUndoOutput>;
 }
 
 #[async_trait::async_trait]
@@ -554,7 +554,7 @@ pub trait Services: Send + Sync + 'static + Clone + EnvironmentInfra {
     type FsRemoveService: FsRemoveService;
     type FsSearchService: FsSearchService;
     type FollowUpService: FollowUpService;
-    type FsUndoService: FsUndoService;
+    type SnapshotService: SnapshotService;
     type NetFetchService: NetFetchService;
     type ShellService: ShellService;
     type McpService: McpService;
@@ -581,7 +581,7 @@ pub trait Services: Send + Sync + 'static + Clone + EnvironmentInfra {
     fn fs_remove_service(&self) -> &Self::FsRemoveService;
     fn fs_search_service(&self) -> &Self::FsSearchService;
     fn follow_up_service(&self) -> &Self::FollowUpService;
-    fn fs_undo_service(&self) -> &Self::FsUndoService;
+    fn snapshot_service(&self) -> &Self::SnapshotService;
     fn net_fetch_service(&self) -> &Self::NetFetchService;
     fn shell_service(&self) -> &Self::ShellService;
     fn mcp_service(&self) -> &Self::McpService;
@@ -615,17 +615,14 @@ impl<I: Services> ConversationService for I {
         self.conversation_service().modify_conversation(id, f).await
     }
 
-    async fn get_conversations(
-        &self,
-        limit: Option<usize>,
-    ) -> anyhow::Result<Option<Vec<Conversation>>> {
-        self.conversation_service().get_conversations(limit).await
+    async fn get_conversations(&self) -> anyhow::Result<Vec<Conversation>> {
+        self.conversation_service().get_conversations().await
     }
 
     async fn get_sub_conversations(
         &self,
         parent_id: &ConversationId,
-    ) -> anyhow::Result<Option<Vec<Conversation>>> {
+    ) -> anyhow::Result<Vec<Conversation>> {
         self.conversation_service()
             .get_sub_conversations(parent_id)
             .await
@@ -755,6 +752,11 @@ impl<I: Services> FsWriteService for I {
         content: String,
         overwrite: bool,
     ) -> anyhow::Result<FsWriteOutput> {
+        self.snapshot_service()
+            .create_snapshot(std::path::PathBuf::from(&path))
+            .await
+            .ok(); // Ignore snapshot errors to not fail the write
+
         self.fs_create_service()
             .write(path, content, overwrite)
             .await
@@ -784,6 +786,11 @@ impl<I: Services> FsPatchService for I {
         content: String,
         replace_all: bool,
     ) -> anyhow::Result<PatchOutput> {
+        self.snapshot_service()
+            .create_snapshot(std::path::PathBuf::from(&path))
+            .await
+            .ok();
+
         self.fs_patch_service()
             .patch(path, search, content, replace_all)
             .await
@@ -794,6 +801,11 @@ impl<I: Services> FsPatchService for I {
         path: String,
         edits: Vec<forge_domain::PatchEdit>,
     ) -> anyhow::Result<PatchOutput> {
+        self.snapshot_service()
+            .create_snapshot(std::path::PathBuf::from(&path))
+            .await
+            .ok();
+
         self.fs_patch_service().multi_patch(path, edits).await
     }
 }
@@ -821,6 +833,11 @@ impl<I: Services> ImageReadService for I {
 #[async_trait::async_trait]
 impl<I: Services> FsRemoveService for I {
     async fn remove(&self, path: String) -> anyhow::Result<FsRemoveOutput> {
+        self.snapshot_service()
+            .create_snapshot(std::path::PathBuf::from(&path))
+            .await
+            .ok();
+
         self.fs_remove_service().remove(path).await
     }
 }
@@ -847,9 +864,15 @@ impl<I: Services> FollowUpService for I {
 }
 
 #[async_trait::async_trait]
-impl<I: Services> FsUndoService for I {
-    async fn undo(&self, path: String) -> anyhow::Result<FsUndoOutput> {
-        self.fs_undo_service().undo(path).await
+impl<I: Services> SnapshotService for I {
+    async fn create_snapshot(
+        &self,
+        path: PathBuf,
+    ) -> anyhow::Result<Option<forge_domain::Snapshot>> {
+        self.snapshot_service().create_snapshot(path).await
+    }
+    async fn undo_snapshot(&self, path: PathBuf) -> anyhow::Result<SnapshotUndoOutput> {
+        self.snapshot_service().undo_snapshot(path).await
     }
 }
 

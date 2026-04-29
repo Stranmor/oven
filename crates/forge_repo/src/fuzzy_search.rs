@@ -29,8 +29,12 @@ impl<I: GrpcInfra> FuzzySearchRepository for ForgeFuzzySearchRepository<I> {
         &self,
         needle: &str,
         haystack: &str,
-        search_all: bool,
+        mode: forge_domain::SearchMode,
     ) -> Result<Vec<SearchMatch>> {
+        let search_all = match mode {
+            forge_domain::SearchMode::AllMatches => true,
+            forge_domain::SearchMode::FirstMatch => false,
+        };
         // Create gRPC request
         let request = tonic::Request::new(FuzzySearchRequest {
             needle: needle.to_string(),

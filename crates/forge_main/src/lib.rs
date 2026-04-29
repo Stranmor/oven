@@ -9,6 +9,7 @@ mod highlighter;
 mod image_paste;
 mod info;
 mod input;
+mod logs;
 mod model;
 mod oauth_callback;
 mod porcelain;

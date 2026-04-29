@@ -65,7 +65,7 @@ pub trait API: Sync + Send {
     async fn conversation(&self, conversation_id: &ConversationId) -> Result<Option<Conversation>>;
 
     /// Lists all conversations for the active workspace
-    async fn get_conversations(&self, limit: Option<usize>) -> Result<Vec<Conversation>>;
+    async fn get_conversations(&self) -> Result<Vec<Conversation>>;
 
     /// Lists sub-conversations (subagent chats) for a parent conversation
     async fn get_sub_conversations(&self, parent_id: &ConversationId) -> Result<Vec<Conversation>>;
@@ -256,11 +256,11 @@ pub trait API: Sync + Send {
     ) -> Result<BoxStream<'static, Result<serde_json::Value, anyhow::Error>>>;
 
     /// Authenticate with an MCP server via OAuth flow
-    async fn mcp_auth(&self, server_url: &str) -> Result<()>;
+    async fn mcp_auth(&self, server_url: &Url) -> Result<()>;
 
     /// Remove stored OAuth credentials for an MCP server (or all servers)
-    async fn mcp_logout(&self, server_url: Option<&str>) -> Result<()>;
+    async fn mcp_logout(&self, server_url: Option<&Url>) -> Result<()>;
 
     /// Check the OAuth authentication status of an MCP server
-    async fn mcp_auth_status(&self, server_url: &str) -> Result<String>;
+    async fn mcp_auth_status(&self, server_url: &Url) -> Result<forge_domain::McpAuthStatus>;
 }
