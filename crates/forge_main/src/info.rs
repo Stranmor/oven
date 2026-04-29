@@ -975,6 +975,7 @@ mod tests {
 
         let fixture = Conversation {
             id: conversation_id,
+            parent_id: None,
             title: Some("Test Conversation".to_string()),
             context: None,
             metrics,
@@ -1002,6 +1003,7 @@ mod tests {
 
         let fixture = Conversation {
             id: conversation_id,
+            parent_id: None,
             title: None,
             context: None,
             metrics,
@@ -1047,6 +1049,7 @@ mod tests {
 
         let fixture = Conversation {
             id: conversation_id,
+            parent_id: None,
             title: Some("Test Task".to_string()),
             context: Some(context),
             metrics,
