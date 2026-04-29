@@ -96,6 +96,8 @@ impl ConversationRepository for ConversationRepositoryImpl {
 
             let records: Vec<ConversationRecord> = query
                 .filter(conversations::initiator.is_null())
+                .filter(conversations::context.not_like("%\"initiator\":\"agent\"%"))
+                .filter(conversations::context.not_like("%\"initiator\": \"agent\"%"))
                 .load(connection)?;
 
             let conversations: Vec<Conversation> = records
@@ -139,6 +141,8 @@ impl ConversationRepository for ConversationRepositoryImpl {
                 .filter(conversations::context.is_not_null())
                 .filter(conversations::parent_id.is_null())
                 .filter(conversations::initiator.is_null())
+                .filter(conversations::context.not_like("%\"initiator\":\"agent\"%"))
+                .filter(conversations::context.not_like("%\"initiator\": \"agent\"%"))
                 .order(conversations::updated_at.desc())
                 .load::<ConversationRecord>(connection)?
                 .into_iter()
@@ -198,6 +202,35 @@ mod tests {
     fn repository() -> anyhow::Result<ConversationRepositoryImpl> {
         let pool = Arc::new(DatabasePool::in_memory()?);
         Ok(ConversationRepositoryImpl::new(pool, WorkspaceHash::new(0)))
+    }
+
+    async fn insert_legacy_agent_record(
+        repo: &ConversationRepositoryImpl,
+        title: &str,
+    ) -> anyhow::Result<ConversationId> {
+        let id = ConversationId::generate();
+        let now = Utc::now().naive_utc();
+        let record = ConversationRecord {
+            conversation_id: id.into_string(),
+            title: Some(title.to_string()),
+            workspace_id: 0,
+            context: Some(r#"{"initiator":"agent"}"#.to_string()),
+            created_at: now,
+            updated_at: Some(now),
+            metrics: None,
+            parent_id: None,
+            initiator: None,
+        };
+
+        repo.run_with_connection(move |connection, _wid| {
+            diesel::insert_into(conversations::table)
+                .values(&record)
+                .execute(connection)?;
+            Ok(())
+        })
+        .await?;
+
+        Ok(id)
     }
 
     #[tokio::test]
@@ -364,6 +397,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_find_all_conversations_excludes_legacy_json_agent() -> anyhow::Result<()> {
+        let user_context =
+            Context::default().messages(vec![ContextMessage::user("Hello", None).into()]);
+        let user_conv = Conversation::new(ConversationId::generate())
+            .title(Some("User Chat".to_string()))
+            .context(Some(user_context));
+        let repo = repository()?;
+
+        repo.upsert_conversation(user_conv.clone()).await?;
+        insert_legacy_agent_record(&repo, "Legacy Agent").await?;
+
+        let actual = repo.get_all_conversations().await?;
+
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0].id, user_conv.id);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_find_last_conversation_excludes_agent_initiated() -> anyhow::Result<()> {
         let user_context =
             Context::default().messages(vec![ContextMessage::user("Hello", None).into()]);
@@ -384,6 +436,26 @@ mod tests {
             .title(Some("Agent Sub-Chat".to_string()))
             .context(Some(agent_context));
         repo.upsert_conversation(agent_conv).await?;
+
+        let actual = repo.get_last_conversation().await?;
+
+        assert!(actual.is_some());
+        assert_eq!(actual.unwrap().id, user_conv.id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_find_last_conversation_excludes_legacy_json_agent() -> anyhow::Result<()> {
+        let user_context =
+            Context::default().messages(vec![ContextMessage::user("Hello", None).into()]);
+        let user_conv = Conversation::new(ConversationId::generate())
+            .title(Some("User Chat".to_string()))
+            .context(Some(user_context));
+        let repo = repository()?;
+
+        repo.upsert_conversation(user_conv.clone()).await?;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        insert_legacy_agent_record(&repo, "Legacy Agent").await?;
 
         let actual = repo.get_last_conversation().await?;
 
