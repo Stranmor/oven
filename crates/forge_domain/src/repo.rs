@@ -1,11 +1,44 @@
+use std::path::Path;
+
 use anyhow::Result;
 use url::Url;
 
 use crate::{
     AnyProvider, AuthCredential, ChatCompletionMessage, Context, Conversation, ConversationId,
     MigrationResult, Model, ModelId, Provider, ProviderId, ProviderTemplate, ResultStream,
-    SearchMatch, Skill, WorkspaceAuth, WorkspaceId,
+    SearchMatch, Skill, Snapshot, WorkspaceAuth, WorkspaceId,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextPatchBlock {
+    pub patch: String,
+    pub patched_text: String,
+}
+
+/// Repository for managing file snapshots
+///
+/// This repository provides operations for creating and restoring file
+/// snapshots, enabling undo functionality for file modifications.
+#[async_trait::async_trait]
+pub trait SnapshotRepository: Send + Sync {
+    /// Inserts a new snapshot for the given file path
+    ///
+    /// # Arguments
+    /// * `file_path` - Path to the file to snapshot
+    ///
+    /// # Errors
+    /// Returns an error if the snapshot creation fails
+    async fn insert_snapshot(&self, file_path: &Path) -> Result<Snapshot>;
+
+    /// Restores the most recent snapshot for the given file path
+    ///
+    /// # Arguments
+    /// * `file_path` - Path to the file to restore
+    ///
+    /// # Errors
+    /// Returns an error if no snapshot exists or restoration fails
+    async fn undo_snapshot(&self, file_path: &Path) -> Result<()>;
+}
 
 /// Repository for managing conversation persistence
 ///
@@ -207,4 +240,14 @@ pub trait FuzzySearchRepository: Send + Sync {
         haystack: &str,
         mode: SearchMode,
     ) -> Result<Vec<SearchMatch>>;
+}
+
+#[async_trait::async_trait]
+pub trait TextPatchRepository: Send + Sync {
+    async fn build_text_patch(
+        &self,
+        haystack: &str,
+        old_string: &str,
+        new_string: &str,
+    ) -> Result<TextPatchBlock>;
 }

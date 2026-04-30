@@ -18,8 +18,8 @@ use crate::truncation::{
 };
 use crate::utils::{compute_hash, format_display_path};
 use crate::{
-    FsRemoveOutput, FsWriteOutput, HttpResponse, PatchOutput, PlanCreateOutput, ReadOutput,
-    ResponseContext, SearchResult, ShellOutput, SnapshotUndoOutput,
+    FsRemoveOutput, FsUndoOutput, FsWriteOutput, HttpResponse, PatchOutput, PlanCreateOutput,
+    ReadOutput, ResponseContext, SearchResult, ShellOutput,
 };
 
 #[derive(Debug, Default, Setters)]
@@ -60,7 +60,7 @@ pub enum ToolOperation {
     },
     FsUndo {
         input: FSUndo,
-        output: SnapshotUndoOutput,
+        output: FsUndoOutput,
     },
     NetFetch {
         input: NetFetch,
@@ -2183,7 +2183,7 @@ mod tests {
     fn test_fs_undo_no_changes() {
         let fixture = ToolOperation::FsUndo {
             input: forge_domain::FSUndo { path: "/home/user/unchanged_file.txt".to_string() },
-            output: SnapshotUndoOutput { before_undo: None, after_undo: None },
+            output: FsUndoOutput { before_undo: None, after_undo: None },
         };
 
         let env = fixture_environment();
@@ -2204,7 +2204,7 @@ mod tests {
     fn test_fs_undo_file_created() {
         let fixture = ToolOperation::FsUndo {
             input: forge_domain::FSUndo { path: "/home/user/new_file.txt".to_string() },
-            output: SnapshotUndoOutput {
+            output: FsUndoOutput {
                 before_undo: None,
                 after_undo: Some("New file content\nLine 2\nLine 3".to_string()),
             },
@@ -2228,7 +2228,7 @@ mod tests {
     fn test_fs_undo_file_removed() {
         let fixture = ToolOperation::FsUndo {
             input: forge_domain::FSUndo { path: "/home/user/deleted_file.txt".to_string() },
-            output: SnapshotUndoOutput {
+            output: FsUndoOutput {
                 before_undo: Some(
                     "Original file content\nThat was deleted\nDuring undo".to_string(),
                 ),
@@ -2254,7 +2254,7 @@ mod tests {
     fn test_fs_undo_file_restored() {
         let fixture = ToolOperation::FsUndo {
             input: forge_domain::FSUndo { path: "/home/user/restored_file.txt".to_string() },
-            output: SnapshotUndoOutput {
+            output: FsUndoOutput {
                 before_undo: Some("Original content\nBefore changes".to_string()),
                 after_undo: Some("Modified content\nAfter restoration".to_string()),
             },
@@ -2278,7 +2278,7 @@ mod tests {
     fn test_fs_undo_success() {
         let fixture = ToolOperation::FsUndo {
             input: forge_domain::FSUndo { path: "/home/user/test.txt".to_string() },
-            output: SnapshotUndoOutput {
+            output: FsUndoOutput {
                 before_undo: Some("ABC".to_string()),
                 after_undo: Some("PQR".to_string()),
             },

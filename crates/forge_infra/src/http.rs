@@ -7,10 +7,10 @@ use anyhow::Context;
 use bytes::Bytes;
 use forge_app::HttpInfra;
 use forge_config::{ForgeConfig, TlsBackend, TlsVersion};
+use forge_eventsource::{EventSource, RequestBuilderExt};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use reqwest::redirect::Policy;
 use reqwest::{Certificate, Client, Response, StatusCode, Url};
-use reqwest_eventsource::{EventSource, RequestBuilderExt};
 use serde_json::Value;
 use tracing::{debug, warn};
 

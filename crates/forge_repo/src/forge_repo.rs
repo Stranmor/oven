@@ -13,19 +13,21 @@ use forge_domain::{
     AnyProvider, AuthCredential, ChatCompletionMessage, ChatRepository, CommandOutput, Context,
     Conversation, ConversationId, ConversationRepository, Environment, FileInfo,
     FuzzySearchRepository, McpServerConfig, MigrationResult, Model, ModelId, Provider, ProviderId,
-    ProviderRepository, ResultStream, SearchMatch, Skill, SkillRepository,
+    ProviderRepository, ResultStream, SearchMatch, Skill, SkillRepository, Snapshot,
+    SnapshotRepository, TextPatchBlock, TextPatchRepository,
 };
+use forge_eventsource::EventSource;
 // Re-export CacacheStorage from forge_infra
 pub use forge_infra::CacacheStorage;
 use reqwest::Response;
 use reqwest::header::HeaderMap;
-use reqwest_eventsource::EventSource;
 use url::Url;
 
 use crate::agent::ForgeAgentRepository;
 use crate::context_engine::ForgeContextEngineRepository;
 use crate::conversation::ConversationRepositoryImpl;
 use crate::database::{DatabasePool, PoolConfig};
+use crate::fs_snap::ForgeFileSnapshotService;
 use crate::fuzzy_search::ForgeFuzzySearchRepository;
 use crate::provider::{ForgeChatRepository, ForgeProviderRepository};
 use crate::skill::ForgeSkillRepository;
@@ -38,6 +40,7 @@ use crate::validation::ForgeValidationRepository;
 #[derive(Clone)]
 pub struct ForgeRepo<F> {
     infra: Arc<F>,
+    file_snapshot_service: Arc<ForgeFileSnapshotService>,
     conversation_repository: Arc<ConversationRepositoryImpl>,
     mcp_cache_repository: Arc<CacacheStorage>,
     provider_repository: Arc<ForgeProviderRepository<F>>,
@@ -59,6 +62,7 @@ impl<
 {
     pub fn new(infra: Arc<F>) -> anyhow::Result<Self> {
         let env = infra.get_environment();
+        let file_snapshot_service = Arc::new(ForgeFileSnapshotService::new(env.clone()));
         let db_pool = Arc::new(DatabasePool::try_from(PoolConfig::new(
             env.database_path(),
         ))?);
@@ -82,6 +86,7 @@ impl<
         let fuzzy_search_repository = Arc::new(ForgeFuzzySearchRepository::new(infra.clone()));
         Ok(Self {
             infra,
+            file_snapshot_service,
             conversation_repository,
             mcp_cache_repository,
             provider_repository,
@@ -92,6 +97,17 @@ impl<
             validation_repository,
             fuzzy_search_repository,
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl<F: Send + Sync> SnapshotRepository for ForgeRepo<F> {
+    async fn insert_snapshot(&self, file_path: &Path) -> anyhow::Result<Snapshot> {
+        self.file_snapshot_service.insert_snapshot(file_path).await
+    }
+
+    async fn undo_snapshot(&self, file_path: &Path) -> anyhow::Result<()> {
+        self.file_snapshot_service.undo_snapshot(file_path).await
     }
 }
 
@@ -614,6 +630,29 @@ impl<F: GrpcInfra + Send + Sync> FuzzySearchRepository for ForgeRepo<F> {
         self.fuzzy_search_repository
             .fuzzy_search(needle, haystack, mode)
             .await
+    }
+}
+
+#[async_trait::async_trait]
+impl<F: GrpcInfra + Send + Sync> TextPatchRepository for ForgeRepo<F> {
+    async fn build_text_patch(
+        &self,
+        haystack: &str,
+        old_string: &str,
+        new_string: &str,
+    ) -> anyhow::Result<TextPatchBlock> {
+        let request = tonic::Request::new(crate::proto_generated::BuildTextPatchRequest {
+            haystack: haystack.to_string(),
+            old_string: old_string.to_string(),
+            new_string: new_string.to_string(),
+        });
+
+        let channel = self.infra.channel()?;
+        let mut client =
+            crate::proto_generated::forge_service_client::ForgeServiceClient::new(channel);
+        let response = client.build_text_patch(request).await?.into_inner();
+
+        Ok(TextPatchBlock { patch: response.patch, patched_text: response.patched_text })
     }
 }
 

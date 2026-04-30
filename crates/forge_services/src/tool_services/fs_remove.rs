@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use forge_app::{FileReaderInfra, FileRemoverInfra, FsRemoveOutput, FsRemoveService};
+use forge_domain::SnapshotRepository;
 
 use crate::utils::assert_absolute_path;
 
@@ -21,12 +22,17 @@ impl<F> ForgeFsRemove<F> {
 }
 
 #[async_trait::async_trait]
-impl<F: FileReaderInfra + FileRemoverInfra> FsRemoveService for ForgeFsRemove<F> {
+impl<F: FileReaderInfra + FileRemoverInfra + SnapshotRepository> FsRemoveService
+    for ForgeFsRemove<F>
+{
     async fn remove(&self, input_path: String) -> anyhow::Result<FsRemoveOutput> {
         let path = Path::new(&input_path);
         assert_absolute_path(path)?;
 
         let content = self.infra.read_utf8(path).await.unwrap_or_default();
+
+        // SNAPSHOT COORDINATION: Always capture snapshot before removing
+        self.infra.insert_snapshot(path).await?;
 
         self.infra.remove(path).await?;
 

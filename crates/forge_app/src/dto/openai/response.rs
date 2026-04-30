@@ -261,10 +261,15 @@ impl<'de> Deserialize<'de> for ToolCall {
         match wire.kind.as_deref() {
             Some("code_interpreter") => Ok(Self::CodeInterpreter { id: wire.id }),
             Some("function") | None => {
-                let function = wire.function.ok_or_else(|| de::Error::missing_field("function"))?;
+                let function = wire
+                    .function
+                    .ok_or_else(|| de::Error::missing_field("function"))?;
                 Ok(Self::Function { id: wire.id, function, extra_content: wire.extra_content })
             }
-            Some(other) => Err(de::Error::unknown_variant(other, &["function", "code_interpreter"])),
+            Some(other) => Err(de::Error::unknown_variant(
+                other,
+                &["function", "code_interpreter"],
+            )),
         }
     }
 }

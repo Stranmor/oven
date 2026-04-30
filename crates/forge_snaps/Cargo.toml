@@ -1,0 +1,19 @@
+[package]
+name = "forge_snaps"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+fnv_rs.workspace = true
+forge_domain.workspace = true
+forge_fs.workspace = true
+serde.workspace = true
+tokio = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "time", "test-util"] }
