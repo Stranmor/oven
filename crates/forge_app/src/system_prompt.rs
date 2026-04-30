@@ -12,38 +12,16 @@ use tracing::debug;
 
 use crate::{ShellService, SkillFetchService, TemplateEngine};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum InstructionProfile {
-    Full,
-    Delegated,
-}
-
-impl InstructionProfile {
-    fn from_conversation(conversation: &Conversation) -> Self {
-        if conversation.is_agent_initiated() {
-            Self::Delegated
-        } else {
-            Self::Full
-        }
-    }
-}
-
-fn collect_custom_rules<'a>(
-    agent: &'a Agent,
-    custom_instructions: &'a [String],
-    profile: InstructionProfile,
-) -> Vec<&'a str> {
+fn collect_custom_rules<'a>(agent: &'a Agent, custom_instructions: &'a [String]) -> Vec<&'a str> {
     let mut custom_rules = Vec::new();
 
     agent.custom_rules.iter().for_each(|rule| {
         custom_rules.push(rule.as_str());
     });
 
-    if profile == InstructionProfile::Full {
-        custom_instructions.iter().for_each(|rule| {
-            custom_rules.push(rule.as_str());
-        });
-    }
+    custom_instructions.iter().for_each(|rule| {
+        custom_rules.push(rule.as_str());
+    });
 
     custom_rules
 }
@@ -105,7 +83,6 @@ impl<S: SkillFetchService + ShellService> SystemPrompt<S> {
         &self,
         mut conversation: Conversation,
     ) -> anyhow::Result<Conversation> {
-        let instruction_profile = InstructionProfile::from_conversation(&conversation);
         let context = conversation.context.take().unwrap_or_default();
         let agent = &self.agent;
         let context = if let Some(system_prompt) = &agent.system_prompt {
@@ -119,8 +96,7 @@ impl<S: SkillFetchService + ShellService> SystemPrompt<S> {
                 false => Some(ToolUsagePrompt::from(&self.tool_definitions).to_string()),
             };
 
-            let custom_rules =
-                collect_custom_rules(agent, &self.custom_instructions, instruction_profile);
+            let custom_rules = collect_custom_rules(agent, &self.custom_instructions);
 
             let skills = self.services.list_skills().await?;
 
@@ -342,47 +318,13 @@ mod tests {
     }
 
     #[test]
-    fn test_instruction_profile_uses_full_rules_for_user_conversation() {
-        let fixture = Conversation::generate().initiator(Initiator::User);
-        let actual = InstructionProfile::from_conversation(&fixture);
-        let expected = InstructionProfile::Full;
-
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn test_instruction_profile_uses_delegated_rules_for_agent_conversation() {
-        let fixture = Conversation::generate().initiator(Initiator::Agent);
-        let actual = InstructionProfile::from_conversation(&fixture);
-        let expected = InstructionProfile::Delegated;
-
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn test_collect_custom_rules_keeps_global_instructions_for_full_profile() {
+    fn test_collect_custom_rules_keeps_global_instructions() {
         let fixture = Agent::new("forge", ProviderId::FORGE, ModelId::new("gpt-5.5"))
             .custom_rules("agent rule");
         let custom_instructions = vec!["global rule".to_string(), "repo rule".to_string()];
 
-        let actual = collect_custom_rules(&fixture, &custom_instructions, InstructionProfile::Full);
+        let actual = collect_custom_rules(&fixture, &custom_instructions);
         let expected = vec!["agent rule", "global rule", "repo rule"];
-
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn test_collect_custom_rules_omits_global_instructions_for_delegated_profile() {
-        let fixture = Agent::new("agi-dev", ProviderId::FORGE, ModelId::new("gpt-5.5"))
-            .custom_rules("agent rule");
-        let custom_instructions = vec!["global rule".to_string(), "repo rule".to_string()];
-
-        let actual = collect_custom_rules(
-            &fixture,
-            &custom_instructions,
-            InstructionProfile::Delegated,
-        );
-        let expected = vec!["agent rule"];
 
         assert_eq!(actual, expected);
     }
@@ -410,7 +352,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_add_system_message_omits_global_instructions_for_agent_conversation() {
+    async fn test_add_system_message_keeps_global_instructions_for_agent_conversation() {
         let fixture = Conversation::generate()
             .initiator(Initiator::Agent)
             .context(Context::default());
@@ -426,7 +368,7 @@ mod tests {
         .unwrap();
 
         let actual = actual.context.unwrap().system_prompt().unwrap().to_string();
-        let expected = "agent rule".to_string();
+        let expected = "agent rule\n\nglobal rule".to_string();
 
         assert_eq!(actual, expected);
     }

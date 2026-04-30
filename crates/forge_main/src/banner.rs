@@ -1,7 +1,8 @@
 use std::{fmt, io};
 
 use colored::Colorize;
-use forge_tracker::VERSION;
+
+use crate::version::VERSION_WITH_LAST_UPDATED;
 
 const BANNER: &str = include_str!("banner");
 
@@ -61,7 +62,7 @@ pub fn display(cli_mode: bool) -> io::Result<()> {
         .unwrap_or_else(|| BANNER.to_string());
 
     // Always show version
-    let version_label = ("Version:", VERSION);
+    let version_label = ("Version:", VERSION_WITH_LAST_UPDATED);
 
     // Build tips based on mode
     let tips: Vec<(&str, &str)> = if cli_mode {

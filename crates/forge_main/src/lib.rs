@@ -23,6 +23,7 @@ mod tools_display;
 pub mod tracker;
 mod ui;
 mod utils;
+pub mod version;
 mod vscode;
 mod zsh;
 

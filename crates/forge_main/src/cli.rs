@@ -10,8 +10,10 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 use forge_domain::{AgentId, ConversationId, Effort, ModelId, ProviderId};
 
+use crate::version::VERSION_WITH_LAST_UPDATED;
+
 #[derive(Parser)]
-#[command(version = env!("CARGO_PKG_VERSION"))]
+#[command(version = VERSION_WITH_LAST_UPDATED)]
 pub struct Cli {
     /// Direct prompt to process without entering interactive mode.
     ///
@@ -845,10 +847,19 @@ pub struct LogsArgs {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn test_cli_version_includes_last_updated_date() {
+        let fixture = Cli::command();
+        let actual = fixture.get_version().unwrap();
+        let expected = crate::version::VERSION_WITH_LAST_UPDATED;
+
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn test_data_command_group_conversion() {

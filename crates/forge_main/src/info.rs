@@ -4,11 +4,11 @@ use std::time::Duration;
 
 use colored::Colorize;
 use forge_api::{Conversation, Environment, ForgeConfig, Metrics, Role, Usage, UserUsage};
-use forge_tracker::VERSION;
 use num_format::{Locale, ToFormattedString};
 
 use crate::display_constants::markers;
 use crate::model::ForgeCommandManager;
+use crate::version::VERSION_WITH_LAST_UPDATED;
 
 #[derive(Debug, PartialEq)]
 pub enum Section {
@@ -279,7 +279,7 @@ impl From<&Environment> for Info {
 
         let mut info = Info::new()
             .add_title("ENVIRONMENT")
-            .add_key_value("Version", VERSION)
+            .add_key_value("Version", VERSION_WITH_LAST_UPDATED)
             .add_key_value("Working Directory", format_path_for_display(env, &env.cwd))
             .add_key_value("Shell", env.shell.as_str())
             .add_key_value("Git Branch", branch_info)
@@ -777,9 +777,7 @@ mod tests {
         use fake::{Fake, Faker};
         let mut fixture: Environment = Faker.fake();
         fixture = fixture.os(os.to_string());
-        if let Some(home_path) = home {
-            fixture = fixture.home(PathBuf::from(home_path));
-        }
+        fixture.home = home.map(PathBuf::from);
         fixture
     }
 

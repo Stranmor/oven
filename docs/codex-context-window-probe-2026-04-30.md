@@ -20,6 +20,7 @@ No API key or credential material is recorded here.
 | `260_000` repetitions | `260_016` prompt tokens | HTTP 200, returned `OK` |
 | `400_000` repetitions | not returned | client read timeout after 240s on first run |
 | `400_000` repetitions | not returned | HTTP 503 after 216.42s: all accounts exhausted |
+| `400_000` repetitions | not returned | HTTP 503 after 165.75s: all accounts exhausted |
 
 ## Conclusion
 
@@ -32,6 +33,6 @@ after upstream processing time. Treat 400k as operationally unproven on the
 current account pool, not as proven unsupported by context length.
 
 Forge should not assume that a configured 400k context window is safely usable
-for every request. Subagent prompts still need compact context because requests
-above 260k enter a slow/high-risk operational zone even when they are not
-rejected by a hard 256k limit.
+for every request. Subagent prompts still need compact context that preserves
+mandatory global rules because requests above 260k enter a slow/high-risk
+operational zone even when they are not rejected by a hard 256k limit.
