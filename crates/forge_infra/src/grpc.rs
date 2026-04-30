@@ -28,7 +28,7 @@ impl ForgeGrpcClient {
     /// Channels are cheap to clone and can be shared across multiple clients.
     /// The channel is created on first call and cached for subsequent calls.
     pub fn channel(&self) -> anyhow::Result<Channel> {
-        let mut guard = self.channel.lock().unwrap();
+        let mut guard = self.channel.lock().expect("grpc channel mutex poisoned");
 
         if let Some(channel) = guard.as_ref() {
             return Ok(channel.clone());
@@ -57,7 +57,7 @@ impl ForgeGrpcClient {
     /// on the next call to `channel()`.
     /// Used to warm up or reset the connection.
     pub fn hydrate(&self) {
-        let mut guard = self.channel.lock().unwrap();
+        let mut guard = self.channel.lock().expect("grpc channel mutex poisoned");
         *guard = None;
     }
 }

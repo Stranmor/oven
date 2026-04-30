@@ -69,22 +69,26 @@ impl<F: HttpInfra + EnvironmentInfra<Config = forge_config::ForgeConfig> + Sync>
         match backend {
             OpenCodeBackend::Anthropic => {
                 // Claude models use /v1/messages endpoint
-                new_provider.url = Url::parse(&format!("{base}/v1/messages")).unwrap();
+                new_provider.url =
+                    Url::parse(&format!("{base}/v1/messages")).expect("provider URL is valid");
                 new_provider.response = Some(ProviderResponse::Anthropic);
             }
             OpenCodeBackend::OpenAIResponses => {
                 // GPT-5 models use /v1/responses endpoint
-                new_provider.url = Url::parse(&format!("{base}/v1/responses")).unwrap();
+                new_provider.url =
+                    Url::parse(&format!("{base}/v1/responses")).expect("provider URL is valid");
                 new_provider.response = Some(ProviderResponse::OpenAIResponses);
             }
             OpenCodeBackend::Google => {
                 // Gemini models use model-specific endpoint
-                new_provider.url = Url::parse(&format!("{base}/v1")).unwrap();
+                new_provider.url =
+                    Url::parse(&format!("{base}/v1")).expect("provider URL is valid");
                 new_provider.response = Some(ProviderResponse::Google);
             }
             OpenCodeBackend::OpenAI => {
                 // Other models use /v1/chat/completions endpoint (default)
-                new_provider.url = Url::parse(&format!("{base}/v1/chat/completions")).unwrap();
+                new_provider.url = Url::parse(&format!("{base}/v1/chat/completions"))
+                    .expect("provider URL is valid");
                 new_provider.response = Some(ProviderResponse::OpenAI);
             }
         }

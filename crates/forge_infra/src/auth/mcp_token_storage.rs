@@ -38,7 +38,10 @@ impl McpTokenStorage {
         if guard.is_none() {
             *guard = Some(McpCredentialStore::load(&self.env).await?);
         }
-        Ok(guard.as_ref().unwrap().clone())
+        guard
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("MCP credential store was not initialized"))
     }
 
     /// Update the cached store after modifications
@@ -119,8 +122,9 @@ impl CredentialStore for McpTokenStorage {
                     .unwrap_or_default()
                     .as_secs();
                 if expires_at > now {
-                    token_response
-                        .set_expires_in(Some(&std::time::Duration::from_secs(expires_at - now)));
+                    token_response.set_expires_in(Some(&std::time::Duration::from_secs(
+                        expires_at.saturating_sub(now),
+                    )));
                 } else {
                     // Token has expired - set zero duration so rmcp triggers refresh
                     token_response.set_expires_in(Some(&std::time::Duration::from_secs(0)));
@@ -163,7 +167,9 @@ impl CredentialStore for McpTokenStorage {
             let access_token = response.access_token().secret().to_string();
             let refresh_token = response.refresh_token().map(|rt| rt.secret().to_string());
             let expires_at = response.expires_in().map(|d| {
-                (std::time::SystemTime::now() + d)
+                std::time::SystemTime::now()
+                    .checked_add(d)
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs()

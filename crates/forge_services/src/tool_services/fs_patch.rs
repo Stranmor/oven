@@ -29,7 +29,7 @@ impl Range {
 
     /// Get the end position (exclusive) of this match
     fn end(&self) -> usize {
-        self.start + self.length
+        self.start.saturating_add(self.length)
     }
 
     /// Try to find an exact match in the source text
@@ -69,10 +69,15 @@ impl Range {
 
         // SearchMatch uses 0-based inclusive line numbers
         // Convert to 0-based array indices
-        let start_idx = (search_match.start_line as usize).min(lines.len());
+        let start_idx = usize::try_from(search_match.start_line)
+            .unwrap_or(usize::MAX)
+            .min(lines.len());
         // end_line is 0-based inclusive, convert to 0-based exclusive for slicing
         // Add 1 to make it exclusive: line 0 to line 0 means [0..1], one line
-        let end_idx = ((search_match.end_line as usize) + 1).min(lines.len());
+        let end_idx = usize::try_from(search_match.end_line)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1)
+            .min(lines.len());
 
         // Find the byte position of the start line.
         // Split on '\n' so each segment retains its '\r' (if any), giving the
@@ -80,7 +85,7 @@ impl Range {
         let start_pos = source
             .split('\n')
             .take(start_idx)
-            .map(|l| l.len() + 1)
+            .map(|l| l.len().saturating_add(1))
             .sum::<usize>()
             .min(source.len());
 
@@ -102,7 +107,7 @@ impl Range {
                     .get(start_idx..end_idx)
                     .map_or(0, |slice| slice.iter().map(|l| l.len()).sum())
             };
-            let newlines_between = end_idx - start_idx - 1;
+            let newlines_between = end_idx.saturating_sub(start_idx).saturating_sub(1);
             // Count actual newline bytes (\r\n = 2, \n = 1) to handle mixed endings
             let newline_bytes: usize = source
                 .split('\n')
@@ -110,7 +115,7 @@ impl Range {
                 .take(newlines_between)
                 .map(|l| if l.ends_with('\r') { 2 } else { 1 })
                 .sum();
-            content_len + newline_bytes
+            content_len.saturating_add(newline_bytes)
         };
 
         Self::new(start_pos, length)
@@ -248,14 +253,16 @@ fn apply_replacement(
             // Replace matched text with new content
             PatchOperation::Replace => {
                 // Check if there are multiple matches
-                let mut match_count = 0;
+                let mut match_count = 0usize;
                 let mut search_start = 0;
                 while let Some(pos) = haystack.get(search_start..).and_then(|s| s.find(needle)) {
-                    match_count += 1;
+                    match_count = match_count.saturating_add(1);
                     if match_count > 1 {
                         return Err(Error::MultipleMatches(needle.to_string()));
                     }
-                    search_start += pos + needle.len();
+                    search_start = search_start
+                        .saturating_add(pos)
+                        .saturating_add(needle.len());
                 }
 
                 let before = haystack.get(..patch.start).ok_or(Error::RangeOutOfBounds(

@@ -98,7 +98,7 @@ impl Prompt for ForgePrompt {
             "{}",
             dir_style.paint(format!("{DIR_SYMBOL} {current_dir}"))
         )
-        .unwrap();
+        .expect("writing to String must not fail");
 
         // Git branch — branch icon + name, bold green (only when present and
         // different from the directory name, matching existing behaviour)
@@ -110,11 +110,12 @@ impl Prompt for ForgePrompt {
                 " {}",
                 branch_style.paint(format!("{BRANCH_SYMBOL} {branch}"))
             )
-            .unwrap();
+            .expect("writing to String must not fail");
         }
 
         // Second line: success chevron
-        write!(result, "\n{} ", chevron_style.paint(SUCCESS_SYMBOL)).unwrap();
+        write!(result, "\n{} ", chevron_style.paint(SUCCESS_SYMBOL))
+            .expect("writing to String must not fail");
 
         Cow::Owned(result)
     }
@@ -144,7 +145,7 @@ impl Prompt for ForgePrompt {
             " {}",
             Style::new().bold().fg(agent_color).paint(&agent_str)
         )
-        .unwrap();
+        .expect("writing to String must not fail");
 
         // Token count (only shown when active)
         if let Some(tokens) = total_tokens
@@ -160,7 +161,7 @@ impl Prompt for ForgePrompt {
                 " {}",
                 Style::new().bold().fg(Color::LightGray).paint(&count_str)
             )
-            .unwrap();
+            .expect("writing to String must not fail");
         }
 
         // Cost (only shown when active)
@@ -173,7 +174,7 @@ impl Prompt for ForgePrompt {
                 " {}",
                 Style::new().bold().fg(Color::Green).paint(&cost_str)
             )
-            .unwrap();
+            .expect("writing to String must not fail");
         }
 
         // Model with nerd font symbol
@@ -186,7 +187,8 @@ impl Prompt for ForgePrompt {
             } else {
                 Color::DarkGray
             };
-            write!(result, " {}", Style::new().fg(color).paint(&model_label)).unwrap();
+            write!(result, " {}", Style::new().fg(color).paint(&model_label))
+                .expect("writing to String must not fail");
         }
 
         // Reasoning effort — rendered to the right of the model, matching the
@@ -202,7 +204,8 @@ impl Prompt for ForgePrompt {
             } else {
                 Color::DarkGray
             };
-            write!(result, " {}", Style::new().fg(color).paint(&effort_label)).unwrap();
+            write!(result, " {}", Style::new().fg(color).paint(&effort_label))
+                .expect("writing to String must not fail");
         }
 
         Cow::Owned(result)
@@ -229,14 +232,14 @@ impl Prompt for ForgePrompt {
 
         // Handle empty search term more elegantly
         if history_search.term.is_empty() {
-            write!(result, "({prefix}reverse-search) ").unwrap();
+            write!(result, "({prefix}reverse-search) ").expect("writing to String must not fail");
         } else {
             write!(
                 result,
                 "({}reverse-search: {}) ",
                 prefix, history_search.term
             )
-            .unwrap();
+            .expect("writing to String must not fail");
         }
 
         Cow::Owned(Style::new().fg(Color::White).paint(&result).to_string())

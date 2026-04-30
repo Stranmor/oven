@@ -97,7 +97,7 @@ impl DatabasePool {
             .notify(|err, dur| {
                 warn!(
                     error = %err,
-                    retry_after_ms = dur.as_millis() as u64,
+                    retry_after_ms = u64::try_from(dur.as_millis()).unwrap_or(u64::MAX),
                     "{}",
                     message
                 );

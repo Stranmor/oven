@@ -286,6 +286,24 @@ pub struct StreamOptions {
 }
 
 impl Request {
+    pub fn validate_and_canonicalize_images(&mut self) -> anyhow::Result<()> {
+        for message in self.messages.iter_mut().flatten() {
+            if let Some(MessageContent::Parts(parts)) = &mut message.content {
+                for part in parts {
+                    if let ContentPart::ImageUrl { image_url, .. } = part {
+                        let trimmed_url = image_url.url.trim();
+                        if trimmed_url.len() >= 5 && trimmed_url[..5].eq_ignore_ascii_case("data:")
+                        {
+                            image_url.url =
+                                crate::domain::Image::canonicalize_data_url(&image_url.url)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn message_count(&self) -> usize {
         self.messages
             .as_ref()
@@ -563,6 +581,98 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn validate_and_canonicalize_images_rejects_unsupported_mime() {
+        let mut fixture = Request {
+            messages: Some(vec![Message {
+                role: super::Role::User,
+                content: Some(MessageContent::Parts(vec![ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "data:image/bmp;base64,AAAA".to_string(),
+                        detail: None,
+                    },
+                    cache_control: None,
+                }])),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_details: None,
+                reasoning_text: None,
+                reasoning_opaque: None,
+                reasoning_content: None,
+                extra_content: None,
+            }]),
+            ..Default::default()
+        };
+        let actual = fixture
+            .validate_and_canonicalize_images()
+            .unwrap_err()
+            .to_string();
+        let expected = "Unsupported image MIME type: image/bmp".to_string();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn validate_and_canonicalize_images_rejects_uppercase_unsupported_data_uri() {
+        let mut fixture = Request {
+            messages: Some(vec![Message {
+                role: super::Role::User,
+                content: Some(MessageContent::Parts(vec![ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "DATA:image/bmp;base64,AAAA".to_string(),
+                        detail: None,
+                    },
+                    cache_control: None,
+                }])),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_details: None,
+                reasoning_text: None,
+                reasoning_opaque: None,
+                reasoning_content: None,
+                extra_content: None,
+            }]),
+            ..Default::default()
+        };
+        assert!(fixture.validate_and_canonicalize_images().is_err());
+    }
+
+    #[test]
+    fn validate_and_canonicalize_images_normalizes_payload() {
+        let mut fixture = Request {
+            messages: Some(vec![Message {
+                role: super::Role::User,
+                content: Some(MessageContent::Parts(vec![ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "data:image/png;base64,iVBO\nRw0KGgo=".to_string(),
+                        detail: None,
+                    },
+                    cache_control: None,
+                }])),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_details: None,
+                reasoning_text: None,
+                reasoning_opaque: None,
+                reasoning_content: None,
+                extra_content: None,
+            }]),
+            ..Default::default()
+        };
+        fixture.validate_and_canonicalize_images().unwrap();
+        let actual = fixture.messages.unwrap()[0].content.clone().unwrap();
+        let expected = MessageContent::Parts(vec![ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "data:image/png;base64,iVBORw0KGgo=".to_string(),
+                detail: None,
+            },
+            cache_control: None,
+        }]);
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn test_cached_text_true() {

@@ -9,7 +9,8 @@ lazy_static! {
     /// Bedrock (especially with Anthropic models) requires tool call IDs to match
     /// the pattern `^[a-zA-Z0-9_-]+$`. This regex matches any character that is
     /// NOT alphanumeric, underscore, or hyphen.
-    static ref INVALID_CHARS: Regex = Regex::new(r"[^a-zA-Z0-9_-]").unwrap();
+    static ref INVALID_CHARS: Regex =
+        Regex::new(r"[^a-zA-Z0-9_-]").expect("Bedrock tool ID sanitizer regex must compile");
 }
 
 /// Transformer that sanitizes tool call IDs for Bedrock compatibility.

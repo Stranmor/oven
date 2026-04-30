@@ -116,7 +116,9 @@ impl<F: forge_app::FileWriterInfra + 'static> ForgeHttpInfra<F> {
 
         Self {
             debug_requests: config.debug_requests,
-            client: client.build().unwrap(),
+            client: client
+                .build()
+                .expect("HTTP client configuration must be valid"),
             file: file_writer,
         }
     }

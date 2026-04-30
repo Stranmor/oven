@@ -123,9 +123,11 @@ async fn fetch_local_dependencies(content: &str, file_path: &Path) -> Vec<(PathB
                 // Try progressively shorter prefixes: crate::a::b::c → a/b/c.rs,
                 // a/b/c/mod.rs, then a/b.rs, a/b/mod.rs, then a.rs, a/mod.rs
                 for depth in (1..=parts.len()).rev() {
-                    let sub_path = parts[..depth].join("/");
-                    candidate_paths.push(src.join(format!("{sub_path}.rs")));
-                    candidate_paths.push(src.join(&sub_path).join("mod.rs"));
+                    if let Some(prefix_parts) = parts.get(..depth) {
+                        let sub_path = prefix_parts.join("/");
+                        candidate_paths.push(src.join(format!("{sub_path}.rs")));
+                        candidate_paths.push(src.join(&sub_path).join("mod.rs"));
+                    }
                 }
             }
         }
@@ -296,8 +298,10 @@ impl<F: FileInfoInfra + EnvironmentInfra<Config = forge_config::ForgeConfig> + I
             String::new()
         } else {
             // Return range with line truncation
+            let start_pos = usize::try_from(start_pos).unwrap_or(usize::MAX);
+            let end_pos = usize::try_from(end_pos).unwrap_or(usize::MAX);
             lines
-                .get(start_pos as usize..=end_pos as usize)
+                .get(start_pos..=end_pos)
                 .map(|slice| {
                     slice
                         .iter()

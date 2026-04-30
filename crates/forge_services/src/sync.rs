@@ -107,7 +107,7 @@ impl<F: 'static + WorkspaceIndexRepository + FileReaderInfra, D: FileDiscovery +
         let failed_statuses = extract_failed_statuses(&results);
         let local_hashes: Vec<FileHash> = results.into_iter().flatten().collect();
 
-        let total_file_count = local_hashes.len() + failed_statuses.len();
+        let total_file_count = local_hashes.len().saturating_add(failed_statuses.len());
         emit(SyncProgress::FilesDiscovered { count: total_file_count }).await;
 
         let remote_files = self.fetch_remote_hashes().await?;
@@ -141,7 +141,7 @@ impl<F: 'static + WorkspaceIndexRepository + FileReaderInfra, D: FileDiscovery +
             .count();
 
         // Compute total number of affected files
-        let total_file_changes = added + deleted + modified;
+        let total_file_changes = added.saturating_add(deleted).saturating_add(modified);
 
         // Only emit diff computed event if there are actual changes
         if total_file_changes > 0 {
@@ -151,7 +151,10 @@ impl<F: 'static + WorkspaceIndexRepository + FileReaderInfra, D: FileDiscovery +
         // Derive the exact paths to delete/upload — no file content required
         let sync_paths = plan.get_sync_paths(local_hashes);
 
-        let total_operations = sync_paths.delete.len() + sync_paths.upload.len();
+        let total_operations = sync_paths
+            .delete
+            .len()
+            .saturating_add(sync_paths.upload.len());
         let mut counter = SyncProgressCounter::new(total_file_changes, total_operations);
 
         emit(counter.sync_progress()).await;
@@ -164,7 +167,7 @@ impl<F: 'static + WorkspaceIndexRepository + FileReaderInfra, D: FileDiscovery +
             }
             Err(e) => {
                 warn!(workspace_id = %self.workspace_id, error = ?e, "Failed to delete files during sync");
-                failed_files += sync_paths.delete.len();
+                failed_files = failed_files.saturating_add(sync_paths.delete.len());
             }
         }
 
@@ -181,7 +184,7 @@ impl<F: 'static + WorkspaceIndexRepository + FileReaderInfra, D: FileDiscovery +
                 }
                 Err(e) => {
                     warn!(workspace_id = %self.workspace_id, error = ?e, "Failed to upload file during sync");
-                    failed_files += attempted;
+                    failed_files = failed_files.saturating_add(attempted);
                     // Continue processing remaining uploads
                 }
             }

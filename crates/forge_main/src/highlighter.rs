@@ -99,11 +99,11 @@ fn highlight_mentions(line: &str, styled: &mut StyledText) {
                     }
                     Some(rel_close) => {
                         // Absolute position of `]` within `after_open`.
-                        let close = 2 + rel_close;
+                        let close = 2usize.saturating_add(rel_close);
                         // Emit `@[...]` in cyan bold (inclusive of both brackets).
                         let mention = after_open.get(..=close).unwrap_or(after_open);
                         styled.push((Style::new().bold().fg(Color::Cyan), mention.to_string()));
-                        match after_open.get(close + 1..) {
+                        match after_open.get(close.saturating_add(1)..) {
                             Some(rest) => remaining = rest,
                             None => break,
                         }

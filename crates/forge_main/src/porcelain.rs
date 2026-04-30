@@ -365,7 +365,7 @@ impl fmt::Display for Porcelain {
             for (i, cell) in row.iter().enumerate() {
                 let content = cell.as_ref().map(|s| s.as_str()).unwrap_or("");
 
-                if i == row.len() - 1 {
+                if i == row.len().saturating_sub(1) {
                     // Last column: no padding
                     line.push_str(content);
                 } else {
@@ -407,7 +407,7 @@ impl From<&Info> for Porcelain {
         // Extract all unique keys
         let mut keys = IndexSet::new();
         // Track count of unnamed values separately
-        let mut value_counter = 1;
+        let mut value_counter: usize = 1;
         let mut last_key: Option<String> = None;
 
         for section in info.sections() {
@@ -428,7 +428,7 @@ impl From<&Info> for Porcelain {
                         key
                     } else {
                         let default_key = format!("{}_{}", headers::VALUE, value_counter);
-                        value_counter += 1;
+                        value_counter = value_counter.saturating_add(1);
                         default_key
                     };
                     last_key = Some(key.clone());

@@ -1932,7 +1932,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
 
     async fn list_subchats(&mut self) -> anyhow::Result<()> {
         let parent_id = match &self.state.conversation_id {
-            Some(id) => id.clone(),
+            Some(id) => *id,
             None => {
                 self.writeln_title(TitleFormat::error(
                     "No active conversation to find subchats for.",
@@ -1995,16 +1995,9 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                 .unwrap_or_else(|| markers::EMPTY.to_string());
 
             // Format time using humantime library (same as conversation_selector.rs)
-            let duration = chrono::Utc::now().signed_duration_since(
+            let time_ago = crate::utils::humanize_time(
                 conv.metadata.updated_at.unwrap_or(conv.metadata.created_at),
             );
-            let duration =
-                std::time::Duration::from_secs((duration.num_minutes() * 60).max(0) as u64);
-            let time_ago = if duration.is_zero() {
-                "now".to_string()
-            } else {
-                format!("{} ago", humantime::format_duration(duration))
-            };
 
             // Add conversation: Title=<title>, Updated=<time_ago>, with ID as section title
             info = info
@@ -3762,12 +3755,11 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
 
         title.push_str(format!(" {}", id.into_string()).as_str());
 
-        if !new_conversation {
-            if let Ok(Some(conversation)) = self.api.conversation(&id).await {
-                if let Some(conv_title) = conversation.title {
-                    title.push_str(&format!(" ({})", conv_title));
-                }
-            }
+        if !new_conversation
+            && let Ok(Some(conversation)) = self.api.conversation(&id).await
+            && let Some(conv_title) = conversation.title
+        {
+            title.push_str(&format!(" ({})", conv_title));
         }
 
         self.writeln_title(TitleFormat::debug(title))?;
@@ -4104,10 +4096,10 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                 writer.finish()?;
                 if let Some(conversation_id) = self.state.conversation_id {
                     let mut title_str = "Finished".to_string();
-                    if let Ok(Some(conversation)) = self.api.conversation(&conversation_id).await {
-                        if let Some(conv_title) = conversation.title {
-                            title_str = format!("Finished: {}", conv_title);
-                        }
+                    if let Ok(Some(conversation)) = self.api.conversation(&conversation_id).await
+                        && let Some(conv_title) = conversation.title
+                    {
+                        title_str = format!("Finished: {}", conv_title);
                     }
                     self.writeln_title(
                         TitleFormat::debug(title_str).sub_title(conversation_id.into_string()),
@@ -4571,7 +4563,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                     .collect::<Vec<_>>()
                     .join(", ");
                 let suggestion = if models.len() > 10 {
-                    format!("{hints} (and {} more)", models.len() - 10)
+                    format!("{hints} (and {} more)", models.len().saturating_sub(10))
                 } else {
                     hints
                 };

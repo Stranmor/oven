@@ -4,7 +4,13 @@ use std::time::Duration;
 /// minutes ago").
 pub fn humanize_time(dt: chrono::DateTime<chrono::Utc>) -> String {
     let duration = chrono::Utc::now().signed_duration_since(dt);
-    let duration = Duration::from_secs((duration.num_minutes() * 60).max(0) as u64);
+    let seconds = duration
+        .num_minutes()
+        .max(0)
+        .checked_mul(60)
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or(0);
+    let duration = Duration::from_secs(seconds);
     if duration.is_zero() {
         "now".to_string()
     } else {

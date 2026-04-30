@@ -169,7 +169,10 @@ impl ForgeCommandManager {
 
     /// Registers workflow commands from the API.
     pub fn register_all(&self, commands: Vec<forge_domain::Command>) {
-        let mut guard = self.commands.lock().unwrap();
+        let mut guard = self
+            .commands
+            .lock()
+            .expect("command registry mutex poisoned");
 
         // Remove existing workflow commands (those with ⚙ prefix in description)
         guard.retain(|cmd| !cmd.description.starts_with("⚙ "));
@@ -195,7 +198,10 @@ impl ForgeCommandManager {
         &self,
         agents: Vec<AgentInfo>,
     ) -> AgentCommandRegistrationResult {
-        let mut guard = self.commands.lock().unwrap();
+        let mut guard = self
+            .commands
+            .lock()
+            .expect("command registry mutex poisoned");
         let mut result =
             AgentCommandRegistrationResult { registered_count: 0, skipped_conflicts: Vec::new() };
 
@@ -224,7 +230,7 @@ impl ForgeCommandManager {
                 value: Some(agent_id_str.to_string()),
             });
 
-            result.registered_count += 1;
+            result.registered_count = result.registered_count.saturating_add(1);
         }
 
         // Sort commands for consistent completion behavior
@@ -237,7 +243,7 @@ impl ForgeCommandManager {
     fn find(&self, command: &str) -> Option<ForgeCommand> {
         self.commands
             .lock()
-            .unwrap()
+            .expect("command registry mutex poisoned")
             .iter()
             .find(|c| c.name == command)
             .cloned()
@@ -245,7 +251,10 @@ impl ForgeCommandManager {
 
     /// Lists all registered commands.
     pub fn list(&self) -> Vec<ForgeCommand> {
-        self.commands.lock().unwrap().clone()
+        self.commands
+            .lock()
+            .expect("command registry mutex poisoned")
+            .clone()
     }
 
     /// Extracts the command value from the input parts
@@ -270,7 +279,7 @@ impl ForgeCommandManager {
         let value_default = self
             .commands
             .lock()
-            .unwrap()
+            .expect("command registry mutex poisoned")
             .iter()
             .find(|c| c.name == command.name)
             .and_then(|cmd| cmd.value.clone());
@@ -755,7 +764,8 @@ impl AppCommand {
 
     /// Returns the usage description for the command.
     pub fn usage(&self) -> &str {
-        self.get_str("usage").unwrap()
+        self.get_str("usage")
+            .expect("app command usage metadata must be defined")
     }
 
     /// Returns true for internal/meta variants that should not appear in the

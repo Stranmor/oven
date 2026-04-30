@@ -195,8 +195,10 @@ impl<H: HttpInfra> OpenAIProvider<H> {
         context: ChatContext,
     ) -> ResultStream<ChatCompletionMessage, anyhow::Error> {
         let mut request = Request::from(context).model(model.clone());
+        request.validate_and_canonicalize_images()?;
         let mut pipeline = ProviderPipeline::new(&self.provider);
         request = pipeline.transform(request);
+        request.validate_and_canonicalize_images()?;
 
         let url = self.provider.url.clone();
         let headers = create_headers(self.get_headers_with_request(&request));
@@ -314,7 +316,8 @@ impl<H: HttpInfra> OpenAIProvider<H> {
                 #[serde(default)]
                 input_modalities: Vec<forge_domain::InputModality>,
             }
-            let parsed: Vec<VertexModel> = serde_json::from_str(models).unwrap();
+            let parsed: Vec<VertexModel> =
+                serde_json::from_str(models).expect("embedded Vertex model list must be valid");
             parsed
                 .into_iter()
                 .map(|m| forge_domain::Model {

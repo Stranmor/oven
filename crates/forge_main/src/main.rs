@@ -113,10 +113,9 @@ async fn run() -> Result<()> {
             sandbox
         }
         (Some(sandbox), _) => Sandbox::new(sandbox).create()?,
-        (_, Some(cli)) => match cli.canonicalize() {
-            Ok(cwd) => cwd,
-            Err(_) => panic!("Invalid path: {}", cli.display()),
-        },
+        (_, Some(cli)) => cli
+            .canonicalize()
+            .with_context(|| format!("Invalid path: {}", cli.display()))?,
         (_, _) => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     };
 

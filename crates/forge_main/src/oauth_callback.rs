@@ -299,7 +299,9 @@ fn wait_for_localhost_oauth_callback(
     expected_state: String,
     shutdown: Arc<AtomicBool>,
 ) -> anyhow::Result<String> {
-    let deadline = Instant::now() + OAUTH_CALLBACK_TIMEOUT;
+    let deadline = Instant::now()
+        .checked_add(OAUTH_CALLBACK_TIMEOUT)
+        .ok_or_else(|| anyhow::anyhow!("OAuth callback timeout overflow"))?;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {

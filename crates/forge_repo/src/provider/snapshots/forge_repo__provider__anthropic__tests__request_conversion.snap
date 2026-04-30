@@ -36,7 +36,12 @@ expression: "serde_json::to_string_pretty(&request).unwrap()"
         {
           "type": "tool_result",
           "tool_use_id": "math-1",
-          "content": "{\"result\":4}",
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"result\":4}"
+            }
+          ],
           "is_error": false
         }
       ],

@@ -261,7 +261,8 @@ impl AuthStrategy for OAuthDeviceStrategy {
             verification_uri: Url::parse(&device_auth_response.verification_uri().to_string())?,
             verification_uri_complete: device_auth_response
                 .verification_uri_complete()
-                .map(|u| Url::parse(&u.secret().to_string()).unwrap()),
+                .map(|u| Url::parse(&u.secret().to_string()))
+                .transpose()?,
             expires_in: device_auth_response.expires_in().as_secs(),
             interval: device_auth_response.interval().as_secs(),
             oauth_config: self.config.clone(),
@@ -363,7 +364,8 @@ impl AuthStrategy for OAuthWithApiKeyStrategy {
             verification_uri: Url::parse(&device_auth_response.verification_uri().to_string())?,
             verification_uri_complete: device_auth_response
                 .verification_uri_complete()
-                .map(|u| Url::parse(&u.secret().to_string()).unwrap()),
+                .map(|u| Url::parse(&u.secret().to_string()))
+                .transpose()?,
             expires_in: device_auth_response.expires_in().as_secs(),
             interval: device_auth_response.interval().as_secs(),
             oauth_config: self.oauth_config.clone(),
@@ -854,12 +856,10 @@ async fn poll_for_tokens(
 
             // Check for error field first
             if let Some(error) = token_response.get("error").and_then(|v| v.as_str()) {
-                if handle_oauth_error(error).is_ok() {
-                    // Retryable error - continue polling
-                    continue;
+                match handle_oauth_error(error) {
+                    Ok(()) => continue,
+                    Err(error) => return Err(error.into()),
                 }
-                // Terminal error - propagate
-                return Err(handle_oauth_error(error).unwrap_err().into());
             }
 
             // No error field - parse as success
@@ -876,18 +876,18 @@ async fn poll_for_tokens(
             .unwrap_or_else(|_| serde_json::json!({"error": "unknown_error"}));
 
         if let Some(error) = error_response.get("error").and_then(|v| v.as_str()) {
-            if handle_oauth_error(error).is_ok() {
-                // Retryable error - sleep and continue
-                tokio::time::sleep(if error == "slow_down" {
-                    interval * 2
-                } else {
-                    interval
-                })
-                .await;
-                continue;
+            match handle_oauth_error(error) {
+                Ok(()) => {
+                    let sleep_duration = if error == "slow_down" {
+                        interval.saturating_mul(2)
+                    } else {
+                        interval
+                    };
+                    tokio::time::sleep(sleep_duration).await;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
             }
-            // Terminal error - propagate
-            return Err(handle_oauth_error(error).unwrap_err().into());
         }
 
         // Unknown error
@@ -913,7 +913,7 @@ async fn codex_poll_for_tokens(
     let timeout = Duration::from_secs(request.expires_in);
     let interval = Duration::from_secs(request.interval.max(1));
     // Add a safety margin to polling interval to avoid rate limiting
-    let poll_interval = interval + Duration::from_secs(3);
+    let poll_interval = interval.saturating_add(Duration::from_secs(3));
 
     let start_time = tokio::time::Instant::now();
 

@@ -109,7 +109,9 @@ impl<'a> Sandbox<'a> {
             worktree_cmd.args(["-b", worktree_name]);
         }
 
-        worktree_cmd.args([worktree_path.to_str().unwrap()]);
+        worktree_cmd.args([worktree_path
+            .to_str()
+            .expect("sandbox worktree path must be valid UTF-8")]);
 
         if branch_exists {
             worktree_cmd.arg(worktree_name);

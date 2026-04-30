@@ -305,9 +305,18 @@ pub fn setup_zsh_integration(
         }
         MarkerState::Invalid { start, end } => {
             let location = match (start, end) {
-                (Some(s), Some(e)) => Some(format!("{}:{}-{}", zshrc_path.display(), s + 1, e + 1)),
-                (Some(s), None) => Some(format!("{}:{}", zshrc_path.display(), s + 1)),
-                (None, Some(e)) => Some(format!("{}:{}", zshrc_path.display(), e + 1)),
+                (Some(s), Some(e)) => Some(format!(
+                    "{}:{}-{}",
+                    zshrc_path.display(),
+                    s.saturating_add(1),
+                    e.saturating_add(1)
+                )),
+                (Some(s), None) => {
+                    Some(format!("{}:{}", zshrc_path.display(), s.saturating_add(1)))
+                }
+                (None, Some(e)) => {
+                    Some(format!("{}:{}", zshrc_path.display(), e.saturating_add(1)))
+                }
                 (None, None) => None,
             };
 

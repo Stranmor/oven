@@ -24,7 +24,7 @@ impl SyncProgressDisplay for SyncProgress {
             Self::FilesDiscovered { count: _ } => None,
             Self::ComparingFiles { .. } => None,
             Self::DiffComputed { added, deleted, modified } => {
-                let total = added + deleted + modified;
+                let total = (*added).saturating_add(*deleted).saturating_add(*modified);
                 if total == 0 {
                     Some("Index is up to date".to_string())
                 } else {

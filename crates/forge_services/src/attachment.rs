@@ -102,7 +102,9 @@ impl<
 
                 AttachmentContent::FileContent {
                     content: file_content
-                        .to_numbered_from(file_info.start_line as usize)
+                        .to_numbered_from(
+                            usize::try_from(file_info.start_line).unwrap_or(usize::MAX),
+                        )
                         .to_string(),
                     info: file_info,
                 }

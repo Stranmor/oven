@@ -26,7 +26,7 @@ impl fmt::Display for DisplayBox {
             .map(|s| visible_len(s))
             .max()
             .unwrap_or(0)
-            + 4;
+            .saturating_add(4);
         let top = format!("┌{}┐", "─".repeat(width.saturating_sub(2)));
         let bottom = format!("└{}┘", "─".repeat(width.saturating_sub(2)));
         let fmt_line = |s: &str| {

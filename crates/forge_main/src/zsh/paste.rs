@@ -36,7 +36,7 @@ pub fn wrap_pasted_text(pasted: &str) -> String {
         let trim_start_len = normalised.trim_start().len();
         let trim_end_len = normalised.trim_end().len();
         let leading = normalised
-            .get(..normalised.len() - trim_start_len)
+            .get(..normalised.len().saturating_sub(trim_start_len))
             .unwrap_or("");
         let trailing = normalised.get(trim_end_len..).unwrap_or("");
         return format!("{leading}@[{resolved}]{trailing}");
@@ -139,7 +139,7 @@ fn find_token_end(input: &str) -> usize {
 /// (single or double quotes) so that paths containing spaces are kept
 /// together as a single token.
 fn wrap_tokens(input: &str) -> String {
-    let mut result = String::with_capacity(input.len() + 32);
+    let mut result = String::with_capacity(input.len().saturating_add(32));
     let mut remaining = input;
 
     while !remaining.is_empty() {

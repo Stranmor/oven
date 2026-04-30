@@ -1,7 +1,6 @@
 use std::fmt::Display;
 
 use anyhow::Result;
-use chrono::Utc;
 use forge_api::Conversation;
 use forge_domain::ConversationId;
 use forge_select::ForgeWidget;
@@ -9,6 +8,7 @@ use forge_select::ForgeWidget;
 use crate::display_constants::markers;
 use crate::info::Info;
 use crate::porcelain::Porcelain;
+use crate::utils::humanize_time;
 
 /// Logic for selecting conversations from a list
 pub struct ConversationSelector;
@@ -36,7 +36,6 @@ impl ConversationSelector {
         }
 
         // Build Info structure (same as on_show_conversations)
-        let now = Utc::now();
         let mut info = Info::new();
 
         for conv in &valid_conversations {
@@ -46,16 +45,8 @@ impl ConversationSelector {
                 .map(|t| t.to_string())
                 .unwrap_or_else(|| markers::EMPTY.to_string());
 
-            let duration = now.signed_duration_since(
-                conv.metadata.updated_at.unwrap_or(conv.metadata.created_at),
-            );
-            let duration =
-                std::time::Duration::from_secs((duration.num_minutes() * 60).max(0) as u64);
-            let time_ago = if duration.is_zero() {
-                "now".to_string()
-            } else {
-                format!("{} ago", humantime::format_duration(duration))
-            };
+            let time_ago =
+                humanize_time(conv.metadata.updated_at.unwrap_or(conv.metadata.created_at));
 
             info = info
                 .add_title(conv.id)

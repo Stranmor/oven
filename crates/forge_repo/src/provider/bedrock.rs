@@ -242,10 +242,10 @@ impl BedrockProvider {
                     _ => Self::is_retryable_sdk_error(&sdk_error),
                 };
 
-                // Extract the source error for better error messages
-                // SAFETY: into_source() always returns Ok for all SdkError variants
-                // (see aws-smithy-runtime-api/src/client/result.rs:448-459)
-                let source = sdk_error.into_source().unwrap();
+                let source = match sdk_error.into_source() {
+                    Ok(source) => source,
+                    Err(error) => return anyhow::anyhow!("{error}"),
+                };
 
                 if is_retryable {
                     forge_domain::Error::Retryable(anyhow::anyhow!("{}", source)).into()
@@ -421,12 +421,18 @@ impl IntoDomain for aws_sdk_bedrockruntime::types::ConverseStreamOutput {
                         .saturating_add(u.cache_write_input_tokens.unwrap_or(0));
 
                     forge_domain::Usage {
-                        prompt_tokens: forge_domain::TokenCount::Actual(u.input_tokens as usize),
-                        completion_tokens: forge_domain::TokenCount::Actual(
-                            u.output_tokens as usize,
+                        prompt_tokens: forge_domain::TokenCount::Actual(
+                            usize::try_from(u.input_tokens).unwrap_or_default(),
                         ),
-                        total_tokens: forge_domain::TokenCount::Actual(u.total_tokens as usize),
-                        cached_tokens: forge_domain::TokenCount::Actual(cached_tokens as usize),
+                        completion_tokens: forge_domain::TokenCount::Actual(
+                            usize::try_from(u.output_tokens).unwrap_or_default(),
+                        ),
+                        total_tokens: forge_domain::TokenCount::Actual(
+                            usize::try_from(u.total_tokens).unwrap_or_default(),
+                        ),
+                        cached_tokens: forge_domain::TokenCount::Actual(
+                            usize::try_from(cached_tokens).unwrap_or_default(),
+                        ),
                         ..Default::default()
                     }
                 });
@@ -578,7 +584,11 @@ impl FromDomain<forge_domain::Context>
                 InferenceConfiguration::builder()
                     .set_temperature(context.temperature.map(|t| t.value()))
                     .set_top_p(adjusted_top_p.map(|t| t.value()))
-                    .set_max_tokens(context.max_tokens.map(|t| t as i32))
+                    .set_max_tokens(
+                        context
+                            .max_tokens
+                            .map(|tokens| i32::try_from(tokens).unwrap_or(i32::MAX)),
+                    )
                     .build(),
             )
         } else {
@@ -616,7 +626,7 @@ impl FromDomain<forge_domain::Context>
                     thinking_config.insert(
                         "budget_tokens".to_string(),
                         aws_smithy_types::Document::Number(aws_smithy_types::Number::PosInt(
-                            budget as u64,
+                            u64::try_from(budget).unwrap_or(u64::MAX),
                         )),
                     );
                 } else {
@@ -935,7 +945,11 @@ fn json_value_to_document(value: serde_json::Value) -> aws_smithy_types::Documen
         serde_json::Value::Bool(b) => Document::Bool(b),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                Document::Number(Number::PosInt(i as u64))
+                if let Ok(value) = u64::try_from(i) {
+                    Document::Number(Number::PosInt(value))
+                } else {
+                    Document::Number(Number::NegInt(i))
+                }
             } else if let Some(f) = n.as_f64() {
                 Document::Number(Number::Float(f))
             } else {

@@ -265,7 +265,7 @@ impl<W: WalkerInfra + FileReaderInfra + FileInfoInfra> ForgeFsSearch<W> {
                 matcher,
                 &content,
                 UTF8(|_, _| {
-                    count += 1;
+                    count = count.saturating_add(1);
                     Ok(true)
                 }),
             )?;
@@ -386,7 +386,7 @@ impl Sink for ContextSink {
 
         // Store the current match (before_context is already accumulated, after_context
         // will be added via context() calls)
-        let line_num = mat.line_number().unwrap_or(0) as usize;
+        let line_num = usize::try_from(mat.line_number().unwrap_or(0)).unwrap_or(usize::MAX);
         let line = mat.bytes().to_str_lossy().trim_end().to_string();
         self.current_match = Some((line_num, line));
 
@@ -475,7 +475,7 @@ impl<W: WalkerInfra + FileReaderInfra + FileInfoInfra> ForgeFsSearch<W> {
                             path: path_string.clone(),
                             result: Some(MatchResult::Found {
                                 line_number: if show_line_numbers {
-                                    Some(line_num as usize)
+                                    Some(usize::try_from(line_num).unwrap_or(usize::MAX))
                                 } else {
                                     None
                                 },

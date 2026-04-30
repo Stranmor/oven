@@ -141,7 +141,7 @@ impl Clipper {
         // Find the byte index corresponding to where the suffix starts
         let start_idx = content
             .char_indices()
-            .nth(char_count - limit)
+            .nth(char_count.saturating_sub(limit))
             .map_or(0, |(idx, _)| idx);
 
         ClipperResult {
@@ -161,7 +161,7 @@ impl Clipper {
     ) -> ClipperResult<'a> {
         // If the combined limits exceed or equal content length, return the whole
         // content
-        if prefix_limit + suffix_limit >= char_count {
+        if prefix_limit.saturating_add(suffix_limit) >= char_count {
             return ClipperResult { prefix: None, suffix: None, actual: content };
         }
 
@@ -174,7 +174,7 @@ impl Clipper {
         // Find the byte index for suffix
         let suffix_start_idx = content
             .char_indices()
-            .nth(char_count - suffix_limit)
+            .nth(char_count.saturating_sub(suffix_limit))
             .map_or(0, |(idx, _)| idx);
 
         ClipperResult {

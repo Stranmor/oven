@@ -12,6 +12,10 @@ pub struct ConversationRepositoryImpl {
     wid: WorkspaceHash,
 }
 
+fn workspace_db_id(wid: WorkspaceHash) -> i64 {
+    i64::try_from(wid.id()).unwrap_or(i64::MAX)
+}
+
 impl ConversationRepositoryImpl {
     pub fn new(pool: Arc<DatabasePool>, workspace_id: WorkspaceHash) -> Self {
         Self { pool, wid: workspace_id }
@@ -86,7 +90,7 @@ impl ConversationRepository for ConversationRepositoryImpl {
 
     async fn get_all_conversations(&self) -> anyhow::Result<Vec<Conversation>> {
         self.run_with_connection(move |connection, wid| {
-            let workspace_id = wid.id() as i64;
+            let workspace_id = workspace_db_id(wid);
             let query = conversations::table
                 .filter(conversations::workspace_id.eq(&workspace_id))
                 .filter(conversations::context.is_not_null())
@@ -118,7 +122,7 @@ impl ConversationRepository for ConversationRepositoryImpl {
     ) -> anyhow::Result<Vec<Conversation>> {
         let parent_id = *parent_id;
         self.run_with_connection(move |connection, wid| {
-            let workspace_id = wid.id() as i64;
+            let workspace_id = workspace_db_id(wid);
             let records: Vec<ConversationRecord> = conversations::table
                 .filter(conversations::workspace_id.eq(&workspace_id))
                 .filter(conversations::context.is_not_null())
@@ -128,14 +132,14 @@ impl ConversationRepository for ConversationRepositoryImpl {
 
             let conversations: Result<Vec<Conversation>, _> =
                 records.into_iter().map(Conversation::try_from).collect();
-            Ok(conversations?)
+            conversations
         })
         .await
     }
 
     async fn get_last_conversation(&self) -> anyhow::Result<Option<Conversation>> {
         self.run_with_connection(move |connection, wid| {
-            let workspace_id = wid.id() as i64;
+            let workspace_id = workspace_db_id(wid);
             let conversation: Option<Conversation> = conversations::table
                 .filter(conversations::workspace_id.eq(&workspace_id))
                 .filter(conversations::context.is_not_null())
@@ -158,7 +162,7 @@ impl ConversationRepository for ConversationRepositoryImpl {
     async fn delete_conversation(&self, conversation_id: &ConversationId) -> anyhow::Result<()> {
         let conversation_id = *conversation_id;
         self.run_with_connection(move |connection, wid| {
-            let workspace_id = wid.id() as i64;
+            let workspace_id = workspace_db_id(wid);
 
             diesel::sql_query(
                 "WITH RECURSIVE descendants(id) AS (

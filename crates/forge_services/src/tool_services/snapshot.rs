@@ -38,11 +38,10 @@ impl<F: DirectoryReaderInfra + Send + Sync> ForgeSnapshotService<F> {
                 let time_str = filename.trim_end_matches(".snap");
                 if let Ok(time) =
                     chrono::NaiveDateTime::parse_from_str(time_str, "%Y-%m-%d_%H-%M-%S-%f")
+                    && latest_time.is_none_or(|lt| time > lt)
                 {
-                    if latest_time.map_or(true, |lt| time > lt) {
-                        latest_time = Some(time);
-                        latest_path = Some(path);
-                    }
+                    latest_time = Some(time);
+                    latest_path = Some(path);
                 }
             }
         }

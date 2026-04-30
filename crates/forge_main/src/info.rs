@@ -502,7 +502,11 @@ impl From<&Usage> for Info {
 fn calculate_cache_percentage(usage: &Usage) -> u8 {
     let total = *usage.prompt_tokens; // Use prompt tokens as the base for cache percentage
     let cached = *usage.cached_tokens;
-    (cached * 100).checked_div(total).unwrap_or(0) as u8
+    cached
+        .saturating_mul(100)
+        .checked_div(total)
+        .and_then(|value| u8::try_from(value).ok())
+        .unwrap_or(0)
 }
 
 impl fmt::Display for Info {
@@ -519,7 +523,7 @@ impl fmt::Display for Info {
                     width = self
                         .sections
                         .iter()
-                        .skip(i + 1)
+                        .skip(i.saturating_add(1))
                         .take_while(|s| matches!(s, Section::Items(..)))
                         .filter_map(|s| s.key())
                         .map(|key| key.len())
@@ -678,9 +682,16 @@ pub fn create_progress_bar(current: u32, limit: u32, width: usize) -> String {
     }
 
     let percentage = (current as f64 / limit as f64 * 100.0).min(100.0);
-    let filled_chars = ((current as f64 / limit as f64) * width as f64).round() as usize;
-    let filled_chars = filled_chars.min(width);
-    let empty_chars = width - filled_chars;
+    let width_u64 = u64::try_from(width).unwrap_or(u64::MAX);
+    let limit_u64 = u64::from(limit);
+    let filled_chars = u64::from(current)
+        .saturating_mul(width_u64)
+        .saturating_add(limit_u64 / 2)
+        .checked_div(limit_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(width)
+        .min(width);
+    let empty_chars = width.saturating_sub(filled_chars);
 
     // Option 1: Unicode block characters (most visually appealing)
     format!(
@@ -977,7 +988,6 @@ mod tests {
             id: conversation_id,
             parent_id: None,
             title: Some("Test Conversation".to_string()),
-            parent_id: None,
             initiator: forge_domain::Initiator::User,
             context: None,
             metrics,
@@ -1007,7 +1017,6 @@ mod tests {
             id: conversation_id,
             parent_id: None,
             title: None,
-            parent_id: None,
             initiator: forge_domain::Initiator::User,
             context: None,
             metrics,
@@ -1055,7 +1064,6 @@ mod tests {
             id: conversation_id,
             parent_id: None,
             title: Some("Test Task".to_string()),
-            parent_id: None,
             initiator: forge_domain::Initiator::User,
             context: Some(context),
             metrics,

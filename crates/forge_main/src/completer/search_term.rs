@@ -7,13 +7,7 @@ pub struct SearchTerm {
 
 impl SearchTerm {
     pub fn new(line: &str, position: usize) -> Self {
-        if position > line.len() {
-            panic!(
-                "Position {position} is out of bounds: string '{line}' (length: {})",
-                line.len()
-            );
-        }
-        Self { line: line.to_string(), position }
+        Self { line: line.to_string(), position: position.min(line.len()) }
     }
 
     /// Get the search term from the line based on '@' marker or cursor position
@@ -35,7 +29,7 @@ impl SearchTerm {
 
         let prefix = self.line.get(..safe_position)?;
         let at_pos = prefix.rfind('@')?;
-        let start_pos = at_pos + 1;
+        let start_pos = at_pos.saturating_add(1);
         let term = self.line.get(start_pos..safe_position)?;
 
         Some(TermResult { span: Span::new(start_pos, safe_position), term })

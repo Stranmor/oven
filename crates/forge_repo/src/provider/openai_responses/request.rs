@@ -302,7 +302,7 @@ impl FromDomain<ChatContext> for oai::CreateResponse {
                             oai::InputContent::InputImage(oai::InputImageContent {
                                 detail: oai::ImageDetail::Auto,
                                 file_id: None,
-                                image_url: Some(img.url().clone()),
+                                image_url: Some(img.canonical_data_url()?),
                             }),
                         ]),
                         phase: None,
@@ -1347,7 +1347,7 @@ mod tests {
     fn test_codex_request_with_image_input_is_supported() -> anyhow::Result<()> {
         use forge_domain::Image;
 
-        let image = Image::new_base64("test123".to_string(), "image/png");
+        let image = Image::new_base64("iVBORw0KGgo=".to_string(), "image/png");
         let context = ChatContext::default().add_message(ContextMessage::Image(image));
 
         let actual = oai::CreateResponse::from_domain(context)?;
@@ -1378,7 +1378,7 @@ mod tests {
         assert!(image.file_id.is_none());
         assert_eq!(
             image.image_url.as_deref(),
-            Some("data:image/png;base64,test123")
+            Some("data:image/png;base64,iVBORw0KGgo=")
         );
 
         Ok(())

@@ -51,13 +51,19 @@ impl TryFrom<Workspace> for WorkspaceInfo {
         let workspace_id =
             WorkspaceId::from_string(&id_msg.id).context("Failed to parse workspace ID")?;
 
-        let last_updated = workspace
-            .last_updated
-            .and_then(|ts| chrono::DateTime::from_timestamp(ts.seconds, ts.nanos as u32));
+        let last_updated = workspace.last_updated.and_then(|ts| {
+            u32::try_from(ts.nanos)
+                .ok()
+                .and_then(|nanos| chrono::DateTime::from_timestamp(ts.seconds, nanos))
+        });
 
         let created_at = workspace
             .created_at
-            .and_then(|ts| chrono::DateTime::from_timestamp(ts.seconds, ts.nanos as u32))
+            .and_then(|ts| {
+                u32::try_from(ts.nanos)
+                    .ok()
+                    .and_then(|nanos| chrono::DateTime::from_timestamp(ts.seconds, nanos))
+            })
             .context("Missing or invalid created_at")?;
 
         Ok(WorkspaceInfo {
@@ -200,7 +206,10 @@ impl<I: GrpcInfra> WorkspaceIndexRepository for ForgeContextEngineRepository<I> 
             }),
             query: Some(Query {
                 prompt: Some(search_query.data.query.to_string()),
-                limit: search_query.data.limit.map(|l| l as u32),
+                limit: search_query
+                    .data
+                    .limit
+                    .map(|limit| u32::try_from(limit).unwrap_or(u32::MAX)),
                 top_k: search_query.data.top_k,
                 relevance_query: Some(search_query.data.use_case.to_string()),
                 starts_with: search_query.data.starts_with.clone().into_iter().collect(),

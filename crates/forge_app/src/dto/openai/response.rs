@@ -4,7 +4,7 @@ use forge_domain::{
     ChatCompletionMessage, Content, FinishReason, TokenCount, ToolCallFull, ToolCallId,
     ToolCallPart, ToolName, Usage,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de};
 
 use crate::dto::openai::ReasoningDetail;
 use crate::dto::openai::error::{Error, ErrorCode, ErrorResponse};
@@ -228,7 +228,7 @@ impl From<String> for ExtraContent {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(tag = "type")]
 pub enum ToolCall {
     #[serde(rename = "function")]
@@ -240,6 +240,33 @@ pub enum ToolCall {
     },
     #[serde(rename = "code_interpreter")]
     CodeInterpreter { id: Option<ToolCallId> },
+}
+
+impl<'de> Deserialize<'de> for ToolCall {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireToolCall {
+            #[serde(rename = "type")]
+            kind: Option<String>,
+            id: Option<ToolCallId>,
+            function: Option<FunctionCall>,
+            #[serde(default)]
+            extra_content: Option<ExtraContent>,
+        }
+
+        let wire = WireToolCall::deserialize(deserializer)?;
+        match wire.kind.as_deref() {
+            Some("code_interpreter") => Ok(Self::CodeInterpreter { id: wire.id }),
+            Some("function") | None => {
+                let function = wire.function.ok_or_else(|| de::Error::missing_field("function"))?;
+                Ok(Self::Function { id: wire.id, function, extra_content: wire.extra_content })
+            }
+            Some(other) => Err(de::Error::unknown_variant(other, &["function", "code_interpreter"])),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

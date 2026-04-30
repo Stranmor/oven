@@ -910,13 +910,9 @@ impl From<MetricsRecord> for forge_domain::Metrics {
                 .filter_map(|(path, file_record)| {
                     let operation = match file_record {
                         // If it's an array, take the last operation (most recent)
-                        FileOperationOrArray::Array(mut arr) if !arr.is_empty() => {
-                            arr.pop().unwrap().into()
-                        }
+                        FileOperationOrArray::Array(mut arr) => arr.pop()?.into(),
                         // If it's a single object, use it directly
                         FileOperationOrArray::Single(record) => record.into(),
-                        // If it's an empty array, skip this file
-                        FileOperationOrArray::Array(_) => return None,
                     };
                     Some((path, operation))
                 })
@@ -987,7 +983,7 @@ impl ConversationRecord {
             context,
             created_at: conversation.metadata.created_at.naive_utc(),
             updated_at,
-            workspace_id: workspace_id.id() as i64,
+            workspace_id: i64::try_from(workspace_id.id()).unwrap_or(i64::MAX),
             metrics,
             parent_id: conversation.parent_id.map(|id| id.into_string()),
             initiator,
@@ -1047,10 +1043,10 @@ impl TryFrom<ConversationRecord> for forge_domain::Conversation {
                 forge_domain::MetaData::new(record.created_at.and_utc())
                     .updated_at(record.updated_at.map(|updated_at| updated_at.and_utc())),
             );
-        if let Some(parent_id_str) = record.parent_id {
-            if let Ok(parent_id) = ConversationId::parse(parent_id_str) {
-                conv.parent_id = Some(parent_id);
-            }
+        if let Some(parent_id_str) = record.parent_id
+            && let Ok(parent_id) = ConversationId::parse(parent_id_str)
+        {
+            conv.parent_id = Some(parent_id);
         }
         Ok(conv)
     }

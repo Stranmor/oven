@@ -14,10 +14,13 @@ pub(crate) fn calculate_token_expiry(
     expires_in: Option<u64>,
     fallback: chrono::Duration,
 ) -> chrono::DateTime<chrono::Utc> {
+    let now = Utc::now();
     if let Some(seconds) = expires_in {
-        Utc::now() + chrono::Duration::seconds(seconds as i64)
+        let seconds = i64::try_from(seconds).unwrap_or(i64::MAX);
+        now.checked_add_signed(chrono::Duration::seconds(seconds))
+            .unwrap_or(now)
     } else {
-        Utc::now() + fallback
+        now.checked_add_signed(fallback).unwrap_or(now)
     }
 }
 

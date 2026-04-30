@@ -109,7 +109,7 @@ impl ForgeFetch {
             // Find the nearest char boundary at or before byte index 100
             let mut end = 100;
             while end > 0 && !page_raw.is_char_boundary(end) {
-                end -= 1;
+                end = end.saturating_sub(1);
             }
             end
         } else {
