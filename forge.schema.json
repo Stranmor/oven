@@ -66,6 +66,11 @@
         "null"
       ]
     },
+    "expand_read_rust_dependencies": {
+      "description": "Whether read-tool output expands first-level local Rust dependencies\nreferenced by `mod` declarations and `use crate::` imports. Defaults to\n`false` to keep reads scoped to the requested file.",
+      "type": "boolean",
+      "default": false
+    },
     "frequency_penalty": {
       "description": "Penalizes tokens based on how frequently they have appeared in the\ngenerated text. Helps prevent repetitive degeneration loops.\nRange: -2.0 to 2.0",
       "anyOf": [

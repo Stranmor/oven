@@ -220,7 +220,9 @@ mod tests {
         let actual = ConfigReader::resolve_base_path();
         // Without FORGE_CONFIG set the path must be either "forge" (legacy,
         // preferred when ~/forge exists) or ".forge" (default new path).
-        let name = actual.file_name().unwrap();
+        let name = actual
+            .file_name()
+            .expect("resolved config base path should have a final component");
         assert!(
             name == "forge" || name == ".forge",
             "Expected base_path to end with 'forge' or '.forge', got: {:?}",
@@ -246,14 +248,15 @@ mod tests {
             }),
             ..Default::default()
         };
-        let legacy_toml = toml_edit::ser::to_string_pretty(&legacy).unwrap();
+        let legacy_toml = toml_edit::ser::to_string_pretty(&legacy)
+            .expect("legacy fixture should serialize to TOML");
 
         let actual = ConfigReader::default()
             // Read legacy first and then defaults
             .read_toml(&legacy_toml)
             .read_defaults()
             .build()
-            .unwrap();
+            .expect("merged config should deserialize");
 
         // Session should come from the legacy layer
         assert_eq!(
@@ -267,6 +270,7 @@ mod tests {
         // Default values from .forge.toml must be retained, not reset to zero
         assert_eq!(actual.max_parallel_file_reads, 64);
         assert_eq!(actual.max_read_lines, 2000);
+        assert_eq!(actual.expand_read_rust_dependencies, false);
         assert_eq!(actual.tool_timeout_secs, 300);
         assert_eq!(actual.max_search_lines, 1000);
         assert_eq!(actual.tool_supported, true);
@@ -283,7 +287,7 @@ mod tests {
             .read_defaults()
             .read_env()
             .build()
-            .unwrap();
+            .expect("merged config should deserialize");
 
         let expected = Some(ModelConfig {
             provider_id: "fake-provider".to_string(),
@@ -293,8 +297,34 @@ mod tests {
     }
 
     #[test]
+    fn test_expand_read_rust_dependencies_defaults_to_false() {
+        let actual = ConfigReader::default()
+            .read_defaults()
+            .build()
+            .expect("default config should deserialize");
+
+        assert_eq!(actual.expand_read_rust_dependencies, false);
+    }
+
+    #[test]
+    fn test_expand_read_rust_dependencies_can_be_enabled() {
+        let toml = "expand_read_rust_dependencies = true\n";
+
+        let actual = ConfigReader::default()
+            .read_defaults()
+            .read_toml(toml)
+            .build()
+            .expect("merged config should deserialize");
+
+        assert_eq!(actual.expand_read_rust_dependencies, true);
+    }
+
+    #[test]
     fn test_use_forge_committer_defaults_to_true() {
-        let actual = ConfigReader::default().read_defaults().build().unwrap();
+        let actual = ConfigReader::default()
+            .read_defaults()
+            .build()
+            .expect("default config should deserialize");
 
         assert_eq!(actual.use_forge_committer, true);
     }
@@ -307,7 +337,7 @@ mod tests {
             .read_defaults()
             .read_toml(toml)
             .build()
-            .unwrap();
+            .expect("merged config should deserialize");
 
         assert_eq!(actual.use_forge_committer, false);
     }

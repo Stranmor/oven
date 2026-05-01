@@ -151,7 +151,15 @@ pub mod tests {
     use crate::attachment::ForgeChatRequest;
 
     #[derive(Debug)]
-    pub struct MockEnvironmentInfra {}
+    pub struct MockEnvironmentInfra {
+        config: forge_config::ForgeConfig,
+    }
+
+    impl MockEnvironmentInfra {
+        fn with_config(config: forge_config::ForgeConfig) -> Self {
+            Self { config }
+        }
+    }
 
     impl EnvironmentInfra for MockEnvironmentInfra {
         type Config = forge_config::ForgeConfig;
@@ -171,7 +179,7 @@ pub mod tests {
         }
 
         fn get_config(&self) -> anyhow::Result<forge_config::ForgeConfig> {
-            Ok(forge_config::ForgeConfig { max_read_lines: 2000, ..Default::default() })
+            Ok(self.config.clone())
         }
 
         async fn update_environment(&self, _ops: Vec<ConfigOperation>) -> anyhow::Result<()> {
@@ -462,9 +470,19 @@ pub mod tests {
 
     impl MockCompositeService {
         pub fn new() -> Self {
+            Self::with_config(forge_config::ForgeConfig {
+                max_line_chars: 2000,
+                max_read_lines: 2000,
+                max_file_size_bytes: 1024 * 1024,
+                max_image_size_bytes: 1024 * 1024,
+                ..Default::default()
+            })
+        }
+
+        pub fn with_config(config: forge_config::ForgeConfig) -> Self {
             Self {
                 file_service: Arc::new(MockFileService::new()),
-                env_service: Arc::new(MockEnvironmentInfra {}),
+                env_service: Arc::new(MockEnvironmentInfra::with_config(config)),
             }
         }
 

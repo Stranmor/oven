@@ -136,6 +136,11 @@ pub struct ForgeConfig {
     /// Maximum number of files read in a single batch operation.
     #[serde(default)]
     pub max_file_read_batch_size: usize,
+    /// Whether read-tool output expands first-level local Rust dependencies
+    /// referenced by `mod` declarations and `use crate::` imports. Defaults to
+    /// `false` to keep reads scoped to the requested file.
+    #[serde(default)]
+    pub expand_read_rust_dependencies: bool,
     /// HTTP client settings including proxy, TLS, and timeout configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http: Option<HttpConfig>,

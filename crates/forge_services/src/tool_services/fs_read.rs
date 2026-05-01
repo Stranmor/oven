@@ -312,14 +312,15 @@ impl<F: FileInfoInfra + EnvironmentInfra<Config = forge_config::ForgeConfig> + I
                 .unwrap_or_default()
         };
 
-        // Append local Rust dependencies (mod declarations, use crate:: imports)
-        let deps = fetch_local_dependencies(&full_content, path).await;
-        for (dep_path, dep_content) in deps {
-            content.push_str(&format!(
-                "\n\n--- Local Dependency: {} ---\n{}",
-                dep_path.display(),
-                dep_content
-            ));
+        if config.expand_read_rust_dependencies {
+            let deps = fetch_local_dependencies(&full_content, path).await;
+            for (dep_path, dep_content) in deps {
+                content.push_str(&format!(
+                    "\n\n--- Local Dependency: {} ---\n{}",
+                    dep_path.display(),
+                    dep_content
+                ));
+            }
         }
 
         let file_info = FileInfo::new(start_line, end_line, total_lines, hash);
@@ -335,7 +336,7 @@ mod tests {
     use tokio::fs;
 
     use super::*;
-    use crate::attachment::tests::MockFileService;
+    use crate::attachment::tests::{MockCompositeService, MockFileService};
 
     // Helper to create a temporary file with specific content size
     async fn create_test_file_with_size(size: usize) -> anyhow::Result<NamedTempFile> {
@@ -579,6 +580,59 @@ mod tests {
         fs::write(root.join("src/models.rs"), "pub struct Foo;\n")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_read_rust_file_does_not_append_dependencies_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture_rust_crate(dir.path()).await;
+        let main_path = dir.path().join("src/main.rs");
+        let infra = Arc::new(MockCompositeService::new());
+        let read_service = ForgeFsRead::new(infra.clone());
+        infra.add_file(
+            main_path.clone(),
+            "mod utils;\nuse crate::models::Foo;\nfn main() {}\n".to_string(),
+        );
+
+        let actual = read_service
+            .read(main_path.to_string_lossy().to_string(), None, None)
+            .await
+            .unwrap();
+        let expected = "mod utils;\nuse crate::models::Foo;\nfn main() {}";
+
+        assert_eq!(actual.content.file_content(), expected);
+    }
+
+    #[tokio::test]
+    async fn test_read_rust_file_appends_dependencies_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture_rust_crate(dir.path()).await;
+        let main_path = dir.path().join("src/main.rs");
+        let infra = Arc::new(MockCompositeService::with_config(
+            forge_config::ForgeConfig {
+                max_line_chars: 2000,
+                max_read_lines: 2000,
+                max_file_size_bytes: 1024 * 1024,
+                max_image_size_bytes: 1024 * 1024,
+                expand_read_rust_dependencies: true,
+                ..Default::default()
+            },
+        ));
+        let read_service = ForgeFsRead::new(infra.clone());
+        infra.add_file(
+            main_path.clone(),
+            "mod utils;\nuse crate::models::Foo;\nfn main() {}\n".to_string(),
+        );
+
+        let actual = read_service
+            .read(main_path.to_string_lossy().to_string(), None, None)
+            .await
+            .unwrap();
+        let actual = actual.content.file_content();
+
+        assert!(actual.contains("--- Local Dependency:"));
+        assert!(actual.contains("pub fn helper() {}"));
+        assert!(actual.contains("pub struct Foo;"));
     }
 
     #[tokio::test]
