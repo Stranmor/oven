@@ -1,8 +1,10 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::anyhow;
-use forge_domain::{CodebaseQueryResult, ToolCallContext, ToolCatalog, ToolOutput};
+use forge_domain::{
+    CodebaseQueryResult, ToolCallContext, ToolCatalog, ToolOutput, resolve_execution_cwd,
+};
 
 use crate::fmt::content::FormatContent;
 use crate::operation::{TempContentFiles, ToolOperation};
@@ -16,6 +18,10 @@ use crate::{
 
 pub struct ToolExecutor<S> {
     services: Arc<S>,
+}
+
+fn resolve_tool_execution_cwd(requested_cwd: Option<&PathBuf>, environment_cwd: &Path) -> PathBuf {
+    resolve_execution_cwd(requested_cwd, environment_cwd)
 }
 
 impl<
@@ -123,6 +129,12 @@ impl<
         } else {
             PathBuf::from(&env.cwd).join(path_buf).display().to_string()
         }
+    }
+
+    /// Resolves command execution cwd to the same physical path used for
+    /// permission checks.
+    fn resolve_execution_cwd(&self, cwd: Option<&PathBuf>) -> PathBuf {
+        resolve_tool_execution_cwd(cwd, self.services.get_environment().cwd.as_path())
     }
 
     async fn create_temp_file(
@@ -266,16 +278,12 @@ impl<
                 (input, output).into()
             }
             ToolCatalog::Shell(input) => {
-                let cwd = input
-                    .cwd
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| self.services.get_environment().cwd.display().to_string());
-                let normalized_cwd = self.normalize_path(cwd);
+                let execution_cwd = self.resolve_execution_cwd(input.cwd.as_ref());
                 let output = self
                     .services
                     .execute(
                         input.command.clone(),
-                        PathBuf::from(normalized_cwd),
+                        execution_cwd,
                         input.keep_ansi,
                         false,
                         input.env.clone(),
@@ -285,16 +293,12 @@ impl<
                 output.into()
             }
             ToolCatalog::ProcessStart(input) => {
-                let cwd = input
-                    .cwd
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| self.services.get_environment().cwd.display().to_string());
-                let normalized_cwd = self.normalize_path(cwd);
+                let execution_cwd = self.resolve_execution_cwd(input.cwd.as_ref());
                 let output = self
                     .services
                     .process_start(
                         input.command.clone(),
-                        PathBuf::from(normalized_cwd),
+                        execution_cwd,
                         input.env.clone(),
                         input.description.clone(),
                     )
@@ -429,5 +433,65 @@ impl<
         context.with_metrics(|metrics| {
             operation.into_tool_output(tool_kind, truncation_path, &env, &config, metrics)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::symlink;
+    use std::path::PathBuf;
+
+    use forge_domain::{PermissionOperation, ProcessStart, Shell};
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    fn symlink_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        let physical = fixture.path().join("physical");
+        let alias = workspace.join("alias");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&physical).unwrap();
+        symlink(&physical, &alias).unwrap();
+        (fixture, workspace, physical)
+    }
+
+    #[test]
+    fn test_shell_execution_cwd_matches_policy_physical_symlink_resolution() {
+        let (_fixture, workspace, physical) = symlink_fixture();
+        let cwd = PathBuf::from("alias");
+        let tool = ToolCatalog::Shell(Shell {
+            command: "pwd".to_string(),
+            cwd: Some(cwd.clone()),
+            ..Default::default()
+        });
+
+        let actual = resolve_tool_execution_cwd(Some(&cwd), workspace.as_path());
+        let expected = match tool.to_policy_operation(workspace).unwrap() {
+            PermissionOperation::Execute { cwd, .. } => cwd,
+            _ => unreachable!("shell policy operation must be execute"),
+        };
+        assert_eq!(actual, physical);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_process_start_execution_cwd_matches_policy_physical_symlink_resolution() {
+        let (_fixture, workspace, physical) = symlink_fixture();
+        let cwd = PathBuf::from("alias");
+        let tool = ToolCatalog::ProcessStart(ProcessStart {
+            command: "pwd".to_string(),
+            cwd: Some(cwd.clone()),
+            ..Default::default()
+        });
+
+        let actual = resolve_tool_execution_cwd(Some(&cwd), workspace.as_path());
+        let expected = match tool.to_policy_operation(workspace).unwrap() {
+            PermissionOperation::Execute { cwd, .. } => cwd,
+            _ => unreachable!("process_start policy operation must be execute"),
+        };
+        assert_eq!(actual, physical);
+        assert_eq!(actual, expected);
     }
 }

@@ -1079,14 +1079,14 @@ impl ToolCatalog {
                 ),
             }),
             ToolCatalog::Shell(input) => {
-                let execution_cwd = policy_execution_cwd(input.cwd.as_ref(), &cwd);
+                let execution_cwd = resolve_execution_cwd(input.cwd.as_ref(), &cwd);
                 Some(crate::policies::PermissionOperation::Execute {
                     command: input.command.clone(),
                     cwd: execution_cwd,
                 })
             }
             ToolCatalog::ProcessStart(input) => {
-                let execution_cwd = policy_execution_cwd(input.cwd.as_ref(), &cwd);
+                let execution_cwd = resolve_execution_cwd(input.cwd.as_ref(), &cwd);
                 Some(crate::policies::PermissionOperation::Execute {
                     command: input.command.clone(),
                     cwd: execution_cwd,
@@ -1228,13 +1228,16 @@ impl ToolCatalog {
     }
 }
 
-fn policy_execution_cwd(requested_cwd: Option<&PathBuf>, environment_cwd: &Path) -> PathBuf {
+/// Resolves a tool execution working directory using the same physical path
+/// semantics for permission matching and command execution.
+pub fn resolve_execution_cwd(requested_cwd: Option<&PathBuf>, environment_cwd: &Path) -> PathBuf {
     let path = match requested_cwd {
         Some(path) if path.is_absolute() => path.clone(),
         Some(path) => environment_cwd.join(path),
         None => environment_cwd.to_path_buf(),
     };
-    normalize_policy_path(path.as_path())
+
+    std::fs::canonicalize(path.as_path()).unwrap_or_else(|_| normalize_policy_path(path.as_path()))
 }
 
 fn normalize_policy_path(path: &Path) -> PathBuf {
