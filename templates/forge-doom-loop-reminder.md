@@ -3,4 +3,4 @@ This indicates you are not making progress. Please:
 
 1. Reconsider your approach to solving this problem
 2. Try a different tool or different arguments
-3. If you're stuck, explain what you're trying to accomplish and ask for clarification
+3. Classify the blocker explicitly and switch strategy instead of repeating the same action

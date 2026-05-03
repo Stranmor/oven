@@ -30,6 +30,9 @@ pub struct Runner {
     // History of all the updates made to the conversation
     conversation_history: Mutex<Vec<Conversation>>,
 
+    // History of all model request contexts.
+    chat_contexts: Mutex<Vec<forge_domain::Context>>,
+
     // Tool call requests and the mock responses
     test_tool_calls: Mutex<VecDeque<(ToolCallFull, ToolResult)>>,
 
@@ -62,6 +65,7 @@ impl Runner {
             config: setup.config.clone(),
             env: setup.env.clone(),
             conversation_history: Mutex::new(Vec::new()),
+            chat_contexts: Mutex::new(Vec::new()),
             test_tool_calls: Mutex::new(VecDeque::from(setup.mock_tool_call_responses.clone())),
             test_completions: Mutex::new(VecDeque::from(setup.mock_assistant_responses.clone())),
             test_shell_outputs: Mutex::new(VecDeque::from(setup.mock_shell_outputs.clone())),
@@ -71,6 +75,10 @@ impl Runner {
     // Returns the conversation history
     async fn get_history(&self) -> Vec<Conversation> {
         self.conversation_history.lock().await.clone()
+    }
+
+    async fn get_chat_contexts(&self) -> Vec<forge_domain::Context> {
+        self.chat_contexts.lock().await.clone()
     }
 
     pub async fn run(setup: &mut TestContext, event: Event) -> anyhow::Result<()> {
@@ -93,7 +101,11 @@ impl Runner {
 
         let services = Arc::new(Runner::new(setup));
         // setup the conversation
-        let conversation = Conversation::new(ConversationId::generate()).title(setup.title.clone());
+        let mut conversation =
+            Conversation::new(ConversationId::generate()).title(setup.title.clone());
+        if let Some(context) = setup.initial_context.clone() {
+            conversation.context = Some(context);
+        }
 
         let agent = setup.agent.clone();
         let system_tools = setup.tools.clone();
@@ -151,6 +163,10 @@ impl Runner {
             .output
             .conversation_history
             .extend(runner.get_history().await);
+        setup
+            .output
+            .chat_contexts
+            .extend(runner.get_chat_contexts().await);
 
         result
     }
@@ -164,6 +180,7 @@ impl AgentService for Runner {
         context: forge_domain::Context,
         _provider_id: Option<ProviderId>,
     ) -> forge_domain::ResultStream<ChatCompletionMessage, anyhow::Error> {
+        self.chat_contexts.lock().await.push(context.clone());
         let mut responses = self.test_completions.lock().await;
 
         if let Some(message) = responses.pop_front() {

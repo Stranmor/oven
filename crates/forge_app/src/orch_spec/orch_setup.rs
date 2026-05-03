@@ -5,9 +5,9 @@ use chrono::{DateTime, Local};
 use derive_setters::Setters;
 use forge_config::ForgeConfig;
 use forge_domain::{
-    Agent, AgentId, Attachment, ChatCompletionMessage, ChatResponse, Conversation, Environment,
-    Event, File, MessageEntry, Metrics, ModelId, ProviderId, Role, Template, ToolCallFull,
-    ToolDefinition, ToolResult,
+    Agent, AgentId, Attachment, ChatCompletionMessage, ChatResponse, Context, Conversation,
+    Environment, Event, File, MessageEntry, Metrics, ModelId, ProviderId, Role, Template,
+    ToolCallFull, ToolDefinition, ToolResult,
 };
 
 use crate::ShellOutput;
@@ -40,6 +40,7 @@ pub struct TestContext {
     pub output: TestOutput,
     pub agent: Agent,
     pub tools: Vec<ToolDefinition>,
+    pub initial_context: Option<Context>,
     /// ForgeConfig used to populate TemplateConfig for
     /// system prompt rendering in tests.
     pub config: ForgeConfig,
@@ -58,6 +59,7 @@ impl Default for TestContext {
             files: Default::default(),
             attachments: Default::default(),
             initial_metrics: None,
+            initial_context: None,
             env: Environment {
                 os: "MacOS".to_string(),
                 cwd: PathBuf::from("/Users/tushar"),
@@ -99,6 +101,7 @@ impl TestContext {
 #[derive(Default, Debug)]
 pub struct TestOutput {
     pub conversation_history: Vec<Conversation>,
+    pub chat_contexts: Vec<Context>,
     pub chat_responses: Vec<anyhow::Result<ChatResponse>>,
 }
 

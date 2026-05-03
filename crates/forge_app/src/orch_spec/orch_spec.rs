@@ -1,6 +1,7 @@
 use forge_domain::{
-    ChatCompletionMessage, ChatResponse, Content, EventValue, FinishReason, ReasoningConfig, Role,
-    ToolCallArguments, ToolCallFull, ToolOutput, ToolResult,
+    ChatCompletionMessage, ChatResponse, Content, Context, ContextMessage, EventValue,
+    FinishReason, MessageEntry, ReasoningConfig, Role, TextMessage, ToolCallArguments,
+    ToolCallFull, ToolOutput, ToolResult,
 };
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -405,7 +406,7 @@ async fn test_multiple_consecutive_tool_calls() {
 }
 
 #[tokio::test]
-async fn test_doom_loop_detection_adds_user_reminder_after_repeated_calls_on_next_request() {
+async fn test_doom_loop_detection_adds_system_reminder_after_repeated_calls_on_next_request() {
     let tool_call = ToolCallFull::new("fs_read")
         .arguments(ToolCallArguments::from(json!({"path": "loop.txt"})));
     let tool_result = ToolResult::new("fs_read").output(Ok(ToolOutput::text("Same content")));
@@ -462,7 +463,7 @@ async fn test_doom_loop_detection_adds_user_reminder_after_repeated_calls_on_nex
         .iter()
         .enumerate()
         .find(|(_, message)| {
-            message.has_role(Role::User)
+            message.has_role(Role::System)
                 && message
                     .content()
                     .is_some_and(|content| content.contains("system_reminder"))
@@ -489,6 +490,88 @@ async fn test_doom_loop_detection_adds_user_reminder_after_repeated_calls_on_nex
     assert!(
         reminder_message_index > third_assistant_with_tool_call_index,
         "Reminder should be appended after the triggering tool-call history is persisted"
+    );
+}
+
+#[tokio::test]
+async fn test_doom_loop_reminder_is_not_duplicated_without_new_tool_evidence() {
+    fn assistant_with(tool_call: ToolCallFull) -> MessageEntry {
+        ContextMessage::Text(TextMessage {
+            role: Role::Assistant,
+            content: String::new(),
+            raw_content: None,
+            tool_calls: Some(vec![tool_call]),
+            thought_signature: None,
+            model: None,
+            reasoning_details: None,
+            droppable: false,
+            phase: None,
+        })
+        .into()
+    }
+
+    let tool_call = ToolCallFull::new("fs_read")
+        .arguments(ToolCallArguments::from(json!({"path": "loop.txt"})));
+    let mut ctx = TestContext::default()
+        .initial_context(Context::default().messages(vec![
+            assistant_with(tool_call.clone()),
+            assistant_with(tool_call.clone()),
+            assistant_with(tool_call),
+        ]))
+        .mock_assistant_responses(vec![
+            ChatCompletionMessage::assistant("Still thinking"),
+            ChatCompletionMessage::assistant("Done").finish_reason(FinishReason::Stop),
+        ]);
+
+    ctx.run("Continue").await.unwrap();
+
+    let first_request = ctx
+        .output
+        .chat_contexts
+        .first()
+        .expect("Expected first model request context");
+    let first_request_reminders = first_request
+        .messages
+        .iter()
+        .filter(|message| {
+            message.has_role(Role::System)
+                && message.content().is_some_and(|content| {
+                    content.contains("doom_loop_id=")
+                        && content.contains("You appear to be stuck in a repetitive loop")
+                        && content.contains("3 similar calls")
+                })
+        })
+        .count();
+    assert_eq!(
+        first_request_reminders, 1,
+        "Reminder should be in the next model request"
+    );
+
+    let messages = ctx.output.context_messages();
+    let reminders: Vec<_> = messages
+        .iter()
+        .filter(|message| {
+            message.has_role(Role::System)
+                && message.content().is_some_and(|content| {
+                    content.contains("doom_loop_id=")
+                        && content.contains("You appear to be stuck in a repetitive loop")
+                        && content.contains("3 similar calls")
+                })
+        })
+        .collect();
+    let assistant_tool_messages = messages
+        .iter()
+        .filter(|message| message.has_role(Role::Assistant) && message.has_tool_call())
+        .count();
+
+    assert_eq!(
+        reminders.len(),
+        1,
+        "Should suppress duplicate doom-loop reminder"
+    );
+    assert_eq!(
+        assistant_tool_messages, 3,
+        "No new tool-call evidence was added"
     );
 }
 

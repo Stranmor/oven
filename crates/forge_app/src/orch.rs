@@ -258,7 +258,8 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
                 "}" | "{" | "]" | "[" | "```" | "```json" | "```json\n```"
             );
 
-            // 3. Raw JSON/Markdown hallucination (model output tool call syntax as raw text)
+            // 3. Raw JSON/Markdown hallucination (model output tool call syntax as raw
+            //    text)
             let has_tool_keywords = trimmed.contains("\"name\"")
                 && (trimmed.contains("\"arguments\"")
                     || trimmed.contains("\"tool_calls\"")
@@ -322,6 +323,9 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
             self.hook
                 .handle(&request_event, &mut self.conversation)
                 .await?;
+            if let Some(updated_context) = &self.conversation.context {
+                context = updated_context.clone();
+            }
 
             let message = crate::retry::retry_with_config(
                 &self.config.clone().retry.unwrap_or_default(),
