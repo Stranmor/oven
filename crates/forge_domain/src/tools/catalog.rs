@@ -1229,11 +1229,28 @@ impl ToolCatalog {
 }
 
 fn policy_execution_cwd(requested_cwd: Option<&PathBuf>, environment_cwd: &Path) -> PathBuf {
-    match requested_cwd {
+    let path = match requested_cwd {
         Some(path) if path.is_absolute() => path.clone(),
         Some(path) => environment_cwd.join(path),
         None => environment_cwd.to_path_buf(),
+    };
+    normalize_policy_path(path.as_path())
+}
+
+fn normalize_policy_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(part) => normalized.push(part),
+        }
     }
+    normalized
 }
 
 fn format_display_path(path: &Path, cwd: &Path) -> String {
@@ -1605,6 +1622,26 @@ mod tests {
     }
 
     #[test]
+    fn test_process_start_policy_normalizes_requested_cwd_before_permission_match() {
+        use crate::policies::PermissionOperation;
+
+        let fixture = ToolCatalog::ProcessStart(ProcessStart {
+            command: "printf traversal".to_string(),
+            cwd: Some(PathBuf::from("allowed/../forbidden")),
+            ..Default::default()
+        });
+
+        let actual = fixture
+            .to_policy_operation(PathBuf::from("/workspace"))
+            .unwrap();
+        let expected = PermissionOperation::Execute {
+            command: "printf traversal".to_string(),
+            cwd: PathBuf::from("/workspace/forbidden"),
+        };
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn test_shell_policy_uses_requested_cwd_for_execute_permission() {
         use crate::policies::PermissionOperation;
 
@@ -1940,6 +1977,26 @@ mod tests {
         assert_eq!(enum_values[0], serde_json::json!("content"));
         assert_eq!(enum_values[1], serde_json::json!("files_with_matches"));
         assert_eq!(enum_values[2], serde_json::json!("count"));
+    }
+
+    #[test]
+    fn test_shell_policy_normalizes_requested_cwd_before_permission_match() {
+        use crate::policies::PermissionOperation;
+
+        let fixture = ToolCatalog::Shell(Shell {
+            command: "printf traversal".to_string(),
+            cwd: Some(PathBuf::from("allowed/../forbidden")),
+            ..Default::default()
+        });
+
+        let actual = fixture
+            .to_policy_operation(PathBuf::from("/workspace"))
+            .unwrap();
+        let expected = PermissionOperation::Execute {
+            command: "printf traversal".to_string(),
+            cwd: PathBuf::from("/workspace/forbidden"),
+        };
+        assert_eq!(actual, expected);
     }
 
     #[test]
