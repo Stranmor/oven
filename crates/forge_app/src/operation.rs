@@ -666,13 +666,19 @@ impl ToolOperation {
                 forge_domain::ToolOutput::text(elm)
             }
             ToolOperation::ProcessRead { output } => {
-                let body = serde_json::to_string(&output.output.entries).unwrap_or_default();
-                let elm = Element::new("process_output")
+                let body = serde_json::to_string(&output.output.entries)
+                    .expect("process log entries should serialize");
+                let mut elm = Element::new("process_output")
                     .attr("process_id", output.output.process_id.as_str())
                     .attr("next_cursor", output.output.next_cursor.get())
-                    .attr("shell", &output.shell)
-                    .cdata(body);
-                forge_domain::ToolOutput::text(elm)
+                    .attr("shell", &output.shell);
+                if let Some(cursor) = output.output.first_available_cursor {
+                    elm = elm.attr("first_available_cursor", cursor.get());
+                }
+                if let Some(cursor) = output.output.dropped_before_cursor {
+                    elm = elm.attr("dropped_before_cursor", cursor.get());
+                }
+                forge_domain::ToolOutput::text(elm.cdata(body))
             }
             ToolOperation::ProcessList { output } => {
                 let body = serde_json::to_string(&output).unwrap_or_default();
@@ -799,7 +805,10 @@ mod tests {
     use std::fmt::Write;
     use std::path::PathBuf;
 
-    use forge_domain::{FSRead, FSReadRange, FileInfo, ToolValue};
+    use forge_domain::{
+        FSRead, FSReadRange, FileInfo, ProcessId, ProcessLogEntry, ProcessReadCursor,
+        ProcessReadOutput, ProcessStream, ToolValue,
+    };
 
     use super::*;
     use crate::{Content, Match, MatchResult};
@@ -1449,6 +1458,35 @@ mod tests {
             TempContentFiles::default(),
             &env,
             &config,
+            &mut Metrics::default(),
+        );
+
+        insta::assert_snapshot!(to_value(actual));
+    }
+    #[test]
+    fn test_process_output_exposes_background_log_retention_range_attrs() {
+        let fixture = ToolOperation::ProcessRead {
+            output: ProcessReadServiceOutput {
+                shell: "bash".to_string(),
+                output: ProcessReadOutput {
+                    process_id: ProcessId::new("process-overflow"),
+                    next_cursor: ProcessReadCursor::new(9),
+                    first_available_cursor: Some(ProcessReadCursor::new(4)),
+                    dropped_before_cursor: Some(ProcessReadCursor::new(3)),
+                    entries: vec![ProcessLogEntry {
+                        cursor: ProcessReadCursor::new(9),
+                        stream: ProcessStream::Stdout,
+                        content: "survived".to_string(),
+                    }],
+                },
+            },
+        };
+
+        let actual = fixture.into_tool_output(
+            ToolKind::ProcessRead,
+            TempContentFiles::default(),
+            &fixture_environment(),
+            &fixture_config(),
             &mut Metrics::default(),
         );
 

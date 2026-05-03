@@ -183,7 +183,13 @@ mod tests {
             process_id: ProcessId,
             cursor: ProcessReadCursor,
         ) -> anyhow::Result<ProcessReadOutput> {
-            Ok(ProcessReadOutput { process_id, next_cursor: cursor, entries: Vec::new() })
+            Ok(ProcessReadOutput {
+                process_id,
+                next_cursor: cursor,
+                first_available_cursor: None,
+                dropped_before_cursor: None,
+                entries: Vec::new(),
+            })
         }
 
         async fn list_processes(&self) -> anyhow::Result<Vec<ProcessStatus>> {

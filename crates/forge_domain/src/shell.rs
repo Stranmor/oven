@@ -116,5 +116,7 @@ pub struct ProcessStartOutput {
 pub struct ProcessReadOutput {
     pub process_id: ProcessId,
     pub next_cursor: ProcessReadCursor,
+    pub first_available_cursor: Option<ProcessReadCursor>,
+    pub dropped_before_cursor: Option<ProcessReadCursor>,
     pub entries: Vec<ProcessLogEntry>,
 }

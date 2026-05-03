@@ -1078,14 +1078,18 @@ impl ToolCatalog {
                     display_path_for(&input.file_path)
                 ),
             }),
-            ToolCatalog::Shell(input) => Some(crate::policies::PermissionOperation::Execute {
-                command: input.command.clone(),
-                cwd,
-            }),
-            ToolCatalog::ProcessStart(input) => {
+            ToolCatalog::Shell(input) => {
+                let execution_cwd = policy_execution_cwd(input.cwd.as_ref(), &cwd);
                 Some(crate::policies::PermissionOperation::Execute {
                     command: input.command.clone(),
-                    cwd,
+                    cwd: execution_cwd,
+                })
+            }
+            ToolCatalog::ProcessStart(input) => {
+                let execution_cwd = policy_execution_cwd(input.cwd.as_ref(), &cwd);
+                Some(crate::policies::PermissionOperation::Execute {
+                    command: input.command.clone(),
+                    cwd: execution_cwd,
                 })
             }
             ToolCatalog::Fetch(input) => Some(crate::policies::PermissionOperation::Fetch {
@@ -1224,6 +1228,14 @@ impl ToolCatalog {
     }
 }
 
+fn policy_execution_cwd(requested_cwd: Option<&PathBuf>, environment_cwd: &Path) -> PathBuf {
+    match requested_cwd {
+        Some(path) if path.is_absolute() => path.clone(),
+        Some(path) => environment_cwd.join(path),
+        None => environment_cwd.to_path_buf(),
+    }
+}
+
 fn format_display_path(path: &Path, cwd: &Path) -> String {
     // Try to create a relative path for display if possible
     let display_path = if path.starts_with(cwd) {
@@ -1317,7 +1329,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use strum::IntoEnumIterator;
 
-    use super::Shell;
+    use super::{ProcessStart, Shell};
     use crate::{ToolCatalog, ToolKind, ToolName};
 
     #[test]
@@ -1570,6 +1582,46 @@ mod tests {
             ToolCatalog::contains(&ToolName::new("Write")),
             "Should contain capitalized 'Write'"
         );
+    }
+
+    #[test]
+    fn test_process_start_policy_uses_requested_cwd_for_execute_permission() {
+        use crate::policies::PermissionOperation;
+
+        let fixture = ToolCatalog::ProcessStart(ProcessStart {
+            command: "printf restricted".to_string(),
+            cwd: Some(PathBuf::from("allowed")),
+            ..Default::default()
+        });
+
+        let actual = fixture
+            .to_policy_operation(PathBuf::from("/workspace"))
+            .unwrap();
+        let expected = PermissionOperation::Execute {
+            command: "printf restricted".to_string(),
+            cwd: PathBuf::from("/workspace/allowed"),
+        };
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_shell_policy_uses_requested_cwd_for_execute_permission() {
+        use crate::policies::PermissionOperation;
+
+        let fixture = ToolCatalog::Shell(Shell {
+            command: "printf restricted".to_string(),
+            cwd: Some(PathBuf::from("allowed")),
+            ..Default::default()
+        });
+
+        let actual = fixture
+            .to_policy_operation(PathBuf::from("/workspace"))
+            .unwrap();
+        let expected = PermissionOperation::Execute {
+            command: "printf restricted".to_string(),
+            cwd: PathBuf::from("/workspace/allowed"),
+        };
+        assert_eq!(actual, expected);
     }
 
     #[test]

@@ -1,0 +1,12 @@
+---
+source: crates/forge_app/src/operation.rs
+expression: to_value(actual)
+---
+<process_output
+  process_id="process-overflow"
+  next_cursor="9"
+  shell="bash"
+  first_available_cursor="4"
+  dropped_before_cursor="3"
+><![CDATA[[{"cursor":9,"stream":"stdout","content":"survived"}]]]>
+</process_output>

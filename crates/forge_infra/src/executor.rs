@@ -36,6 +36,7 @@ struct ManagedProcess {
     child: Child,
     status: ProcessStatusKind,
     logs: Arc<Mutex<VecDeque<ProcessLogEntry>>>,
+    dropped_before_cursor: Arc<AtomicU64>,
 }
 
 impl ManagedProcess {
@@ -143,6 +144,7 @@ impl ForgeCommandExecutorService {
         stream: ProcessStream,
         logs: Arc<Mutex<VecDeque<ProcessLogEntry>>>,
         next_cursor: Arc<AtomicU64>,
+        dropped_before_cursor: Arc<AtomicU64>,
     ) where
         A: AsyncReadExt + Unpin + Send + 'static,
     {
@@ -166,9 +168,7 @@ impl ForgeCommandExecutorService {
                     stream,
                     content,
                 });
-                while logs.len() > MAX_BACKGROUND_LOG_ENTRIES {
-                    logs.pop_front();
-                }
+                trim_background_logs(&mut logs, &dropped_before_cursor);
             }
         });
     }
@@ -320,6 +320,37 @@ fn write_lossy_utf8<W: Write>(writer: &mut W, buf: &[u8]) -> io::Result<Vec<u8>>
     Ok(Vec::new())
 }
 
+fn trim_background_logs(logs: &mut VecDeque<ProcessLogEntry>, dropped_before_cursor: &AtomicU64) {
+    while logs.len() > MAX_BACKGROUND_LOG_ENTRIES {
+        if let Some(dropped) = logs.pop_front() {
+            dropped_before_cursor.store(dropped.cursor.get(), Ordering::Relaxed);
+        }
+    }
+}
+
+fn process_read_output_from_logs(
+    process_id: ProcessId,
+    cursor: ProcessReadCursor,
+    logs: &VecDeque<ProcessLogEntry>,
+    dropped_before_cursor: Option<ProcessReadCursor>,
+) -> ProcessReadOutput {
+    let first_available_cursor = logs.front().map(|entry| entry.cursor);
+    let mut entries: Vec<_> = logs
+        .iter()
+        .filter(|entry| entry.cursor > cursor)
+        .cloned()
+        .collect();
+    entries.sort_by_key(|entry| entry.cursor);
+    let next = entries.last().map(|entry| entry.cursor).unwrap_or(cursor);
+    ProcessReadOutput {
+        process_id,
+        next_cursor: next,
+        first_available_cursor,
+        dropped_before_cursor,
+        entries,
+    }
+}
+
 /// The implementation for CommandExecutorService
 #[async_trait::async_trait]
 impl CommandInfra for ForgeCommandExecutorService {
@@ -359,6 +390,7 @@ impl CommandInfra for ForgeCommandExecutorService {
         let mut child = prepared_command.spawn()?;
         let logs = Arc::new(Mutex::new(VecDeque::new()));
         let next_cursor = Arc::new(AtomicU64::new(1));
+        let dropped_before_cursor = Arc::new(AtomicU64::new(0));
 
         if let Some(stdout) = child.stdout.take() {
             Self::capture_stream(
@@ -366,6 +398,7 @@ impl CommandInfra for ForgeCommandExecutorService {
                 ProcessStream::Stdout,
                 logs.clone(),
                 next_cursor.clone(),
+                dropped_before_cursor.clone(),
             );
         }
         if let Some(stderr) = child.stderr.take() {
@@ -374,6 +407,7 @@ impl CommandInfra for ForgeCommandExecutorService {
                 ProcessStream::Stderr,
                 logs.clone(),
                 next_cursor.clone(),
+                dropped_before_cursor.clone(),
             );
         }
 
@@ -392,6 +426,7 @@ impl CommandInfra for ForgeCommandExecutorService {
                 child,
                 status: ProcessStatusKind::Running,
                 logs,
+                dropped_before_cursor,
             },
         );
         Ok(output)
@@ -415,17 +450,17 @@ impl CommandInfra for ForgeCommandExecutorService {
         let process = processes
             .get(&process_id)
             .ok_or_else(|| anyhow::anyhow!("Unknown process id: {process_id}"))?;
-        let mut entries: Vec<_> = process
-            .logs
-            .lock()
-            .await
-            .iter()
-            .filter(|entry| entry.cursor > cursor)
-            .cloned()
-            .collect();
-        entries.sort_by_key(|entry| entry.cursor);
-        let next = entries.last().map(|entry| entry.cursor).unwrap_or(cursor);
-        Ok(ProcessReadOutput { process_id, next_cursor: next, entries })
+        let logs = process.logs.lock().await;
+        let dropped_before_cursor = match process.dropped_before_cursor.load(Ordering::Relaxed) {
+            0 => None,
+            cursor => Some(ProcessReadCursor::new(cursor)),
+        };
+        Ok(process_read_output_from_logs(
+            process_id,
+            cursor,
+            &logs,
+            dropped_before_cursor,
+        ))
     }
 
     async fn list_processes(&self) -> anyhow::Result<Vec<ProcessStatus>> {
@@ -535,6 +570,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_process_read_exposes_dropped_background_log_range() {
+        let mut fixture = VecDeque::new();
+        let dropped_before_cursor = AtomicU64::new(0);
+        let last_cursor = u64::try_from(MAX_BACKGROUND_LOG_ENTRIES).unwrap() + 1;
+        for cursor in 1..=last_cursor {
+            fixture.push_back(ProcessLogEntry {
+                cursor: ProcessReadCursor::new(cursor),
+                stream: ProcessStream::Stdout,
+                content: format!("entry-{cursor}"),
+            });
+        }
+
+        trim_background_logs(&mut fixture, &dropped_before_cursor);
+        let actual = process_read_output_from_logs(
+            ProcessId::new("process-overflow"),
+            ProcessReadCursor::new(0),
+            &fixture,
+            Some(ProcessReadCursor::new(
+                dropped_before_cursor.load(Ordering::Relaxed),
+            )),
+        );
+
+        assert_eq!(
+            actual.first_available_cursor,
+            Some(ProcessReadCursor::new(2))
+        );
+        assert_eq!(
+            actual.dropped_before_cursor,
+            Some(ProcessReadCursor::new(1))
+        );
+        assert_eq!(actual.entries.len(), MAX_BACKGROUND_LOG_ENTRIES);
+        assert_eq!(
+            actual.entries.first().unwrap().cursor,
+            ProcessReadCursor::new(2)
+        );
+        assert_eq!(actual.next_cursor, ProcessReadCursor::new(last_cursor));
+    }
+
     #[tokio::test]
     async fn test_process_list_refreshes_exited_status_without_status_probe() {
         let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
@@ -557,6 +631,7 @@ mod tests {
 
         let logs = Arc::new(Mutex::new(VecDeque::new()));
         let next_cursor = Arc::new(AtomicU64::new(1));
+        let dropped_before_cursor = Arc::new(AtomicU64::new(0));
         let (mut writer, reader) = tokio::io::duplex(64);
         let log_guard = logs.lock().await;
 
@@ -565,6 +640,7 @@ mod tests {
             ProcessStream::Stdout,
             logs.clone(),
             next_cursor.clone(),
+            dropped_before_cursor,
         );
         writer.write_all(b"pending").await.unwrap();
         writer.flush().await.unwrap();
