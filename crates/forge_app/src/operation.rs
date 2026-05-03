@@ -657,7 +657,7 @@ impl ToolOperation {
                 forge_domain::ToolOutput::text(elm)
             }
             ToolOperation::ProcessKill { output } => {
-                let elm = Element::new("process_status")
+                let elm = Element::new("process_kill")
                     .attr("process_id", output.status.process_id.as_str())
                     .attr("status", format!("{:?}", output.status.status))
                     .attr("command", &output.status.command)

@@ -1,8 +1,9 @@
 use pretty_assertions::assert_eq;
 
 use super::fixtures::{
-    assistant_message, conversation_from_tool_calls, conversation_with_context_messages,
-    detector_with_threshold, tool_call,
+    assistant_message, assistant_message_with_tool_calls, conversation_from_tool_calls,
+    conversation_with_context_messages, conversation_with_messages, detector_with_threshold,
+    tool_call,
 };
 use super::*;
 use forge_domain::{ContextMessage, ToolOutput, ToolResult};
@@ -184,6 +185,20 @@ fn test_doom_loop_detector_normalizes_search_field_order() {
 
     let actual = DoomLoopDetector::new().detect_from_conversation(&conversation);
     let expected = Some(3);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn test_doom_loop_detector_does_not_treat_parallel_calls_as_retries() {
+    let first = tool_call("read", r#"{"path":"src/main.rs"}"#);
+    let second = tool_call("read", r#"{"path":"./src/main.rs"}"#);
+    let third = tool_call("read", r#"{"file_path":"src/main.rs"}"#);
+    let conversation = conversation_with_messages(vec![assistant_message_with_tool_calls(vec![
+        first, second, third,
+    ])]);
+
+    let actual = DoomLoopDetector::new().detect_from_conversation(&conversation);
+    let expected = None;
     assert_eq!(actual, expected);
 }
 

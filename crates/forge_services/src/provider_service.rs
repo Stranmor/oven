@@ -52,15 +52,15 @@ impl<R> ForgeProviderService<R> {
             self.render_url_template(&template_provider.url.template, &credential.url_params)?;
 
         // Render model source URLs
-        let models = template_provider.models.as_ref().and_then(|m| match m {
-            ModelSource::Url(template) => {
-                let model_url = self
-                    .render_url_template(&template.template, &credential.url_params)
-                    .ok();
-                model_url.map(ModelSource::Url)
+        let models = match template_provider.models.as_ref() {
+            Some(ModelSource::Url(template)) => {
+                let model_url =
+                    self.render_url_template(&template.template, &credential.url_params)?;
+                Some(ModelSource::Url(model_url))
             }
-            ModelSource::Hardcoded(list) => Some(ModelSource::Hardcoded(list.clone())),
-        });
+            Some(ModelSource::Hardcoded(list)) => Some(ModelSource::Hardcoded(list.clone())),
+            None => None,
+        };
 
         Ok(Provider {
             id: template_provider.id,
@@ -99,19 +99,16 @@ impl<R: ChatRepository + ProviderRepository> ProviderService for ForgeProviderSe
         let rendered_providers = providers
             .into_iter()
             .map(|provider| {
-                // If provider is a Template with credentials, render it to Url
                 if let AnyProvider::Template(template_provider) = &provider
                     && template_provider.is_configured()
                 {
-                    // Clone and render the provider
-                    if let Ok(rendered) = self.render_provider(template_provider.clone()) {
-                        return AnyProvider::Url(rendered);
-                    }
+                    return self
+                        .render_provider(template_provider.clone())
+                        .map(AnyProvider::Url);
                 }
-                // Otherwise return as-is
-                provider
+                Ok(provider)
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(rendered_providers)
     }
@@ -253,7 +250,7 @@ mod tests {
     fn test_model(id: &str) -> Model {
         Model {
             id: ModelId::from(id),
-            provider_id: Some(forge_domain::ProviderId::OPENAI),
+            provider_id: forge_domain::ProviderId::OPENAI,
             name: Some(id.to_string()),
             description: None,
             context_length: Some(4096),

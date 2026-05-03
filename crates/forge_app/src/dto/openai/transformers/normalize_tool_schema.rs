@@ -102,14 +102,15 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::domain::ToolName;
     use crate::dto::openai::{FunctionDescription, Tool};
 
     fn tool_fixture(parameters: serde_json::Value) -> Tool {
         Tool::Function {
             function: FunctionDescription {
-                name: "test_tool".to_string(),
+                name: ToolName::new("test_tool"),
                 description: Some("Test tool description".to_string()),
-                parameters,
+                parameters: serde_json::from_value(parameters).unwrap(),
             },
         }
     }

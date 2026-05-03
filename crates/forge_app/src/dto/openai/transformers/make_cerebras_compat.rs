@@ -23,14 +23,16 @@ mod tests {
 
     #[test]
     fn test_parallel_tool_calls_dropped() {
+        use forge_domain::ToolName;
+
         use crate::dto::openai::{FunctionDescription, Request, Tool};
 
         let fixture = Request::default()
             .tools(vec![Tool::Function {
                 function: FunctionDescription {
                     description: Some("test".to_string()),
-                    name: "test".to_string(),
-                    parameters: serde_json::json!({}),
+                    name: ToolName::new("test"),
+                    parameters: schemars::schema_for!(()),
                 },
             }])
             .parallel_tool_calls(true);

@@ -170,7 +170,7 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::domain::{ModelSource, ProviderResponse};
+    use crate::domain::{ModelSource, ProviderResponse, ToolName};
 
     // Test helper functions
     fn make_credential(provider_id: ProviderId, key: &str) -> Option<forge_domain::AuthCredential> {
@@ -731,9 +731,9 @@ mod tests {
         let provider = opencode_zen("opencode-zen");
         let fixture = Request::default().tools(vec![crate::dto::openai::Tool::Function {
             function: crate::dto::openai::FunctionDescription {
-                name: "fs_search".to_string(),
+                name: ToolName::new("fs_search"),
                 description: Some("Search files".to_string()),
-                parameters: serde_json::json!({
+                parameters: serde_json::from_value(serde_json::json!({
                     "type": "object",
                     "properties": {
                         "output_mode": {
@@ -743,7 +743,8 @@ mod tests {
                             "enum": ["content", "files_with_matches", "count", null]
                         }
                     }
-                }),
+                }))
+                .unwrap(),
             },
         }]);
 
@@ -768,7 +769,10 @@ mod tests {
         let crate::dto::openai::Tool::Function { function } = &actual.tools.unwrap()[0] else {
             panic!()
         };
-        assert_eq!(function.parameters, expected);
+        assert_eq!(
+            serde_json::to_value(&function.parameters).unwrap(),
+            expected
+        );
     }
 
     #[test]
@@ -777,9 +781,9 @@ mod tests {
         let fixture = Request::default()
             .tools(vec![crate::dto::openai::Tool::Function {
                 function: crate::dto::openai::FunctionDescription {
-                    name: "fs_search".to_string(),
+                    name: ToolName::new("fs_search"),
                     description: Some("Search files".to_string()),
-                    parameters: serde_json::json!({
+                    parameters: serde_json::from_value(serde_json::json!({
                         "type": "object",
                         "properties": {
                             "output_mode": {
@@ -789,7 +793,8 @@ mod tests {
                                 "enum": ["content", "files_with_matches", "count", null]
                             }
                         }
-                    }),
+                    }))
+                    .unwrap(),
                 },
             }])
             .response_format(crate::dto::openai::ResponseFormat::JsonSchema {
@@ -1100,9 +1105,9 @@ mod tests {
         let provider = openai("openai");
         let fixture = Request::default().tools(vec![crate::dto::openai::Tool::Function {
             function: crate::dto::openai::FunctionDescription {
-                name: "fs_search".to_string(),
+                name: ToolName::new("fs_search"),
                 description: Some("Search files".to_string()),
-                parameters: serde_json::json!({
+                parameters: serde_json::from_value(serde_json::json!({
                     "type": "object",
                     "properties": {
                         "output_mode": {
@@ -1112,7 +1117,8 @@ mod tests {
                             "enum": ["content", "files_with_matches", "count", null]
                         }
                     }
-                }),
+                }))
+                .unwrap(),
             },
         }]);
 
@@ -1134,6 +1140,9 @@ mod tests {
         let crate::dto::openai::Tool::Function { function } = &actual.tools.unwrap()[0] else {
             panic!()
         };
-        assert_eq!(function.parameters, expected);
+        assert_eq!(
+            serde_json::to_value(&function.parameters).unwrap(),
+            expected
+        );
     }
 }

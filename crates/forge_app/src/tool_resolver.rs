@@ -9,6 +9,11 @@ pub struct ToolResolver {
     all_tool_definitions: Vec<ToolDefinition>,
 }
 
+struct AllowedToolSpec {
+    exact: ToolName,
+    pattern: Option<Pattern>,
+}
+
 /// Maps deprecated tool names to their current names for backward compatibility
 fn deprecated_tool_aliases() -> HashMap<&'static str, ToolName> {
     HashMap::from([
@@ -35,59 +40,59 @@ impl ToolResolver {
     /// agent's tool order (derived from the tools list).
     /// Returns references to avoid unnecessary cloning.
     pub fn resolve<'a>(&'a self, agent: &Agent) -> Vec<&'a ToolDefinition> {
-        let patterns = Self::build_patterns(agent);
-        let mut resolved = self.match_tools(&patterns);
+        let specs = Self::build_specs(agent);
+        let mut resolved = self.match_tools(&specs);
         self.dedupe_tools(&mut resolved);
         agent.tool_order().sort_refs(&mut resolved);
         resolved
     }
 
-    fn is_allowed_pattern(patterns: &[Pattern], tool_name: &ToolName) -> bool {
-        patterns
-            .iter()
-            .any(|pattern| pattern.matches(tool_name.as_str()))
+    fn is_allowed_tool(specs: &[AllowedToolSpec], tool_name: &ToolName) -> bool {
+        specs.iter().any(|spec| {
+            spec.exact == *tool_name
+                || spec
+                    .pattern
+                    .as_ref()
+                    .is_some_and(|pattern| pattern.matches(tool_name.as_str()))
+        })
     }
 
     pub fn is_allowed(agent: &Agent, tool_name: &ToolName) -> bool {
-        let aliases = deprecated_tool_aliases();
-        let normalized_tool_name = aliases.get(tool_name.as_str()).unwrap_or(tool_name);
-        let legacy_mcp_tool_name = normalized_tool_name.to_legacy_mcp_name();
-        let patterns = Self::build_patterns(agent);
+        let legacy_mcp_tool_name = tool_name.to_legacy_mcp_name();
+        let specs = Self::build_specs(agent);
 
-        Self::is_allowed_pattern(&patterns, normalized_tool_name)
+        Self::is_allowed_tool(&specs, tool_name)
             || legacy_mcp_tool_name
                 .as_ref()
-                .is_some_and(|legacy_tool_name| {
-                    Self::is_allowed_pattern(&patterns, legacy_tool_name)
-                })
+                .is_some_and(|legacy_tool_name| Self::is_allowed_tool(&specs, legacy_tool_name))
     }
 
     /// Builds glob patterns from the agent's tool patterns, deduplicating
     /// patterns. Supports backward compatibility by automatically adding
     /// current tool names when deprecated aliases are used.
-    fn build_patterns(agent: &Agent) -> Vec<Pattern> {
+    fn build_specs(agent: &Agent) -> Vec<AllowedToolSpec> {
         let aliases = deprecated_tool_aliases();
         let tool_names = agent
             .tools
             .iter()
             .flatten()
-            .map(|name| {
-                // Resolve deprecated tool name via aliases
-                aliases.get(name.as_str()).unwrap_or(name)
-            })
+            .map(|name| aliases.get(name.as_str()).unwrap_or(name))
             .collect::<HashSet<_>>();
 
         tool_names
             .into_iter()
-            .filter_map(|pattern| Pattern::new(pattern.as_str()).ok())
+            .map(|tool_name| AllowedToolSpec {
+                exact: tool_name.clone(),
+                pattern: Pattern::new(tool_name.as_str()).ok(),
+            })
             .collect()
     }
 
-    /// Matches tool definitions against glob patterns
-    fn match_tools<'a>(&'a self, patterns: &[Pattern]) -> Vec<&'a ToolDefinition> {
+    /// Matches tool definitions against exact names and glob patterns
+    fn match_tools<'a>(&'a self, specs: &[AllowedToolSpec]) -> Vec<&'a ToolDefinition> {
         self.all_tool_definitions
             .iter()
-            .filter(|tool| Self::is_allowed_pattern(patterns, &tool.name))
+            .filter(|tool| Self::is_allowed_tool(specs, &tool.name))
             .collect()
     }
 
@@ -403,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn test_capitalized_read_alias() {
+    fn test_capitalized_read_alias_is_not_allowed_during_authorization() {
         // Test that capitalized "Read" resolves to "read"
         let all_tool_definitions = vec![
             ToolDefinition::new("read").description("Read Tool"),
@@ -420,15 +425,15 @@ mod tests {
         )
         .tools(vec![ToolName::new("read"), ToolName::new("write")]);
 
-        // Validation should accept both capitalized and lowercase
+        // Validation accepts exact tool call names only; aliases are for config resolution.
         assert!(ToolResolver::is_allowed(&fixture, &ToolName::new("read")));
-        assert!(ToolResolver::is_allowed(&fixture, &ToolName::new("Read")));
+        assert!(!ToolResolver::is_allowed(&fixture, &ToolName::new("Read")));
         assert!(ToolResolver::is_allowed(&fixture, &ToolName::new("write")));
-        assert!(ToolResolver::is_allowed(&fixture, &ToolName::new("Write")));
+        assert!(!ToolResolver::is_allowed(&fixture, &ToolName::new("Write")));
     }
 
     #[test]
-    fn test_capitalized_write_alias() {
+    fn test_capitalized_write_alias_is_not_allowed_during_authorization() {
         // Test that capitalized "Write" resolves to "write"
         let all_tool_definitions = vec![
             ToolDefinition::new("read").description("Read Tool"),
@@ -444,13 +449,13 @@ mod tests {
         )
         .tools(vec![ToolName::new("write")]);
 
-        // Both lowercase and capitalized should be allowed
+        // Validation accepts exact tool call names only; aliases are for config resolution.
         assert!(ToolResolver::is_allowed(&fixture, &ToolName::new("write")));
-        assert!(ToolResolver::is_allowed(&fixture, &ToolName::new("Write")));
+        assert!(!ToolResolver::is_allowed(&fixture, &ToolName::new("Write")));
     }
 
     #[test]
-    fn test_capitalized_task_alias() {
+    fn test_capitalized_task_alias_is_not_allowed_during_authorization() {
         // Test that capitalized "Task" resolves to "task"
         let all_tool_definitions = vec![ToolDefinition::new("task").description("Task Tool")];
 
@@ -463,8 +468,8 @@ mod tests {
         )
         .tools(vec![ToolName::new("task")]);
 
-        // Both lowercase and capitalized should be allowed
+        // Validation accepts exact tool call names only; aliases are for config resolution.
         assert!(ToolResolver::is_allowed(&fixture, &ToolName::new("task")));
-        assert!(ToolResolver::is_allowed(&fixture, &ToolName::new("Task")));
+        assert!(!ToolResolver::is_allowed(&fixture, &ToolName::new("Task")));
     }
 }

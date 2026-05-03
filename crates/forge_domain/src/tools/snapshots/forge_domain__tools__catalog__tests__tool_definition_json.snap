@@ -314,6 +314,87 @@ expression: tools
   ]
 }
 {
+  "title": "ProcessStart",
+  "type": "object",
+  "properties": {
+    "command": {
+      "description": "The shell command to start as a managed background process.",
+      "type": "string"
+    },
+    "cwd": {
+      "description": "The working directory where the process should start.",
+      "type": "string",
+      "nullable": true
+    },
+    "description": {
+      "description": "Clear, concise description of what this background process does.",
+      "type": "string",
+      "nullable": true
+    },
+    "env": {
+      "description": "Environment variable names to pass to the process.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "nullable": true
+    }
+  },
+  "required": [
+    "command"
+  ]
+}
+{
+  "title": "ProcessStatusInput",
+  "type": "object",
+  "properties": {
+    "process_id": {
+      "description": "Handle returned by process_start.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "process_id"
+  ]
+}
+{
+  "title": "ProcessRead",
+  "type": "object",
+  "properties": {
+    "cursor": {
+      "description": "Cursor returned by the previous process_read call. Defaults to 0.",
+      "type": "integer",
+      "format": "uint64",
+      "default": 0,
+      "minimum": 0
+    },
+    "process_id": {
+      "description": "Handle returned by process_start.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "process_id"
+  ]
+}
+{
+  "title": "ProcessList",
+  "type": "object"
+}
+{
+  "title": "ProcessKill",
+  "type": "object",
+  "properties": {
+    "process_id": {
+      "description": "Handle returned by process_start.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "process_id"
+  ]
+}
+{
   "title": "NetFetch",
   "description": "Input type for the net fetch tool",
   "type": "object",

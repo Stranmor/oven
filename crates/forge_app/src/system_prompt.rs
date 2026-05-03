@@ -147,6 +147,12 @@ impl<S: SkillFetchService + ShellService> SystemPrompt<S> {
         Ok(conversation.context(context))
     }
 
+    fn model_for_agent(&self) -> Option<&Model> {
+        self.models
+            .iter()
+            .find(|model| model.id == self.agent.model && model.provider_id == self.agent.provider)
+    }
+
     // Returns if agent supports tool or not.
     fn is_tool_supported(&self) -> anyhow::Result<bool> {
         let agent = &self.agent;
@@ -158,7 +164,7 @@ impl<S: SkillFetchService + ShellService> SystemPrompt<S> {
             None => {
                 // If not defined at agent level, check model level
 
-                let model = self.models.iter().find(|model| &model.id == model_id);
+                let model = self.model_for_agent();
                 model
                     .and_then(|model| model.tools_supported)
                     .unwrap_or_default()
@@ -176,10 +182,7 @@ impl<S: SkillFetchService + ShellService> SystemPrompt<S> {
 
     /// Checks if parallel tool calls is supported by agent
     fn is_parallel_tool_call_supported(&self) -> bool {
-        let agent = &self.agent;
-        self.models
-            .iter()
-            .find(|model| model.id == agent.model)
+        self.model_for_agent()
             .and_then(|model| model.supports_parallel_tool_calls)
             .unwrap_or_default()
     }

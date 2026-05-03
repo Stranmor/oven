@@ -173,17 +173,21 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
         Ok(())
     }
 
+    fn model_for_agent(&self) -> Option<&Model> {
+        self.models
+            .iter()
+            .find(|model| model.id == self.agent.model && model.provider_id == self.agent.provider)
+    }
+
     // Returns if agent supports tool or not.
     fn is_tool_supported(&self) -> anyhow::Result<bool> {
-        let model_id = &self.agent.model;
-
         // Check if at agent level tool support is defined
         let tool_supported = match self.agent.tool_supported {
             Some(tool_supported) => tool_supported,
             None => {
                 // If not defined at agent level, check model level
 
-                let model = self.models.iter().find(|model| &model.id == model_id);
+                let model = self.model_for_agent();
                 model
                     .and_then(|model| model.tools_supported)
                     .unwrap_or_default()

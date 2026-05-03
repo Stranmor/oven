@@ -13,7 +13,7 @@ pub struct ConversationRepositoryImpl {
 }
 
 fn workspace_db_id(wid: WorkspaceHash) -> i64 {
-    i64::try_from(wid.id()).unwrap_or(i64::MAX)
+    i64::from_ne_bytes(wid.id().to_ne_bytes())
 }
 
 impl ConversationRepositoryImpl {
@@ -50,20 +50,39 @@ impl ConversationRepositoryImpl {
 impl ConversationRepository for ConversationRepositoryImpl {
     async fn upsert_conversation(&self, conversation: Conversation) -> anyhow::Result<()> {
         self.run_with_connection(move |connection, wid| {
-            let record = ConversationRecord::new(conversation, wid);
-            diesel::insert_into(conversations::table)
-                .values(&record)
-                .on_conflict(conversations::conversation_id)
-                .do_update()
-                .set((
-                    conversations::title.eq(&record.title),
-                    conversations::context.eq(&record.context),
-                    conversations::updated_at.eq(record.updated_at),
-                    conversations::metrics.eq(&record.metrics),
-                    conversations::parent_id.eq(&record.parent_id),
-                    conversations::initiator.eq(&record.initiator),
-                ))
-                .execute(connection)?;
+            let workspace_id = workspace_db_id(wid);
+            let record = ConversationRecord::new(conversation, workspace_id);
+            let changed_rows = diesel::sql_query(
+                "INSERT INTO conversations (
+                    conversation_id, title, workspace_id, context, created_at,
+                    updated_at, metrics, parent_id, initiator
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(conversation_id) DO UPDATE SET
+                    title = excluded.title,
+                    context = excluded.context,
+                    updated_at = excluded.updated_at,
+                    metrics = excluded.metrics,
+                    parent_id = excluded.parent_id,
+                    initiator = excluded.initiator
+                WHERE conversations.workspace_id = excluded.workspace_id",
+            )
+            .bind::<diesel::sql_types::Text, _>(&record.conversation_id)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.title)
+            .bind::<diesel::sql_types::BigInt, _>(record.workspace_id)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.context)
+            .bind::<diesel::sql_types::Timestamp, _>(record.created_at)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamp>, _>(record.updated_at)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.metrics)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.parent_id)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.initiator)
+            .execute(connection)?;
+
+            if changed_rows == 0 {
+                anyhow::bail!(
+                    "Conversation {} belongs to a different workspace",
+                    record.conversation_id
+                );
+            }
             Ok(())
         })
         .await
@@ -74,8 +93,10 @@ impl ConversationRepository for ConversationRepositoryImpl {
         conversation_id: &ConversationId,
     ) -> anyhow::Result<Option<Conversation>> {
         let conversation_id = *conversation_id;
-        self.run_with_connection(move |connection, _wid| {
+        self.run_with_connection(move |connection, wid| {
+            let workspace_id = workspace_db_id(wid);
             let record: Option<ConversationRecord> = conversations::table
+                .filter(conversations::workspace_id.eq(&workspace_id))
                 .filter(conversations::conversation_id.eq(conversation_id.into_string()))
                 .first(connection)
                 .optional()?;
@@ -204,8 +225,21 @@ mod tests {
     use crate::database::DatabasePool;
 
     fn repository() -> anyhow::Result<ConversationRepositoryImpl> {
+        repository_with_workspace(WorkspaceHash::new(0))
+    }
+
+    fn repository_with_workspace(
+        workspace_id: WorkspaceHash,
+    ) -> anyhow::Result<ConversationRepositoryImpl> {
         let pool = Arc::new(DatabasePool::in_memory()?);
-        Ok(ConversationRepositoryImpl::new(pool, WorkspaceHash::new(0)))
+        Ok(ConversationRepositoryImpl::new(pool, workspace_id))
+    }
+
+    fn repository_with_pool(
+        pool: Arc<DatabasePool>,
+        workspace_id: WorkspaceHash,
+    ) -> ConversationRepositoryImpl {
+        ConversationRepositoryImpl::new(pool, workspace_id)
     }
 
     async fn insert_legacy_agent_record(
@@ -250,6 +284,63 @@ mod tests {
         let retrieved = actual.unwrap();
         assert_eq!(retrieved.id, fixture.id);
         assert_eq!(retrieved.title, fixture.title);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_find_by_id_is_scoped_to_repository_workspace() -> anyhow::Result<()> {
+        let pool = Arc::new(DatabasePool::in_memory()?);
+        let foreign_repo = repository_with_pool(pool.clone(), WorkspaceHash::new(1));
+        let scoped_repo = repository_with_pool(pool, WorkspaceHash::new(0));
+        let fixture = Conversation::new(ConversationId::generate())
+            .title(Some("Foreign Workspace Conversation".to_string()));
+
+        foreign_repo.upsert_conversation(fixture.clone()).await?;
+        let actual = scoped_repo.get_conversation(&fixture.id).await?;
+        let expected = None;
+
+        assert_eq!(actual.map(|conversation| conversation.id), expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_upsert_does_not_promote_same_id_in_foreign_workspace() -> anyhow::Result<()> {
+        let pool = Arc::new(DatabasePool::in_memory()?);
+        let foreign_repo = repository_with_pool(pool.clone(), WorkspaceHash::new(1));
+        let scoped_repo = repository_with_pool(pool, WorkspaceHash::new(0));
+        let parent_id = ConversationId::generate();
+        let fixture = Conversation::new(ConversationId::generate())
+            .title(Some("Foreign Workspace Conversation".to_string()));
+        let mut scoped_promotion = fixture.clone().title(Some("Scoped Promotion".to_string()));
+        scoped_promotion.ensure_delegated(Some(parent_id));
+
+        foreign_repo.upsert_conversation(fixture.clone()).await?;
+        let promotion_result = scoped_repo.upsert_conversation(scoped_promotion).await;
+        let actual = foreign_repo
+            .get_conversation(&fixture.id)
+            .await?
+            .expect("foreign conversation should remain visible in its workspace");
+        let expected = (fixture.title, fixture.initiator, fixture.parent_id);
+
+        assert!(promotion_result.is_err());
+        assert_eq!((actual.title, actual.initiator, actual.parent_id), expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_high_bit_workspace_ids_remain_distinct() -> anyhow::Result<()> {
+        let pool = Arc::new(DatabasePool::in_memory()?);
+        let first_repo =
+            repository_with_pool(pool.clone(), WorkspaceHash::new(i64::MAX as u64 + 1));
+        let second_repo = repository_with_pool(pool, WorkspaceHash::new(i64::MAX as u64 + 2));
+        let fixture = Conversation::new(ConversationId::generate())
+            .title(Some("High Bit Workspace Conversation".to_string()));
+
+        first_repo.upsert_conversation(fixture.clone()).await?;
+        let actual = second_repo.get_conversation(&fixture.id).await?;
+        let expected = None;
+
+        assert_eq!(actual.map(|conversation| conversation.id), expected);
         Ok(())
     }
 
@@ -726,7 +817,7 @@ mod tests {
         let fixture = Conversation::new(ConversationId::generate())
             .title(Some("Test Conversation".to_string()));
 
-        let actual = ConversationRecord::new(fixture.clone(), WorkspaceHash::new(0));
+        let actual = ConversationRecord::new(fixture.clone(), 0);
 
         assert_eq!(actual.conversation_id, fixture.id.into_string());
         assert_eq!(actual.title, Some("Test Conversation".to_string()));
@@ -741,7 +832,7 @@ mod tests {
             .title(Some("Conversation with Context".to_string()))
             .context(Some(context));
 
-        let actual = ConversationRecord::new(fixture.clone(), WorkspaceHash::new(0));
+        let actual = ConversationRecord::new(fixture.clone(), 0);
 
         assert_eq!(actual.conversation_id, fixture.id.into_string());
         assert_eq!(actual.title, Some("Conversation with Context".to_string()));
@@ -755,7 +846,7 @@ mod tests {
             .title(Some("Conversation with Empty Context".to_string()))
             .context(Some(Context::default()));
 
-        let actual = ConversationRecord::new(fixture.clone(), WorkspaceHash::new(0));
+        let actual = ConversationRecord::new(fixture.clone(), 0);
 
         assert_eq!(actual.conversation_id, fixture.id.into_string());
         assert_eq!(

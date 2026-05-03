@@ -152,8 +152,8 @@ pub enum CacheControlType {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct FunctionDescription {
     pub description: Option<String>,
-    pub name: String,
-    pub parameters: serde_json::Value,
+    pub name: ToolName,
+    pub parameters: schemars::Schema,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
@@ -336,12 +336,9 @@ impl From<ToolDefinition> for Tool {
         Tool::Function {
             function: FunctionDescription {
                 description: Some(value.description),
-                name: value.name.to_string(),
+                name: value.name,
                 parameters: {
-                    // Ensure OpenAI compatibility by adding properties field if missing
-                    let mut params = serde_json::to_value(&value.input_schema)
-                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-                    // Ensure OpenAI compatibility by adding properties field if missing
+                    let mut params = value.input_schema;
                     if let Some(obj) = params.as_object_mut()
                         && obj.get("type") == Some(&serde_json::Value::String("object".to_string()))
                         && !obj.contains_key("properties")
@@ -986,13 +983,14 @@ mod tests {
         let expected = Tool::Function {
             function: FunctionDescription {
                 description: Some("Test tool".to_string()),
-                name: "test_tool".to_string(),
-                parameters: serde_json::json!({
+                name: ToolName::new("test_tool"),
+                parameters: serde_json::from_value(serde_json::json!({
                     "$schema": "http://json-schema.org/draft-07/schema#",
                     "properties": {},
                     "title": "Null",
                     "type": "object"
-                }),
+                }))
+                .unwrap(),
             },
         };
 

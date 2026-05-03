@@ -184,20 +184,27 @@ impl DoomLoopDetector {
             match &entry.message {
                 ContextMessage::Text(message) if message.role == Role::Assistant => {
                     if let Some(calls) = &message.tool_calls {
-                        current_segment.extend(calls.iter().map(|call| {
-                            let name = call.name.as_str().trim().to_lowercase();
-                            let arguments = call.arguments.clone().into_string();
-                            ToolActionSignature {
-                                intent: Self::classify_intent(&name, &arguments),
-                                name,
-                                arguments,
-                            }
-                        }));
+                        let mut message_signatures: Vec<ToolActionSignature> = calls
+                            .iter()
+                            .map(|call| {
+                                let name = call.name.as_str().trim().to_lowercase();
+                                let arguments = call.arguments.clone().into_string();
+                                ToolActionSignature {
+                                    intent: Self::classify_intent(&name, &arguments),
+                                    name,
+                                    arguments,
+                                }
+                            })
+                            .collect();
+                        message_signatures.dedup();
+                        current_segment.extend(message_signatures);
                     }
                 }
                 ContextMessage::Tool(result) => {
                     if let Some(progress_intent) = Self::progress_intent(result) {
-                        current_segment.retain(|signature| signature.intent != progress_intent);
+                        current_segment.retain(|signature| {
+                            !Self::signature_matches_progress(signature, &progress_intent)
+                        });
                     }
                 }
                 _ => {}
@@ -223,7 +230,11 @@ impl DoomLoopDetector {
             "shell" => ToolIntent { family: ToolFamily::Shell, target: arguments.to_string() },
             "process_read" => ToolIntent {
                 family: ToolFamily::ProcessRead,
-                target: Self::json_string(&parsed, "process_id").unwrap_or_default(),
+                target: format!(
+                    "process_id={};cursor={}",
+                    Self::json_string(&parsed, "process_id").unwrap_or_default(),
+                    Self::json_u64(&parsed, "cursor").unwrap_or_default()
+                ),
             },
             other => ToolIntent {
                 family: ToolFamily::Other(other.to_string()),
@@ -234,6 +245,10 @@ impl DoomLoopDetector {
 
     fn json_string(parsed: &Option<serde_json::Value>, field: &str) -> Option<String> {
         parsed.as_ref()?.get(field)?.as_str().map(ToOwned::to_owned)
+    }
+
+    fn json_u64(parsed: &Option<serde_json::Value>, field: &str) -> Option<u64> {
+        parsed.as_ref()?.get(field)?.as_u64()
     }
 
     fn normalize_target(path: String) -> String {
@@ -263,12 +278,22 @@ impl DoomLoopDetector {
         Some(text[start..start + end].to_string())
     }
 
-    fn process_output_id(result: &ToolResult) -> Option<String> {
+    fn process_output_attr(result: &ToolResult, name: &str) -> Option<String> {
         let text = result.output.as_str()?;
-        let marker = "process_id=\"";
-        let start = text.find(marker)? + marker.len();
+        let marker = format!("{name}=\"");
+        let start = text.find(&marker)? + marker.len();
         let end = text[start..].find('"')?;
         Some(text[start..start + end].to_string())
+    }
+
+    fn process_output_id(result: &ToolResult) -> Option<String> {
+        Self::process_output_attr(result, "process_id")
+    }
+
+    fn process_output_next_cursor(result: &ToolResult) -> Option<u64> {
+        Self::process_output_attr(result, "next_cursor")?
+            .parse()
+            .ok()
     }
 
     fn process_output_has_entries(result: &ToolResult) -> bool {
@@ -319,13 +344,52 @@ impl DoomLoopDetector {
             "shell" => ToolIntent { family: ToolFamily::Shell, target: String::new() },
             "process_read" => ToolIntent {
                 family: ToolFamily::ProcessRead,
-                target: Self::process_output_id(result).unwrap_or_default(),
+                target: format!(
+                    "process_id={};next_cursor={}",
+                    Self::process_output_id(result).unwrap_or_default(),
+                    Self::process_output_next_cursor(result).unwrap_or_default()
+                ),
             },
             other => ToolIntent {
                 family: ToolFamily::Other(other.to_string()),
                 target: String::new(),
             },
         })
+    }
+
+    fn target_field(target: &str, field: &str) -> Option<String> {
+        target.split(';').find_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            (key == field).then(|| value.to_string())
+        })
+    }
+
+    fn process_signature_progressed(signature: &ToolIntent, progress: &ToolIntent) -> bool {
+        let Some(signature_process_id) = Self::target_field(&signature.target, "process_id") else {
+            return false;
+        };
+        let Some(progress_process_id) = Self::target_field(&progress.target, "process_id") else {
+            return false;
+        };
+        if signature_process_id != progress_process_id {
+            return false;
+        }
+        let cursor = Self::target_field(&signature.target, "cursor")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_default();
+        let next_cursor = Self::target_field(&progress.target, "next_cursor")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_default();
+        cursor < next_cursor
+    }
+
+    fn signature_matches_progress(signature: &ToolActionSignature, progress: &ToolIntent) -> bool {
+        if signature.intent.family == ToolFamily::ProcessRead
+            && progress.family == ToolFamily::ProcessRead
+        {
+            return Self::process_signature_progressed(&signature.intent, progress);
+        }
+        signature.intent == *progress
     }
 
     fn check_repeating_pattern<T>(&self, sequence: &[T]) -> Option<(usize, usize)>

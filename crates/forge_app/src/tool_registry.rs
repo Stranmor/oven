@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,6 +13,7 @@ use forge_template::Element;
 use futures::future::join_all;
 use serde_json::{Map, Value, json};
 use strum::IntoEnumIterator;
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 use crate::agent_executor::AgentExecutor;
@@ -25,11 +27,33 @@ use crate::{
     ToolResolver, WorkspaceService,
 };
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ToolDefinitionsCacheKey {
+    cwd: PathBuf,
+    active_agent_id: Option<AgentId>,
+    indexed: bool,
+    authenticated: bool,
+    research_subagent: bool,
+    max_read_lines: u64,
+    max_line_chars: usize,
+    max_image_size_bytes: u64,
+    max_stdout_prefix_lines: usize,
+    max_stdout_suffix_lines: usize,
+    max_stdout_line_chars: usize,
+}
+
+#[derive(Clone, Debug)]
+struct CachedToolDefinitions {
+    key: ToolDefinitionsCacheKey,
+    definitions: Vec<ToolDefinition>,
+}
+
 pub struct ToolRegistry<S> {
     tool_executor: ToolExecutor<S>,
     agent_executor: AgentExecutor<S>,
     mcp_executor: McpExecutor<S>,
     services: Arc<S>,
+    tool_definitions_cache: Arc<Mutex<Option<CachedToolDefinitions>>>,
 }
 
 impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolRegistry<S> {
@@ -39,6 +63,7 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
             tool_executor: ToolExecutor::new(services.clone()),
             agent_executor: AgentExecutor::new(services.clone()),
             mcp_executor: McpExecutor::new(services.clone()),
+            tool_definitions_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -108,14 +133,8 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
             // Special handling for Task tool - delegate to AgentExecutor
             if let ToolCatalog::Task(task_input) = tool_input {
                 let executor = self.agent_executor.clone();
-                let session_id = task_input.session_id.clone();
                 let agent_id = task_input.agent_id.clone();
-                // Parse session_id into ConversationId if present
-                let conversation_id = session_id
-                    .map(|id| forge_domain::ConversationId::parse(&id))
-                    .transpose()
-                    .ok()
-                    .flatten();
+                let conversation_id = task_input.session_id;
                 // NOTE: Agents should not timeout
                 let outputs = join_all(task_input.tasks.into_iter().map(|task| {
                     let agent_id = agent_id.clone();
@@ -223,8 +242,40 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
         ToolResult::new(tool_name).call_id(call_id).output(output)
     }
 
+    async fn tool_definitions_cache_key(&self) -> anyhow::Result<ToolDefinitionsCacheKey> {
+        let active_agent_id = self.services.get_active_agent_id().await.unwrap_or(None);
+        let environment = self.services.get_environment();
+        let cwd = environment.cwd;
+        let indexed = self.services.is_indexed(&cwd).await.unwrap_or(false);
+        let authenticated = self.services.is_authenticated().await.unwrap_or(false);
+        let config = self.services.get_config()?;
+        Ok(ToolDefinitionsCacheKey {
+            cwd,
+            active_agent_id,
+            indexed,
+            authenticated,
+            research_subagent: config.research_subagent,
+            max_read_lines: config.max_read_lines,
+            max_line_chars: config.max_line_chars,
+            max_image_size_bytes: config.max_image_size_bytes,
+            max_stdout_prefix_lines: config.max_stdout_prefix_lines,
+            max_stdout_suffix_lines: config.max_stdout_suffix_lines,
+            max_stdout_line_chars: config.max_stdout_line_chars,
+        })
+    }
+
     pub async fn list(&self) -> anyhow::Result<Vec<ToolDefinition>> {
-        Ok(self.tools_overview().await?.into())
+        let key = self.tool_definitions_cache_key().await?;
+        if let Some(cached) = self.tool_definitions_cache.lock().await.as_ref()
+            && cached.key == key
+        {
+            return Ok(cached.definitions.clone());
+        }
+
+        let definitions: Vec<ToolDefinition> = self.tools_overview().await?.into();
+        *self.tool_definitions_cache.lock().await =
+            Some(CachedToolDefinitions { key, definitions: definitions.clone() });
+        Ok(definitions)
     }
 
     /// Gets the model for the currently active agent by looking up the agent
@@ -235,9 +286,13 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
     async fn get_current_model(&self) -> Option<Model> {
         let agent_id = self.services.get_active_agent_id().await.ok()??;
         let agent = self.services.get_agent(&agent_id).await.ok()??;
-        let provider = self.services.get_provider(agent.provider).await.ok()?;
+        let provider = self
+            .services
+            .get_provider(agent.provider.clone())
+            .await
+            .ok()?;
         let models = self.services.models(provider).await.ok()?;
-        models.iter().find(|m| m.id == agent.model).cloned()
+        Self::model_for_agent(&agent, &models).cloned()
     }
 
     pub async fn tools_overview(&self) -> anyhow::Result<ToolsOverview> {
@@ -349,6 +404,12 @@ impl<S> ToolRegistry<S> {
             .collect::<Vec<_>>()
     }
 
+    fn model_for_agent<'a>(agent: &Agent, models: &'a [Model]) -> Option<&'a Model> {
+        models
+            .iter()
+            .find(|model| model.id == agent.model && model.provider_id == agent.provider)
+    }
+
     /// Validates if a tool is supported by both the agent and the system.
     ///
     /// # Validation Process
@@ -455,6 +516,37 @@ mod tests {
         .tools(vec![ToolName::new("read"), ToolName::new("fs_search")])
     }
 
+    fn provider_model(id: &str, provider_id: ProviderId) -> forge_domain::Model {
+        forge_domain::Model {
+            id: ModelId::new(id),
+            provider_id,
+            name: None,
+            description: None,
+            context_length: None,
+            tools_supported: Some(true),
+            supports_parallel_tool_calls: None,
+            supports_reasoning: None,
+            input_modalities: vec![],
+        }
+    }
+
+    #[test]
+    fn test_model_for_agent_matches_provider_when_model_ids_collide() {
+        let fixture = Agent::new(
+            AgentId::new("test_agent"),
+            ProviderId::ANTHROPIC,
+            ModelId::new("shared-model"),
+        );
+        let models = vec![
+            provider_model("shared-model", ProviderId::OPENAI).tools_supported(Some(false)),
+            provider_model("shared-model", ProviderId::ANTHROPIC).tools_supported(Some(true)),
+        ];
+
+        let actual = ToolRegistry::<()>::model_for_agent(&fixture, &models);
+        let expected = Some(&models[1]);
+
+        assert_eq!(actual, expected);
+    }
     #[tokio::test]
     async fn test_restricted_tool_call() {
         let result = ToolRegistry::<()>::validate_tool_call(
@@ -603,10 +695,7 @@ mod tests {
         let actual =
             ToolRegistry::<()>::validate_tool_call(&fixture, &ToolName::new("tool_[special]"));
 
-        // The glob pattern "tool_[special]" will match "tool_s", "tool_p", etc., not
-        // the literal string So this test verifies that exact matching doesn't
-        // work when the pattern is a valid glob
-        assert!(actual.is_err());
+        assert!(actual.is_ok());
     }
 
     #[test]
@@ -665,9 +754,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_tool_call_capitalized_read_write() {
-        // Test that capitalized "Read" and "Write" are accepted when agent has
-        // lowercase versions
+    fn test_validate_tool_call_capitalized_read_write_requires_exact_names() {
         let fixture = Agent::new(
             AgentId::new("test_agent"),
             ProviderId::ANTHROPIC,
@@ -681,10 +768,13 @@ mod tests {
         let actual_lowercase_read =
             ToolRegistry::<()>::validate_tool_call(&fixture, &ToolName::new("read"));
 
-        assert!(actual_read.is_ok(), "Capitalized 'Read' should be accepted");
         assert!(
-            actual_write.is_ok(),
-            "Capitalized 'Write' should be accepted"
+            actual_read.is_err(),
+            "Capitalized 'Read' should be rejected"
+        );
+        assert!(
+            actual_write.is_err(),
+            "Capitalized 'Write' should be rejected"
         );
         assert!(
             actual_lowercase_read.is_ok(),
@@ -804,7 +894,7 @@ fn create_test_model(
 
     Model {
         id: ModelId::new(id),
-        provider_id: Some(forge_domain::ProviderId::OPENAI),
+        provider_id: forge_domain::ProviderId::OPENAI,
         name: Some(format!("Test {}", id)),
         description: None,
         context_length: Some(128000),

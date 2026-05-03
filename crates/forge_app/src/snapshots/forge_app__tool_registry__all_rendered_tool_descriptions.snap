@@ -201,6 +201,50 @@ Returns complete output including stdout, stderr, and exit code for diagnostic p
 
 ---
 
+### process_start
+
+Starts a shell command as a managed background process and returns immediately with a `process_id` handle.
+
+Use this for long-running servers, watchers, REPL-adjacent daemons, and commands expected to run longer than an interactive foreground turn. Do not use it for short commands; use `shell` instead.
+
+The process captures stdout/stderr asynchronously. Use `process_status` to inspect lifecycle state, `process_read` to read captured output with a cursor, `process_list` to see active handles, and `process_kill` to stop a process.
+
+The `cwd` parameter sets the working directory. Do not put `cd` in the command string.
+
+---
+
+### process_status
+
+Returns structured lifecycle status for a managed background process previously started with `process_start`.
+
+The result includes the typed `process_id`, command, working directory, and status: running, exited with exit code, or killed.
+
+---
+
+### process_read
+
+Reads captured stdout/stderr from a managed background process previously started with `process_start`.
+
+Pass the `cursor` returned by the previous `process_read` call to receive only new output. Omit it or pass `0` to read from the beginning. The result returns `next_cursor` for idempotent continuation.
+
+---
+
+### process_list
+
+Lists all managed background process handles known to the current Forge runtime.
+
+Use this before starting duplicate servers or to discover handles for status, log reading, and cleanup.
+
+---
+
+### process_kill
+
+Stops a managed background process previously started with `process_start`.
+
+Use this to clean up servers, watchers, or long-running commands after verification. The result reports the final process status.
+
+---
+
 ### fetch
 
 Retrieves content from URLs as markdown or raw text. Enables access to current online information including websites, APIs and documentation. Use for obtaining up-to-date information beyond training data, verifying facts, or retrieving specific online content. Handles HTTP/HTTPS and converts HTML to readable markdown by default. Cannot access private/restricted resources requiring authentication. Respects robots.txt and may be blocked by anti-scraping measures. For large pages, returns the first 40,000 characters and stores the complete content in a temporary file for subsequent access.

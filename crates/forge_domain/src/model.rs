@@ -25,8 +25,7 @@ fn default_input_modalities() -> Vec<InputModality> {
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Setters)]
 pub struct Model {
     pub id: ModelId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_id: Option<ProviderId>,
+    pub provider_id: ProviderId,
     pub name: Option<String>,
     pub description: Option<String>,
     pub context_length: Option<u64>,
@@ -92,12 +91,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_model_provider_id_default() {
+    fn test_model_provider_id_is_required() {
         let json = r#"{"id": "test-model"}"#;
-        let result: Model = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            result.provider_id, None,
-            "provider_id should be None when missing"
-        );
+        let result = serde_json::from_str::<Model>(json);
+        assert!(result.is_err());
     }
 }

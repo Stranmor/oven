@@ -5,18 +5,22 @@ use forge_domain::{
 
 use super::DoomLoopDetector;
 
-pub(super) fn assistant_message(tool_call: &ToolCallFull) -> TextMessage {
+pub(super) fn assistant_message_with_tool_calls(tool_calls: Vec<ToolCallFull>) -> TextMessage {
     TextMessage {
         role: Role::Assistant,
         content: String::new(),
         raw_content: None,
-        tool_calls: Some(vec![tool_call.clone()]),
+        tool_calls: Some(tool_calls),
         thought_signature: None,
         model: None,
         reasoning_details: None,
         droppable: false,
         phase: None,
     }
+}
+
+pub(super) fn assistant_message(tool_call: &ToolCallFull) -> TextMessage {
+    assistant_message_with_tool_calls(vec![tool_call.clone()])
 }
 
 pub(super) fn text_message(role: Role, content: &str) -> TextMessage {

@@ -14,7 +14,9 @@ use serde_json::Map;
 use strum::IntoEnumIterator;
 use strum_macros::{AsRefStr, Display, EnumDiscriminants, EnumIter};
 
-use crate::{ToolCallArguments, ToolCallFull, ToolDefinition, ToolDescription, ToolName};
+use crate::{
+    ConversationId, ToolCallArguments, ToolCallFull, ToolDefinition, ToolDescription, ToolName,
+};
 
 /// Enum representing all possible tool input types.
 ///
@@ -96,7 +98,9 @@ pub struct TaskInput {
     /// maintain context across multiple task invocations with the same
     /// agent.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
+    #[eserde(compat)]
+    #[schemars(with = "Option<String>")]
+    pub session_id: Option<ConversationId>,
 }
 
 fn default_true() -> bool {
@@ -1321,6 +1325,24 @@ mod tests {
         let actual = ToolKind::Remove.name();
         let expected = ToolName::new("remove");
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_task_input_rejects_invalid_session_id_at_catalog_boundary() {
+        use crate::{ToolCallArguments, ToolCallFull};
+
+        let fixture = ToolCallFull {
+            name: ToolKind::Task.name(),
+            call_id: None,
+            arguments: ToolCallArguments::from_json(
+                r#"{"agent_id":"forge","tasks":["run"],"session_id":"not-a-uuid"}"#,
+            ),
+            thought_signature: None,
+        };
+
+        let actual = ToolCatalog::try_from(fixture);
+
+        assert!(actual.is_err());
     }
 
     #[test]

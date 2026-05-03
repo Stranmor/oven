@@ -959,10 +959,7 @@ pub(super) struct ConversationRecord {
 
 impl ConversationRecord {
     /// Creates a new ConversationRecord from a Conversation domain object
-    pub fn new(
-        conversation: forge_domain::Conversation,
-        workspace_id: forge_domain::WorkspaceHash,
-    ) -> Self {
+    pub fn new(conversation: forge_domain::Conversation, workspace_id: i64) -> Self {
         let initiator = match conversation.initiator {
             forge_domain::Initiator::User => None, // NULL in DB = user
             forge_domain::Initiator::Agent => Some("agent".to_string()),
@@ -983,7 +980,7 @@ impl ConversationRecord {
             context,
             created_at: conversation.metadata.created_at.naive_utc(),
             updated_at,
-            workspace_id: i64::try_from(workspace_id.id()).unwrap_or(i64::MAX),
+            workspace_id,
             metrics,
             parent_id: conversation.parent_id.map(|id| id.into_string()),
             initiator,

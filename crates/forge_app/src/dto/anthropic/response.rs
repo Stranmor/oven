@@ -48,7 +48,7 @@ impl Model {
 
         forge_domain::Model {
             id: ModelId::new(self.id),
-            provider_id: Some(provider_id),
+            provider_id,
             name: self.display_name,
             description: None,
             context_length,

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,6 +17,8 @@ use tokio::sync::Mutex;
 
 use crate::console::StdConsoleWriter;
 
+const MAX_BACKGROUND_LOG_ENTRIES: usize = 8192;
+
 /// Service for executing shell commands
 #[derive(Clone)]
 pub struct ForgeCommandExecutorService {
@@ -33,7 +35,7 @@ struct ManagedProcess {
     cwd: String,
     child: Child,
     status: ProcessStatusKind,
-    logs: Arc<Mutex<Vec<ProcessLogEntry>>>,
+    logs: Arc<Mutex<VecDeque<ProcessLogEntry>>>,
 }
 
 impl ManagedProcess {
@@ -139,7 +141,7 @@ impl ForgeCommandExecutorService {
     fn capture_stream<A>(
         mut reader: A,
         stream: ProcessStream,
-        logs: Arc<Mutex<Vec<ProcessLogEntry>>>,
+        logs: Arc<Mutex<VecDeque<ProcessLogEntry>>>,
         next_cursor: Arc<AtomicU64>,
     ) where
         A: AsyncReadExt + Unpin + Send + 'static,
@@ -159,11 +161,14 @@ impl ForgeCommandExecutorService {
                 let content = bytes.to_str_lossy().into_owned();
                 let mut logs = logs.lock().await;
                 let cursor = next_cursor.fetch_add(1, Ordering::Relaxed);
-                logs.push(ProcessLogEntry {
+                logs.push_back(ProcessLogEntry {
                     cursor: ProcessReadCursor::new(cursor),
                     stream,
                     content,
                 });
+                while logs.len() > MAX_BACKGROUND_LOG_ENTRIES {
+                    logs.pop_front();
+                }
             }
         });
     }
@@ -350,8 +355,9 @@ impl CommandInfra for ForgeCommandExecutorService {
         env_vars: Option<Vec<String>>,
     ) -> anyhow::Result<ProcessStartOutput> {
         let mut prepared_command = self.prepare_command(&command, &working_dir, env_vars);
+        prepared_command.stdin(std::process::Stdio::null());
         let mut child = prepared_command.spawn()?;
-        let logs = Arc::new(Mutex::new(Vec::new()));
+        let logs = Arc::new(Mutex::new(VecDeque::new()));
         let next_cursor = Arc::new(AtomicU64::new(1));
 
         if let Some(stdout) = child.stdout.take() {
@@ -549,7 +555,7 @@ mod tests {
     async fn test_process_read_cursor_does_not_advance_before_entry_is_visible() {
         use tokio::io::AsyncWriteExt;
 
-        let logs = Arc::new(Mutex::new(Vec::new()));
+        let logs = Arc::new(Mutex::new(VecDeque::new()));
         let next_cursor = Arc::new(AtomicU64::new(1));
         let (mut writer, reader) = tokio::io::duplex(64);
         let log_guard = logs.lock().await;
@@ -635,10 +641,24 @@ mod tests {
         })
         .await
         .unwrap();
-        let actual = fixture
-            .read_process(started.process_id.clone(), ProcessReadCursor::new(0))
-            .await
-            .unwrap();
+        let actual = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let output = fixture
+                    .read_process(started.process_id.clone(), ProcessReadCursor::new(0))
+                    .await
+                    .unwrap();
+                if output
+                    .entries
+                    .iter()
+                    .any(|entry| entry.content.contains("final"))
+                {
+                    return output;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
 
         assert_eq!(
             status.status,
