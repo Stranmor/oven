@@ -128,7 +128,7 @@ Always verify changes by running tests and linting the codebase
 
 ## Local Forge Update Source
 
-The active local `forge` binary is protected infrastructure. Its updater-consumed source MUST be the user's fork `Stranmor/oven` on `origin/main`, because that branch integrates upstream Forge changes with local regression fixes. Directly tracking or consuming `antinomyhq/forgecode` `upstream/main` for the active local binary is forbidden: it can overwrite local patches and reintroduce fixed regressions.
+The active local `forge` binary is protected infrastructure. Its updater-consumed source MUST be the user's fork `Stranmor/oven` on `origin/main`, because that branch integrates upstream Forge changes with local regression fixes. Upstream input MUST be `tailcallhq/forgecode` `main`; stale `antinomyhq/forgecode` upstream remotes are historical drift and must not drive automation. Directly tracking or consuming upstream `main` for the active local binary is forbidden: it can overwrite local patches and reintroduce fixed regressions.
 
 Correct update flow: merge or port upstream changes into `origin/main` first, verify the integrated fork, then let the updater consume that fork state. The updater MUST also preserve wrapper symlinks: a freshly built binary must never replace `~/.local/bin/forge` when that path is a wrapper/symlink entry point.
 
