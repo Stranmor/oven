@@ -33,11 +33,9 @@ pub(super) fn text_message(role: Role, content: &str) -> TextMessage {
     }
 }
 
-pub(super) fn conversation_with_messages(messages: Vec<TextMessage>) -> Conversation {
-    let context_messages: Vec<MessageEntry> = messages
-        .into_iter()
-        .map(|message| MessageEntry::from(ContextMessage::Text(message)))
-        .collect();
+pub(super) fn conversation_with_context_messages(messages: Vec<ContextMessage>) -> Conversation {
+    let context_messages: Vec<MessageEntry> =
+        messages.into_iter().map(MessageEntry::from).collect();
     let context = Context::default().messages(context_messages);
 
     Conversation {
@@ -49,6 +47,10 @@ pub(super) fn conversation_with_messages(messages: Vec<TextMessage>) -> Conversa
         metrics: Default::default(),
         metadata: forge_domain::MetaData::new(chrono::Utc::now()),
     }
+}
+
+pub(super) fn conversation_with_messages(messages: Vec<TextMessage>) -> Conversation {
+    conversation_with_context_messages(messages.into_iter().map(ContextMessage::Text).collect())
 }
 
 pub(super) fn event() -> EventData<RequestPayload> {

@@ -113,6 +113,27 @@ impl FormatContent for ToolCatalog {
                     .sub_title(&input.command)
                     .into(),
             ),
+            ToolCatalog::ProcessStart(input) => Some(
+                TitleFormat::debug(format!("Start Process [{}]", env.shell))
+                    .sub_title(&input.command)
+                    .into(),
+            ),
+            ToolCatalog::ProcessStatus(input) => Some(
+                TitleFormat::debug("Process Status")
+                    .sub_title(&input.process_id)
+                    .into(),
+            ),
+            ToolCatalog::ProcessRead(input) => Some(
+                TitleFormat::debug("Read Process")
+                    .sub_title(&input.process_id)
+                    .into(),
+            ),
+            ToolCatalog::ProcessList(_) => Some(TitleFormat::debug("List Processes").into()),
+            ToolCatalog::ProcessKill(input) => Some(
+                TitleFormat::debug("Kill Process")
+                    .sub_title(&input.process_id)
+                    .into(),
+            ),
             ToolCatalog::Fetch(input) => {
                 Some(TitleFormat::debug("GET").sub_title(&input.url).into())
             }

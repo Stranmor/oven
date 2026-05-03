@@ -256,11 +256,11 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use forge_domain::{CommandOutput, Context, Initiator, ModelId, ProviderId, Skill};
     use pretty_assertions::assert_eq;
 
     use super::*;
     use crate::ShellOutput;
-    use forge_domain::{CommandOutput, Context, Initiator, ModelId, ProviderId, Skill};
 
     const MAX_EXTENSIONS: usize = 15;
 

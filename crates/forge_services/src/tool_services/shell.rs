@@ -4,7 +4,11 @@ use std::sync::Arc;
 use anyhow::bail;
 use bstr::ByteSlice;
 use forge_app::domain::Environment;
-use forge_app::{CommandInfra, EnvironmentInfra, ShellOutput, ShellService};
+use forge_app::{
+    CommandInfra, EnvironmentInfra, ProcessKillServiceOutput, ProcessOutput,
+    ProcessReadServiceOutput, ProcessStartServiceOutput, ShellOutput, ShellService,
+};
+use forge_domain::{ProcessId, ProcessReadCursor};
 use strip_ansi_escapes::strip;
 
 // Strips out the ansi codes from content.
@@ -63,6 +67,44 @@ impl<I: CommandInfra + EnvironmentInfra> ShellService for ForgeShell<I> {
 
         Ok(ShellOutput { output, shell: self.env.shell.clone(), description })
     }
+
+    async fn process_start(
+        &self,
+        command: String,
+        cwd: PathBuf,
+        env_vars: Option<Vec<String>>,
+        description: Option<String>,
+    ) -> anyhow::Result<ProcessStartServiceOutput> {
+        Self::validate_command(&command)?;
+        let output = self.infra.start_process(command, cwd, env_vars).await?;
+        Ok(ProcessStartServiceOutput { shell: self.env.shell.clone(), description, output })
+    }
+
+    async fn process_status(&self, process_id: ProcessId) -> anyhow::Result<ProcessOutput> {
+        let status = self.infra.process_status(process_id).await?;
+        Ok(ProcessOutput { shell: self.env.shell.clone(), description: None, status })
+    }
+
+    async fn process_read(
+        &self,
+        process_id: ProcessId,
+        cursor: ProcessReadCursor,
+    ) -> anyhow::Result<ProcessReadServiceOutput> {
+        let output = self.infra.read_process(process_id, cursor).await?;
+        Ok(ProcessReadServiceOutput { shell: self.env.shell.clone(), output })
+    }
+
+    async fn process_list(&self) -> anyhow::Result<Vec<forge_domain::ProcessStatus>> {
+        self.infra.list_processes().await
+    }
+
+    async fn process_kill(
+        &self,
+        process_id: ProcessId,
+    ) -> anyhow::Result<ProcessKillServiceOutput> {
+        let status = self.infra.kill_process(process_id).await?;
+        Ok(ProcessKillServiceOutput { shell: self.env.shell.clone(), description: None, status })
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -72,7 +114,10 @@ mod tests {
     use async_trait::async_trait;
     use forge_app::domain::{CommandOutput, Environment};
     use forge_app::{CommandInfra, EnvironmentInfra, ShellService};
-    use forge_domain::ConfigOperation;
+    use forge_domain::{
+        ConfigOperation, ProcessId, ProcessReadCursor, ProcessReadOutput, ProcessStartOutput,
+        ProcessStatus, ProcessStatusKind,
+    };
     use pretty_assertions::assert_eq;
 
     use super::*;
@@ -109,6 +154,50 @@ mod tests {
         ) -> anyhow::Result<std::process::ExitStatus> {
             unimplemented!()
         }
+
+        async fn start_process(
+            &self,
+            command: String,
+            working_dir: PathBuf,
+            _env_vars: Option<Vec<String>>,
+        ) -> anyhow::Result<ProcessStartOutput> {
+            Ok(ProcessStartOutput {
+                process_id: ProcessId::new("process-test"),
+                status: ProcessStatusKind::Running,
+                command,
+                cwd: working_dir.display().to_string(),
+            })
+        }
+
+        async fn process_status(&self, process_id: ProcessId) -> anyhow::Result<ProcessStatus> {
+            Ok(ProcessStatus {
+                process_id,
+                status: ProcessStatusKind::Running,
+                command: "sleep 60".to_string(),
+                cwd: ".".to_string(),
+            })
+        }
+
+        async fn read_process(
+            &self,
+            process_id: ProcessId,
+            cursor: ProcessReadCursor,
+        ) -> anyhow::Result<ProcessReadOutput> {
+            Ok(ProcessReadOutput { process_id, next_cursor: cursor, entries: Vec::new() })
+        }
+
+        async fn list_processes(&self) -> anyhow::Result<Vec<ProcessStatus>> {
+            Ok(Vec::new())
+        }
+
+        async fn kill_process(&self, process_id: ProcessId) -> anyhow::Result<ProcessStatus> {
+            Ok(ProcessStatus {
+                process_id,
+                status: ProcessStatusKind::Killed,
+                command: "sleep 60".to_string(),
+                cwd: ".".to_string(),
+            })
+        }
     }
 
     impl EnvironmentInfra for MockCommandInfra {
@@ -134,6 +223,36 @@ mod tests {
         fn get_env_vars(&self) -> std::collections::BTreeMap<String, String> {
             std::collections::BTreeMap::new()
         }
+    }
+
+    #[tokio::test]
+    async fn test_shell_service_starts_background_process() {
+        let fixture = ForgeShell::new(Arc::new(MockCommandInfra { expected_env_vars: None }));
+
+        let actual = fixture
+            .process_start(
+                "sleep 60".to_string(),
+                PathBuf::from("."),
+                None,
+                Some("Starts test process".to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(actual.output.process_id, ProcessId::new("process-test"));
+        assert_eq!(actual.output.status, ProcessStatusKind::Running);
+        assert_eq!(actual.description, Some("Starts test process".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_shell_service_rejects_empty_background_command() {
+        let fixture = ForgeShell::new(Arc::new(MockCommandInfra { expected_env_vars: None }));
+
+        let actual = fixture
+            .process_start("   ".to_string(), PathBuf::from("."), None, None)
+            .await;
+
+        assert!(actual.is_err());
     }
 
     #[tokio::test]

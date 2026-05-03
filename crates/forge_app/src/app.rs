@@ -356,11 +356,12 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ForgeAp
 mod tests {
     #[tokio::test]
     async fn test_chat_missing_db_record_does_not_panic() {
-        // The panic in `ForgeApp::chat` was caused by `unwrap_or_default().expect(...)`
-        // when `find_conversation` returned `Ok(None)`.
-        // This has been replaced with `.ok_or_else(|| anyhow::anyhow!(...))?`,
-        // safely returning an error without panicking.
-        // Due to the complexity of mocking `Services`, we rely on static analysis
-        // to verify that the unwrap is removed.
+        // The panic in `ForgeApp::chat` was caused by
+        // `unwrap_or_default().expect(...)` when `find_conversation`
+        // returned `Ok(None)`. This has been replaced with
+        // `.ok_or_else(|| anyhow::anyhow!(...))?`, safely returning an
+        // error without panicking. Due to the complexity of mocking
+        // `Services`, we rely on static analysis to verify that the
+        // unwrap is removed.
     }
 }

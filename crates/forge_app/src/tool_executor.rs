@@ -6,12 +6,12 @@ use forge_domain::{CodebaseQueryResult, ToolCallContext, ToolCatalog, ToolOutput
 
 use crate::fmt::content::FormatContent;
 use crate::operation::{TempContentFiles, ToolOperation};
-use crate::services::{Services, ShellService};
+use crate::services::Services;
 use crate::{
     AgentRegistry, ConversationService, EnvironmentInfra, FollowUpService, FsPatchService,
     FsReadService, FsRemoveService, FsSearchService, FsUndoService, FsWriteService,
-    ImageReadService, NetFetchService, PlanCreateService, ProviderService, SkillFetchService,
-    WorkspaceService,
+    ImageReadService, NetFetchService, PlanCreateService, ProviderService, ShellService,
+    SkillFetchService, WorkspaceService,
 };
 
 pub struct ToolExecutor<S> {
@@ -283,6 +283,51 @@ impl<
                     )
                     .await?;
                 output.into()
+            }
+            ToolCatalog::ProcessStart(input) => {
+                let cwd = input
+                    .cwd
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| self.services.get_environment().cwd.display().to_string());
+                let normalized_cwd = self.normalize_path(cwd);
+                let output = self
+                    .services
+                    .process_start(
+                        input.command.clone(),
+                        PathBuf::from(normalized_cwd),
+                        input.env.clone(),
+                        input.description.clone(),
+                    )
+                    .await?;
+                ToolOperation::ProcessStart { output }
+            }
+            ToolCatalog::ProcessStatus(input) => {
+                let output = self
+                    .services
+                    .process_status(forge_domain::ProcessId::parse(input.process_id.clone())?)
+                    .await?;
+                ToolOperation::ProcessStatus { output }
+            }
+            ToolCatalog::ProcessRead(input) => {
+                let output = self
+                    .services
+                    .process_read(
+                        forge_domain::ProcessId::parse(input.process_id.clone())?,
+                        forge_domain::ProcessReadCursor::new(input.cursor),
+                    )
+                    .await?;
+                ToolOperation::ProcessRead { output }
+            }
+            ToolCatalog::ProcessList(_input) => {
+                let output = self.services.process_list().await?;
+                ToolOperation::ProcessList { output }
+            }
+            ToolCatalog::ProcessKill(input) => {
+                let output = self
+                    .services
+                    .process_kill(forge_domain::ProcessId::parse(input.process_id.clone())?)
+                    .await?;
+                ToolOperation::ProcessKill { output }
             }
             ToolCatalog::Fetch(input) => {
                 let output = self.services.fetch(input.url.clone(), input.raw).await?;

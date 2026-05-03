@@ -50,6 +50,11 @@ pub enum ToolCatalog {
     MultiPatch(FSMultiPatch),
     Undo(FSUndo),
     Shell(Shell),
+    ProcessStart(ProcessStart),
+    ProcessStatus(ProcessStatusInput),
+    ProcessRead(ProcessRead),
+    ProcessList(ProcessList),
+    ProcessKill(ProcessKill),
     Fetch(NetFetch),
     Followup(Followup),
     Plan(PlanCreate),
@@ -624,6 +629,57 @@ pub struct Shell {
     pub description: Option<String>,
 }
 
+#[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema, ToolDescription, PartialEq)]
+#[tool_description_file = "crates/forge_domain/src/tools/descriptions/process_start.md"]
+pub struct ProcessStart {
+    /// The shell command to start as a managed background process.
+    pub command: String,
+
+    /// The working directory where the process should start.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+
+    /// Environment variable names to pass to the process.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<Vec<String>>,
+
+    /// Clear, concise description of what this background process does.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema, ToolDescription, PartialEq)]
+#[tool_description_file = "crates/forge_domain/src/tools/descriptions/process_status.md"]
+pub struct ProcessStatusInput {
+    /// Handle returned by process_start.
+    pub process_id: String,
+}
+
+#[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema, ToolDescription, PartialEq)]
+#[tool_description_file = "crates/forge_domain/src/tools/descriptions/process_read.md"]
+pub struct ProcessRead {
+    /// Handle returned by process_start.
+    pub process_id: String,
+
+    /// Cursor returned by the previous process_read call. Defaults to 0.
+    #[serde(default)]
+    pub cursor: u64,
+}
+
+#[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema, ToolDescription, PartialEq)]
+#[tool_description_file = "crates/forge_domain/src/tools/descriptions/process_list.md"]
+pub struct ProcessList {}
+
+#[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema, ToolDescription, PartialEq)]
+#[tool_description_file = "crates/forge_domain/src/tools/descriptions/process_kill.md"]
+pub struct ProcessKill {
+    /// Handle returned by process_start.
+    pub process_id: String,
+}
+
 /// Input type for the net fetch tool
 #[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema, ToolDescription, PartialEq)]
 #[tool_description_file = "crates/forge_domain/src/tools/descriptions/net_fetch.md"]
@@ -814,7 +870,11 @@ impl ToolDescription for ToolCatalog {
             ToolCatalog::Patch(v) => v.description(),
             ToolCatalog::MultiPatch(v) => v.description(),
             ToolCatalog::Shell(v) => v.description(),
-            ToolCatalog::Followup(v) => v.description(),
+            ToolCatalog::ProcessStart(v) => v.description(),
+            ToolCatalog::ProcessStatus(v) => v.description(),
+            ToolCatalog::ProcessRead(v) => v.description(),
+            ToolCatalog::ProcessList(v) => v.description(),
+            ToolCatalog::ProcessKill(v) => v.description(),
             ToolCatalog::Fetch(v) => v.description(),
             ToolCatalog::FsSearch(v) => v.description(),
             ToolCatalog::SemSearch(v) => v.description(),
@@ -824,6 +884,7 @@ impl ToolDescription for ToolCatalog {
             ToolCatalog::Write(v) => v.description(),
             ToolCatalog::Plan(v) => v.description(),
             ToolCatalog::Skill(v) => v.description(),
+            ToolCatalog::Followup(v) => v.description(),
             ToolCatalog::TodoWrite(v) => v.description(),
             ToolCatalog::TodoRead(v) => v.description(),
             ToolCatalog::Task(v) => v.description(),
@@ -883,8 +944,13 @@ impl ToolCatalog {
             ToolCatalog::Patch(_) => r#gen.into_root_schema_for::<FSPatch>(),
             ToolCatalog::MultiPatch(_) => r#gen.into_root_schema_for::<FSMultiPatch>(),
             ToolCatalog::Shell(_) => r#gen.into_root_schema_for::<Shell>(),
-            ToolCatalog::Followup(_) => r#gen.into_root_schema_for::<Followup>(),
+            ToolCatalog::ProcessStart(_) => r#gen.into_root_schema_for::<ProcessStart>(),
+            ToolCatalog::ProcessStatus(_) => r#gen.into_root_schema_for::<ProcessStatusInput>(),
+            ToolCatalog::ProcessRead(_) => r#gen.into_root_schema_for::<ProcessRead>(),
+            ToolCatalog::ProcessList(_) => r#gen.into_root_schema_for::<ProcessList>(),
+            ToolCatalog::ProcessKill(_) => r#gen.into_root_schema_for::<ProcessKill>(),
             ToolCatalog::Fetch(_) => r#gen.into_root_schema_for::<NetFetch>(),
+            ToolCatalog::Followup(_) => r#gen.into_root_schema_for::<Followup>(),
             ToolCatalog::FsSearch(_) => r#gen.into_root_schema_for::<FSSearch>(),
             ToolCatalog::SemSearch(_) => r#gen.into_root_schema_for::<SemanticSearch>(),
             ToolCatalog::Read(_) => r#gen.into_root_schema_for::<FSRead>(),
@@ -1012,6 +1078,12 @@ impl ToolCatalog {
                 command: input.command.clone(),
                 cwd,
             }),
+            ToolCatalog::ProcessStart(input) => {
+                Some(crate::policies::PermissionOperation::Execute {
+                    command: input.command.clone(),
+                    cwd,
+                })
+            }
             ToolCatalog::Fetch(input) => Some(crate::policies::PermissionOperation::Fetch {
                 url: input.url.clone(),
                 cwd,
@@ -1020,6 +1092,10 @@ impl ToolCatalog {
             // Operations that don't require permission checks
             ToolCatalog::SemSearch(_)
             | ToolCatalog::Undo(_)
+            | ToolCatalog::ProcessStatus(_)
+            | ToolCatalog::ProcessRead(_)
+            | ToolCatalog::ProcessList(_)
+            | ToolCatalog::ProcessKill(_)
             | ToolCatalog::Followup(_)
             | ToolCatalog::Plan(_)
             | ToolCatalog::Skill(_)

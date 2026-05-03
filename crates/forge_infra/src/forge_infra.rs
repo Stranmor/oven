@@ -10,7 +10,9 @@ use forge_app::{
     StrategyFactory, UserInfra, WalkerInfra,
 };
 use forge_domain::{
-    AuthMethod, CommandOutput, FileInfo as FileInfoData, McpServerConfig, ProviderId, URLParamSpec,
+    AuthMethod, CommandOutput, FileInfo as FileInfoData, McpServerConfig, ProcessId,
+    ProcessReadCursor, ProcessReadOutput, ProcessStartOutput, ProcessStatus, ProviderId,
+    URLParamSpec,
 };
 use forge_eventsource::EventSource;
 use reqwest::header::HeaderMap;
@@ -249,6 +251,41 @@ impl CommandInfra for ForgeInfra {
         self.command_executor_service
             .execute_command_raw(command, working_dir, env_vars)
             .await
+    }
+
+    async fn start_process(
+        &self,
+        command: String,
+        working_dir: PathBuf,
+        env_vars: Option<Vec<String>>,
+    ) -> anyhow::Result<ProcessStartOutput> {
+        self.command_executor_service
+            .start_process(command, working_dir, env_vars)
+            .await
+    }
+
+    async fn process_status(&self, process_id: ProcessId) -> anyhow::Result<ProcessStatus> {
+        self.command_executor_service
+            .process_status(process_id)
+            .await
+    }
+
+    async fn read_process(
+        &self,
+        process_id: ProcessId,
+        cursor: ProcessReadCursor,
+    ) -> anyhow::Result<ProcessReadOutput> {
+        self.command_executor_service
+            .read_process(process_id, cursor)
+            .await
+    }
+
+    async fn list_processes(&self) -> anyhow::Result<Vec<ProcessStatus>> {
+        self.command_executor_service.list_processes().await
+    }
+
+    async fn kill_process(&self, process_id: ProcessId) -> anyhow::Result<ProcessStatus> {
+        self.command_executor_service.kill_process(process_id).await
     }
 }
 

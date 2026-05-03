@@ -55,24 +55,18 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> AgentEx
         )
         .await?;
 
-        // Reuse existing conversation if provided, otherwise create a new one
+        let parent_id = ctx.conversation_id;
         let conversation = if let Some(conversation_id) = conversation_id {
             self.services
                 .conversation_service()
-                .find_conversation(&conversation_id)
+                .ensure_delegated_conversation(&conversation_id, parent_id)
                 .await?
-                .ok_or(Error::ConversationNotFound { id: conversation_id })?
         } else {
-            // Create conversation with agent initiator since it's spawned by a parent agent
-            // This is crucial for GitHub Copilot billing optimization
-            let context = forge_domain::Context::default();
             let mut conversation = Conversation::generate()
                 .title(task.clone())
                 .initiator(forge_domain::Initiator::Agent)
-                .context(context.clone());
-            if let Some(parent_id) = ctx.conversation_id {
-                conversation.parent_id = Some(parent_id);
-            }
+                .context(forge_domain::Context::default());
+            conversation.ensure_delegated(parent_id);
             self.services
                 .conversation_service()
                 .upsert_conversation(conversation.clone())

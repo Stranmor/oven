@@ -33,8 +33,8 @@ impl CacacheStorage {
     ///
     /// # Arguments
     /// * `cache_dir` - Directory where cache data will be stored
-    /// * `ttl` - Optional TTL duration. If provided, entries older
-    ///   than this will be considered expired.
+    /// * `ttl` - Optional TTL duration. If provided, entries older than this
+    ///   will be considered expired.
     pub fn new(cache_dir: PathBuf, ttl: Option<std::time::Duration>) -> Self {
         Self { cache_dir, ttl }
     }

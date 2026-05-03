@@ -25,11 +25,41 @@ impl ConversationSelector {
         conversations: &[Conversation],
         current_conversation_id: Option<ConversationId>,
     ) -> Result<Option<Conversation>> {
+        Self::select_from_conversations(
+            conversations,
+            current_conversation_id,
+            Self::primary_conversations,
+        )
+        .await
+    }
+
+    /// Select a sub-conversation from an explicit subchat list.
+    ///
+    /// Unlike the primary selector, this keeps agent-initiated delegated
+    /// conversations because explicit subchat browsing is the operator surface
+    /// for delegated work.
+    pub async fn select_sub_conversation(
+        conversations: &[Conversation],
+        current_conversation_id: Option<ConversationId>,
+    ) -> Result<Option<Conversation>> {
+        Self::select_from_conversations(
+            conversations,
+            current_conversation_id,
+            Self::conversations_with_context,
+        )
+        .await
+    }
+
+    async fn select_from_conversations(
+        conversations: &[Conversation],
+        current_conversation_id: Option<ConversationId>,
+        filter: fn(&[Conversation]) -> Vec<&Conversation>,
+    ) -> Result<Option<Conversation>> {
         if conversations.is_empty() {
             return Ok(None);
         }
 
-        let valid_conversations = Self::primary_conversations(conversations);
+        let valid_conversations = filter(conversations);
 
         if valid_conversations.is_empty() {
             return Ok(None);
@@ -112,7 +142,14 @@ impl ConversationSelector {
     fn primary_conversations(conversations: &[Conversation]) -> Vec<&Conversation> {
         conversations
             .iter()
-            .filter(|conv| conv.context.is_some() && !conv.is_agent_initiated())
+            .filter(|conv| conv.is_primary_user_conversation())
+            .collect()
+    }
+
+    fn conversations_with_context(conversations: &[Conversation]) -> Vec<&Conversation> {
+        conversations
+            .iter()
+            .filter(|conv| conv.context.is_some())
             .collect()
     }
 }
@@ -202,5 +239,24 @@ mod tests {
         let expected = 0;
 
         assert_eq!(actual.len(), expected);
+    }
+
+    #[test]
+    fn test_sub_conversations_keep_promoted_reused_agent_chat() {
+        let parent_id = ConversationId::generate();
+        let mut conversation =
+            create_test_conversation("550e8400-e29b-41d4-a716-446655440007", Some("Agent"));
+        conversation.ensure_delegated(Some(parent_id));
+        conversation.context =
+            Some(Context::default().messages(vec![ContextMessage::user("Task", None).into()]));
+        let conversations = [conversation];
+
+        let actual = ConversationSelector::conversations_with_context(&conversations);
+        let expected = (1, Some(parent_id), forge_domain::Initiator::Agent);
+
+        assert_eq!(
+            (actual.len(), actual[0].parent_id, actual[0].initiator),
+            expected
+        );
     }
 }

@@ -1,7 +1,11 @@
 use pretty_assertions::assert_eq;
 
-use super::fixtures::{conversation_from_tool_calls, detector_with_threshold, tool_call};
+use super::fixtures::{
+    assistant_message, conversation_from_tool_calls, conversation_with_context_messages,
+    detector_with_threshold, tool_call,
+};
 use super::*;
+use forge_domain::{ContextMessage, ToolOutput, ToolResult};
 
 #[test]
 fn test_doom_loop_detector_detects_repeating_pattern_123_123_123() {
@@ -87,6 +91,133 @@ fn test_doom_loop_detector_complex_pattern_1234_1234_1234() {
         second,
         third,
         fourth,
+    ]);
+
+    let actual = DoomLoopDetector::new().detect_from_conversation(&conversation);
+    let expected = Some(3);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn test_doom_loop_detector_collapses_equivalent_read_intents() {
+    let first = tool_call("read", r#"{"file_path":"src/main.rs"}"#);
+    let second = tool_call("read", r#"{"file_path":"./src/main.rs"}"#);
+    let third = tool_call("Read", r#"{"file_path":"src/main.rs"}"#);
+    let conversation = conversation_from_tool_calls(&[first, second, third]);
+
+    let actual = DoomLoopDetector::new().detect_from_conversation(&conversation);
+    let expected = Some(3);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn test_doom_loop_detector_treats_progress_results_as_boundary() {
+    let first = tool_call("read", r#"{"file_path":"src/main.rs"}"#);
+    let second = tool_call("read", r#"{"file_path":"./src/main.rs"}"#);
+    let third = tool_call("read", r#"{"file_path":"src/main.rs"}"#);
+    let conversation = conversation_with_context_messages(vec![
+        ContextMessage::Text(assistant_message(&first)),
+        ContextMessage::Tool(ToolResult::new("read").output(Ok(ToolOutput::text(
+            r#"<file path="src/main.rs" total_lines="100">"#,
+        )))),
+        ContextMessage::Text(assistant_message(&second)),
+        ContextMessage::Text(assistant_message(&third)),
+    ]);
+
+    let actual = DoomLoopDetector::new().detect_from_conversation(&conversation);
+    let expected = None;
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn test_doom_loop_detector_does_not_reset_on_error_shaped_output() {
+    let first = tool_call("read", r#"{"file_path":"src/main.rs"}"#);
+    let second = tool_call("read", r#"{"file_path":"./src/main.rs"}"#);
+    let third = tool_call("read", r#"{"path":"src/main.rs"}"#);
+    let error = ToolOutput::text(r#"<file path="src/main.rs">"#).is_error(true);
+    let conversation = conversation_with_context_messages(vec![
+        ContextMessage::Text(assistant_message(&first)),
+        ContextMessage::Tool(ToolResult::new("read").output(Ok(error))),
+        ContextMessage::Text(assistant_message(&second)),
+        ContextMessage::Text(assistant_message(&third)),
+    ]);
+
+    let actual = DoomLoopDetector::new().detect_from_conversation(&conversation);
+    let expected = Some(3);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn test_doom_loop_detector_progress_boundary_is_intent_local() {
+    let first = tool_call("read", r#"{"file_path":"src/main.rs"}"#);
+    let second = tool_call("read", r#"{"file_path":"./src/main.rs"}"#);
+    let third = tool_call("read", r#"{"path":"src/main.rs"}"#);
+    let conversation = conversation_with_context_messages(vec![
+        ContextMessage::Text(assistant_message(&first)),
+        ContextMessage::Tool(ToolResult::new("read").output(Ok(ToolOutput::text(
+            r#"<file path="src/lib.rs" total_lines="100">"#,
+        )))),
+        ContextMessage::Text(assistant_message(&second)),
+        ContextMessage::Text(assistant_message(&third)),
+    ]);
+
+    let actual = DoomLoopDetector::new().detect_from_conversation(&conversation);
+    let expected = Some(3);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn test_doom_loop_detector_normalizes_search_field_order() {
+    let first = tool_call(
+        "fs_search",
+        r#"{"path":"src","pattern":"doom","glob":"*.rs"}"#,
+    );
+    let second = tool_call(
+        "fs_search",
+        r#"{"glob":"*.rs","pattern":"doom","path":"src"}"#,
+    );
+    let third = tool_call(
+        "fs_search",
+        r#"{"pattern":"doom","path":"src","glob":"*.rs"}"#,
+    );
+    let conversation = conversation_from_tool_calls(&[first, second, third]);
+
+    let actual = DoomLoopDetector::new().detect_from_conversation(&conversation);
+    let expected = Some(3);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn test_doom_loop_detector_treats_process_read_output_as_progress_boundary() {
+    let first = tool_call("process_read", r#"{"process_id":"process-1","cursor":0}"#);
+    let second = tool_call("process_read", r#"{"process_id":"process-1","cursor":0}"#);
+    let third = tool_call("process_read", r#"{"process_id":"process-1","cursor":0}"#);
+    let conversation = conversation_with_context_messages(vec![
+        ContextMessage::Text(assistant_message(&first)),
+        ContextMessage::Tool(ToolResult::new("process_read").output(Ok(ToolOutput::text(
+            r#"<process_output process_id="process-1" next_cursor="1"><![CDATA[{"cursor":1,"stream":"stdout","content":"ready"}]]></process_output>"#,
+        )))),
+        ContextMessage::Text(assistant_message(&second)),
+        ContextMessage::Text(assistant_message(&third)),
+    ]);
+
+    let actual = DoomLoopDetector::new().detect_from_conversation(&conversation);
+    let expected = None;
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn test_doom_loop_detector_keeps_process_read_without_progress_in_loop_scope() {
+    let first = tool_call("process_read", r#"{"process_id":"process-1","cursor":0}"#);
+    let second = tool_call("process_read", r#"{"process_id":"process-1","cursor":0}"#);
+    let third = tool_call("process_read", r#"{"process_id":"process-1","cursor":0}"#);
+    let conversation = conversation_with_context_messages(vec![
+        ContextMessage::Text(assistant_message(&first)),
+        ContextMessage::Tool(ToolResult::new("process_read").output(Ok(ToolOutput::text(
+            r#"<process_output process_id="process-1" next_cursor="0"><![CDATA[[]]]></process_output>"#,
+        )))),
+        ContextMessage::Text(assistant_message(&second)),
+        ContextMessage::Text(assistant_message(&third)),
     ]);
 
     let actual = DoomLoopDetector::new().detect_from_conversation(&conversation);

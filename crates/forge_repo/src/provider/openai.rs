@@ -302,8 +302,8 @@ impl<H: HttpInfra> OpenAIProvider<H> {
             let models = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../vertex.json"));
             // We deserialize into serde_json::Value first, then add provider_id, or just
             // deserialize into something without provider_id?
-            // Actually, Model derives Deserialize. If we add `#[serde(default)]` or just map.
-            // Let's create a temporary struct.
+            // Actually, Model derives Deserialize. If we add `#[serde(default)]` or just
+            // map. Let's create a temporary struct.
             #[derive(serde::Deserialize)]
             struct VertexModel {
                 id: String,

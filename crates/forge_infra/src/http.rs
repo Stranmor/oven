@@ -238,9 +238,9 @@ const REDACTED_VALUE: &str = "[REDACTED]";
 const REDACTED_PAYLOAD: &str = "[REDACTED_PAYLOAD]";
 const REDACTED_NON_JSON_BODY: &[u8] = br#"{"debug_request":"[REDACTED_NON_JSON_BODY]"}"#;
 
-/// Sanitizes request bodies before writing debug logs. Debug logs are useful for
-/// transport diagnostics, but raw model payloads and credentials must never be
-/// persisted to disk.
+/// Sanitizes request bodies before writing debug logs. Debug logs are useful
+/// for transport diagnostics, but raw model payloads and credentials must never
+/// be persisted to disk.
 pub fn sanitize_debug_body(body: &Bytes) -> Bytes {
     let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
         return Bytes::from_static(REDACTED_NON_JSON_BODY);

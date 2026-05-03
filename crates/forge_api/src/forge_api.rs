@@ -178,7 +178,9 @@ impl<
     }
 
     async fn get_conversations(&self) -> anyhow::Result<Vec<Conversation>> {
-        Ok(self.services.get_conversations().await?)
+        let mut conversations = self.services.get_conversations().await?;
+        conversations.truncate(self.services.get_config()?.max_conversations);
+        Ok(conversations)
     }
 
     async fn get_sub_conversations(

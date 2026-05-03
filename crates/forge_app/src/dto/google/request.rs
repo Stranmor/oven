@@ -360,7 +360,8 @@ impl From<Context> for Request {
             raw_contents.push(Content { role: Some(Role::User), parts: pending_tool_parts });
         }
 
-        // Google API strictly requires alternating roles. Merge consecutive contents with the same role.
+        // Google API strictly requires alternating roles. Merge consecutive contents
+        // with the same role.
         let mut contents: Vec<Content> = Vec::new();
         for content in raw_contents {
             if let Some(last) = contents.last_mut() {

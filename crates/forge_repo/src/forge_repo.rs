@@ -12,7 +12,8 @@ use forge_config::ForgeConfig;
 use forge_domain::{
     AnyProvider, AuthCredential, ChatCompletionMessage, ChatRepository, CommandOutput, Context,
     Conversation, ConversationId, ConversationRepository, Environment, FileInfo,
-    FuzzySearchRepository, McpServerConfig, MigrationResult, Model, ModelId, Provider, ProviderId,
+    FuzzySearchRepository, McpServerConfig, MigrationResult, Model, ModelId, ProcessId,
+    ProcessReadCursor, ProcessReadOutput, ProcessStartOutput, ProcessStatus, Provider, ProviderId,
     ProviderRepository, ResultStream, SearchMatch, Skill, SkillRepository, Snapshot,
     SnapshotRepository, TextPatchBlock, TextPatchRepository,
 };
@@ -489,6 +490,37 @@ where
         self.infra
             .execute_command_raw(command, working_dir, env_vars)
             .await
+    }
+
+    async fn start_process(
+        &self,
+        command: String,
+        working_dir: PathBuf,
+        env_vars: Option<Vec<String>>,
+    ) -> anyhow::Result<ProcessStartOutput> {
+        self.infra
+            .start_process(command, working_dir, env_vars)
+            .await
+    }
+
+    async fn process_status(&self, process_id: ProcessId) -> anyhow::Result<ProcessStatus> {
+        self.infra.process_status(process_id).await
+    }
+
+    async fn read_process(
+        &self,
+        process_id: ProcessId,
+        cursor: ProcessReadCursor,
+    ) -> anyhow::Result<ProcessReadOutput> {
+        self.infra.read_process(process_id, cursor).await
+    }
+
+    async fn list_processes(&self) -> anyhow::Result<Vec<ProcessStatus>> {
+        self.infra.list_processes().await
+    }
+
+    async fn kill_process(&self, process_id: ProcessId) -> anyhow::Result<ProcessStatus> {
+        self.infra.kill_process(process_id).await
     }
 }
 

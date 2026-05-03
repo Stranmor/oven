@@ -51,6 +51,23 @@ impl<S: ConversationRepository> ConversationService for ForgeConversationService
         Ok(())
     }
 
+    async fn ensure_delegated_conversation(
+        &self,
+        id: &ConversationId,
+        parent_id: Option<ConversationId>,
+    ) -> Result<Conversation> {
+        let mut conversation = self
+            .conversation_repository
+            .get_conversation(id)
+            .await?
+            .ok_or_else(|| forge_app::domain::Error::ConversationNotFound(*id))?;
+        conversation.ensure_delegated(parent_id);
+        self.conversation_repository
+            .upsert_conversation(conversation.clone())
+            .await?;
+        Ok(conversation)
+    }
+
     async fn get_conversations(&self) -> Result<Vec<Conversation>> {
         self.conversation_repository.get_all_conversations().await
     }
@@ -69,5 +86,105 @@ impl<S: ConversationRepository> ConversationService for ForgeConversationService
         self.conversation_repository
             .delete_conversation(conversation_id)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use forge_app::ConversationService;
+    use forge_app::domain::{Context, ContextMessage, ConversationId, Initiator};
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct FixtureRepository {
+        conversations: Mutex<HashMap<ConversationId, Conversation>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ConversationRepository for FixtureRepository {
+        async fn upsert_conversation(&self, conversation: Conversation) -> anyhow::Result<()> {
+            self.conversations
+                .lock()
+                .unwrap()
+                .insert(conversation.id, conversation);
+            Ok(())
+        }
+
+        async fn get_conversation(
+            &self,
+            conversation_id: &ConversationId,
+        ) -> anyhow::Result<Option<Conversation>> {
+            Ok(self
+                .conversations
+                .lock()
+                .unwrap()
+                .get(conversation_id)
+                .cloned())
+        }
+
+        async fn get_all_conversations(&self) -> anyhow::Result<Vec<Conversation>> {
+            Ok(self
+                .conversations
+                .lock()
+                .unwrap()
+                .values()
+                .cloned()
+                .collect())
+        }
+
+        async fn get_sub_conversations(
+            &self,
+            parent_id: &ConversationId,
+        ) -> anyhow::Result<Vec<Conversation>> {
+            Ok(self
+                .conversations
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|conversation| conversation.parent_id == Some(*parent_id))
+                .cloned()
+                .collect())
+        }
+
+        async fn get_last_conversation(&self) -> anyhow::Result<Option<Conversation>> {
+            Ok(self.conversations.lock().unwrap().values().next().cloned())
+        }
+
+        async fn delete_conversation(
+            &self,
+            conversation_id: &ConversationId,
+        ) -> anyhow::Result<()> {
+            self.conversations.lock().unwrap().remove(conversation_id);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ensure_delegated_conversation_promotes_reused_session() -> anyhow::Result<()> {
+        let repository = Arc::new(FixtureRepository::default());
+        let service = ForgeConversationService::new(repository.clone());
+        let parent_id = ConversationId::generate();
+        let conversation = Conversation::new(ConversationId::generate()).context(Some(
+            Context::default().messages(vec![ContextMessage::user("User chat", None).into()]),
+        ));
+
+        repository.upsert_conversation(conversation.clone()).await?;
+        let actual = service
+            .ensure_delegated_conversation(&conversation.id, Some(parent_id))
+            .await?;
+        let expected = (Initiator::Agent, Some(parent_id));
+
+        assert_eq!((actual.initiator, actual.parent_id), expected);
+        let persisted = repository
+            .get_conversation(&conversation.id)
+            .await?
+            .expect("promoted conversation should be persisted");
+        assert_eq!((persisted.initiator, persisted.parent_id), expected);
+        Ok(())
     }
 }

@@ -347,6 +347,19 @@ fn extract_tool_info(call: &ToolCallFull, current_todos: &[Todo]) -> Option<Summ
             }
             ToolCatalog::Remove(input) => Some(SummaryTool::FileRemove { path: input.path }),
             ToolCatalog::Shell(input) => Some(SummaryTool::Shell { command: input.command }),
+            ToolCatalog::ProcessStart(input) => Some(SummaryTool::Shell { command: input.command }),
+            ToolCatalog::ProcessStatus(_) => {
+                Some(SummaryTool::Mcp { name: "process_status".to_string() })
+            }
+            ToolCatalog::ProcessRead(_) => {
+                Some(SummaryTool::Mcp { name: "process_read".to_string() })
+            }
+            ToolCatalog::ProcessList(_) => {
+                Some(SummaryTool::Mcp { name: "process_list".to_string() })
+            }
+            ToolCatalog::ProcessKill(_) => {
+                Some(SummaryTool::Mcp { name: "process_kill".to_string() })
+            }
             ToolCatalog::FsSearch(input) => {
                 // Use glob, file_type, or pattern as the search identifier
                 let pattern = input.glob.or(input.file_type).unwrap_or(input.pattern);

@@ -1,29 +1,69 @@
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bstr::ByteSlice;
 use forge_app::CommandInfra;
-use forge_domain::{CommandOutput, ConsoleWriter as OutputPrinterTrait, Environment};
+use forge_domain::{
+    CommandOutput, ConsoleWriter as OutputPrinterTrait, Environment, ProcessId, ProcessLogEntry,
+    ProcessReadCursor, ProcessReadOutput, ProcessStartOutput, ProcessStatus, ProcessStatusKind,
+    ProcessStream,
+};
 use tokio::io::AsyncReadExt;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 use crate::console::StdConsoleWriter;
 
 /// Service for executing shell commands
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ForgeCommandExecutorService {
     env: Environment,
     output_printer: Arc<StdConsoleWriter>,
 
     // Mutex to ensure that only one command is executed at a time
     ready: Arc<Mutex<()>>,
+    processes: Arc<Mutex<HashMap<ProcessId, ManagedProcess>>>,
+}
+
+struct ManagedProcess {
+    command: String,
+    cwd: String,
+    child: Child,
+    status: ProcessStatusKind,
+    logs: Arc<Mutex<Vec<ProcessLogEntry>>>,
+}
+
+impl ManagedProcess {
+    fn refresh_status(&mut self) -> anyhow::Result<()> {
+        if matches!(self.status, ProcessStatusKind::Running)
+            && let Some(status) = self.child.try_wait()?
+        {
+            self.status = ProcessStatusKind::Exited { exit_code: status.code() };
+        }
+        Ok(())
+    }
+
+    fn status(&self, process_id: ProcessId) -> ProcessStatus {
+        ProcessStatus {
+            process_id,
+            status: self.status.clone(),
+            command: self.command.clone(),
+            cwd: self.cwd.clone(),
+        }
+    }
 }
 
 impl ForgeCommandExecutorService {
     pub fn new(env: Environment, output_printer: Arc<StdConsoleWriter>) -> Self {
-        Self { env, output_printer, ready: Arc::new(Mutex::new(())) }
+        Self {
+            env,
+            output_printer,
+            ready: Arc::new(Mutex::new(())),
+            processes: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     fn prepare_command(
@@ -88,6 +128,44 @@ impl ForgeCommandExecutorService {
         }
 
         command
+    }
+
+    fn next_process_id() -> ProcessId {
+        static PROCESS_COUNTER: AtomicU64 = AtomicU64::new(1);
+        let sequence = PROCESS_COUNTER.fetch_add(1, Ordering::Relaxed);
+        ProcessId::new(format!("process-{sequence}"))
+    }
+
+    fn capture_stream<A>(
+        mut reader: A,
+        stream: ProcessStream,
+        logs: Arc<Mutex<Vec<ProcessLogEntry>>>,
+        next_cursor: Arc<AtomicU64>,
+    ) where
+        A: AsyncReadExt + Unpin + Send + 'static,
+    {
+        tokio::spawn(async move {
+            let mut buffer = [0; 1024];
+            loop {
+                let Ok(count) = reader.read(&mut buffer).await else {
+                    break;
+                };
+                if count == 0 {
+                    break;
+                }
+                let Some(bytes) = buffer.get(..count) else {
+                    break;
+                };
+                let content = bytes.to_str_lossy().into_owned();
+                let mut logs = logs.lock().await;
+                let cursor = next_cursor.fetch_add(1, Ordering::Relaxed);
+                logs.push(ProcessLogEntry {
+                    cursor: ProcessReadCursor::new(cursor),
+                    stream,
+                    content,
+                });
+            }
+        });
     }
 
     /// Internal method to execute commands with streaming to console
@@ -258,14 +336,112 @@ impl CommandInfra for ForgeCommandExecutorService {
         env_vars: Option<Vec<String>>,
     ) -> anyhow::Result<std::process::ExitStatus> {
         let mut prepared_command = self.prepare_command(command, &working_dir, env_vars);
-
-        // overwrite the stdin, stdout and stderr to inherit
         prepared_command
             .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit());
-
         Ok(prepared_command.spawn()?.wait().await?)
+    }
+
+    async fn start_process(
+        &self,
+        command: String,
+        working_dir: PathBuf,
+        env_vars: Option<Vec<String>>,
+    ) -> anyhow::Result<ProcessStartOutput> {
+        let mut prepared_command = self.prepare_command(&command, &working_dir, env_vars);
+        let mut child = prepared_command.spawn()?;
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let next_cursor = Arc::new(AtomicU64::new(1));
+
+        if let Some(stdout) = child.stdout.take() {
+            Self::capture_stream(
+                stdout,
+                ProcessStream::Stdout,
+                logs.clone(),
+                next_cursor.clone(),
+            );
+        }
+        if let Some(stderr) = child.stderr.take() {
+            Self::capture_stream(
+                stderr,
+                ProcessStream::Stderr,
+                logs.clone(),
+                next_cursor.clone(),
+            );
+        }
+
+        let process_id = Self::next_process_id();
+        let output = ProcessStartOutput {
+            process_id: process_id.clone(),
+            status: ProcessStatusKind::Running,
+            command: command.clone(),
+            cwd: working_dir.display().to_string(),
+        };
+        self.processes.lock().await.insert(
+            process_id,
+            ManagedProcess {
+                command,
+                cwd: working_dir.display().to_string(),
+                child,
+                status: ProcessStatusKind::Running,
+                logs,
+            },
+        );
+        Ok(output)
+    }
+
+    async fn process_status(&self, process_id: ProcessId) -> anyhow::Result<ProcessStatus> {
+        let mut processes = self.processes.lock().await;
+        let process = processes
+            .get_mut(&process_id)
+            .ok_or_else(|| anyhow::anyhow!("Unknown process id: {process_id}"))?;
+        process.refresh_status()?;
+        Ok(process.status(process_id))
+    }
+
+    async fn read_process(
+        &self,
+        process_id: ProcessId,
+        cursor: ProcessReadCursor,
+    ) -> anyhow::Result<ProcessReadOutput> {
+        let processes = self.processes.lock().await;
+        let process = processes
+            .get(&process_id)
+            .ok_or_else(|| anyhow::anyhow!("Unknown process id: {process_id}"))?;
+        let mut entries: Vec<_> = process
+            .logs
+            .lock()
+            .await
+            .iter()
+            .filter(|entry| entry.cursor > cursor)
+            .cloned()
+            .collect();
+        entries.sort_by_key(|entry| entry.cursor);
+        let next = entries.last().map(|entry| entry.cursor).unwrap_or(cursor);
+        Ok(ProcessReadOutput { process_id, next_cursor: next, entries })
+    }
+
+    async fn list_processes(&self) -> anyhow::Result<Vec<ProcessStatus>> {
+        let mut processes = self.processes.lock().await;
+        let mut statuses = Vec::with_capacity(processes.len());
+        for (process_id, process) in processes.iter_mut() {
+            process.refresh_status()?;
+            statuses.push(process.status(process_id.clone()));
+        }
+        Ok(statuses)
+    }
+
+    async fn kill_process(&self, process_id: ProcessId) -> anyhow::Result<ProcessStatus> {
+        let mut processes = self.processes.lock().await;
+        let process = processes
+            .get_mut(&process_id)
+            .ok_or_else(|| anyhow::anyhow!("Unknown process id: {process_id}"))?;
+        if matches!(process.status, ProcessStatusKind::Running) {
+            process.child.kill().await?;
+            process.status = ProcessStatusKind::Killed;
+        }
+        Ok(process.status(process_id))
     }
 }
 
@@ -291,6 +467,189 @@ mod tests {
 
     fn test_printer() -> Arc<StdConsoleWriter> {
         Arc::new(StdConsoleWriter::default())
+    }
+
+    #[tokio::test]
+    async fn test_background_process_lifecycle_captures_output() {
+        let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
+        let actual = fixture
+            .start_process(
+                "printf ready; sleep 1".to_string(),
+                PathBuf::new().join("."),
+                None,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let output = fixture
+            .read_process(actual.process_id.clone(), ProcessReadCursor::new(0))
+            .await
+            .unwrap();
+        let status = fixture.kill_process(actual.process_id).await.unwrap();
+
+        assert!(
+            output
+                .entries
+                .iter()
+                .any(|entry| entry.content.contains("ready"))
+        );
+        assert_eq!(status.status, ProcessStatusKind::Killed);
+    }
+
+    #[tokio::test]
+    async fn test_process_read_next_cursor_does_not_skip_later_output() {
+        let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
+        let started = fixture
+            .start_process(
+                "printf first; sleep 0.3; printf second; sleep 2".to_string(),
+                PathBuf::new().join("."),
+                None,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let first = fixture
+            .read_process(started.process_id.clone(), ProcessReadCursor::new(0))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let actual = fixture
+            .read_process(started.process_id.clone(), first.next_cursor)
+            .await
+            .unwrap();
+        let _ = fixture.kill_process(started.process_id).await;
+
+        assert!(
+            actual
+                .entries
+                .iter()
+                .any(|entry| entry.content.contains("second"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_list_refreshes_exited_status_without_status_probe() {
+        let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
+        let started = fixture
+            .start_process("exit 7".to_string(), PathBuf::new().join("."), None)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let actual = fixture.list_processes().await.unwrap();
+        let expected = ProcessStatusKind::Exited { exit_code: Some(7) };
+
+        assert_eq!(actual.first().unwrap().process_id, started.process_id);
+        assert_eq!(actual.first().unwrap().status, expected);
+    }
+
+    #[tokio::test]
+    async fn test_process_read_cursor_does_not_advance_before_entry_is_visible() {
+        use tokio::io::AsyncWriteExt;
+
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let next_cursor = Arc::new(AtomicU64::new(1));
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let log_guard = logs.lock().await;
+
+        ForgeCommandExecutorService::capture_stream(
+            reader,
+            ProcessStream::Stdout,
+            logs.clone(),
+            next_cursor.clone(),
+        );
+        writer.write_all(b"pending").await.unwrap();
+        writer.flush().await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let actual = next_cursor.load(Ordering::Relaxed);
+        let expected = 1;
+        assert_eq!(log_guard.len(), 0);
+        assert_eq!(actual, expected);
+        drop(log_guard);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if !logs.lock().await.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_background_process_does_not_block_foreground_shell_execution() {
+        let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
+        let started = fixture
+            .start_process(
+                "sleep 1; printf background".to_string(),
+                PathBuf::new().join("."),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let actual = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            fixture.execute_command(
+                "printf foreground".to_string(),
+                PathBuf::new().join("."),
+                true,
+                None,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let _ = fixture.kill_process(started.process_id).await;
+
+        let expected = "foreground";
+        assert_eq!(actual.stdout, expected);
+    }
+
+    #[tokio::test]
+    async fn test_process_read_after_exit_observes_trailing_output() {
+        let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
+        let started = fixture
+            .start_process("printf final".to_string(), PathBuf::new().join("."), None)
+            .await
+            .unwrap();
+
+        let status = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let status = fixture
+                    .process_status(started.process_id.clone())
+                    .await
+                    .unwrap();
+                if !matches!(status.status, ProcessStatusKind::Running) {
+                    return status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let actual = fixture
+            .read_process(started.process_id.clone(), ProcessReadCursor::new(0))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            status.status,
+            ProcessStatusKind::Exited { exit_code: Some(0) }
+        );
+        assert!(
+            actual
+                .entries
+                .iter()
+                .any(|entry| entry.content.contains("final"))
+        );
     }
 
     #[tokio::test]

@@ -109,7 +109,7 @@ impl ConversationRepository for ConversationRepositoryImpl {
                 .map(Conversation::try_from)
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
-                .filter(|conv| !conv.is_agent_initiated())
+                .filter(Conversation::is_primary_user_conversation)
                 .collect();
             Ok(conversations)
         })
@@ -153,7 +153,7 @@ impl ConversationRepository for ConversationRepositoryImpl {
                 .map(Conversation::try_from)
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
-                .find(|conv| !conv.is_agent_initiated());
+                .find(Conversation::is_primary_user_conversation);
             Ok(conversation)
         })
         .await
@@ -329,6 +329,89 @@ mod tests {
 
         assert_eq!(
             actual.iter().map(|conv| conv.id).collect::<Vec<_>>(),
+            expected
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_reused_delegated_conversation_promotion_hides_from_primary_lists()
+    -> anyhow::Result<()> {
+        let parent_id = ConversationId::generate();
+        let delegated_context =
+            Context::default().messages(vec![ContextMessage::user("Delegated task", None).into()]);
+        let mut reused_conversation = Conversation::new(ConversationId::generate())
+            .title(Some("Reused User Session".to_string()))
+            .context(Some(delegated_context));
+        reused_conversation.ensure_delegated(Some(parent_id));
+        let repo = repository()?;
+
+        repo.upsert_conversation(reused_conversation.clone())
+            .await?;
+
+        let actual = repo.get_all_conversations().await?;
+        let expected: Vec<ConversationId> = Vec::new();
+
+        assert_eq!(
+            actual.iter().map(|conv| conv.id).collect::<Vec<_>>(),
+            expected
+        );
+        assert!(repo.get_last_conversation().await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_reused_delegated_conversation_promotion_keeps_subchat_visible()
+    -> anyhow::Result<()> {
+        let parent_id = ConversationId::generate();
+        let delegated_context =
+            Context::default().messages(vec![ContextMessage::user("Delegated task", None).into()]);
+        let mut reused_conversation = Conversation::new(ConversationId::generate())
+            .title(Some("Reused User Session".to_string()))
+            .context(Some(delegated_context));
+        reused_conversation.ensure_delegated(Some(parent_id));
+        let repo = repository()?;
+
+        repo.upsert_conversation(reused_conversation.clone())
+            .await?;
+
+        let actual = repo.get_sub_conversations(&parent_id).await?;
+        let expected = vec![reused_conversation.id];
+
+        assert_eq!(
+            actual.iter().map(|conv| conv.id).collect::<Vec<_>>(),
+            expected
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_persisted_user_session_promotion_updates_primary_and_subchat_indexes()
+    -> anyhow::Result<()> {
+        let parent_id = ConversationId::generate();
+        let delegated_context =
+            Context::default().messages(vec![ContextMessage::user("Delegated task", None).into()]);
+        let mut reused_conversation = Conversation::new(ConversationId::generate())
+            .title(Some("Persisted User Session".to_string()))
+            .context(Some(delegated_context));
+        let repo = repository()?;
+
+        repo.upsert_conversation(reused_conversation.clone())
+            .await?;
+        assert_eq!(repo.get_all_conversations().await?.len(), 1);
+
+        reused_conversation.ensure_delegated(Some(parent_id));
+        repo.upsert_conversation(reused_conversation.clone())
+            .await?;
+
+        let primary = repo.get_all_conversations().await?;
+        let subchats = repo.get_sub_conversations(&parent_id).await?;
+        let expected = vec![reused_conversation.id];
+
+        assert!(primary.is_empty());
+        assert!(repo.get_last_conversation().await?.is_none());
+        assert_eq!(
+            subchats.iter().map(|conv| conv.id).collect::<Vec<_>>(),
             expected
         );
         Ok(())

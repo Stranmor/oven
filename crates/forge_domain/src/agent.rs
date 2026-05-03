@@ -171,8 +171,8 @@ pub struct Agent {
     /// repetitive degeneration loops. Range: -2.0 to 2.0
     pub frequency_penalty: Option<f64>,
 
-    /// Penalizes tokens that have appeared at least once, encouraging diversity.
-    /// Range: -2.0 to 2.0
+    /// Penalizes tokens that have appeared at least once, encouraging
+    /// diversity. Range: -2.0 to 2.0
     pub presence_penalty: Option<f64>,
 }
 

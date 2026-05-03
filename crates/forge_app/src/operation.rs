@@ -19,8 +19,9 @@ use crate::truncation::{
 use crate::utils::{compute_hash, format_display_path};
 use crate::{
     FsRemoveOutput, FsUndoOutput, FsWriteOutput, HttpResponse, PatchOutput, PlanCreateOutput,
-    ReadOutput, ResponseContext, SearchResult, ShellOutput,
+    ProcessStartServiceOutput, ReadOutput, ResponseContext, SearchResult, ShellOutput,
 };
+use crate::{ProcessKillServiceOutput, ProcessOutput, ProcessReadServiceOutput};
 
 #[derive(Debug, Default, Setters)]
 #[setters(into, strip_option)]
@@ -68,6 +69,23 @@ pub enum ToolOperation {
     },
     Shell {
         output: ShellOutput,
+    },
+    ProcessStart {
+        output: ProcessStartServiceOutput,
+    },
+    #[from(skip)]
+    ProcessStatus {
+        output: ProcessOutput,
+    },
+    ProcessRead {
+        output: ProcessReadServiceOutput,
+    },
+    ProcessList {
+        output: Vec<forge_domain::ProcessStatus>,
+    },
+    #[from(skip)]
+    ProcessKill {
+        output: ProcessKillServiceOutput,
     },
     FollowUp {
         output: Option<String>,
@@ -619,6 +637,46 @@ impl ToolOperation {
                 parent_elem = parent_elem.append(stderr_elem);
 
                 forge_domain::ToolOutput::text(parent_elem)
+            }
+            ToolOperation::ProcessStart { output } => {
+                let elm = Element::new("process_start")
+                    .attr("process_id", output.output.process_id.as_str())
+                    .attr("status", format!("{:?}", output.output.status))
+                    .attr("command", &output.output.command)
+                    .attr("cwd", &output.output.cwd)
+                    .attr("shell", &output.shell);
+                forge_domain::ToolOutput::text(elm)
+            }
+            ToolOperation::ProcessStatus { output } => {
+                let elm = Element::new("process_status")
+                    .attr("process_id", output.status.process_id.as_str())
+                    .attr("status", format!("{:?}", output.status.status))
+                    .attr("command", &output.status.command)
+                    .attr("cwd", &output.status.cwd)
+                    .attr("shell", &output.shell);
+                forge_domain::ToolOutput::text(elm)
+            }
+            ToolOperation::ProcessKill { output } => {
+                let elm = Element::new("process_status")
+                    .attr("process_id", output.status.process_id.as_str())
+                    .attr("status", format!("{:?}", output.status.status))
+                    .attr("command", &output.status.command)
+                    .attr("cwd", &output.status.cwd)
+                    .attr("shell", &output.shell);
+                forge_domain::ToolOutput::text(elm)
+            }
+            ToolOperation::ProcessRead { output } => {
+                let body = serde_json::to_string(&output.output.entries).unwrap_or_default();
+                let elm = Element::new("process_output")
+                    .attr("process_id", output.output.process_id.as_str())
+                    .attr("next_cursor", output.output.next_cursor.get())
+                    .attr("shell", &output.shell)
+                    .cdata(body);
+                forge_domain::ToolOutput::text(elm)
+            }
+            ToolOperation::ProcessList { output } => {
+                let body = serde_json::to_string(&output).unwrap_or_default();
+                forge_domain::ToolOutput::text(Element::new("processes").cdata(body))
             }
             ToolOperation::FollowUp { output } => match output {
                 None => {

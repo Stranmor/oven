@@ -151,7 +151,8 @@ impl Compactor {
             .splice(start..=end, std::iter::once(summary_entry));
 
         // Inject preserved reasoning into first assistant message (if empty)
-        // Must happen BEFORE retain() so indices (like `start`) remain accurately aligned
+        // Must happen BEFORE retain() so indices (like `start`) remain accurately
+        // aligned
         if let Some(reasoning) = reasoning_details
             && let Some(ContextMessage::Text(msg)) = context
                 .messages
@@ -411,7 +412,8 @@ mod tests {
             panic!("Expected TextMessage");
         }
 
-        // Check the targeted assistant message (R2), which is now the second assistant message
+        // Check the targeted assistant message (R2), which is now the second assistant
+        // message
         let second_assistant = actual
             .messages
             .iter()

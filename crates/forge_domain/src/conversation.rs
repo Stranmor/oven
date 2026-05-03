@@ -218,6 +218,24 @@ impl Conversation {
     pub fn is_agent_initiated(&self) -> bool {
         self.initiator == Initiator::Agent
     }
+
+    /// Returns whether the conversation is a primary human/user chat.
+    pub fn is_primary_user_conversation(&self) -> bool {
+        self.context.is_some() && self.parent_id.is_none() && !self.is_agent_initiated()
+    }
+
+    /// Ensures this conversation is marked as delegated agent work.
+    ///
+    /// # Arguments
+    ///
+    /// * `parent_id` - The parent conversation that spawned the delegated work,
+    ///   when known.
+    pub fn ensure_delegated(&mut self, parent_id: Option<ConversationId>) {
+        self.initiator = Initiator::Agent;
+        if parent_id.is_some() {
+            self.parent_id = parent_id;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -232,6 +250,18 @@ mod tests {
         let conversation = Conversation::generate();
         let actual = conversation.related_conversation_ids();
         assert_eq!(actual, vec![]);
+    }
+
+    #[test]
+    fn test_ensure_delegated_marks_agent_and_parent() {
+        let parent_id = ConversationId::generate();
+        let mut conversation = Conversation::generate();
+
+        conversation.ensure_delegated(Some(parent_id));
+        let actual = (conversation.initiator, conversation.parent_id);
+        let expected = (Initiator::Agent, Some(parent_id));
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

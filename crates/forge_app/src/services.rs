@@ -6,9 +6,10 @@ use derive_setters::Setters;
 use forge_domain::{
     AgentId, AnyProvider, Attachment, AuthContextRequest, AuthContextResponse, AuthMethod,
     ChatCompletionMessage, CommandOutput, Context, Conversation, ConversationId, File, FileInfo,
-    FileStatus, Image, McpConfig, McpServers, Model, ModelId, Node, Provider, ProviderId,
-    ResultStream, Scope, SearchParams, SyncProgress, SyntaxError, Template, ToolCallFull,
-    ToolOutput, WorkspaceAuth, WorkspaceId, WorkspaceInfo,
+    FileStatus, Image, McpConfig, McpServers, Model, ModelId, Node, ProcessId, ProcessReadCursor,
+    ProcessReadOutput, ProcessStartOutput, ProcessStatus, Provider, ProviderId, ResultStream,
+    Scope, SearchParams, SyncProgress, SyntaxError, Template, ToolCallFull, ToolOutput,
+    WorkspaceAuth, WorkspaceId, WorkspaceInfo,
 };
 use forge_eventsource::EventSource;
 use reqwest::Response;
@@ -23,6 +24,33 @@ pub struct ShellOutput {
     pub output: CommandOutput,
     pub shell: String,
     pub description: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcessOutput {
+    pub shell: String,
+    pub description: Option<String>,
+    pub status: ProcessStatus,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcessKillServiceOutput {
+    pub shell: String,
+    pub description: Option<String>,
+    pub status: ProcessStatus,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcessStartServiceOutput {
+    pub shell: String,
+    pub description: Option<String>,
+    pub output: ProcessStartOutput,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcessReadServiceOutput {
+    pub shell: String,
+    pub output: ProcessReadOutput,
 }
 
 #[derive(Debug)]
@@ -229,6 +257,14 @@ pub trait ConversationService: Send + Sync {
     async fn find_conversation(&self, id: &ConversationId) -> anyhow::Result<Option<Conversation>>;
 
     async fn upsert_conversation(&self, conversation: Conversation) -> anyhow::Result<()>;
+
+    /// Marks an existing conversation as delegated agent work and links it to
+    /// the current parent conversation when available.
+    async fn ensure_delegated_conversation(
+        &self,
+        id: &ConversationId,
+        parent_id: Option<ConversationId>,
+    ) -> anyhow::Result<Conversation>;
 
     /// This is useful when you want to perform several operations on a
     /// conversation atomically.
@@ -441,6 +477,44 @@ pub trait ShellService: Send + Sync {
         env_vars: Option<Vec<String>>,
         description: Option<String>,
     ) -> anyhow::Result<ShellOutput>;
+
+    /// Starts a managed background process and returns its handle immediately.
+    async fn process_start(
+        &self,
+        _command: String,
+        _cwd: PathBuf,
+        _env_vars: Option<Vec<String>>,
+        _description: Option<String>,
+    ) -> anyhow::Result<ProcessStartServiceOutput> {
+        anyhow::bail!("Managed background processes are not supported by this shell service")
+    }
+
+    /// Returns status for a managed background process.
+    async fn process_status(&self, _process_id: ProcessId) -> anyhow::Result<ProcessOutput> {
+        anyhow::bail!("Managed background processes are not supported by this shell service")
+    }
+
+    /// Reads captured output from a managed background process.
+    async fn process_read(
+        &self,
+        _process_id: ProcessId,
+        _cursor: ProcessReadCursor,
+    ) -> anyhow::Result<ProcessReadServiceOutput> {
+        anyhow::bail!("Managed background processes are not supported by this shell service")
+    }
+
+    /// Lists all managed background process statuses.
+    async fn process_list(&self) -> anyhow::Result<Vec<ProcessStatus>> {
+        anyhow::bail!("Managed background processes are not supported by this shell service")
+    }
+
+    /// Stops a managed background process.
+    async fn process_kill(
+        &self,
+        _process_id: ProcessId,
+    ) -> anyhow::Result<ProcessKillServiceOutput> {
+        anyhow::bail!("Managed background processes are not supported by this shell service")
+    }
 }
 
 #[async_trait::async_trait]
@@ -599,6 +673,16 @@ impl<I: Services> ConversationService for I {
     async fn upsert_conversation(&self, conversation: Conversation) -> anyhow::Result<()> {
         self.conversation_service()
             .upsert_conversation(conversation)
+            .await
+    }
+
+    async fn ensure_delegated_conversation(
+        &self,
+        id: &ConversationId,
+        parent_id: Option<ConversationId>,
+    ) -> anyhow::Result<Conversation> {
+        self.conversation_service()
+            .ensure_delegated_conversation(id, parent_id)
             .await
     }
 
@@ -866,6 +950,41 @@ impl<I: Services> ShellService for I {
         self.shell_service()
             .execute(command, cwd, keep_ansi, silent, env_vars, description)
             .await
+    }
+
+    async fn process_start(
+        &self,
+        command: String,
+        cwd: PathBuf,
+        env_vars: Option<Vec<String>>,
+        description: Option<String>,
+    ) -> anyhow::Result<ProcessStartServiceOutput> {
+        self.shell_service()
+            .process_start(command, cwd, env_vars, description)
+            .await
+    }
+
+    async fn process_status(&self, process_id: ProcessId) -> anyhow::Result<ProcessOutput> {
+        self.shell_service().process_status(process_id).await
+    }
+
+    async fn process_read(
+        &self,
+        process_id: ProcessId,
+        cursor: ProcessReadCursor,
+    ) -> anyhow::Result<ProcessReadServiceOutput> {
+        self.shell_service().process_read(process_id, cursor).await
+    }
+
+    async fn process_list(&self) -> anyhow::Result<Vec<ProcessStatus>> {
+        self.shell_service().process_list().await
+    }
+
+    async fn process_kill(
+        &self,
+        process_id: ProcessId,
+    ) -> anyhow::Result<ProcessKillServiceOutput> {
+        self.shell_service().process_kill(process_id).await
     }
 }
 

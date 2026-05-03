@@ -1,6 +1,7 @@
+use std::sync::LazyLock;
+
 use forge_domain::Transformer;
 use regex::Regex;
-use std::sync::LazyLock;
 
 use crate::dto::anthropic::{Content, Request};
 

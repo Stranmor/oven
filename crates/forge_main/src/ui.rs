@@ -1952,9 +1952,11 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             return Ok(());
         }
 
-        if let Some(conversation) =
-            ConversationSelector::select_conversation(&conversations, self.state.conversation_id)
-                .await?
+        if let Some(conversation) = ConversationSelector::select_sub_conversation(
+            &conversations,
+            self.state.conversation_id,
+        )
+        .await?
         {
             let conversation_id = conversation.id;
             self.state.conversation_id = Some(conversation_id);

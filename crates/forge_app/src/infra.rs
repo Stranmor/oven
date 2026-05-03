@@ -6,7 +6,8 @@ use anyhow::Result;
 use bytes::Bytes;
 use forge_domain::{
     AuthCodeParams, CommandOutput, ConfigOperation, Environment, FileInfo, McpServerConfig,
-    OAuthConfig, OAuthTokenResponse, ToolDefinition, ToolName, ToolOutput,
+    OAuthConfig, OAuthTokenResponse, ProcessId, ProcessReadCursor, ProcessReadOutput,
+    ProcessStartOutput, ProcessStatus, ToolDefinition, ToolName, ToolOutput,
 };
 use forge_eventsource::EventSource;
 use reqwest::Response;
@@ -162,6 +163,30 @@ pub trait CommandInfra: Send + Sync {
         working_dir: PathBuf,
         env_vars: Option<Vec<String>>,
     ) -> anyhow::Result<std::process::ExitStatus>;
+
+    /// Starts a command as a managed background process.
+    async fn start_process(
+        &self,
+        command: String,
+        working_dir: PathBuf,
+        env_vars: Option<Vec<String>>,
+    ) -> anyhow::Result<ProcessStartOutput>;
+
+    /// Returns structured status for a managed background process.
+    async fn process_status(&self, process_id: ProcessId) -> anyhow::Result<ProcessStatus>;
+
+    /// Reads captured process output since the provided cursor.
+    async fn read_process(
+        &self,
+        process_id: ProcessId,
+        cursor: ProcessReadCursor,
+    ) -> anyhow::Result<ProcessReadOutput>;
+
+    /// Lists managed background process statuses.
+    async fn list_processes(&self) -> anyhow::Result<Vec<ProcessStatus>>;
+
+    /// Kills a managed background process.
+    async fn kill_process(&self, process_id: ProcessId) -> anyhow::Result<ProcessStatus>;
 }
 
 #[async_trait::async_trait]

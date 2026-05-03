@@ -51,6 +51,11 @@ impl FormatContent for ToolOperation {
             | ToolOperation::FsUndo { input: _, output: _ }
             | ToolOperation::NetFetch { input: _, output: _ }
             | ToolOperation::Shell { output: _ }
+            | ToolOperation::ProcessStart { output: _ }
+            | ToolOperation::ProcessStatus { output: _ }
+            | ToolOperation::ProcessRead { output: _ }
+            | ToolOperation::ProcessList { output: _ }
+            | ToolOperation::ProcessKill { output: _ }
             | ToolOperation::FollowUp { output: _ }
             | ToolOperation::Skill { output: _ } => None,
         }

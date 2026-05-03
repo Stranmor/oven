@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use forge_domain::{
-    ContextMessage, Conversation, EventData, EventHandle, RequestPayload, Role, TextMessage,
+    ContextMessage, Conversation, EventData, EventHandle, RequestPayload, Role, ToolResult,
+    ToolValue,
 };
 use forge_template::Element;
 use sha2::{Digest, Sha256};
@@ -23,10 +24,51 @@ impl DoomLoopThreshold {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone)]
 struct ToolActionSignature {
     name: String,
     arguments: String,
+    intent: ToolIntent,
+}
+
+impl PartialEq for ToolActionSignature {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.intent.family, &other.intent.family) {
+            (ToolFamily::Read, ToolFamily::Read) | (ToolFamily::Search, ToolFamily::Search) => {
+                self.intent == other.intent
+            }
+            _ => self.name == other.name && self.arguments == other.arguments,
+        }
+    }
+}
+
+impl Eq for ToolActionSignature {}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ToolIntent {
+    family: ToolFamily,
+    target: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum ToolFamily {
+    Read,
+    Search,
+    Shell,
+    ProcessRead,
+    Other(String),
+}
+
+impl ToolFamily {
+    fn as_str(&self) -> &str {
+        match self {
+            ToolFamily::Read => "read",
+            ToolFamily::Search => "search",
+            ToolFamily::Shell => "shell",
+            ToolFamily::ProcessRead => "process_read",
+            ToolFamily::Other(name) => name,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -39,6 +81,20 @@ struct DoomLoopDetection {
 }
 
 impl DoomLoopDetection {
+    fn pattern_family(&self) -> &str {
+        self.pattern
+            .first()
+            .map(|signature| signature.intent.family.as_str())
+            .unwrap_or("unknown")
+    }
+
+    fn pattern_intent(&self) -> &str {
+        self.pattern
+            .first()
+            .map(|signature| signature.intent.target.as_str())
+            .unwrap_or("unknown")
+    }
+
     fn suppression_key(&self) -> String {
         let mut hasher = Sha256::new();
         Self::update_hash(&mut hasher, &self.tool_call_count.to_string());
@@ -49,6 +105,8 @@ impl DoomLoopDetection {
         for signature in &self.pattern {
             Self::update_hash(&mut hasher, &signature.name);
             Self::update_hash(&mut hasher, &signature.arguments);
+            Self::update_hash(&mut hasher, signature.intent.family.as_str());
+            Self::update_hash(&mut hasher, &signature.intent.target);
         }
 
         hex::encode(hasher.finalize())
@@ -117,23 +175,157 @@ impl DoomLoopDetector {
     }
 
     fn extract_tool_signatures(&self, conversation: &Conversation) -> Vec<ToolActionSignature> {
-        let assistant_messages = conversation
-            .context
-            .as_ref()
-            .map(|ctx| {
-                Self::extract_assistant_messages(ctx.messages.iter().map(|entry| &entry.message))
-            })
-            .unwrap_or_default();
+        let Some(context) = conversation.context.as_ref() else {
+            return Vec::new();
+        };
 
-        assistant_messages
-            .iter()
-            .filter_map(|msg| msg.tool_calls.as_ref())
-            .flat_map(|calls| calls.iter())
-            .map(|call| ToolActionSignature {
-                name: call.name.as_str().to_string(),
-                arguments: call.arguments.clone().into_string(),
+        let mut current_segment = Vec::new();
+        for entry in &context.messages {
+            match &entry.message {
+                ContextMessage::Text(message) if message.role == Role::Assistant => {
+                    if let Some(calls) = &message.tool_calls {
+                        current_segment.extend(calls.iter().map(|call| {
+                            let name = call.name.as_str().trim().to_lowercase();
+                            let arguments = call.arguments.clone().into_string();
+                            ToolActionSignature {
+                                intent: Self::classify_intent(&name, &arguments),
+                                name,
+                                arguments,
+                            }
+                        }));
+                    }
+                }
+                ContextMessage::Tool(result) => {
+                    if let Some(progress_intent) = Self::progress_intent(result) {
+                        current_segment.retain(|signature| signature.intent != progress_intent);
+                    }
+                }
+                _ => {}
+            }
+        }
+        current_segment
+    }
+
+    fn classify_intent(name: &str, arguments: &str) -> ToolIntent {
+        let parsed = serde_json::from_str::<serde_json::Value>(arguments).ok();
+        match name {
+            "read" => ToolIntent {
+                family: ToolFamily::Read,
+                target: Self::json_string(&parsed, "file_path")
+                    .or_else(|| Self::json_string(&parsed, "path"))
+                    .map(Self::normalize_target)
+                    .unwrap_or_else(|| arguments.to_string()),
+            },
+            "fs_search" | "sem_search" => ToolIntent {
+                family: ToolFamily::Search,
+                target: Self::search_target(&parsed).unwrap_or_else(|| arguments.to_string()),
+            },
+            "shell" => ToolIntent { family: ToolFamily::Shell, target: arguments.to_string() },
+            "process_read" => ToolIntent {
+                family: ToolFamily::ProcessRead,
+                target: Self::json_string(&parsed, "process_id").unwrap_or_default(),
+            },
+            other => ToolIntent {
+                family: ToolFamily::Other(other.to_string()),
+                target: arguments.to_string(),
+            },
+        }
+    }
+
+    fn json_string(parsed: &Option<serde_json::Value>, field: &str) -> Option<String> {
+        parsed.as_ref()?.get(field)?.as_str().map(ToOwned::to_owned)
+    }
+
+    fn normalize_target(path: String) -> String {
+        path.trim().trim_start_matches("./").to_string()
+    }
+
+    fn search_target(parsed: &Option<serde_json::Value>) -> Option<String> {
+        let path = Self::json_string(parsed, "path")
+            .map(Self::normalize_target)
+            .unwrap_or_default();
+        let pattern = Self::json_string(parsed, "pattern").unwrap_or_default();
+        let glob = Self::json_string(parsed, "glob").unwrap_or_default();
+        let kind = Self::json_string(parsed, "type").unwrap_or_default();
+        if path.is_empty() && pattern.is_empty() && glob.is_empty() && kind.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "path={path};pattern={pattern};glob={glob};type={kind}"
+        ))
+    }
+
+    fn output_file_path(result: &ToolResult) -> Option<String> {
+        let text = result.output.as_str()?;
+        let marker = "path=\"";
+        let start = text.find(marker)? + marker.len();
+        let end = text[start..].find('"')?;
+        Some(text[start..start + end].to_string())
+    }
+
+    fn process_output_id(result: &ToolResult) -> Option<String> {
+        let text = result.output.as_str()?;
+        let marker = "process_id=\"";
+        let start = text.find(marker)? + marker.len();
+        let end = text[start..].find('"')?;
+        Some(text[start..start + end].to_string())
+    }
+
+    fn process_output_has_entries(result: &ToolResult) -> bool {
+        result
+            .output
+            .as_str()
+            .and_then(|text| {
+                let start_marker = "<![CDATA[";
+                let start = text.find(start_marker)? + start_marker.len();
+                let end = text[start..].find("]]>")?;
+                Some(text[start..start + end].trim())
             })
-            .collect()
+            .is_some_and(|body| !body.is_empty() && body != "[]")
+    }
+
+    fn progress_intent(result: &ToolResult) -> Option<ToolIntent> {
+        if result.output.is_error
+            || !result.output.values.iter().any(|value| match value {
+                ToolValue::Text(text) => {
+                    let trimmed = text.trim();
+                    trimmed.contains("<file ")
+                        || trimmed.contains("<http_response")
+                        || trimmed.contains("<process_")
+                        || trimmed.contains("<shell_output")
+                }
+                ToolValue::Image(_) | ToolValue::AI { .. } => true,
+                ToolValue::Empty => false,
+            })
+        {
+            return None;
+        }
+
+        if result.name.as_str() == "process_read" && !Self::process_output_has_entries(result) {
+            return None;
+        }
+
+        Some(match result.name.as_str() {
+            "read" => ToolIntent {
+                family: ToolFamily::Read,
+                target: Self::output_file_path(result)
+                    .map(Self::normalize_target)
+                    .unwrap_or_default(),
+            },
+            "fs_search" | "sem_search" => ToolIntent {
+                family: ToolFamily::Search,
+                target: result.output.as_str().unwrap_or_default().to_string(),
+            },
+            "shell" => ToolIntent { family: ToolFamily::Shell, target: String::new() },
+            "process_read" => ToolIntent {
+                family: ToolFamily::ProcessRead,
+                target: Self::process_output_id(result).unwrap_or_default(),
+            },
+            other => ToolIntent {
+                family: ToolFamily::Other(other.to_string()),
+                target: String::new(),
+            },
+        })
     }
 
     fn check_repeating_pattern<T>(&self, sequence: &[T]) -> Option<(usize, usize)>
@@ -194,10 +386,10 @@ impl DoomLoopDetector {
         repetitions
     }
 
-    /// Extracts assistant messages from conversation context messages.
+    #[cfg(test)]
     pub fn extract_assistant_messages<'a>(
         messages: impl Iterator<Item = &'a ContextMessage> + 'a,
-    ) -> Vec<&'a TextMessage> {
+    ) -> Vec<&'a forge_domain::TextMessage> {
         messages
             .filter_map(|msg| {
                 if let ContextMessage::Text(text_msg) = msg
@@ -233,6 +425,12 @@ impl DoomLoopDetector {
             .attr("doom_loop_id", detection.suppression_key())
             .attr("tool_call_count", detection.tool_call_count)
             .attr("pattern_length", detection.pattern_length)
+            .attr(
+                "suppression_count",
+                detection.repetition_count.saturating_sub(1),
+            )
+            .attr("tool_family", detection.pattern_family())
+            .attr("tool_intent", detection.pattern_intent())
             .cdata(reminder)
             .render())
     }
@@ -252,6 +450,9 @@ impl EventHandle<EventData<RequestPayload>> for DoomLoopDetector {
                 consecutive_calls = detection.repetition_count,
                 tool_call_count = detection.tool_call_count,
                 pattern_length = detection.pattern_length,
+                suppression_count = detection.repetition_count.saturating_sub(1),
+                tool_family = detection.pattern_family(),
+                tool_intent = detection.pattern_intent(),
                 doom_loop_id = detection.suppression_key(),
                 "Doom loop detected from conversation context before next request"
             );

@@ -136,8 +136,8 @@ pub(crate) struct AgentDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frequency_penalty: Option<f64>,
 
-    /// Penalizes tokens that have appeared at least once, encouraging diversity.
-    /// Range: -2.0 to 2.0
+    /// Penalizes tokens that have appeared at least once, encouraging
+    /// diversity. Range: -2.0 to 2.0
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presence_penalty: Option<f64>,
