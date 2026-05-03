@@ -5,7 +5,7 @@ use bytes::Bytes;
 use forge_app::domain::PatchOperation;
 use forge_app::{FileWriterInfra, FsPatchService, PatchOutput, compute_hash};
 use forge_domain::{
-    FuzzySearchRepository, SearchMatch, SnapshotRepository, TextPatchRepository,
+    FuzzySearchRepository, SearchMatch, SnapshotRepository, TextPatchBlock, TextPatchRepository,
     ValidationRepository,
 };
 use thiserror::Error;
@@ -62,6 +62,7 @@ impl Range {
     }
 
     /// Create a range from a fuzzy search match
+    #[allow(dead_code)]
     fn from_search_match(source: &str, search_match: &SearchMatch) -> Self {
         let lines: Vec<&str> = source.lines().collect();
 
@@ -284,7 +285,7 @@ fn apply_replacement(
             // Swap with another text in the source
             PatchOperation::Swap => {
                 // Find the target text to swap with
-                let target_patch = Range::find_exact(&haystack, content)
+                let target_patch = Range::find_exact(&haystack, &normalized_content)
                     .ok_or_else(|| Error::NoSwapTarget(content.to_string()))?;
 
                 // Handle the case where patches overlap
@@ -368,6 +369,49 @@ fn apply_replacement(
 
 // Using FSPatchInput from forge_domain
 
+fn build_fuzzy_patch(
+    current_content: &str,
+    search_text: &str,
+    content: &str,
+    patch: TextPatchBlock,
+) -> String {
+    let _ = (
+        Range::normalize_search_line_endings(current_content, search_text),
+        Range::normalize_search_line_endings(current_content, content),
+        patch.patch,
+    );
+    patch.patched_text
+}
+
+async fn apply_replace_operation<F: TextPatchRepository>(
+    infra: &F,
+    current_content: String,
+    search: &str,
+    content: &str,
+    operation: &PatchOperation,
+) -> Result<String, Error> {
+    match compute_range(&current_content, Some(search), operation) {
+        Ok(range) => apply_replacement(current_content, range, operation, content),
+        Err(Error::NoMatch(search_text)) if matches!(operation, PatchOperation::Replace) => {
+            let normalized_search =
+                Range::normalize_search_line_endings(&current_content, &search_text);
+            let normalized_content =
+                Range::normalize_search_line_endings(&current_content, content);
+            let patch = infra
+                .build_text_patch(&current_content, &normalized_search, &normalized_content)
+                .await
+                .map_err(|error| Error::PatchBuild { message: error.to_string() })?;
+            Ok(build_fuzzy_patch(
+                &current_content,
+                &search_text,
+                content,
+                patch,
+            ))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Service for patching files with snapshot coordination
 ///
 /// This service coordinates between infrastructure (file I/O) and repository
@@ -416,27 +460,9 @@ impl<
         // Save the old content before modification for diff generation
         let old_content = current_content.clone();
 
-        current_content = match compute_range(&current_content, Some(&search), &operation) {
-            Ok(range) => apply_replacement(current_content, range, &operation, &content)?,
-            Err(Error::NoMatch(search_text))
-                if matches!(
-                    operation,
-                    PatchOperation::Replace | PatchOperation::ReplaceAll | PatchOperation::Swap
-                ) =>
-            {
-                let normalized_search =
-                    Range::normalize_search_line_endings(&current_content, &search_text);
-                let normalized_content =
-                    Range::normalize_search_line_endings(&current_content, &content);
-                let patch = self
-                    .infra
-                    .build_text_patch(&current_content, &normalized_search, &normalized_content)
-                    .await
-                    .map_err(|error| Error::PatchBuild { message: error.to_string() })?;
-                patch.patched_text
-            }
-            Err(e) => return Err(e.into()),
-        };
+        current_content =
+            apply_replace_operation(&*self.infra, current_content, &search, &content, &operation)
+                .await?;
 
         // SNAPSHOT COORDINATION: Always capture snapshot before modifying
         self.infra.insert_snapshot(path).await?;
@@ -488,40 +514,14 @@ impl<
                 PatchOperation::Replace
             };
 
-            // Compute range from search if provided
-            let range = match compute_range(&current_content, Some(&edit.old_string), &operation) {
-                Ok(r) => r,
-                Err(Error::NoMatch(search_text))
-                    if matches!(
-                        operation,
-                        PatchOperation::Replace | PatchOperation::ReplaceAll | PatchOperation::Swap
-                    ) =>
-                {
-                    // Try fuzzy search as fallback
-                    match self
-                        .infra
-                        .fuzzy_search(
-                            &search_text,
-                            &current_content,
-                            forge_domain::SearchMode::FirstMatch,
-                        )
-                        .await
-                    {
-                        Ok(matches) if !matches.is_empty() => {
-                            // Use the first fuzzy match
-                            matches
-                                .first()
-                                .map(|m| Range::from_search_match(&current_content, m))
-                        }
-                        _ => return Err(Error::NoMatch(search_text).into()),
-                    }
-                }
-                Err(e) => return Err(e.into()),
-            };
-
-            // Apply the replacement
-            current_content =
-                apply_replacement(current_content, range, &operation, &edit.new_string)?;
+            current_content = apply_replace_operation(
+                &*self.infra,
+                current_content,
+                &edit.old_string,
+                &edit.new_string,
+                &operation,
+            )
+            .await?;
         }
 
         // SNAPSHOT COORDINATION: Always capture snapshot before modifying
@@ -554,8 +554,83 @@ impl<
 #[cfg(test)]
 mod tests {
     use forge_app::domain::PatchOperation;
-    use forge_domain::SearchMatch;
+    use forge_domain::{SearchMatch, TextPatchBlock};
     use pretty_assertions::assert_eq;
+
+    struct StubTextPatchRepository;
+
+    #[async_trait::async_trait]
+    impl forge_domain::TextPatchRepository for StubTextPatchRepository {
+        async fn build_text_patch(
+            &self,
+            _haystack: &str,
+            _old_string: &str,
+            _new_string: &str,
+        ) -> anyhow::Result<TextPatchBlock> {
+            Ok(TextPatchBlock {
+                patch: "synthetic patch".to_string(),
+                patched_text: "patched by repository".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apply_replace_operation_uses_text_patch_for_missing_replace_only() {
+        let fixture = StubTextPatchRepository;
+        let source = "hello world".to_string();
+        let operation = PatchOperation::Replace;
+
+        let actual = super::apply_replace_operation(
+            &fixture,
+            source,
+            "missing text",
+            "replacement",
+            &operation,
+        )
+        .await
+        .unwrap();
+        let expected = "patched by repository";
+
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_apply_replace_operation_rejects_missing_replace_all() {
+        let fixture = StubTextPatchRepository;
+        let source = "hello world".to_string();
+        let operation = PatchOperation::ReplaceAll;
+
+        let actual = super::apply_replace_operation(
+            &fixture,
+            source,
+            "missing text",
+            "replacement",
+            &operation,
+        )
+        .await;
+        let expected = "Could not find match for search text: 'missing text'. File may have changed externally, consider reading the file again.";
+
+        assert_eq!(actual.unwrap_err().to_string(), expected);
+    }
+
+    #[tokio::test]
+    async fn test_apply_replace_operation_rejects_missing_swap() {
+        let fixture = StubTextPatchRepository;
+        let source = "hello world".to_string();
+        let operation = PatchOperation::Swap;
+
+        let actual = super::apply_replace_operation(
+            &fixture,
+            source,
+            "missing text",
+            "replacement",
+            &operation,
+        )
+        .await;
+        let expected = "Could not find match for search text: 'missing text'. File may have changed externally, consider reading the file again.";
+
+        assert_eq!(actual.unwrap_err().to_string(), expected);
+    }
 
     #[test]
     fn test_range_from_search_match_single_line() {
@@ -837,6 +912,24 @@ mod tests {
             content,
         );
         assert_eq!(result.unwrap(), "banana apple cherry");
+    }
+
+    #[test]
+    fn test_apply_replacement_swap_normalizes_target_line_endings() {
+        let source = "before\r\nleft\r\nseparator\r\nright\r\nafter";
+        let search = Some("left".to_string());
+        let operation = PatchOperation::Swap;
+        let content = "right\nafter";
+
+        let result = super::apply_replacement(
+            source.to_string(),
+            super::compute_range(source, search.as_deref(), &operation).unwrap(),
+            &operation,
+            content,
+        );
+        let expected = "before\r\nright\r\nafter\r\nseparator\r\nleft";
+
+        assert_eq!(result.unwrap(), expected);
     }
 
     #[test]
