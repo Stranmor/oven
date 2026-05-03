@@ -673,6 +673,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_process_kill_terminates_descendant_background_jobs() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let marker_path = temp_dir.path().join("leaked-descendant");
+        let command = format!(
+            "(sleep 0.3; printf leaked > {}) & wait",
+            marker_path.display()
+        );
+        let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
+        let started = fixture
+            .start_process(command, temp_dir.path().to_path_buf(), None)
+            .await
+            .unwrap();
+
+        fixture.kill_process(started.process_id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+
+        assert!(!marker_path.exists());
+    }
+
+    #[tokio::test]
     async fn test_command_executor() {
         let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
         let cmd = "echo 'hello world'";
