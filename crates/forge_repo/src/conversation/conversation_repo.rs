@@ -501,6 +501,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_sub_conversations_is_scoped_by_workspace_when_parent_id_is_reused()
+    -> anyhow::Result<()> {
+        let pool = Arc::new(DatabasePool::in_memory()?);
+        let parent_id = ConversationId::generate();
+        let scoped_repo = repository_with_pool(pool.clone(), WorkspaceHash::new(0));
+        let foreign_repo = repository_with_pool(pool, WorkspaceHash::new(1));
+        let child_context =
+            Context::default().messages(vec![ContextMessage::user("Agent task", None).into()]);
+        let child_conversation = Conversation::new(ConversationId::generate())
+            .initiator(forge_domain::Initiator::Agent)
+            .title(Some("Foreign Explicit Subchat".to_string()))
+            .context(Some(child_context))
+            .parent_id(Some(parent_id));
+
+        foreign_repo
+            .upsert_conversation(child_conversation.clone())
+            .await?;
+        let scoped_actual = scoped_repo.get_sub_conversations(&parent_id).await?;
+        let foreign_actual = foreign_repo.get_sub_conversations(&parent_id).await?;
+        let expected = vec![child_conversation.id];
+
+        assert!(scoped_actual.is_empty());
+        assert_eq!(
+            foreign_actual
+                .iter()
+                .map(|conv| conv.id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_persisted_user_session_promotion_updates_primary_and_subchat_indexes()
     -> anyhow::Result<()> {
         let parent_id = ConversationId::generate();
