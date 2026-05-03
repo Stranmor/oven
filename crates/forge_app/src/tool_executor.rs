@@ -438,13 +438,16 @@ impl<
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::symlink;
-    use std::path::PathBuf;
-
+    use super::*;
     use forge_domain::{PermissionOperation, ProcessStart, Shell};
     use pretty_assertions::assert_eq;
-
-    use super::*;
+    use std::path::PathBuf;
+    fn create_directory_symlink(physical: &PathBuf, alias: &PathBuf) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(physical, alias).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(physical, alias).unwrap();
+    }
 
     fn symlink_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let fixture = tempfile::tempdir().unwrap();
@@ -453,7 +456,7 @@ mod tests {
         let alias = workspace.join("alias");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&physical).unwrap();
-        symlink(&physical, &alias).unwrap();
+        create_directory_symlink(&physical, &alias);
         (fixture, workspace, physical)
     }
 
