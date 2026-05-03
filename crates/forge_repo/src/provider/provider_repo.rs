@@ -4,8 +4,8 @@ use bytes::Bytes;
 use forge_app::domain::{ProviderId, ProviderResponse};
 use forge_app::{EnvironmentInfra, FileReaderInfra, FileWriterInfra, HttpInfra};
 use forge_domain::{
-    AnyProvider, ApiKey, AuthCredential, AuthDetails, Error, MigrationResult, Provider,
-    ProviderRepository, ProviderType, URLParam, URLParamSpec, URLParamValue,
+    AnyProvider, ApiKey, AuthCredential, AuthDetails, Error, InputModality, MigrationResult, Model,
+    ModelId, Provider, ProviderRepository, ProviderType, URLParam, URLParamSpec, URLParamValue,
 };
 use merge::Merge;
 use serde::Deserialize;
@@ -17,7 +17,62 @@ enum Models {
     /// Models are fetched from a URL
     Url(String),
     /// Models are hardcoded in the configuration
-    Hardcoded(Vec<forge_app::domain::Model>),
+    Hardcoded(Vec<HardcodedModelConfig>),
+}
+
+/// Hardcoded provider-local model config. The provider id is derived from the
+/// enclosing provider config during domain conversion.
+#[derive(Debug, Clone, Deserialize)]
+struct HardcodedModelConfig {
+    id: ModelId,
+    name: Option<String>,
+    description: Option<String>,
+    context_length: Option<u64>,
+    tools_supported: Option<bool>,
+    supports_parallel_tool_calls: Option<bool>,
+    supports_reasoning: Option<bool>,
+    #[serde(default = "default_input_modalities")]
+    input_modalities: Vec<InputModality>,
+}
+
+fn default_input_modalities() -> Vec<InputModality> {
+    vec![InputModality::Text]
+}
+
+impl HardcodedModelConfig {
+    fn into_model(self, provider_id: ProviderId) -> Model {
+        Model {
+            id: self.id,
+            provider_id,
+            name: self.name,
+            description: self.description,
+            context_length: self.context_length,
+            tools_supported: self.tools_supported,
+            supports_parallel_tool_calls: self.supports_parallel_tool_calls,
+            supports_reasoning: self.supports_reasoning,
+            input_modalities: self.input_modalities,
+        }
+    }
+}
+
+impl Models {
+    fn to_model_source(
+        &self,
+        provider_id: &ProviderId,
+    ) -> forge_domain::ModelSource<forge_domain::Template<forge_domain::URLParameters>> {
+        match self {
+            Self::Url(model_url_template) => forge_domain::ModelSource::Url(
+                forge_domain::Template::<forge_domain::URLParameters>::new(model_url_template),
+            ),
+            Self::Hardcoded(model_list) => forge_domain::ModelSource::Hardcoded(
+                model_list
+                    .clone()
+                    .into_iter()
+                    .map(|model| model.into_model(provider_id.clone()))
+                    .collect(),
+            ),
+        }
+    }
 }
 
 /// A single URL parameter variable entry, supporting both plain names and names
@@ -191,14 +246,10 @@ impl From<forge_config::ProviderEntry> for ProviderConfig {
 
 impl From<&ProviderConfig> for forge_domain::ProviderTemplate {
     fn from(config: &ProviderConfig) -> Self {
-        let models = config.models.as_ref().map(|m| match m {
-            Models::Url(model_url_template) => forge_domain::ModelSource::Url(
-                forge_domain::Template::<forge_domain::URLParameters>::new(model_url_template),
-            ),
-            Models::Hardcoded(model_list) => {
-                forge_domain::ModelSource::Hardcoded(model_list.clone())
-            }
-        });
+        let models = config
+            .models
+            .as_ref()
+            .map(|model_source| model_source.to_model_source(&config.id));
 
         Provider {
             id: config.id.clone(),
@@ -438,14 +489,10 @@ impl<
         }
 
         // Handle models - keep as templates
-        let models = config.models.as_ref().map(|m| match m {
-            Models::Url(model_url_template) => forge_domain::ModelSource::Url(
-                forge_domain::Template::<forge_domain::URLParameters>::new(model_url_template),
-            ),
-            Models::Hardcoded(model_list) => {
-                forge_domain::ModelSource::Hardcoded(model_list.clone())
-            }
-        });
+        let models = config
+            .models
+            .as_ref()
+            .map(|model_source| model_source.to_model_source(&config.id));
 
         Ok(Provider {
             id: config.id.clone(),
@@ -659,6 +706,163 @@ mod tests {
         assert_eq!(
             vivgrid_config.url.as_str(),
             "https://api.vivgrid.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn test_hardcoded_models_derive_provider_id_from_provider_config() {
+        let configs = serde_json::from_str::<Vec<ProviderConfig>>(
+            r#"[
+                {
+                    "id": "test-provider",
+                    "url": "https://example.com/v1/chat/completions",
+                    "models": [
+                        {
+                            "id": "test-model",
+                            "name": "Test Model",
+                            "context_length": 12345,
+                            "tools_supported": true
+                        }
+                    ],
+                    "auth_methods": ["api_key"]
+                }
+            ]"#,
+        )
+        .unwrap();
+        let fixture = configs.first().unwrap();
+
+        let actual = forge_domain::ProviderTemplate::from(fixture);
+        let expected = forge_domain::ProviderTemplate {
+            id: ProviderId::from("test-provider".to_string()),
+            provider_type: ProviderType::Llm,
+            response: None,
+            url: forge_domain::Template::<forge_domain::URLParameters>::new(
+                "https://example.com/v1/chat/completions",
+            ),
+            models: Some(forge_domain::ModelSource::Hardcoded(vec![Model {
+                id: ModelId::from("test-model"),
+                provider_id: ProviderId::from("test-provider".to_string()),
+                name: Some("Test Model".to_string()),
+                description: None,
+                context_length: Some(12345),
+                tools_supported: Some(true),
+                supports_parallel_tool_calls: None,
+                supports_reasoning: None,
+                input_modalities: vec![InputModality::Text],
+            }])),
+            auth_methods: vec![AuthMethod::ApiKey],
+            url_params: vec![],
+            credential: None,
+            custom_headers: None,
+        };
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_hardcoded_model_provider_id_field_is_ignored_and_derived() {
+        let configs = serde_json::from_str::<Vec<ProviderConfig>>(
+            r#"[
+                {
+                    "id": "authoritative-provider",
+                    "url": "https://example.com/v1/chat/completions",
+                    "models": [{"id": "test-model", "provider_id": "spoofed-provider"}],
+                    "auth_methods": ["api_key"]
+                }
+            ]"#,
+        )
+        .unwrap();
+
+        let actual = forge_domain::ProviderTemplate::from(configs.first().unwrap());
+        let forge_domain::ModelSource::Hardcoded(models) = actual.models.unwrap() else {
+            panic!("Expected hardcoded models");
+        };
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(
+            models[0].provider_id,
+            ProviderId::from("authoritative-provider".to_string())
+        );
+    }
+
+    #[test]
+    fn test_hardcoded_model_input_modalities_default_and_explicit_values() {
+        let configs = serde_json::from_str::<Vec<ProviderConfig>>(
+            r#"[
+                {
+                    "id": "modality-provider",
+                    "url": "https://example.com/v1/chat/completions",
+                    "models": [
+                        {"id": "text-default"},
+                        {"id": "vision", "input_modalities": ["text", "image"]}
+                    ],
+                    "auth_methods": ["api_key"]
+                }
+            ]"#,
+        )
+        .unwrap();
+
+        let actual = forge_domain::ProviderTemplate::from(configs.first().unwrap());
+        let forge_domain::ModelSource::Hardcoded(models) = actual.models.unwrap() else {
+            panic!("Expected hardcoded models");
+        };
+
+        assert_eq!(models[0].input_modalities, vec![InputModality::Text]);
+        assert_eq!(
+            models[1].input_modalities,
+            vec![InputModality::Text, InputModality::Image]
+        );
+    }
+
+    #[test]
+    fn test_inline_provider_url_model_source_is_preserved() {
+        let entry = forge_config::ProviderEntry {
+            id: "url-provider".to_string(),
+            api_key_var: Some("URL_PROVIDER_API_KEY".to_string()),
+            url: "https://example.com/v1/chat/completions".to_string(),
+            models: Some("https://example.com/v1/models".to_string()),
+            response_type: Some(forge_config::ProviderResponseType::OpenAI),
+            url_param_vars: vec![],
+            custom_headers: None,
+            provider_type: None,
+            auth_methods: vec![],
+        };
+
+        let config = ProviderConfig::from(entry);
+        let actual = forge_domain::ProviderTemplate::from(&config);
+        let expected = forge_domain::Template::<forge_domain::URLParameters>::new(
+            "https://example.com/v1/models",
+        );
+
+        assert_eq!(
+            actual.models,
+            Some(forge_domain::ModelSource::Url(expected))
+        );
+    }
+
+    #[test]
+    fn test_vivgrid_hardcoded_models_use_vivgrid_provider_id() {
+        let configs = get_provider_configs();
+        let fixture = configs
+            .iter()
+            .find(|c| c.id == ProviderId::VIVGRID)
+            .unwrap();
+
+        let actual = forge_domain::ProviderTemplate::from(fixture);
+        let expected = Some(ProviderId::VIVGRID);
+
+        let forge_domain::ModelSource::Hardcoded(models) = actual.models.unwrap() else {
+            panic!("Expected hardcoded Vivgrid models");
+        };
+        assert!(models.len() >= 3);
+        assert_eq!(
+            models.first().map(|model| model.provider_id.clone()),
+            expected
+        );
+        assert!(
+            models
+                .iter()
+                .all(|model| model.provider_id == ProviderId::VIVGRID)
         );
     }
 

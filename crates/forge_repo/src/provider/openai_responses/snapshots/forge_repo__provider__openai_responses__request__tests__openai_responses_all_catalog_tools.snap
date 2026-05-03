@@ -505,6 +505,145 @@ expression: actual.tools
   },
   {
     "type": "function",
+    "name": "process_start",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "description": "The shell command to start as a managed background process.",
+          "type": "string"
+        },
+        "cwd": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The working directory where the process should start."
+        },
+        "description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Clear, concise description of what this background process does."
+        },
+        "env": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Environment variable names to pass to the process."
+        }
+      },
+      "required": [
+        "command",
+        "cwd",
+        "description",
+        "env"
+      ],
+      "title": "ProcessStart",
+      "type": "object"
+    },
+    "strict": true,
+    "description": "Starts a shell command as a managed background process and returns immediately with a `process_id` handle.\n\nUse this for long-running servers, watchers, REPL-adjacent daemons, and commands expected to run longer than an interactive foreground turn. Do not use it for short commands; use `shell` instead.\n\nThe process captures stdout/stderr asynchronously. Use `process_status` to inspect lifecycle state, `process_read` to read captured output with a cursor, `process_list` to see active handles, and `process_kill` to stop a process.\n\nThe `cwd` parameter sets the working directory. Do not put `cd` in the command string."
+  },
+  {
+    "type": "function",
+    "name": "process_status",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "process_id": {
+          "description": "Handle returned by process_start.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "process_id"
+      ],
+      "title": "ProcessStatusInput",
+      "type": "object"
+    },
+    "strict": true,
+    "description": "Returns structured lifecycle status for a managed background process previously started with `process_start`.\n\nThe result includes the typed `process_id`, command, working directory, and status: running, exited with exit code, or killed."
+  },
+  {
+    "type": "function",
+    "name": "process_read",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "cursor": {
+          "default": 0,
+          "description": "Cursor returned by the previous process_read call. Defaults to 0.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "process_id": {
+          "description": "Handle returned by process_start.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "cursor",
+        "process_id"
+      ],
+      "title": "ProcessRead",
+      "type": "object"
+    },
+    "strict": true,
+    "description": "Reads captured stdout/stderr from a managed background process previously started with `process_start`.\n\nPass the `cursor` returned by the previous `process_read` call to receive only new output. Omit it or pass `0` to read from the beginning. The result returns `next_cursor` for idempotent continuation."
+  },
+  {
+    "type": "function",
+    "name": "process_list",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "ProcessList",
+      "type": "object"
+    },
+    "strict": true,
+    "description": "Lists all managed background process handles known to the current Forge runtime.\n\nUse this before starting duplicate servers or to discover handles for status, log reading, and cleanup."
+  },
+  {
+    "type": "function",
+    "name": "process_kill",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "process_id": {
+          "description": "Handle returned by process_start.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "process_id"
+      ],
+      "title": "ProcessKill",
+      "type": "object"
+    },
+    "strict": true,
+    "description": "Stops a managed background process previously started with `process_start`.\n\nUse this to clean up servers, watchers, or long-running commands after verification. The result reports the final process status."
+  },
+  {
+    "type": "function",
     "name": "fetch",
     "parameters": {
       "additionalProperties": false,
