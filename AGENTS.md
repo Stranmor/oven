@@ -126,6 +126,16 @@ Always verify changes by running tests and linting the codebase
 - Safely assume github cli (gh) is pre-installed
 - Always use `Co-Authored-By: ForgeCode <noreply@forgecode.dev>` for git commits and Github comments
 
+## Local Forge Update Source
+
+The active local `forge` binary is protected infrastructure. Its updater-consumed source MUST be the user's fork `Stranmor/oven` on `origin/main`, because that branch integrates upstream Forge changes with local regression fixes. Directly tracking or consuming `antinomyhq/forgecode` `upstream/main` for the active local binary is forbidden: it can overwrite local patches and reintroduce fixed regressions.
+
+Correct update flow: merge or port upstream changes into `origin/main` first, verify the integrated fork, then let the updater consume that fork state. The updater MUST also preserve wrapper symlinks: a freshly built binary must never replace `~/.local/bin/forge` when that path is a wrapper/symlink entry point.
+
+Detection: About to point a local Forge auto-updater at upstream/main, install a built binary directly over `~/.local/bin/forge`, or bypass the fork integration branch → STOP → update `origin/main` first and preserve the wrapper/symlink boundary.
+
+Mnemonic: The fork is the update source; upstream is input, not the installed truth.
+
 ## Service Implementation Guidelines
 
 Services should follow clean architecture principles and maintain clear separation of concerns:
