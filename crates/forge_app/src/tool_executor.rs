@@ -442,27 +442,39 @@ mod tests {
     use forge_domain::{PermissionOperation, ProcessStart, Shell};
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
-    fn create_directory_symlink(physical: &PathBuf, alias: &PathBuf) {
+    fn create_directory_symlink(physical: &PathBuf, alias: &PathBuf) -> anyhow::Result<()> {
         #[cfg(unix)]
-        std::os::unix::fs::symlink(physical, alias).unwrap();
+        std::os::unix::fs::symlink(physical, alias)?;
         #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(physical, alias).unwrap();
+        if let Err(error) = std::os::windows::fs::symlink_dir(physical, alias) {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+        Ok(())
     }
 
-    fn symlink_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
-        let fixture = tempfile::tempdir().unwrap();
+    fn symlink_fixture() -> anyhow::Result<Option<(tempfile::TempDir, PathBuf, PathBuf)>> {
+        let fixture = tempfile::tempdir()?;
         let workspace = fixture.path().join("workspace");
         let physical = fixture.path().join("physical");
         let alias = workspace.join("alias");
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::create_dir_all(&physical).unwrap();
-        create_directory_symlink(&physical, &alias);
-        (fixture, workspace, physical)
+        std::fs::create_dir_all(&workspace)?;
+        std::fs::create_dir_all(&physical)?;
+        create_directory_symlink(&physical, &alias)?;
+        if !alias.exists() {
+            return Ok(None);
+        }
+        let physical = std::fs::canonicalize(&physical)?;
+        Ok(Some((fixture, workspace, physical)))
     }
 
     #[test]
-    fn test_shell_execution_cwd_matches_policy_physical_symlink_resolution() {
-        let (_fixture, workspace, physical) = symlink_fixture();
+    fn test_shell_execution_cwd_matches_policy_physical_symlink_resolution() -> anyhow::Result<()> {
+        let Some((_fixture, workspace, physical)) = symlink_fixture()? else {
+            return Ok(());
+        };
         let cwd = PathBuf::from("alias");
         let tool = ToolCatalog::Shell(Shell {
             command: "pwd".to_string(),
@@ -477,11 +489,15 @@ mod tests {
         };
         assert_eq!(actual, physical);
         assert_eq!(actual, expected);
+        Ok(())
     }
 
     #[test]
-    fn test_process_start_execution_cwd_matches_policy_physical_symlink_resolution() {
-        let (_fixture, workspace, physical) = symlink_fixture();
+    fn test_process_start_execution_cwd_matches_policy_physical_symlink_resolution()
+    -> anyhow::Result<()> {
+        let Some((_fixture, workspace, physical)) = symlink_fixture()? else {
+            return Ok(());
+        };
         let cwd = PathBuf::from("alias");
         let tool = ToolCatalog::ProcessStart(ProcessStart {
             command: "pwd".to_string(),
@@ -496,5 +512,6 @@ mod tests {
         };
         assert_eq!(actual, physical);
         assert_eq!(actual, expected);
+        Ok(())
     }
 }

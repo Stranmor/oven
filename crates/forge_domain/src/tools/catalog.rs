@@ -1,4 +1,7 @@
-#![allow(clippy::enum_variant_names)]
+#![allow(
+    clippy::enum_variant_names,
+    reason = "tool catalog variants intentionally preserve externally visible tool names"
+)]
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
