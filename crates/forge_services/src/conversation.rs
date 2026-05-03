@@ -187,4 +187,50 @@ mod tests {
         assert_eq!((persisted.initiator, persisted.parent_id), expected);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_ensure_delegated_conversation_without_parent_keeps_parentless_agent()
+    -> anyhow::Result<()> {
+        let repository = Arc::new(FixtureRepository::default());
+        let service = ForgeConversationService::new(repository.clone());
+        let conversation = Conversation::new(ConversationId::generate()).context(Some(
+            Context::default().messages(vec![ContextMessage::user("User chat", None).into()]),
+        ));
+
+        repository.upsert_conversation(conversation.clone()).await?;
+        let actual = service
+            .ensure_delegated_conversation(&conversation.id, None)
+            .await?;
+        let expected = (Initiator::Agent, None);
+
+        assert_eq!((actual.initiator, actual.parent_id), expected);
+        let persisted = repository
+            .get_conversation(&conversation.id)
+            .await?
+            .expect("parentless promoted conversation should be persisted");
+        assert_eq!((persisted.initiator, persisted.parent_id), expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ensure_delegated_conversation_reparents_already_agent_session()
+    -> anyhow::Result<()> {
+        let repository = Arc::new(FixtureRepository::default());
+        let service = ForgeConversationService::new(repository.clone());
+        let parent_id = ConversationId::generate();
+        let conversation = Conversation::new(ConversationId::generate())
+            .initiator(Initiator::Agent)
+            .context(Some(
+                Context::default().messages(vec![ContextMessage::user("Agent chat", None).into()]),
+            ));
+
+        repository.upsert_conversation(conversation.clone()).await?;
+        let actual = service
+            .ensure_delegated_conversation(&conversation.id, Some(parent_id))
+            .await?;
+        let expected = (Initiator::Agent, Some(parent_id));
+
+        assert_eq!((actual.initiator, actual.parent_id), expected);
+        Ok(())
+    }
 }

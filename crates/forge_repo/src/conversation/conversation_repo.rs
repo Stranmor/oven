@@ -386,6 +386,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_sub_conversations_includes_agent_conversations_for_explicit_parent()
+    -> anyhow::Result<()> {
+        let parent_id = ConversationId::generate();
+        let child_context =
+            Context::default().messages(vec![ContextMessage::user("Agent task", None).into()]);
+        let child_conversation = Conversation::new(ConversationId::generate())
+            .initiator(forge_domain::Initiator::Agent)
+            .title(Some("Explicit Subchat".to_string()))
+            .context(Some(child_context))
+            .parent_id(Some(parent_id));
+        let repo = repository()?;
+
+        repo.upsert_conversation(child_conversation.clone()).await?;
+        let actual = repo.get_sub_conversations(&parent_id).await?;
+        let expected = vec![child_conversation.id];
+
+        assert_eq!(
+            actual.iter().map(|conv| conv.id).collect::<Vec<_>>(),
+            expected
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_persisted_user_session_promotion_updates_primary_and_subchat_indexes()
     -> anyhow::Result<()> {
         let parent_id = ConversationId::generate();
@@ -480,6 +504,73 @@ mod tests {
 
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0].id, user_conv.id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_find_all_conversations_excludes_parentless_delegated_reused_session()
+    -> anyhow::Result<()> {
+        let user_context =
+            Context::default().messages(vec![ContextMessage::user("Hello", None).into()]);
+        let delegated_context =
+            Context::default().messages(vec![ContextMessage::user("Delegated", None).into()]);
+        let user_conv = Conversation::new(ConversationId::generate())
+            .title(Some("User Chat".to_string()))
+            .context(Some(user_context));
+        let mut delegated_conv = Conversation::new(ConversationId::generate())
+            .title(Some("Parentless Delegated".to_string()))
+            .context(Some(delegated_context));
+        delegated_conv.ensure_delegated(None);
+        let repo = repository()?;
+
+        repo.upsert_conversation(user_conv.clone()).await?;
+        repo.upsert_conversation(delegated_conv).await?;
+        let actual = repo.get_all_conversations().await?;
+        let expected = vec![user_conv.id];
+
+        assert_eq!(
+            actual.iter().map(|conv| conv.id).collect::<Vec<_>>(),
+            expected
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_find_all_conversations_returns_limitable_user_items_after_filtering()
+    -> anyhow::Result<()> {
+        let repo = repository()?;
+        let mut expected = Vec::new();
+
+        for index in 0..4 {
+            let agent_context = Context::default().messages(vec![
+                ContextMessage::user(format!("Agent task {index}"), None).into(),
+            ]);
+            let agent_conv = Conversation::new(ConversationId::generate())
+                .initiator(forge_domain::Initiator::Agent)
+                .title(Some(format!("Agent {index}")))
+                .context(Some(agent_context));
+            repo.upsert_conversation(agent_conv).await?;
+        }
+        for index in 0..3 {
+            let user_context = Context::default().messages(vec![
+                ContextMessage::user(format!("User task {index}"), None).into(),
+            ]);
+            let user_conv = Conversation::new(ConversationId::generate())
+                .title(Some(format!("User {index}")))
+                .context(Some(user_context));
+            repo.upsert_conversation(user_conv.clone()).await?;
+            expected.push(user_conv.id);
+        }
+
+        let actual = repo.get_all_conversations().await?;
+        let actual_ids = actual
+            .into_iter()
+            .take(2)
+            .map(|conv| conv.id)
+            .collect::<Vec<_>>();
+        let expected = expected.into_iter().rev().take(2).collect::<Vec<_>>();
+
+        assert_eq!(actual_ids, expected);
         Ok(())
     }
 
