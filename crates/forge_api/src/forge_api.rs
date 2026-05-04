@@ -219,6 +219,7 @@ impl<
         self.infra
             .execute_command(command.to_string(), working_dir, false, None)
             .await
+            .map(|execution| execution.output)
     }
     async fn read_mcp_config(&self, scope: Option<&Scope>) -> Result<McpConfig> {
         self.services

@@ -2,8 +2,15 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+/// Result of executing a shell command.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CommandExecutionOutput {
+    pub output: CommandOutput,
+    pub process: Option<ProcessStartOutput>,
+}
+
 /// Output from a command execution
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CommandOutput {
     pub command: String,
     pub stdout: String,

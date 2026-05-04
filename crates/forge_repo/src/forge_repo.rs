@@ -10,8 +10,8 @@ use forge_app::{
 };
 use forge_config::ForgeConfig;
 use forge_domain::{
-    AnyProvider, AuthCredential, ChatCompletionMessage, ChatRepository, CommandOutput, Context,
-    Conversation, ConversationId, ConversationRepository, Environment, FileInfo,
+    AnyProvider, AuthCredential, ChatCompletionMessage, ChatRepository, CommandExecutionOutput,
+    Context, Conversation, ConversationId, ConversationRepository, Environment, FileInfo,
     FuzzySearchRepository, McpServerConfig, MigrationResult, Model, ModelId, ProcessId,
     ProcessReadCursor, ProcessReadOutput, ProcessStartOutput, ProcessStatus, Provider, ProviderId,
     ProviderRepository, ResultStream, SearchMatch, Skill, SkillRepository, Snapshot,
@@ -475,7 +475,7 @@ where
         working_dir: PathBuf,
         silent: bool,
         env_vars: Option<Vec<String>>,
-    ) -> anyhow::Result<CommandOutput> {
+    ) -> anyhow::Result<CommandExecutionOutput> {
         self.infra
             .execute_command(command, working_dir, silent, env_vars)
             .await

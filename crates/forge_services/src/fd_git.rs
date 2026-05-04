@@ -31,7 +31,7 @@ impl<F: CommandInfra> FsGit<F> {
     /// Returns an error when the command cannot be executed or exits with a
     /// non-zero status (e.g. the directory is not a git repository).
     async fn git_ls_files(&self, dir_path: &Path) -> anyhow::Result<Vec<String>> {
-        let output = self
+        let execution = self
             .infra
             .execute_command(
                 "git ls-files".to_string(),
@@ -40,6 +40,7 @@ impl<F: CommandInfra> FsGit<F> {
                 None,
             )
             .await?;
+        let output = execution.output;
 
         if output.exit_code != Some(0) {
             let err = anyhow::anyhow!(output.stderr);

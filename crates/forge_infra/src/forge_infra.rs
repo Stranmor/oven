@@ -10,7 +10,7 @@ use forge_app::{
     StrategyFactory, UserInfra, WalkerInfra,
 };
 use forge_domain::{
-    AuthMethod, CommandOutput, FileInfo as FileInfoData, McpServerConfig, ProcessId,
+    AuthMethod, CommandExecutionOutput, FileInfo as FileInfoData, McpServerConfig, ProcessId,
     ProcessReadCursor, ProcessReadOutput, ProcessStartOutput, ProcessStatus, ProviderId,
     URLParamSpec,
 };
@@ -236,7 +236,7 @@ impl CommandInfra for ForgeInfra {
         working_dir: PathBuf,
         silent: bool,
         env_vars: Option<Vec<String>>,
-    ) -> anyhow::Result<CommandOutput> {
+    ) -> anyhow::Result<CommandExecutionOutput> {
         self.command_executor_service
             .execute_command(command, working_dir, silent, env_vars)
             .await

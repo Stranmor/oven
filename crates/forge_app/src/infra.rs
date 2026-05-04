@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use bytes::Bytes;
 use forge_domain::{
-    AuthCodeParams, CommandOutput, ConfigOperation, Environment, FileInfo, McpServerConfig,
-    OAuthConfig, OAuthTokenResponse, ProcessId, ProcessReadCursor, ProcessReadOutput,
-    ProcessStartOutput, ProcessStatus, ToolDefinition, ToolName, ToolOutput,
+    AuthCodeParams, CommandExecutionOutput, ConfigOperation, Environment, FileInfo,
+    McpServerConfig, OAuthConfig, OAuthTokenResponse, ProcessId, ProcessReadCursor,
+    ProcessReadOutput, ProcessStartOutput, ProcessStatus, ToolDefinition, ToolName, ToolOutput,
 };
 use forge_eventsource::EventSource;
 use reqwest::Response;
@@ -154,7 +154,7 @@ pub trait CommandInfra: Send + Sync {
         working_dir: PathBuf,
         silent: bool,
         env_vars: Option<Vec<String>>,
-    ) -> anyhow::Result<CommandOutput>;
+    ) -> anyhow::Result<CommandExecutionOutput>;
 
     /// execute the shell command on present stdio.
     async fn execute_command_raw(

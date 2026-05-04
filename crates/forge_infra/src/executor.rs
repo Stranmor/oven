@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bstr::ByteSlice;
 use forge_app::CommandInfra;
 use forge_domain::{
-    CommandOutput, ConsoleWriter as OutputPrinterTrait, Environment, ProcessId, ProcessLogEntry,
-    ProcessReadCursor, ProcessReadOutput, ProcessStartOutput, ProcessStatus, ProcessStatusKind,
-    ProcessStream,
+    CommandExecutionOutput, CommandOutput, ConsoleWriter as OutputPrinterTrait, Environment,
+    ProcessId, ProcessLogEntry, ProcessReadCursor, ProcessReadOutput, ProcessStartOutput,
+    ProcessStatus, ProcessStatusKind, ProcessStream,
 };
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 use crate::console::StdConsoleWriter;
 
 const MAX_BACKGROUND_LOG_ENTRIES: usize = 8192;
+const SHELL_SYNC_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Service for executing shell commands
 #[derive(Clone)]
@@ -37,14 +38,59 @@ struct ManagedProcess {
     status: ProcessStatusKind,
     logs: Arc<Mutex<VecDeque<ProcessLogEntry>>>,
     dropped_before_cursor: Arc<AtomicU64>,
+    stdout_task: Option<tokio::task::JoinHandle<()>>,
+    stderr_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+struct LaunchedProcess {
+    process_id: ProcessId,
+    child: Child,
+    command: String,
+    cwd: String,
+    logs: Arc<Mutex<VecDeque<ProcessLogEntry>>>,
+    dropped_before_cursor: Arc<AtomicU64>,
+    stdout: Arc<Mutex<Vec<u8>>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    stdout_task: Option<tokio::task::JoinHandle<()>>,
+    stderr_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl LaunchedProcess {
+    fn start_output(&self) -> ProcessStartOutput {
+        ProcessStartOutput {
+            process_id: self.process_id.clone(),
+            status: ProcessStatusKind::Running,
+            command: self.command.clone(),
+            cwd: self.cwd.clone(),
+        }
+    }
+
+    fn into_managed(self) -> ManagedProcess {
+        ManagedProcess {
+            command: self.command,
+            cwd: self.cwd,
+            child: self.child,
+            status: ProcessStatusKind::Running,
+            logs: self.logs,
+            dropped_before_cursor: self.dropped_before_cursor,
+            stdout_task: self.stdout_task,
+            stderr_task: self.stderr_task,
+        }
+    }
 }
 
 impl ManagedProcess {
-    fn refresh_status(&mut self) -> anyhow::Result<()> {
+    async fn refresh_status(&mut self) -> anyhow::Result<()> {
         if matches!(self.status, ProcessStatusKind::Running)
             && let Some(status) = self.child.try_wait()?
         {
             self.status = ProcessStatusKind::Exited { exit_code: status.code() };
+            if let Some(stdout_task) = self.stdout_task.take() {
+                stdout_task.await?;
+            }
+            if let Some(stderr_task) = self.stderr_task.take() {
+                stderr_task.await?;
+            }
         }
         Ok(())
     }
@@ -108,6 +154,8 @@ impl ForgeCommandExecutorService {
         tracing::info!(command = command_str, "Executing command");
 
         command.kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
 
         // Set the working directory
         command.current_dir(working_dir);
@@ -139,17 +187,83 @@ impl ForgeCommandExecutorService {
         ProcessId::new(format!("process-{sequence}"))
     }
 
-    fn capture_stream<A>(
+    fn launch_process(
+        &self,
+        command: String,
+        working_dir: &Path,
+        env_vars: Option<Vec<String>>,
+        silent: bool,
+    ) -> anyhow::Result<LaunchedProcess> {
+        let mut prepared_command = self.prepare_command(&command, working_dir, env_vars);
+        prepared_command.stdin(std::process::Stdio::null());
+        let mut child = prepared_command.spawn()?;
+        let logs = Arc::new(Mutex::new(VecDeque::new()));
+        let next_cursor = Arc::new(AtomicU64::new(1));
+        let dropped_before_cursor = Arc::new(AtomicU64::new(0));
+        let stdout = Arc::new(Mutex::new(Vec::new()));
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+
+        let stdout_task = child.stdout.take().map(|stdout_pipe| {
+            Self::capture_stream(
+                stdout_pipe,
+                ProcessStream::Stdout,
+                logs.clone(),
+                next_cursor.clone(),
+                dropped_before_cursor.clone(),
+                stdout.clone(),
+                if silent {
+                    OutputSink::silent()
+                } else {
+                    OutputSink::stdout(self.output_printer.clone())
+                },
+            )
+        });
+        let stderr_task = child.stderr.take().map(|stderr_pipe| {
+            Self::capture_stream(
+                stderr_pipe,
+                ProcessStream::Stderr,
+                logs.clone(),
+                next_cursor,
+                dropped_before_cursor.clone(),
+                stderr.clone(),
+                if silent {
+                    OutputSink::silent()
+                } else {
+                    OutputSink::stderr(self.output_printer.clone())
+                },
+            )
+        });
+
+        Ok(LaunchedProcess {
+            process_id: Self::next_process_id(),
+            child,
+            command,
+            cwd: working_dir.display().to_string(),
+            logs,
+            dropped_before_cursor,
+            stdout,
+            stderr,
+            stdout_task,
+            stderr_task,
+        })
+    }
+
+    fn capture_stream<A, W>(
         mut reader: A,
         stream: ProcessStream,
         logs: Arc<Mutex<VecDeque<ProcessLogEntry>>>,
         next_cursor: Arc<AtomicU64>,
         dropped_before_cursor: Arc<AtomicU64>,
-    ) where
+        output: Arc<Mutex<Vec<u8>>>,
+        mut writer: W,
+    ) -> tokio::task::JoinHandle<()>
+    where
         A: AsyncReadExt + Unpin + Send + 'static,
+        W: Write + Send + 'static,
     {
         tokio::spawn(async move {
             let mut buffer = [0; 1024];
+            let mut pending = Vec::<u8>::new();
             loop {
                 let Ok(count) = reader.read(&mut buffer).await else {
                     break;
@@ -160,6 +274,7 @@ impl ForgeCommandExecutorService {
                 let Some(bytes) = buffer.get(..count) else {
                     break;
                 };
+                output.lock().await.extend_from_slice(bytes);
                 let content = bytes.to_str_lossy().into_owned();
                 let mut logs = logs.lock().await;
                 let cursor = next_cursor.fetch_add(1, Ordering::Relaxed);
@@ -169,66 +284,125 @@ impl ForgeCommandExecutorService {
                     content,
                 });
                 trim_background_logs(&mut logs, &dropped_before_cursor);
+                drop(logs);
+
+                let mut working = std::mem::take(&mut pending);
+                working.extend_from_slice(bytes);
+                pending = match write_lossy_utf8(&mut writer, &working) {
+                    Ok(pending) => pending,
+                    Err(_) => break,
+                };
+                let _ = writer.flush();
             }
-        });
+
+            if !pending.is_empty() {
+                let _ = writer.write_all(pending.to_str_lossy().as_bytes());
+                let _ = writer.flush();
+            }
+        })
     }
 
-    /// Internal method to execute commands with streaming to console
+    async fn snapshot_output(output: &Arc<Mutex<Vec<u8>>>) -> String {
+        output.lock().await.to_str_lossy().into_owned()
+    }
+
+    async fn register_launched_process(&self, launched: LaunchedProcess) {
+        self.processes
+            .lock()
+            .await
+            .insert(launched.process_id.clone(), launched.into_managed());
+    }
+
     async fn execute_command_internal(
         &self,
         command: String,
         working_dir: &Path,
         silent: bool,
         env_vars: Option<Vec<String>>,
-    ) -> anyhow::Result<CommandOutput> {
-        let ready = self.ready.lock().await;
+    ) -> anyhow::Result<CommandExecutionOutput> {
+        let _ready = self.ready.lock().await;
+        let mut launched = self.launch_process(command, working_dir, env_vars, silent)?;
+        let exit = tokio::time::timeout(SHELL_SYNC_STARTUP_TIMEOUT, launched.child.wait()).await;
 
-        let mut prepared_command = self.prepare_command(&command, working_dir, env_vars);
+        match exit {
+            Ok(status) => {
+                let status = status?;
+                if let Some(stdout_task) = launched.stdout_task.take() {
+                    stdout_task.await?;
+                }
+                if let Some(stderr_task) = launched.stderr_task.take() {
+                    stderr_task.await?;
+                }
+                let stdout = Self::snapshot_output(&launched.stdout).await;
+                let stderr = Self::snapshot_output(&launched.stderr).await;
 
-        // Spawn the command
-        let mut child = prepared_command.spawn()?;
+                if !silent && !stdout.ends_with('\n') && !stdout.is_empty() {
+                    let _ = self.output_printer.write(b"\n");
+                    let _ = self.output_printer.flush();
+                }
 
-        let mut stdout_pipe = child.stdout.take();
-        let mut stderr_pipe = child.stderr.take();
-
-        // Stream the output of the command to stdout and stderr concurrently
-        let (status, stdout_buffer, stderr_buffer) = if silent {
-            tokio::try_join!(
-                child.wait(),
-                stream(&mut stdout_pipe, io::sink()),
-                stream(&mut stderr_pipe, io::sink())
-            )?
-        } else {
-            let stdout_writer = OutputPrinterWriter::stdout(self.output_printer.clone());
-            let stderr_writer = OutputPrinterWriter::stderr(self.output_printer.clone());
-            let result = tokio::try_join!(
-                child.wait(),
-                stream(&mut stdout_pipe, stdout_writer),
-                stream(&mut stderr_pipe, stderr_writer)
-            )?;
-
-            // If the command's stdout did not end with a newline, the terminal
-            // cursor is left mid-line. Write a newline so that subsequent output
-            // (e.g. the LLM response) starts on a fresh line.
-            if result.1.last() != Some(&b'\n') && !result.1.is_empty() {
-                let _ = self.output_printer.write(b"\n");
-                let _ = self.output_printer.flush();
+                Ok(CommandExecutionOutput {
+                    output: CommandOutput {
+                        stdout,
+                        stderr,
+                        exit_code: status.code(),
+                        command: launched.command,
+                    },
+                    process: None,
+                })
             }
+            Err(_) => {
+                let process = launched.start_output();
+                let stdout = Self::snapshot_output(&launched.stdout).await;
+                let captured_stderr = Self::snapshot_output(&launched.stderr).await;
+                let stderr = format!(
+                    "{captured_stderr}Command exceeded the 2 second synchronous shell window and is running as managed background process {process_id}. Use process_status and process_read with this process_id to observe it.",
+                    process_id = process.process_id
+                );
+                let command = launched.command.clone();
+                self.register_launched_process(launched).await;
 
-            result
-        };
+                Ok(CommandExecutionOutput {
+                    output: CommandOutput { stdout, stderr, exit_code: None, command },
+                    process: Some(process),
+                })
+            }
+        }
+    }
+}
 
-        // Drop happens after `try_join` due to <https://github.com/tokio-rs/tokio/issues/4309>
-        drop(stdout_pipe);
-        drop(stderr_pipe);
-        drop(ready);
+enum OutputSink {
+    Console(OutputPrinterWriter),
+    Silent(io::Sink),
+}
 
-        Ok(CommandOutput {
-            stdout: stdout_buffer.to_str_lossy().into_owned(),
-            stderr: stderr_buffer.to_str_lossy().into_owned(),
-            exit_code: status.code(),
-            command,
-        })
+impl OutputSink {
+    fn stdout(printer: Arc<StdConsoleWriter>) -> Self {
+        Self::Console(OutputPrinterWriter::stdout(printer))
+    }
+
+    fn stderr(printer: Arc<StdConsoleWriter>) -> Self {
+        Self::Console(OutputPrinterWriter::stderr(printer))
+    }
+
+    fn silent() -> Self {
+        Self::Silent(io::sink())
+    }
+}
+
+impl Write for OutputSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Console(writer) => writer.write(buf),
+            Self::Silent(writer) => writer.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Console(writer) => writer.flush(),
+            Self::Silent(writer) => writer.flush(),
+        }
     }
 }
 
@@ -265,40 +439,6 @@ impl Write for OutputPrinterWriter {
     }
 }
 
-/// reads the output from A and writes it to W
-async fn stream<A: AsyncReadExt + Unpin, W: Write>(
-    io: &mut Option<A>,
-    mut writer: W,
-) -> io::Result<Vec<u8>> {
-    let mut output = Vec::new();
-    if let Some(io) = io.as_mut() {
-        let mut buff = [0; 1024];
-        // Carry incomplete trailing UTF-8 codepoint bytes across reads — Windows
-        // console stdio rejects even one byte of a split codepoint.
-        let mut pending = Vec::<u8>::new();
-        loop {
-            let n = io.read(&mut buff).await?;
-            if n == 0 {
-                break;
-            }
-            let chunk = buff.get(..n).unwrap_or(&[]);
-            output.extend_from_slice(chunk);
-
-            let mut working = std::mem::take(&mut pending);
-            working.extend_from_slice(chunk);
-            pending = write_lossy_utf8(&mut writer, &working)?;
-            // note: flush is necessary else we get the cursor could not be found error.
-            writer.flush()?;
-        }
-        // Flush dangling bytes from a stream that ended mid-codepoint.
-        if !pending.is_empty() {
-            writer.write_all(pending.to_str_lossy().as_bytes())?;
-            writer.flush()?;
-        }
-    }
-    Ok(output)
-}
-
 /// Writes `buf` as valid UTF-8 (invalid bytes → `U+FFFD`) and returns any
 /// incomplete trailing codepoint bytes for the caller to carry into the next
 /// chunk.
@@ -325,6 +465,33 @@ fn trim_background_logs(logs: &mut VecDeque<ProcessLogEntry>, dropped_before_cur
             dropped_before_cursor.store(dropped.cursor.get(), Ordering::Relaxed);
         }
     }
+}
+
+#[cfg(unix)]
+async fn kill_child_process_group(child: &mut Child) -> anyhow::Result<()> {
+    let pid = child
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Managed process has no live pid"))?;
+    let process_group_id = i32::try_from(pid)?;
+    let kill_target = process_group_id
+        .checked_neg()
+        .ok_or_else(|| anyhow::anyhow!("Invalid managed process group id: {process_group_id}"))?;
+    // SAFETY: The child was created with `process_group(0)`, so its process
+    // group id is its pid. Passing the negative process group id to POSIX
+    // `kill` targets that group instead of an unrelated process.
+    let result = unsafe { libc::kill(kill_target, libc::SIGKILL) };
+    if result == -1 {
+        child.kill().await?;
+    } else {
+        let _ = child.wait().await?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn kill_child_process_group(child: &mut Child) -> anyhow::Result<()> {
+    child.kill().await?;
+    Ok(())
 }
 
 fn process_read_output_from_logs(
@@ -359,7 +526,7 @@ impl CommandInfra for ForgeCommandExecutorService {
         working_dir: PathBuf,
         silent: bool,
         env_vars: Option<Vec<String>>,
-    ) -> anyhow::Result<CommandOutput> {
+    ) -> anyhow::Result<CommandExecutionOutput> {
         self.execute_command_internal(command, &working_dir, silent, env_vars)
             .await
     }
@@ -384,50 +551,9 @@ impl CommandInfra for ForgeCommandExecutorService {
         working_dir: PathBuf,
         env_vars: Option<Vec<String>>,
     ) -> anyhow::Result<ProcessStartOutput> {
-        let mut prepared_command = self.prepare_command(&command, &working_dir, env_vars);
-        prepared_command.stdin(std::process::Stdio::null());
-        let mut child = prepared_command.spawn()?;
-        let logs = Arc::new(Mutex::new(VecDeque::new()));
-        let next_cursor = Arc::new(AtomicU64::new(1));
-        let dropped_before_cursor = Arc::new(AtomicU64::new(0));
-
-        if let Some(stdout) = child.stdout.take() {
-            Self::capture_stream(
-                stdout,
-                ProcessStream::Stdout,
-                logs.clone(),
-                next_cursor.clone(),
-                dropped_before_cursor.clone(),
-            );
-        }
-        if let Some(stderr) = child.stderr.take() {
-            Self::capture_stream(
-                stderr,
-                ProcessStream::Stderr,
-                logs.clone(),
-                next_cursor.clone(),
-                dropped_before_cursor.clone(),
-            );
-        }
-
-        let process_id = Self::next_process_id();
-        let output = ProcessStartOutput {
-            process_id: process_id.clone(),
-            status: ProcessStatusKind::Running,
-            command: command.clone(),
-            cwd: working_dir.display().to_string(),
-        };
-        self.processes.lock().await.insert(
-            process_id,
-            ManagedProcess {
-                command,
-                cwd: working_dir.display().to_string(),
-                child,
-                status: ProcessStatusKind::Running,
-                logs,
-                dropped_before_cursor,
-            },
-        );
+        let launched = self.launch_process(command, &working_dir, env_vars, false)?;
+        let output = launched.start_output();
+        self.register_launched_process(launched).await;
         Ok(output)
     }
 
@@ -436,7 +562,7 @@ impl CommandInfra for ForgeCommandExecutorService {
         let process = processes
             .get_mut(&process_id)
             .ok_or_else(|| anyhow::anyhow!("Unknown process id: {process_id}"))?;
-        process.refresh_status()?;
+        process.refresh_status().await?;
         Ok(process.status(process_id))
     }
 
@@ -466,7 +592,7 @@ impl CommandInfra for ForgeCommandExecutorService {
         let mut processes = self.processes.lock().await;
         let mut statuses = Vec::with_capacity(processes.len());
         for (process_id, process) in processes.iter_mut() {
-            process.refresh_status()?;
+            process.refresh_status().await?;
             statuses.push(process.status(process_id.clone()));
         }
         Ok(statuses)
@@ -478,7 +604,7 @@ impl CommandInfra for ForgeCommandExecutorService {
             .get_mut(&process_id)
             .ok_or_else(|| anyhow::anyhow!("Unknown process id: {process_id}"))?;
         if matches!(process.status, ProcessStatusKind::Running) {
-            process.child.kill().await?;
+            kill_child_process_group(&mut process.child).await?;
             process.status = ProcessStatusKind::Killed;
         }
         Ok(process.status(process_id))
@@ -634,12 +760,15 @@ mod tests {
         let (mut writer, reader) = tokio::io::duplex(64);
         let log_guard = logs.lock().await;
 
-        ForgeCommandExecutorService::capture_stream(
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let stream_task = ForgeCommandExecutorService::capture_stream(
             reader,
             ProcessStream::Stdout,
             logs.clone(),
             next_cursor.clone(),
             dropped_before_cursor,
+            output,
+            OutputSink::silent(),
         );
         writer.write_all(b"pending").await.unwrap();
         writer.flush().await.unwrap();
@@ -662,6 +791,8 @@ mod tests {
         })
         .await
         .unwrap();
+        drop(writer);
+        stream_task.await.unwrap();
     }
 
     #[tokio::test]
@@ -691,7 +822,7 @@ mod tests {
         let _ = fixture.kill_process(started.process_id).await;
 
         let expected = "foreground";
-        assert_eq!(actual.stdout, expected);
+        assert_eq!(actual.output.stdout, expected);
     }
 
     #[tokio::test]
@@ -768,6 +899,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_execute_command_timeout_handoff_preserves_single_process_side_effects() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let marker_path = temp_dir.path().join("side-effect-count");
+        let command = format!(
+            "printf run >> {marker}; printf early-output; sleep 5",
+            marker = marker_path.display()
+        );
+        let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
+
+        let actual = fixture
+            .execute_command(command, temp_dir.path().to_path_buf(), true, None)
+            .await
+            .unwrap();
+        let process = actual
+            .process
+            .clone()
+            .expect("long-running command should be handed off");
+        let read_output = fixture
+            .read_process(process.process_id.clone(), ProcessReadCursor::new(0))
+            .await
+            .unwrap();
+        let _ = fixture.kill_process(process.process_id).await;
+        let side_effects = std::fs::read_to_string(marker_path).unwrap();
+
+        assert_eq!(actual.output.stdout, "early-output");
+        assert_eq!(actual.output.exit_code, None);
+        assert!(
+            read_output
+                .entries
+                .iter()
+                .any(|entry| entry.content.contains("early-output"))
+        );
+        assert_eq!(side_effects, "run");
+    }
+
+    #[tokio::test]
     async fn test_command_executor() {
         let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
         let cmd = "echo 'hello world'";
@@ -789,9 +956,9 @@ mod tests {
             expected.stdout = format!("'{}'", expected.stdout);
         }
 
-        assert_eq!(actual.stdout.trim(), expected.stdout.trim());
-        assert_eq!(actual.stderr, expected.stderr);
-        assert_eq!(actual.success(), expected.success());
+        assert_eq!(actual.output.stdout.trim(), expected.stdout.trim());
+        assert_eq!(actual.output.stderr, expected.stderr);
+        assert_eq!(actual.output.success(), expected.success());
     }
     #[tokio::test]
     async fn test_command_executor_with_env_vars_success() {
@@ -818,8 +985,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(actual.success());
-        assert!(actual.stdout.contains("test_value"));
+        assert!(actual.output.success());
+        assert!(actual.output.stdout.contains("test_value"));
 
         // Clean up
         unsafe {
@@ -852,7 +1019,7 @@ mod tests {
             .unwrap();
 
         // Should still succeed even with missing env vars
-        assert!(actual.success());
+        assert!(actual.output.success());
     }
 
     #[tokio::test]
@@ -870,8 +1037,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(actual.success());
-        assert!(actual.stdout.contains("no env vars"));
+        assert!(actual.output.success());
+        assert!(actual.output.stdout.contains("no env vars"));
     }
 
     #[tokio::test]
@@ -898,9 +1065,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(actual.success());
-        assert!(actual.stdout.contains("first"));
-        assert!(actual.stdout.contains("second"));
+        assert!(actual.output.success());
+        assert!(actual.output.stdout.contains("first"));
+        assert!(actual.output.stdout.contains("second"));
 
         // Clean up
         unsafe {
@@ -932,9 +1099,9 @@ mod tests {
         }
 
         // The output should still be captured in the CommandOutput
-        assert_eq!(actual.stdout.trim(), expected.stdout.trim());
-        assert_eq!(actual.stderr, expected.stderr);
-        assert_eq!(actual.success(), expected.success());
+        assert_eq!(actual.output.stdout.trim(), expected.stdout.trim());
+        assert_eq!(actual.output.stderr, expected.stderr);
+        assert_eq!(actual.output.success(), expected.success());
     }
 
     mod write_lossy_utf8 {

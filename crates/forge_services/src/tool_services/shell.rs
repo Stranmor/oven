@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::bail;
 use bstr::ByteSlice;
@@ -9,10 +8,8 @@ use forge_app::{
     CommandInfra, EnvironmentInfra, ProcessKillServiceOutput, ProcessOutput,
     ProcessReadServiceOutput, ProcessStartServiceOutput, ShellOutput, ShellService,
 };
-use forge_domain::{CommandOutput, ProcessId, ProcessReadCursor};
+use forge_domain::{ProcessId, ProcessReadCursor};
 use strip_ansi_escapes::strip;
-
-const SHELL_SYNC_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 // Strips out the ansi codes from content.
 fn strip_ansi(content: String) -> String {
@@ -24,7 +21,9 @@ fn strip_ansi(content: String) -> String {
 /// installing packages, or executing build commands. For operations requiring
 /// unrestricted access, advise users to run forge CLI with '-u' flag. Returns
 /// complete output including stdout, stderr, and exit code for diagnostic
-/// purposes.
+/// purposes. Commands that are still running after the synchronous startup
+/// window return the already-started managed process handle; use process_status
+/// and process_read to poll that same process without re-running the command.
 pub struct ForgeShell<I> {
     env: Environment,
     infra: Arc<I>,
@@ -58,38 +57,12 @@ impl<I: CommandInfra + EnvironmentInfra> ShellService for ForgeShell<I> {
     ) -> anyhow::Result<ShellOutput> {
         Self::validate_command(&command)?;
 
-        let command_for_process = command.clone();
-        let cwd_for_process = cwd.clone();
-        let env_vars_for_process = env_vars.clone();
-        let output = tokio::time::timeout(
-            SHELL_SYNC_STARTUP_TIMEOUT,
-            self.infra.execute_command(command, cwd, silent, env_vars),
-        )
-        .await;
-
-        let (mut output, process) = match output {
-            Ok(output) => (output?, None),
-            Err(_) => {
-                let process = self
-                    .infra
-                    .start_process(
-                        command_for_process.clone(),
-                        cwd_for_process,
-                        env_vars_for_process,
-                    )
-                    .await?;
-                let output = CommandOutput {
-                    stdout: String::new(),
-                    stderr: format!(
-                        "Command exceeded the 2 second synchronous shell window and is running as managed background process {process_id}. Use process_status and process_read with this process_id to observe it.",
-                        process_id = process.process_id
-                    ),
-                    command: command_for_process,
-                    exit_code: None,
-                };
-                (output, Some(process))
-            }
-        };
+        let execution = self
+            .infra
+            .execute_command(command, cwd, silent, env_vars)
+            .await?;
+        let mut output = execution.output;
+        let process = execution.process;
 
         if !keep_ansi {
             output.stdout = strip_ansi(output.stdout);
@@ -137,13 +110,15 @@ impl<I: CommandInfra + EnvironmentInfra> ShellService for ForgeShell<I> {
         Ok(ProcessKillServiceOutput { shell: self.env.shell.clone(), description: None, status })
     }
 }
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
-    use forge_app::domain::{CommandOutput, Environment};
+    use forge_app::domain::{CommandExecutionOutput, CommandOutput, Environment};
     use forge_app::{CommandInfra, EnvironmentInfra, ShellService};
     use forge_domain::{
         ConfigOperation, ProcessId, ProcessReadCursor, ProcessReadOutput, ProcessStartOutput,
@@ -161,6 +136,8 @@ mod tests {
     struct MockCommandInfra {
         expected_env_vars: Option<Vec<String>>,
         execution_mode: MockExecutionMode,
+        process_id: ProcessId,
+        side_effect_count: AtomicUsize,
     }
 
     impl MockCommandInfra {
@@ -168,6 +145,8 @@ mod tests {
             Self {
                 expected_env_vars,
                 execution_mode: MockExecutionMode::Immediate,
+                process_id: ProcessId::new("process-test"),
+                side_effect_count: AtomicUsize::new(0),
             }
         }
 
@@ -175,6 +154,17 @@ mod tests {
             Self {
                 expected_env_vars,
                 execution_mode: MockExecutionMode::Pending,
+                process_id: ProcessId::new("process-test"),
+                side_effect_count: AtomicUsize::new(0),
+            }
+        }
+
+        fn pending_with_ansi_process_id() -> Self {
+            Self {
+                expected_env_vars: None,
+                execution_mode: MockExecutionMode::Pending,
+                process_id: ProcessId::new("\u{1b}[31mprocess-test\u{1b}[0m"),
+                side_effect_count: AtomicUsize::new(0),
             }
         }
     }
@@ -187,20 +177,37 @@ mod tests {
             _working_dir: PathBuf,
             _silent: bool,
             env_vars: Option<Vec<String>>,
-        ) -> anyhow::Result<CommandOutput> {
-            // Verify that environment variables are passed through correctly
+        ) -> anyhow::Result<CommandExecutionOutput> {
             assert_eq!(env_vars, self.expected_env_vars);
-
             match self.execution_mode {
-                MockExecutionMode::Immediate => Ok(CommandOutput {
-                    stdout: "Mock output".to_string(),
-                    stderr: "".to_string(),
-                    command,
-                    exit_code: Some(0),
+                MockExecutionMode::Immediate => Ok(CommandExecutionOutput {
+                    output: CommandOutput {
+                        stdout: "Mock output".to_string(),
+                        stderr: String::new(),
+                        command,
+                        exit_code: Some(0),
+                    },
+                    process: None,
                 }),
                 MockExecutionMode::Pending => {
-                    std::future::pending::<()>().await;
-                    unreachable!("pending mock command never resolves")
+                    let process_command = command.clone();
+                    Ok(CommandExecutionOutput {
+                        output: CommandOutput {
+                            stdout: "early stdout".to_string(),
+                            stderr: format!(
+                                "early stderr\nCommand exceeded the 2 second synchronous shell window and is running as managed background process {process_id}. Use process_status and process_read with this process_id to observe it.",
+                                process_id = self.process_id
+                            ),
+                            command,
+                            exit_code: None,
+                        },
+                        process: Some(ProcessStartOutput {
+                            process_id: self.process_id.clone(),
+                            status: ProcessStatusKind::Running,
+                            command: process_command,
+                            cwd: ".".to_string(),
+                        }),
+                    })
                 }
             }
         }
@@ -220,8 +227,9 @@ mod tests {
             working_dir: PathBuf,
             _env_vars: Option<Vec<String>>,
         ) -> anyhow::Result<ProcessStartOutput> {
+            self.side_effect_count.fetch_add(1, Ordering::SeqCst);
             Ok(ProcessStartOutput {
-                process_id: ProcessId::new("process-test"),
+                process_id: self.process_id.clone(),
                 status: ProcessStatusKind::Running,
                 command,
                 cwd: working_dir.display().to_string(),
@@ -413,7 +421,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_shell_service_hands_off_timeout_to_managed_process() {
-        let fixture = ForgeShell::new(Arc::new(MockCommandInfra::pending(None)));
+        let infra = Arc::new(MockCommandInfra::pending(None));
+        let fixture = ForgeShell::new(infra.clone());
 
         let actual = fixture
             .execute(
@@ -431,6 +440,7 @@ mod tests {
             .process
             .expect("timeout handoff should start process");
         assert_eq!(actual.output.command, "sleep 60");
+        assert_eq!(actual.output.stdout, "early stdout");
         assert_eq!(actual.output.exit_code, None);
         assert!(
             actual
@@ -439,6 +449,44 @@ mod tests {
                 .contains("managed background process process-test")
         );
         assert_eq!(process.process_id, ProcessId::new("process-test"));
+        assert_eq!(process.status, ProcessStatusKind::Running);
+        assert_eq!(process.cwd, ".");
+        assert_eq!(infra.side_effect_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_shell_service_handoff_strips_ansi_from_process_id() {
+        let fixture = ForgeShell::new(Arc::new(MockCommandInfra::pending_with_ansi_process_id()));
+
+        let actual = fixture
+            .execute(
+                "sleep 60".to_string(),
+                PathBuf::from("."),
+                false,
+                true,
+                None,
+                Some("Starts a long command".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let process = actual
+            .process
+            .expect("timeout handoff should start process");
+        assert_eq!(
+            process.process_id,
+            ProcessId::new("\u{1b}[31mprocess-test\u{1b}[0m")
+        );
+        assert_eq!(actual.output.command, "sleep 60");
+        assert_eq!(actual.output.exit_code, None);
+        assert_eq!(actual.output.stdout, "early stdout");
+        assert!(
+            actual
+                .output
+                .stderr
+                .contains("managed background process process-test")
+        );
+        assert!(!actual.output.stderr.contains("\u{1b}[31m"));
         assert_eq!(process.status, ProcessStatusKind::Running);
         assert_eq!(process.cwd, ".");
     }

@@ -57,6 +57,7 @@ impl<F: EnvironmentInfra + FileReaderInfra + CommandInfra> ForgeCustomInstructio
             )
             .await
             .ok()?;
+        let output = output.output;
 
         if output.success() {
             Some(PathBuf::from(output.stdout.trim()))
