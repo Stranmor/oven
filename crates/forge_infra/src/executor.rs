@@ -603,6 +603,7 @@ impl CommandInfra for ForgeCommandExecutorService {
         let process = processes
             .get_mut(&process_id)
             .ok_or_else(|| anyhow::anyhow!("Unknown process id: {process_id}"))?;
+        process.refresh_status().await?;
         if matches!(process.status, ProcessStatusKind::Running) {
             kill_child_process_group(&mut process.child).await?;
             process.status = ProcessStatusKind::Killed;
@@ -748,6 +749,21 @@ mod tests {
 
         assert_eq!(actual.first().unwrap().process_id, started.process_id);
         assert_eq!(actual.first().unwrap().status, expected);
+    }
+
+    #[tokio::test]
+    async fn test_process_kill_refreshes_naturally_exited_status_before_killing() {
+        let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
+        let started = fixture
+            .start_process("exit 9".to_string(), PathBuf::new().join("."), None)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let actual = fixture.kill_process(started.process_id).await.unwrap();
+        let expected = ProcessStatusKind::Exited { exit_code: Some(9) };
+
+        assert_eq!(actual.status, expected);
     }
 
     #[tokio::test]
