@@ -35,11 +35,24 @@ struct ManagedProcess {
     command: String,
     cwd: String,
     child: Child,
+    process_group_id: ProcessGroupId,
     status: ProcessStatusKind,
     logs: Arc<Mutex<VecDeque<ProcessLogEntry>>>,
     dropped_before_cursor: Arc<AtomicU64>,
     stdout_task: Option<tokio::task::JoinHandle<()>>,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[derive(Clone, Copy)]
+struct ProcessGroupId(u32);
+
+impl ProcessGroupId {
+    fn from_child(child: &Child) -> anyhow::Result<Self> {
+        child
+            .id()
+            .map(Self)
+            .ok_or_else(|| anyhow::anyhow!("Managed process has no live pid"))
+    }
 }
 
 struct LaunchedProcess {
@@ -65,31 +78,48 @@ impl LaunchedProcess {
         }
     }
 
-    fn into_managed(self) -> ManagedProcess {
-        ManagedProcess {
+    fn into_managed(self) -> anyhow::Result<ManagedProcess> {
+        let process_group_id = ProcessGroupId::from_child(&self.child)?;
+        Ok(ManagedProcess {
             command: self.command,
             cwd: self.cwd,
             child: self.child,
+            process_group_id,
             status: ProcessStatusKind::Running,
             logs: self.logs,
             dropped_before_cursor: self.dropped_before_cursor,
             stdout_task: self.stdout_task,
             stderr_task: self.stderr_task,
-        }
+        })
     }
 }
 
 impl ManagedProcess {
     async fn refresh_status(&mut self) -> anyhow::Result<()> {
+        self.refresh_status_with_output_join(true).await
+    }
+
+    async fn refresh_status_without_output_join(&mut self) -> anyhow::Result<()> {
+        self.refresh_status_with_output_join(false).await
+    }
+
+    async fn join_output_tasks(&mut self) -> anyhow::Result<()> {
+        if let Some(stdout_task) = self.stdout_task.take() {
+            stdout_task.await?;
+        }
+        if let Some(stderr_task) = self.stderr_task.take() {
+            stderr_task.await?;
+        }
+        Ok(())
+    }
+
+    async fn refresh_status_with_output_join(&mut self, join_output: bool) -> anyhow::Result<()> {
         if matches!(self.status, ProcessStatusKind::Running)
             && let Some(status) = self.child.try_wait()?
         {
             self.status = ProcessStatusKind::Exited { exit_code: status.code() };
-            if let Some(stdout_task) = self.stdout_task.take() {
-                stdout_task.await?;
-            }
-            if let Some(stderr_task) = self.stderr_task.take() {
-                stderr_task.await?;
+            if join_output {
+                self.join_output_tasks().await?;
             }
         }
         Ok(())
@@ -306,11 +336,11 @@ impl ForgeCommandExecutorService {
         output.lock().await.to_str_lossy().into_owned()
     }
 
-    async fn register_launched_process(&self, launched: LaunchedProcess) {
-        self.processes
-            .lock()
-            .await
-            .insert(launched.process_id.clone(), launched.into_managed());
+    async fn register_launched_process(&self, launched: LaunchedProcess) -> anyhow::Result<()> {
+        let process_id = launched.process_id.clone();
+        let managed = launched.into_managed()?;
+        self.processes.lock().await.insert(process_id, managed);
+        Ok(())
     }
 
     async fn execute_command_internal(
@@ -360,7 +390,7 @@ impl ForgeCommandExecutorService {
                     process_id = process.process_id
                 );
                 let command = launched.command.clone();
-                self.register_launched_process(launched).await;
+                self.register_launched_process(launched).await?;
 
                 Ok(CommandExecutionOutput {
                     output: CommandOutput { stdout, stderr, exit_code: None, command },
@@ -468,28 +498,31 @@ fn trim_background_logs(logs: &mut VecDeque<ProcessLogEntry>, dropped_before_cur
 }
 
 #[cfg(unix)]
-async fn kill_child_process_group(child: &mut Child) -> anyhow::Result<()> {
-    let pid = child
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("Managed process has no live pid"))?;
-    let process_group_id = i32::try_from(pid)?;
+async fn kill_child_process_group(
+    child: &mut Child,
+    process_group_id: ProcessGroupId,
+) -> anyhow::Result<()> {
+    let process_group_id = i32::try_from(process_group_id.0)?;
     let kill_target = process_group_id
         .checked_neg()
         .ok_or_else(|| anyhow::anyhow!("Invalid managed process group id: {process_group_id}"))?;
     // SAFETY: The child was created with `process_group(0)`, so its process
     // group id is its pid. Passing the negative process group id to POSIX
-    // `kill` targets that group instead of an unrelated process.
+    // `kill` targets that group instead of an unrelated process. The group id
+    // is captured at launch so descendants remain targetable after parent exit.
     let result = unsafe { libc::kill(kill_target, libc::SIGKILL) };
-    if result == -1 {
+    if result == -1 && (child.try_wait()?).is_none() {
         child.kill().await?;
-    } else {
-        let _ = child.wait().await?;
     }
+    let _ = child.wait().await?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-async fn kill_child_process_group(child: &mut Child) -> anyhow::Result<()> {
+async fn kill_child_process_group(
+    child: &mut Child,
+    _process_group_id: ProcessGroupId,
+) -> anyhow::Result<()> {
     child.kill().await?;
     Ok(())
 }
@@ -553,7 +586,7 @@ impl CommandInfra for ForgeCommandExecutorService {
     ) -> anyhow::Result<ProcessStartOutput> {
         let launched = self.launch_process(command, &working_dir, env_vars, false)?;
         let output = launched.start_output();
-        self.register_launched_process(launched).await;
+        self.register_launched_process(launched).await?;
         Ok(output)
     }
 
@@ -603,10 +636,15 @@ impl CommandInfra for ForgeCommandExecutorService {
         let process = processes
             .get_mut(&process_id)
             .ok_or_else(|| anyhow::anyhow!("Unknown process id: {process_id}"))?;
-        process.refresh_status().await?;
-        if matches!(process.status, ProcessStatusKind::Running) {
-            kill_child_process_group(&mut process.child).await?;
-            process.status = ProcessStatusKind::Killed;
+        process.refresh_status_without_output_join().await?;
+        if !matches!(process.status, ProcessStatusKind::Killed) {
+            let status_before_kill = process.status.clone();
+            kill_child_process_group(&mut process.child, process.process_group_id).await?;
+            process.join_output_tasks().await?;
+            process.refresh_status().await?;
+            if matches!(status_before_kill, ProcessStatusKind::Running) {
+                process.status = ProcessStatusKind::Killed;
+            }
         }
         Ok(process.status(process_id))
     }
@@ -911,6 +949,29 @@ mod tests {
         fixture.kill_process(started.process_id).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(700)).await;
 
+        assert!(!marker_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_process_kill_after_parent_exit_terminates_descendant_group() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let marker_path = temp_dir.path().join("late-descendant");
+        let command = format!(
+            "(sleep 0.3; printf leaked > {}) & sleep 0.05; wait",
+            marker_path.display()
+        );
+        let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
+        let started = fixture
+            .start_process(command, temp_dir.path().to_path_buf(), None)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let actual = fixture.kill_process(started.process_id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        let expected = ProcessStatusKind::Killed;
+
+        assert_eq!(actual.status, expected);
         assert!(!marker_path.exists());
     }
 
