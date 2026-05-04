@@ -661,14 +661,14 @@ pub struct ProcessStart {
 #[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema, ToolDescription, PartialEq)]
 #[tool_description_file = "crates/forge_domain/src/tools/descriptions/process_status.md"]
 pub struct ProcessStatusInput {
-    /// Handle returned by process_start.
+    /// Handle returned by process_start or shell timeout handoff.
     pub process_id: String,
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema, ToolDescription, PartialEq)]
 #[tool_description_file = "crates/forge_domain/src/tools/descriptions/process_read.md"]
 pub struct ProcessRead {
-    /// Handle returned by process_start.
+    /// Handle returned by process_start or shell timeout handoff.
     pub process_id: String,
 
     /// Cursor returned by the previous process_read call. Defaults to 0.
@@ -683,7 +683,7 @@ pub struct ProcessList {}
 #[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema, ToolDescription, PartialEq)]
 #[tool_description_file = "crates/forge_domain/src/tools/descriptions/process_kill.md"]
 pub struct ProcessKill {
-    /// Handle returned by process_start.
+    /// Handle returned by process_start or shell timeout handoff.
     pub process_id: String,
 }
 
