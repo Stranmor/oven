@@ -1,5 +1,7 @@
 Executes shell commands. The `cwd` parameter sets the working directory for command execution. If not specified, defaults to `{{env.cwd}}`.
 
+Short commands remain synchronous and return stdout, stderr, and exit code directly. Commands that exceed the synchronous startup window are automatically handed off to the managed background process subsystem; the shell result then has no exit code, includes the process handle in the output attributes, and should be followed with `process_status` and `process_read` using the returned `process_id`.
+
 CRITICAL: Do NOT use `cd` commands in the command string. This is FORBIDDEN. Always use the `cwd` parameter to set the working directory instead. Any use of `cd` in the command is redundant, incorrect, and violates the tool contract.
 
 IMPORTANT: This tool is for terminal operations like git, npm, docker, etc. DO NOT use it for file operations (reading, writing, editing, searching, finding files) - use the specialized tools for this instead.
@@ -44,4 +46,4 @@ Good examples:
 Bad example:
   cd /foo/bar && pytest tests
 
-Returns complete output including stdout, stderr, and exit code for diagnostic purposes.
+Returns complete output including stdout, stderr, and exit code for synchronous commands, or a managed process handle for commands handed off after the startup window.

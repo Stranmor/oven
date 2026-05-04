@@ -1,0 +1,17 @@
+---
+source: crates/forge_app/src/operation.rs
+expression: to_value(actual)
+---
+<shell_output
+  command="sleep 60"
+  shell="/bin/bash"
+  description="Starts long command"
+  process_id="process-42"
+  process_status="Running"
+  process_cwd="/projects/test"
+>
+<stderr
+  total_lines="1"
+><![CDATA[Command exceeded the 2 second synchronous shell window]]>
+</stderr>
+</shell_output>

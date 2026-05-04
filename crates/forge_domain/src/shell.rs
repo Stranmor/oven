@@ -48,7 +48,7 @@ impl fmt::Display for ProcessId {
 
 impl CommandOutput {
     pub fn success(&self) -> bool {
-        self.exit_code.is_none_or(|code| code >= 0)
+        self.exit_code == Some(0)
     }
 }
 

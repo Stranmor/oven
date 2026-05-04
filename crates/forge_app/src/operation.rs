@@ -615,6 +615,13 @@ impl ToolOperation {
                     parent_elem = parent_elem.attr("exit_code", exit_code);
                 }
 
+                if let Some(process) = &output.process {
+                    parent_elem = parent_elem
+                        .attr("process_id", process.process_id.as_str())
+                        .attr("process_status", format!("{:?}", process.status))
+                        .attr("process_cwd", &process.cwd);
+                }
+
                 let truncated_output = truncate_shell_output(
                     &output.output.stdout,
                     &output.output.stderr,
@@ -807,7 +814,7 @@ mod tests {
 
     use forge_domain::{
         FSRead, FSReadRange, FileInfo, ProcessId, ProcessLogEntry, ProcessReadCursor,
-        ProcessReadOutput, ProcessStream, ToolValue,
+        ProcessReadOutput, ProcessStartOutput, ProcessStatusKind, ProcessStream, ToolValue,
     };
 
     use super::*;
@@ -1115,6 +1122,7 @@ mod tests {
                 },
                 shell: "/bin/bash".to_string(),
                 description: None,
+                process: None,
             },
         };
 
@@ -1150,6 +1158,7 @@ mod tests {
                 },
                 shell: "/bin/bash".to_string(),
                 description: None,
+                process: None,
             },
         };
 
@@ -1187,6 +1196,7 @@ mod tests {
                 },
                 shell: "/bin/bash".to_string(),
                 description: None,
+                process: None,
             },
         };
 
@@ -1230,6 +1240,7 @@ mod tests {
                 },
                 shell: "/bin/bash".to_string(),
                 description: None,
+                process: None,
             },
         };
 
@@ -1268,6 +1279,7 @@ mod tests {
                 },
                 shell: "/bin/bash".to_string(),
                 description: None,
+                process: None,
             },
         };
 
@@ -1296,6 +1308,7 @@ mod tests {
                 },
                 shell: "/bin/bash".to_string(),
                 description: None,
+                process: None,
             },
         };
 
@@ -1324,6 +1337,7 @@ mod tests {
                 },
                 shell: "/bin/bash".to_string(),
                 description: None,
+                process: None,
             },
         };
 
@@ -1365,6 +1379,7 @@ mod tests {
                 },
                 shell: "/bin/bash".to_string(),
                 description: None,
+                process: None,
             },
         };
 
@@ -2482,6 +2497,7 @@ mod tests {
                 },
                 shell: "/bin/bash".to_string(),
                 description: None,
+                process: None,
             },
         };
 
@@ -2511,12 +2527,47 @@ mod tests {
                 },
                 shell: "/bin/bash".to_string(),
                 description: Some("Shows working tree status".to_string()),
+                process: None,
             },
         };
 
         let env = fixture_environment();
         let config = fixture_config();
 
+        let actual = fixture.into_tool_output(
+            ToolKind::Shell,
+            TempContentFiles::default(),
+            &env,
+            &config,
+            &mut Metrics::default(),
+        );
+
+        insta::assert_snapshot!(to_value(actual));
+    }
+
+    #[test]
+    fn test_shell_output_exposes_background_process_handoff() {
+        let fixture = ToolOperation::Shell {
+            output: ShellOutput {
+                output: forge_domain::CommandOutput {
+                    command: "sleep 60".to_string(),
+                    stdout: String::new(),
+                    stderr: "Command exceeded the 2 second synchronous shell window".to_string(),
+                    exit_code: None,
+                },
+                shell: "/bin/bash".to_string(),
+                description: Some("Starts long command".to_string()),
+                process: Some(ProcessStartOutput {
+                    process_id: ProcessId::new("process-42"),
+                    status: ProcessStatusKind::Running,
+                    command: "sleep 60".to_string(),
+                    cwd: "/projects/test".to_string(),
+                }),
+            },
+        };
+
+        let env = fixture_environment();
+        let config = fixture_config();
         let actual = fixture.into_tool_output(
             ToolKind::Shell,
             TempContentFiles::default(),

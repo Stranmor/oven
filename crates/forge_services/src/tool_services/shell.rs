@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::bail;
 use bstr::ByteSlice;
@@ -8,8 +9,10 @@ use forge_app::{
     CommandInfra, EnvironmentInfra, ProcessKillServiceOutput, ProcessOutput,
     ProcessReadServiceOutput, ProcessStartServiceOutput, ShellOutput, ShellService,
 };
-use forge_domain::{ProcessId, ProcessReadCursor};
+use forge_domain::{CommandOutput, ProcessId, ProcessReadCursor};
 use strip_ansi_escapes::strip;
+
+const SHELL_SYNC_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 // Strips out the ansi codes from content.
 fn strip_ansi(content: String) -> String {
@@ -55,17 +58,45 @@ impl<I: CommandInfra + EnvironmentInfra> ShellService for ForgeShell<I> {
     ) -> anyhow::Result<ShellOutput> {
         Self::validate_command(&command)?;
 
-        let mut output = self
-            .infra
-            .execute_command(command, cwd, silent, env_vars)
-            .await?;
+        let command_for_process = command.clone();
+        let cwd_for_process = cwd.clone();
+        let env_vars_for_process = env_vars.clone();
+        let output = tokio::time::timeout(
+            SHELL_SYNC_STARTUP_TIMEOUT,
+            self.infra.execute_command(command, cwd, silent, env_vars),
+        )
+        .await;
+
+        let (mut output, process) = match output {
+            Ok(output) => (output?, None),
+            Err(_) => {
+                let process = self
+                    .infra
+                    .start_process(
+                        command_for_process.clone(),
+                        cwd_for_process,
+                        env_vars_for_process,
+                    )
+                    .await?;
+                let output = CommandOutput {
+                    stdout: String::new(),
+                    stderr: format!(
+                        "Command exceeded the 2 second synchronous shell window and is running as managed background process {process_id}. Use process_status and process_read with this process_id to observe it.",
+                        process_id = process.process_id
+                    ),
+                    command: command_for_process,
+                    exit_code: None,
+                };
+                (output, Some(process))
+            }
+        };
 
         if !keep_ansi {
             output.stdout = strip_ansi(output.stdout);
             output.stderr = strip_ansi(output.stderr);
         }
 
-        Ok(ShellOutput { output, shell: self.env.shell.clone(), description })
+        Ok(ShellOutput { output, shell: self.env.shell.clone(), description, process })
     }
 
     async fn process_start(
@@ -122,8 +153,30 @@ mod tests {
 
     use super::*;
 
+    enum MockExecutionMode {
+        Immediate,
+        Pending,
+    }
+
     struct MockCommandInfra {
         expected_env_vars: Option<Vec<String>>,
+        execution_mode: MockExecutionMode,
+    }
+
+    impl MockCommandInfra {
+        fn immediate(expected_env_vars: Option<Vec<String>>) -> Self {
+            Self {
+                expected_env_vars,
+                execution_mode: MockExecutionMode::Immediate,
+            }
+        }
+
+        fn pending(expected_env_vars: Option<Vec<String>>) -> Self {
+            Self {
+                expected_env_vars,
+                execution_mode: MockExecutionMode::Pending,
+            }
+        }
     }
 
     #[async_trait]
@@ -138,12 +191,18 @@ mod tests {
             // Verify that environment variables are passed through correctly
             assert_eq!(env_vars, self.expected_env_vars);
 
-            Ok(CommandOutput {
-                stdout: "Mock output".to_string(),
-                stderr: "".to_string(),
-                command,
-                exit_code: Some(0),
-            })
+            match self.execution_mode {
+                MockExecutionMode::Immediate => Ok(CommandOutput {
+                    stdout: "Mock output".to_string(),
+                    stderr: "".to_string(),
+                    command,
+                    exit_code: Some(0),
+                }),
+                MockExecutionMode::Pending => {
+                    std::future::pending::<()>().await;
+                    unreachable!("pending mock command never resolves")
+                }
+            }
         }
 
         async fn execute_command_raw(
@@ -233,7 +292,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_shell_service_starts_background_process() {
-        let fixture = ForgeShell::new(Arc::new(MockCommandInfra { expected_env_vars: None }));
+        let fixture = ForgeShell::new(Arc::new(MockCommandInfra::immediate(None)));
 
         let actual = fixture
             .process_start(
@@ -252,7 +311,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_shell_service_rejects_empty_background_command() {
-        let fixture = ForgeShell::new(Arc::new(MockCommandInfra { expected_env_vars: None }));
+        let fixture = ForgeShell::new(Arc::new(MockCommandInfra::immediate(None)));
 
         let actual = fixture
             .process_start("   ".to_string(), PathBuf::from("."), None, None)
@@ -263,9 +322,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_shell_service_forwards_env_vars() {
-        let fixture = ForgeShell::new(Arc::new(MockCommandInfra {
-            expected_env_vars: Some(vec!["PATH".to_string(), "HOME".to_string()]),
-        }));
+        let fixture = ForgeShell::new(Arc::new(MockCommandInfra::immediate(Some(vec![
+            "PATH".to_string(),
+            "HOME".to_string(),
+        ]))));
 
         let actual = fixture
             .execute(
@@ -281,11 +341,12 @@ mod tests {
 
         assert_eq!(actual.output.stdout, "Mock output");
         assert_eq!(actual.output.exit_code, Some(0));
+        assert_eq!(actual.process, None);
     }
 
     #[tokio::test]
     async fn test_shell_service_forwards_no_env_vars() {
-        let fixture = ForgeShell::new(Arc::new(MockCommandInfra { expected_env_vars: None }));
+        let fixture = ForgeShell::new(Arc::new(MockCommandInfra::immediate(None)));
 
         let actual = fixture
             .execute(
@@ -301,13 +362,12 @@ mod tests {
 
         assert_eq!(actual.output.stdout, "Mock output");
         assert_eq!(actual.output.exit_code, Some(0));
+        assert_eq!(actual.process, None);
     }
 
     #[tokio::test]
     async fn test_shell_service_forwards_empty_env_vars() {
-        let fixture = ForgeShell::new(Arc::new(MockCommandInfra {
-            expected_env_vars: Some(vec![]),
-        }));
+        let fixture = ForgeShell::new(Arc::new(MockCommandInfra::immediate(Some(vec![]))));
 
         let actual = fixture
             .execute(
@@ -323,11 +383,12 @@ mod tests {
 
         assert_eq!(actual.output.stdout, "Mock output");
         assert_eq!(actual.output.exit_code, Some(0));
+        assert_eq!(actual.process, None);
     }
 
     #[tokio::test]
     async fn test_shell_service_with_description() {
-        let fixture = ForgeShell::new(Arc::new(MockCommandInfra { expected_env_vars: None }));
+        let fixture = ForgeShell::new(Arc::new(MockCommandInfra::immediate(None)));
 
         let actual = fixture
             .execute(
@@ -343,15 +404,48 @@ mod tests {
 
         assert_eq!(actual.output.stdout, "Mock output");
         assert_eq!(actual.output.exit_code, Some(0));
+        assert_eq!(actual.process, None);
         assert_eq!(
             actual.description,
             Some("Prints hello to stdout".to_string())
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn test_shell_service_hands_off_timeout_to_managed_process() {
+        let fixture = ForgeShell::new(Arc::new(MockCommandInfra::pending(None)));
+
+        let actual = fixture
+            .execute(
+                "sleep 60".to_string(),
+                PathBuf::from("."),
+                false,
+                true,
+                None,
+                Some("Starts a long command".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let process = actual
+            .process
+            .expect("timeout handoff should start process");
+        assert_eq!(actual.output.command, "sleep 60");
+        assert_eq!(actual.output.exit_code, None);
+        assert!(
+            actual
+                .output
+                .stderr
+                .contains("managed background process process-test")
+        );
+        assert_eq!(process.process_id, ProcessId::new("process-test"));
+        assert_eq!(process.status, ProcessStatusKind::Running);
+        assert_eq!(process.cwd, ".");
+    }
+
     #[tokio::test]
     async fn test_shell_service_without_description() {
-        let fixture = ForgeShell::new(Arc::new(MockCommandInfra { expected_env_vars: None }));
+        let fixture = ForgeShell::new(Arc::new(MockCommandInfra::immediate(None)));
 
         let actual = fixture
             .execute(
@@ -367,6 +461,7 @@ mod tests {
 
         assert_eq!(actual.output.stdout, "Mock output");
         assert_eq!(actual.output.exit_code, Some(0));
+        assert_eq!(actual.process, None);
         assert_eq!(actual.description, None);
     }
 }

@@ -301,6 +301,7 @@ mod tests {
                 },
                 shell: "/bin/sh".to_string(),
                 description: None,
+                process: None,
             })
         }
     }

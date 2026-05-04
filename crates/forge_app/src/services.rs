@@ -24,6 +24,9 @@ pub struct ShellOutput {
     pub output: CommandOutput,
     pub shell: String,
     pub description: Option<String>,
+    /// Present when the shell command exceeded the startup window and was
+    /// handed off to the managed background-process session flow.
+    pub process: Option<ProcessStartOutput>,
 }
 
 #[derive(Debug, Clone)]

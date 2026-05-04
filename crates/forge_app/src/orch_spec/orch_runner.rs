@@ -276,6 +276,7 @@ impl ShellService for Runner {
                 },
                 shell: "/bin/bash".to_string(),
                 description: None,
+                process: None,
             })
         }
     }

@@ -232,7 +232,6 @@ impl ForgeCommandExecutorService {
     }
 }
 
-/// Writer that delegates to OutputPrinter for synchronized writes.
 struct OutputPrinterWriter {
     printer: Arc<StdConsoleWriter>,
     is_stdout: bool,
