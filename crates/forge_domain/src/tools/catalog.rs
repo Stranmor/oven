@@ -18,7 +18,8 @@ use strum::IntoEnumIterator;
 use strum_macros::{AsRefStr, Display, EnumDiscriminants, EnumIter};
 
 use crate::{
-    ConversationId, ToolCallArguments, ToolCallFull, ToolDefinition, ToolDescription, ToolName,
+    ConversationId, ShellHandoffTimeoutSeconds, ToolCallArguments, ToolCallFull, ToolDefinition,
+    ToolDescription, ToolName,
 };
 
 /// Enum representing all possible tool input types.
@@ -618,6 +619,15 @@ pub struct Shell {
     #[serde(default)]
     #[serde(skip_serializing_if = "is_default")]
     pub keep_ansi: bool,
+
+    /// Optional synchronous wait window before handoff to managed background execution.
+    /// Defaults to 2 seconds when omitted. The command is not killed when this
+    /// timeout elapses; the already-started process is registered for
+    /// process_status/process_read observation.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[eserde(compat)]
+    pub handoff_timeout_seconds: Option<ShellHandoffTimeoutSeconds>,
 
     /// Environment variable names to pass to command execution (e.g., ["PATH",
     /// "HOME", "USER"]). The system automatically reads the specified
@@ -1352,7 +1362,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use strum::IntoEnumIterator;
 
-    use super::{ProcessStart, Shell};
+    use super::{ProcessStart, Shell, ShellHandoffTimeoutSeconds};
     use crate::{ToolCatalog, ToolKind, ToolName};
 
     #[test]
@@ -2013,6 +2023,7 @@ mod tests {
             command: "git status".to_string(),
             cwd: Some(PathBuf::from("/test")),
             keep_ansi: false,
+            handoff_timeout_seconds: None,
             env: None,
             description: Some("Shows working tree status".to_string()),
         };
@@ -2036,6 +2047,7 @@ mod tests {
             command: "ls -la".to_string(),
             cwd: Some(PathBuf::from("/home")),
             keep_ansi: false,
+            handoff_timeout_seconds: None,
             env: None,
             description: None,
         };
@@ -2058,6 +2070,7 @@ mod tests {
             command: "pwd".to_string(),
             cwd: None,
             keep_ansi: false,
+            handoff_timeout_seconds: None,
             env: None,
             description: None,
         };
@@ -2069,6 +2082,41 @@ mod tests {
         });
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_shell_handoff_timeout_serialization() {
+        use pretty_assertions::assert_eq;
+
+        let fixture = Shell {
+            command: "sleep 60".to_string(),
+            cwd: None,
+            keep_ansi: false,
+            handoff_timeout_seconds: Some(ShellHandoffTimeoutSeconds::new(15).unwrap()),
+            env: None,
+            description: None,
+        };
+
+        let actual = serde_json::to_value(&fixture).unwrap();
+
+        let expected = serde_json::json!({
+            "command": "sleep 60",
+            "handoff_timeout_seconds": 15
+        });
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_shell_omitted_handoff_timeout_deserializes_as_absent() {
+        use pretty_assertions::assert_eq;
+
+        let fixture = serde_json::json!({"command": "pwd"});
+
+        let actual: Shell = serde_json::from_value(fixture).unwrap();
+        let expected = None;
+
+        assert_eq!(actual.handoff_timeout_seconds, expected);
     }
 
     #[test]

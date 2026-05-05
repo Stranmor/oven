@@ -7,8 +7,8 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::services::{
-    AgentRegistry, AppConfigService, ProviderAuthService, ProviderService, ShellService,
-    TemplateService,
+    AgentRegistry, AppConfigService, ProviderAuthService, ProviderService, ShellExecuteRequest,
+    ShellService, TemplateService,
 };
 use crate::{AgentProviderResolver, EnvironmentInfra, Services};
 
@@ -94,6 +94,18 @@ impl<S> GitApp<S> {
 }
 
 impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> GitApp<S> {
+    fn shell_request(command: String, cwd: impl Into<std::path::PathBuf>) -> ShellExecuteRequest {
+        ShellExecuteRequest {
+            command,
+            cwd: cwd.into(),
+            keep_ansi: false,
+            silent: true,
+            env_vars: None,
+            handoff_timeout: Default::default(),
+            description: None,
+        }
+    }
+
     /// Generates a commit message without committing
     ///
     /// # Arguments
@@ -154,7 +166,7 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> GitApp<
 
         let commit_result = self
             .services
-            .execute(commit_command, cwd, false, true, None, None)
+            .execute(Self::shell_request(commit_command, cwd))
             .await
             .context("Failed to commit changes")?;
 
@@ -228,15 +240,11 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> GitApp<
             format!("git log --pretty=format:%s --abbrev-commit --max-count={max_commit_count}");
         let (recent_commits, branch_name) = tokio::join!(
             self.services
-                .execute(git_log_cmd, cwd.to_path_buf(), false, true, None, None,),
-            self.services.execute(
+                .execute(Self::shell_request(git_log_cmd, cwd.to_path_buf())),
+            self.services.execute(Self::shell_request(
                 "git rev-parse --abbrev-ref HEAD".into(),
                 cwd.to_path_buf(),
-                false,
-                true,
-                None,
-                None,
-            ),
+            )),
         );
 
         let recent_commits = recent_commits.context("Failed to get recent commits")?;
@@ -248,22 +256,12 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> GitApp<
     /// Fetches diff from git (staged or unstaged)
     async fn fetch_git_diff(&self, cwd: &Path) -> Result<(String, usize, bool)> {
         let (staged_diff, unstaged_diff) = tokio::join!(
-            self.services.execute(
+            self.services.execute(Self::shell_request(
                 "git diff --staged".into(),
-                cwd.to_path_buf(),
-                false,
-                true,
-                None,
-                None,
-            ),
-            self.services.execute(
-                "git diff".into(),
-                cwd.to_path_buf(),
-                false,
-                true,
-                None,
-                None,
-            )
+                cwd.to_path_buf()
+            )),
+            self.services
+                .execute(Self::shell_request("git diff".into(), cwd.to_path_buf()))
         );
 
         let staged_diff = staged_diff.context("Failed to get staged changes")?;

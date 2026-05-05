@@ -154,6 +154,7 @@ pub trait CommandInfra: Send + Sync {
         working_dir: PathBuf,
         silent: bool,
         env_vars: Option<Vec<String>>,
+        handoff_timeout: forge_domain::ShellHandoffTimeoutSeconds,
     ) -> anyhow::Result<CommandExecutionOutput>;
 
     /// execute the shell command on present stdio.

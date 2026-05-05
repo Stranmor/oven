@@ -96,11 +96,20 @@ impl Default for PreviewLayout {
 
 const SELECT_VIEWPORT_PERCENT: u16 = 80;
 
+fn u16_from_usize_saturating(value: usize) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
+}
+
+fn percent_of_u16(value: u16, percent: u16) -> u16 {
+    let scaled = (u32::from(value) * u32::from(percent)) / 100;
+    u16::try_from(scaled).unwrap_or(u16::MAX)
+}
+
 fn max_select_viewport_height(full_height: u16) -> u16 {
     let full_height = full_height.max(1);
-    ((full_height as u32 * SELECT_VIEWPORT_PERCENT as u32) / 100)
+    percent_of_u16(full_height, SELECT_VIEWPORT_PERCENT)
         .max(1)
-        .min(full_height as u32) as u16
+        .min(full_height)
 }
 
 fn select_viewport_height(full_height: u16, desired_height: u16) -> u16 {
@@ -137,9 +146,9 @@ fn desired_select_viewport_height(
     preview_lines: usize,
     layout: PreviewLayout,
 ) -> u16 {
-    let header_height = 2u16.saturating_add(header_rows as u16);
-    let list_height = (matched_rows as u16).max(1);
-    let preview_lines = preview_lines as u16;
+    let header_height = 2u16.saturating_add(u16_from_usize_saturating(header_rows));
+    let list_height = u16_from_usize_saturating(matched_rows).max(1);
+    let preview_lines = u16_from_usize_saturating(preview_lines);
 
     match layout.placement {
         PreviewPlacement::Right => header_height.saturating_add(list_height),
@@ -754,13 +763,13 @@ fn preview_content_height(
     let desired_height =
         desired_select_viewport_height(header_rows, matched_rows, preview.lines().count(), layout);
     let height = select_viewport_height(height, desired_height).min(reserved_height);
-    let header_height = 2u16.saturating_add(header_rows as u16);
+    let header_height = 2u16.saturating_add(u16_from_usize_saturating(header_rows));
     let body_height = height.saturating_sub(header_height).max(1);
 
     (match layout.placement {
         PreviewPlacement::Right => body_height,
         PreviewPlacement::Bottom => {
-            let preview_height = ((height as u32 * layout.percent as u32) / 100) as u16;
+            let preview_height = percent_of_u16(height, layout.percent);
             preview_height
                 .clamp(3, body_height.saturating_sub(1).max(3))
                 .saturating_sub(2)
@@ -784,19 +793,19 @@ fn mouse_over_preview(
     let desired_height =
         desired_select_viewport_height(header_rows, matched_rows, preview.lines().count(), layout);
     let height = select_viewport_height(height, desired_height).min(reserved_height);
-    let header_height = 2u16.saturating_add(header_rows as u16);
+    let header_height = 2u16.saturating_add(u16_from_usize_saturating(header_rows));
     let body_height = height.saturating_sub(header_height).max(1);
 
     match layout.placement {
         PreviewPlacement::Right => {
-            let preview_width = ((width as u32 * layout.percent as u32) / 100) as u16;
+            let preview_width = percent_of_u16(width, layout.percent);
             let preview_width = preview_width.clamp(10, width.saturating_sub(10));
             let list_width = width.saturating_sub(preview_width + 3).max(10);
             let preview_x = list_width + 3;
             column >= preview_x && column < width && row >= header_height && row < height
         }
         PreviewPlacement::Bottom => {
-            let preview_height = ((height as u32 * layout.percent as u32) / 100) as u16;
+            let preview_height = percent_of_u16(height, layout.percent);
             let preview_height = preview_height.clamp(3, body_height.saturating_sub(1).max(3));
             let list_height = body_height.saturating_sub(preview_height).max(1);
             let preview_y = header_height + list_height;
@@ -895,7 +904,7 @@ fn draw_preview_ui(stderr: &mut io::Stderr, ui: PreviewUi<'_>) -> anyhow::Result
     );
     let height = select_viewport_height(height, desired_height).min(reserved_height);
     let top_offset = 0;
-    let header_height = 3u16.saturating_add(header_rows.len() as u16);
+    let header_height = 3u16.saturating_add(u16_from_usize_saturating(header_rows.len()));
     let body_height = height.saturating_sub(header_height).max(1);
 
     let (
@@ -910,7 +919,7 @@ fn draw_preview_ui(stderr: &mut io::Stderr, ui: PreviewUi<'_>) -> anyhow::Result
     ) = if has_preview {
         match layout.placement {
             PreviewPlacement::Right => {
-                let preview_width = ((width as u32 * layout.percent as u32) / 100) as u16;
+                let preview_width = percent_of_u16(width, layout.percent);
                 let preview_width = preview_width.clamp(10, width.saturating_sub(10));
                 let list_width = width.saturating_sub(preview_width + 3).max(10);
                 (
@@ -925,7 +934,7 @@ fn draw_preview_ui(stderr: &mut io::Stderr, ui: PreviewUi<'_>) -> anyhow::Result
                 )
             }
             PreviewPlacement::Bottom => {
-                let preview_height = ((height as u32 * layout.percent as u32) / 100) as u16;
+                let preview_height = percent_of_u16(height, layout.percent);
                 let preview_height = preview_height.clamp(3, body_height.saturating_sub(1).max(3));
                 let list_height = body_height.saturating_sub(preview_height).max(1);
                 (
@@ -986,7 +995,7 @@ fn draw_preview_ui(stderr: &mut io::Stderr, ui: PreviewUi<'_>) -> anyhow::Result
         ResetColor
     )?;
     for (index, row) in header_rows.iter().enumerate() {
-        let row_y = 2u16.saturating_add(index as u16);
+        let row_y = 2u16.saturating_add(u16_from_usize_saturating(index));
         if row_y < header_height {
             queue!(
                 stderr,
@@ -1142,7 +1151,7 @@ fn draw_preview_ui(stderr: &mut io::Stderr, ui: PreviewUi<'_>) -> anyhow::Result
             {
                 let indicator =
                     preview_scroll_indicator(preview_scroll_offset, preview_lines.len());
-                let indicator_width = indicator.chars().count() as u16;
+                let indicator_width = u16_from_usize_saturating(indicator.chars().count());
                 if indicator_width.saturating_add(1) < preview_width {
                     queue!(
                         stderr,
@@ -1258,7 +1267,7 @@ fn format_prompt_query(prompt: &str, query: &str) -> String {
 }
 
 fn match_count_width(matched: usize, total: usize) -> u16 {
-    format!("{matched}/{total}").chars().count() as u16
+    u16_from_usize_saturating(format!("{matched}/{total}").chars().count())
 }
 
 fn truncate_line_with_ellipsis(value: &str, max_width: usize) -> String {

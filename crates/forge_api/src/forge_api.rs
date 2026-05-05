@@ -217,7 +217,13 @@ impl<
         working_dir: PathBuf,
     ) -> anyhow::Result<CommandOutput> {
         self.infra
-            .execute_command(command.to_string(), working_dir, false, None)
+            .execute_command(
+                command.to_string(),
+                working_dir,
+                false,
+                None,
+                Default::default(),
+            )
             .await
             .map(|execution| execution.output)
     }

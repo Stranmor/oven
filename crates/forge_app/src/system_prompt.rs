@@ -10,7 +10,7 @@ use serde_json::{Map, Value, json};
 use strum::IntoEnumIterator;
 use tracing::debug;
 
-use crate::{ShellService, SkillFetchService, TemplateEngine};
+use crate::{ShellExecuteRequest, ShellService, SkillFetchService, TemplateEngine};
 
 fn collect_custom_rules<'a>(agent: &'a Agent, custom_instructions: &'a [String]) -> Vec<&'a str> {
     let mut custom_rules = Vec::new();
@@ -60,14 +60,15 @@ impl<S: SkillFetchService + ShellService> SystemPrompt<S> {
     async fn fetch_extensions(&self, max_extensions: usize) -> Option<Extension> {
         let output = self
             .services
-            .execute(
-                "git ls-files".into(),
-                self.environment.cwd.clone(),
-                false,
-                true,
-                None,
-                None,
-            )
+            .execute(ShellExecuteRequest {
+                command: "git ls-files".into(),
+                cwd: self.environment.cwd.clone(),
+                keep_ansi: false,
+                silent: true,
+                env_vars: None,
+                handoff_timeout: Default::default(),
+                description: None,
+            })
             .await
             .ok()?;
 
@@ -283,15 +284,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ShellService for TestServices {
-        async fn execute(
-            &self,
-            _command: String,
-            _cwd: PathBuf,
-            _keep_ansi: bool,
-            _silent: bool,
-            _env_vars: Option<Vec<String>>,
-            _description: Option<String>,
-        ) -> anyhow::Result<ShellOutput> {
+        async fn execute(&self, _request: ShellExecuteRequest) -> anyhow::Result<ShellOutput> {
             Ok(ShellOutput {
                 output: CommandOutput {
                     stdout: String::new(),

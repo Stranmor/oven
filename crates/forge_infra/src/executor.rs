@@ -9,7 +9,7 @@ use forge_app::CommandInfra;
 use forge_domain::{
     CommandExecutionOutput, CommandOutput, ConsoleWriter as OutputPrinterTrait, Environment,
     ProcessId, ProcessLogEntry, ProcessReadCursor, ProcessReadOutput, ProcessStartOutput,
-    ProcessStatus, ProcessStatusKind, ProcessStream,
+    ProcessStatus, ProcessStatusKind, ProcessStream, ShellHandoffTimeoutSeconds,
 };
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
@@ -18,7 +18,6 @@ use tokio::sync::Mutex;
 use crate::console::StdConsoleWriter;
 
 const MAX_BACKGROUND_LOG_ENTRIES: usize = 8192;
-const SHELL_SYNC_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Service for executing shell commands
 #[derive(Clone)]
@@ -349,10 +348,11 @@ impl ForgeCommandExecutorService {
         working_dir: &Path,
         silent: bool,
         env_vars: Option<Vec<String>>,
+        handoff_timeout: ShellHandoffTimeoutSeconds,
     ) -> anyhow::Result<CommandExecutionOutput> {
         let _ready = self.ready.lock().await;
         let mut launched = self.launch_process(command, working_dir, env_vars, silent)?;
-        let exit = tokio::time::timeout(SHELL_SYNC_STARTUP_TIMEOUT, launched.child.wait()).await;
+        let exit = tokio::time::timeout(handoff_timeout.duration(), launched.child.wait()).await;
 
         match exit {
             Ok(status) => {
@@ -386,7 +386,7 @@ impl ForgeCommandExecutorService {
                 let stdout = Self::snapshot_output(&launched.stdout).await;
                 let captured_stderr = Self::snapshot_output(&launched.stderr).await;
                 let stderr = format!(
-                    "{captured_stderr}Command exceeded the 2 second synchronous shell window and is running as managed background process {process_id}. Use process_status and process_read with this process_id to observe it.",
+                    "{captured_stderr}Command exceeded the {handoff_timeout} second synchronous shell window and is running as managed background process {process_id}. Use process_status and process_read with this process_id to observe it.",
                     process_id = process.process_id
                 );
                 let command = launched.command.clone();
@@ -559,8 +559,9 @@ impl CommandInfra for ForgeCommandExecutorService {
         working_dir: PathBuf,
         silent: bool,
         env_vars: Option<Vec<String>>,
+        handoff_timeout: ShellHandoffTimeoutSeconds,
     ) -> anyhow::Result<CommandExecutionOutput> {
-        self.execute_command_internal(command, &working_dir, silent, env_vars)
+        self.execute_command_internal(command, &working_dir, silent, env_vars, handoff_timeout)
             .await
     }
 
@@ -868,6 +869,7 @@ mod tests {
                 PathBuf::new().join("."),
                 true,
                 None,
+                Default::default(),
             ),
         )
         .await
@@ -986,7 +988,13 @@ mod tests {
         let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
 
         let actual = fixture
-            .execute_command(command, temp_dir.path().to_path_buf(), true, None)
+            .execute_command(
+                command,
+                temp_dir.path().to_path_buf(),
+                true,
+                None,
+                Default::default(),
+            )
             .await
             .unwrap();
         let process = actual
@@ -1003,6 +1011,12 @@ mod tests {
         assert_eq!(actual.output.stdout, "early-output");
         assert_eq!(actual.output.exit_code, None);
         assert!(
+            actual
+                .output
+                .stderr
+                .contains("exceeded the 2 second synchronous shell window")
+        );
+        assert!(
             read_output
                 .entries
                 .iter()
@@ -1012,13 +1026,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_execute_command_custom_handoff_timeout_is_reported_and_managed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let marker_path = temp_dir.path().join("custom-timeout-side-effect");
+        let command = format!(
+            "printf custom-run >> {marker}; printf custom-early; sleep 5",
+            marker = marker_path.display()
+        );
+        let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
+
+        let actual = fixture
+            .execute_command(
+                command,
+                temp_dir.path().to_path_buf(),
+                true,
+                None,
+                ShellHandoffTimeoutSeconds::new(1).unwrap(),
+            )
+            .await
+            .unwrap();
+        let process = actual
+            .process
+            .clone()
+            .expect("custom timeout should hand off long command");
+        let read_output = fixture
+            .read_process(process.process_id.clone(), ProcessReadCursor::new(0))
+            .await
+            .unwrap();
+        let _ = fixture.kill_process(process.process_id).await;
+        let side_effects = std::fs::read_to_string(marker_path).unwrap();
+
+        assert_eq!(actual.output.stdout, "custom-early");
+        assert_eq!(actual.output.exit_code, None);
+        assert!(
+            actual
+                .output
+                .stderr
+                .contains("exceeded the 1 second synchronous shell window")
+        );
+        assert!(
+            read_output
+                .entries
+                .iter()
+                .any(|entry| entry.content.contains("custom-early"))
+        );
+        assert_eq!(side_effects, "custom-run");
+    }
+
+    #[tokio::test]
     async fn test_command_executor() {
         let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
         let cmd = "echo 'hello world'";
         let dir = ".";
 
         let actual = fixture
-            .execute_command(cmd.to_string(), PathBuf::new().join(dir), false, None)
+            .execute_command(
+                cmd.to_string(),
+                PathBuf::new().join(dir),
+                false,
+                None,
+                Default::default(),
+            )
             .await
             .unwrap();
 
@@ -1058,6 +1126,7 @@ mod tests {
                 PathBuf::new().join("."),
                 false,
                 Some(vec!["TEST_ENV_VAR".to_string()]),
+                Default::default(),
             )
             .await
             .unwrap();
@@ -1091,6 +1160,7 @@ mod tests {
                 PathBuf::new().join("."),
                 false,
                 Some(vec!["MISSING_ENV_VAR".to_string()]),
+                Default::default(),
             )
             .await
             .unwrap();
@@ -1110,6 +1180,7 @@ mod tests {
                 PathBuf::new().join("."),
                 false,
                 Some(vec![]),
+                Default::default(),
             )
             .await
             .unwrap();
@@ -1138,6 +1209,7 @@ mod tests {
                 PathBuf::new().join("."),
                 false,
                 Some(vec!["FIRST_VAR".to_string(), "SECOND_VAR".to_string()]),
+                Default::default(),
             )
             .await
             .unwrap();
@@ -1160,7 +1232,13 @@ mod tests {
         let dir = ".";
 
         let actual = fixture
-            .execute_command(cmd.to_string(), PathBuf::new().join(dir), true, None)
+            .execute_command(
+                cmd.to_string(),
+                PathBuf::new().join(dir),
+                true,
+                None,
+                Default::default(),
+            )
             .await
             .unwrap();
 

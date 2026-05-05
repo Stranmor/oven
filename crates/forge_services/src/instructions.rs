@@ -54,6 +54,7 @@ impl<F: EnvironmentInfra + FileReaderInfra + CommandInfra> ForgeCustomInstructio
                 self.infra.get_environment().cwd,
                 true, // silent mode - don't print git output
                 None, // no environment variables needed for git command
+                Default::default(),
             )
             .await
             .ok()?;

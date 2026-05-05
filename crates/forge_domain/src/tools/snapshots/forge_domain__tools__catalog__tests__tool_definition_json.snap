@@ -304,6 +304,13 @@ expression: tools
       },
       "nullable": true
     },
+    "handoff_timeout_seconds": {
+      "description": "Optional synchronous wait window before handoff to managed background execution.\nDefaults to 2 seconds when omitted. The command is not killed when this\ntimeout elapses; the already-started process is registered for\nprocess_status/process_read observation.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 1,
+      "nullable": true
+    },
     "keep_ansi": {
       "description": "Whether to preserve ANSI escape codes in the output.\nIf true, ANSI escape codes will be preserved in the output.\nIf false (default), ANSI escape codes will be stripped from the output.",
       "type": "boolean"
@@ -349,7 +356,7 @@ expression: tools
   "type": "object",
   "properties": {
     "process_id": {
-      "description": "Handle returned by process_start.",
+      "description": "Handle returned by process_start or shell timeout handoff.",
       "type": "string"
     }
   },
@@ -369,7 +376,7 @@ expression: tools
       "minimum": 0
     },
     "process_id": {
-      "description": "Handle returned by process_start.",
+      "description": "Handle returned by process_start or shell timeout handoff.",
       "type": "string"
     }
   },
@@ -386,7 +393,7 @@ expression: tools
   "type": "object",
   "properties": {
     "process_id": {
-      "description": "Handle returned by process_start.",
+      "description": "Handle returned by process_start or shell timeout handoff.",
       "type": "string"
     }
   },

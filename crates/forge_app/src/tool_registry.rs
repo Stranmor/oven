@@ -47,7 +47,6 @@ struct CachedToolDefinitions {
     key: ToolDefinitionsCacheKey,
     definitions: Vec<ToolDefinition>,
 }
-
 pub struct ToolRegistry<S> {
     tool_executor: ToolExecutor<S>,
     agent_executor: AgentExecutor<S>,
@@ -177,6 +176,10 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
             {
                 let model = self.get_current_model().await;
                 Self::validate_tool_modality(&tool_input, model.as_ref())?;
+            }
+
+            if matches!(tool_input, ToolCatalog::Shell(_)) {
+                return self.tool_executor.execute(tool_input, context).await;
             }
 
             self.call_with_timeout(&tool_name, || {

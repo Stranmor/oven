@@ -475,9 +475,10 @@ where
         working_dir: PathBuf,
         silent: bool,
         env_vars: Option<Vec<String>>,
+        handoff_timeout: forge_domain::ShellHandoffTimeoutSeconds,
     ) -> anyhow::Result<CommandExecutionOutput> {
         self.infra
-            .execute_command(command, working_dir, silent, env_vars)
+            .execute_command(command, working_dir, silent, env_vars, handoff_timeout)
             .await
     }
 

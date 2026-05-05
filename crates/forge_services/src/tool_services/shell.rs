@@ -6,7 +6,8 @@ use bstr::ByteSlice;
 use forge_app::domain::Environment;
 use forge_app::{
     CommandInfra, EnvironmentInfra, ProcessKillServiceOutput, ProcessOutput,
-    ProcessReadServiceOutput, ProcessStartServiceOutput, ShellOutput, ShellService,
+    ProcessReadServiceOutput, ProcessStartServiceOutput, ShellExecuteRequest, ShellOutput,
+    ShellService,
 };
 use forge_domain::{ProcessId, ProcessReadCursor};
 use strip_ansi_escapes::strip;
@@ -46,20 +47,21 @@ impl<I: EnvironmentInfra> ForgeShell<I> {
 
 #[async_trait::async_trait]
 impl<I: CommandInfra + EnvironmentInfra> ShellService for ForgeShell<I> {
-    async fn execute(
-        &self,
-        command: String,
-        cwd: PathBuf,
-        keep_ansi: bool,
-        silent: bool,
-        env_vars: Option<Vec<String>>,
-        description: Option<String>,
-    ) -> anyhow::Result<ShellOutput> {
+    async fn execute(&self, request: ShellExecuteRequest) -> anyhow::Result<ShellOutput> {
+        let ShellExecuteRequest {
+            command,
+            cwd,
+            keep_ansi,
+            silent,
+            env_vars,
+            handoff_timeout,
+            description,
+        } = request;
         Self::validate_command(&command)?;
 
         let execution = self
             .infra
-            .execute_command(command, cwd, silent, env_vars)
+            .execute_command(command, cwd, silent, env_vars, handoff_timeout)
             .await?;
         let mut output = execution.output;
         let process = execution.process;
@@ -177,6 +179,7 @@ mod tests {
             _working_dir: PathBuf,
             _silent: bool,
             env_vars: Option<Vec<String>>,
+            _handoff_timeout: forge_domain::ShellHandoffTimeoutSeconds,
         ) -> anyhow::Result<CommandExecutionOutput> {
             assert_eq!(env_vars, self.expected_env_vars);
             match self.execution_mode {
@@ -317,6 +320,22 @@ mod tests {
         assert_eq!(actual.description, Some("Starts test process".to_string()));
     }
 
+    fn execute_request(
+        command: impl Into<String>,
+        env_vars: Option<Vec<String>>,
+        description: Option<String>,
+    ) -> ShellExecuteRequest {
+        ShellExecuteRequest {
+            command: command.into(),
+            cwd: PathBuf::from("."),
+            keep_ansi: false,
+            silent: false,
+            env_vars,
+            handoff_timeout: forge_domain::ShellHandoffTimeoutSeconds::default(),
+            description,
+        }
+    }
+
     #[tokio::test]
     async fn test_shell_service_rejects_empty_background_command() {
         let fixture = ForgeShell::new(Arc::new(MockCommandInfra::immediate(None)));
@@ -336,14 +355,11 @@ mod tests {
         ]))));
 
         let actual = fixture
-            .execute(
-                "echo hello".to_string(),
-                PathBuf::from("."),
-                false,
-                false,
+            .execute(execute_request(
+                "echo hello",
                 Some(vec!["PATH".to_string(), "HOME".to_string()]),
                 None,
-            )
+            ))
             .await
             .unwrap();
 
@@ -357,14 +373,7 @@ mod tests {
         let fixture = ForgeShell::new(Arc::new(MockCommandInfra::immediate(None)));
 
         let actual = fixture
-            .execute(
-                "echo hello".to_string(),
-                PathBuf::from("."),
-                false,
-                false,
-                None,
-                None,
-            )
+            .execute(execute_request("echo hello", None, None))
             .await
             .unwrap();
 
@@ -378,14 +387,7 @@ mod tests {
         let fixture = ForgeShell::new(Arc::new(MockCommandInfra::immediate(Some(vec![]))));
 
         let actual = fixture
-            .execute(
-                "echo hello".to_string(),
-                PathBuf::from("."),
-                false,
-                false,
-                Some(vec![]),
-                None,
-            )
+            .execute(execute_request("echo hello", Some(vec![]), None))
             .await
             .unwrap();
 
@@ -399,14 +401,11 @@ mod tests {
         let fixture = ForgeShell::new(Arc::new(MockCommandInfra::immediate(None)));
 
         let actual = fixture
-            .execute(
-                "echo hello".to_string(),
-                PathBuf::from("."),
-                false,
-                false,
+            .execute(execute_request(
+                "echo hello",
                 None,
                 Some("Prints hello to stdout".to_string()),
-            )
+            ))
             .await
             .unwrap();
 
@@ -425,14 +424,11 @@ mod tests {
         let fixture = ForgeShell::new(infra.clone());
 
         let actual = fixture
-            .execute(
-                "sleep 60".to_string(),
-                PathBuf::from("."),
-                false,
-                true,
+            .execute(execute_request(
+                "sleep 60",
                 None,
                 Some("Starts a long command".to_string()),
-            )
+            ))
             .await
             .unwrap();
 
@@ -459,14 +455,11 @@ mod tests {
         let fixture = ForgeShell::new(Arc::new(MockCommandInfra::pending_with_ansi_process_id()));
 
         let actual = fixture
-            .execute(
-                "sleep 60".to_string(),
-                PathBuf::from("."),
-                false,
-                true,
+            .execute(execute_request(
+                "sleep 60",
                 None,
                 Some("Starts a long command".to_string()),
-            )
+            ))
             .await
             .unwrap();
 
@@ -496,14 +489,7 @@ mod tests {
         let fixture = ForgeShell::new(Arc::new(MockCommandInfra::immediate(None)));
 
         let actual = fixture
-            .execute(
-                "echo hello".to_string(),
-                PathBuf::from("."),
-                false,
-                false,
-                None,
-                None,
-            )
+            .execute(execute_request("echo hello", None, None))
             .await
             .unwrap();
 

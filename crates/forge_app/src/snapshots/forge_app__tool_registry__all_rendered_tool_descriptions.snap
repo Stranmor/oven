@@ -153,6 +153,8 @@ Reverts the most recent file operation (create/modify/delete) on a specific file
 
 Executes shell commands. The `cwd` parameter sets the working directory for command execution. If not specified, defaults to `/home/user/project`.
 
+Short commands remain synchronous and return stdout, stderr, and exit code directly. Commands that exceed the synchronous startup window are automatically handed off to the managed background process subsystem; the shell result then has no exit code, includes the process handle in the output attributes, and should be followed with `process_status` and `process_read` using the returned `process_id`. The `handoff_timeout_seconds` parameter controls this per command: omit it for the default 2 second window, or set a positive integer (for example `15`) when the command needs a longer synchronous wait before background handoff. Handoff does not kill or restart the command; the already-started process continues exactly once under managed process tracking.
+
 CRITICAL: Do NOT use `cd` commands in the command string. This is FORBIDDEN. Always use the `cwd` parameter to set the working directory instead. Any use of `cd` in the command is redundant, incorrect, and violates the tool contract.
 
 IMPORTANT: This tool is for terminal operations like git, npm, docker, etc. DO NOT use it for file operations (reading, writing, editing, searching, finding files) - use the specialized tools for this instead.
@@ -175,6 +177,7 @@ Before executing the command, please follow these steps:
 
 Usage notes:
   - The command argument is required.
+  - `handoff_timeout_seconds` is optional and must be a positive integer when provided. It changes only how long shell waits synchronously before returning a managed process handle; it is not a kill timeout and does not duplicate execution.
   - It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
   - If the output exceeds 200 prefix lines or 200 suffix lines, or if a line exceeds 2000 characters, it will be truncated and the full output will be written to a temporary file. You can use read with start_line/end_line to read specific sections or fs_search to search the full content. Because of this, you should NOT use `head`, `tail`, or other truncation commands to limit output - just run the command directly.
   - Do not use shell with the `find`, `grep`, `cat`, `head`, `tail`, `sed`, `awk`, or `echo` commands, unless explicitly instructed or when these commands are truly necessary for the task. Instead, always prefer using the dedicated tools for these commands:
@@ -197,7 +200,7 @@ Good examples:
 Bad example:
   cd /foo/bar && pytest tests
 
-Returns complete output including stdout, stderr, and exit code for diagnostic purposes.
+Returns complete output including stdout, stderr, and exit code for synchronous commands, or a managed process handle for commands handed off after the startup window.
 
 ---
 
@@ -215,7 +218,7 @@ The `cwd` parameter sets the working directory. Do not put `cd` in the command s
 
 ### process_status
 
-Returns structured lifecycle status for a managed background process previously started with `process_start`.
+Returns structured lifecycle status for a managed background process. The `process_id` handle may come from `process_start` or from a shell timeout handoff when a shell command exceeds the synchronous execution window.
 
 The result includes the typed `process_id`, command, working directory, and status: running, exited with exit code, or killed.
 
@@ -223,7 +226,7 @@ The result includes the typed `process_id`, command, working directory, and stat
 
 ### process_read
 
-Reads captured stdout/stderr from a managed background process previously started with `process_start`.
+Reads captured stdout/stderr from a managed background process. The `process_id` handle may come from `process_start` or from a shell timeout handoff when a shell command exceeds the synchronous execution window.
 
 Pass the `cursor` returned by the previous `process_read` call to receive only new output. Omit it or pass `0` to read from the beginning. The result returns `next_cursor` for idempotent continuation.
 
@@ -239,7 +242,7 @@ Use this before starting duplicate servers or to discover handles for status, lo
 
 ### process_kill
 
-Stops a managed background process previously started with `process_start`.
+Stops a managed background process. The `process_id` handle may come from `process_start` or from a shell timeout handoff when a shell command exceeds the synchronous execution window.
 
 Use this to clean up servers, watchers, or long-running commands after verification. The result reports the final process status.
 

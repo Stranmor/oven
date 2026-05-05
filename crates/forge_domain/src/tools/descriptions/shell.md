@@ -1,6 +1,6 @@
 Executes shell commands. The `cwd` parameter sets the working directory for command execution. If not specified, defaults to `{{env.cwd}}`.
 
-Short commands remain synchronous and return stdout, stderr, and exit code directly. Commands that exceed the synchronous startup window are automatically handed off to the managed background process subsystem; the shell result then has no exit code, includes the process handle in the output attributes, and should be followed with `process_status` and `process_read` using the returned `process_id`.
+Short commands remain synchronous and return stdout, stderr, and exit code directly. Commands that exceed the synchronous startup window are automatically handed off to the managed background process subsystem; the shell result then has no exit code, includes the process handle in the output attributes, and should be followed with `process_status` and `process_read` using the returned `process_id`. The `handoff_timeout_seconds` parameter controls this per command: omit it for the default 2 second window, or set a positive integer (for example `15`) when the command needs a longer synchronous wait before background handoff. Handoff does not kill or restart the command; the already-started process continues exactly once under managed process tracking.
 
 CRITICAL: Do NOT use `cd` commands in the command string. This is FORBIDDEN. Always use the `cwd` parameter to set the working directory instead. Any use of `cd` in the command is redundant, incorrect, and violates the tool contract.
 
@@ -24,6 +24,7 @@ Before executing the command, please follow these steps:
 
 Usage notes:
   - The command argument is required.
+  - `handoff_timeout_seconds` is optional and must be a positive integer when provided. It changes only how long shell waits synchronously before returning a managed process handle; it is not a kill timeout and does not duplicate execution.
   - It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
   - If the output exceeds {{config.stdoutMaxPrefixLength}} prefix lines or {{config.stdoutMaxSuffixLength}} suffix lines, or if a line exceeds {{config.stdoutMaxLineLength}} characters, it will be truncated and the full output will be written to a temporary file. You can use read with start_line/end_line to read specific sections or fs_search to search the full content. Because of this, you should NOT use `head`, `tail`, or other truncation commands to limit output - just run the command directly.
   - Do not use {{tool_names.shell}} with the `find`, `grep`, `cat`, `head`, `tail`, `sed`, `awk`, or `echo` commands, unless explicitly instructed or when these commands are truly necessary for the task. Instead, always prefer using the dedicated tools for these commands:

@@ -12,8 +12,8 @@ use crate::services::Services;
 use crate::{
     AgentRegistry, ConversationService, EnvironmentInfra, FollowUpService, FsPatchService,
     FsReadService, FsRemoveService, FsSearchService, FsUndoService, FsWriteService,
-    ImageReadService, NetFetchService, PlanCreateService, ProviderService, ShellService,
-    SkillFetchService, WorkspaceService,
+    ImageReadService, NetFetchService, PlanCreateService, ProviderService, ShellExecuteRequest,
+    ShellService, SkillFetchService, WorkspaceService,
 };
 
 pub struct ToolExecutor<S> {
@@ -281,14 +281,15 @@ impl<
                 let execution_cwd = self.resolve_execution_cwd(input.cwd.as_ref());
                 let output = self
                     .services
-                    .execute(
-                        input.command.clone(),
-                        execution_cwd,
-                        input.keep_ansi,
-                        false,
-                        input.env.clone(),
-                        input.description.clone(),
-                    )
+                    .execute(ShellExecuteRequest {
+                        command: input.command.clone(),
+                        cwd: execution_cwd,
+                        keep_ansi: input.keep_ansi,
+                        silent: false,
+                        env_vars: input.env.clone(),
+                        handoff_timeout: input.handoff_timeout_seconds.unwrap_or_default(),
+                        description: input.description.clone(),
+                    })
                     .await?;
                 output.into()
             }

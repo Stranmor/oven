@@ -19,8 +19,8 @@ use crate::set_conversation_id::SetConversationId;
 use crate::system_prompt::SystemPrompt;
 use crate::user_prompt::UserPromptGenerator;
 use crate::{
-    AgentExt, AgentService, AttachmentService, EnvironmentInfra, ShellOutput, ShellService,
-    SkillFetchService, TemplateService,
+    AgentExt, AgentService, AttachmentService, EnvironmentInfra, ShellExecuteRequest, ShellOutput,
+    ShellService, SkillFetchService, TemplateService,
 };
 
 static TEMPLATE_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../templates");
@@ -254,15 +254,7 @@ impl SkillFetchService for Runner {
 
 #[async_trait::async_trait]
 impl ShellService for Runner {
-    async fn execute(
-        &self,
-        _command: String,
-        _cwd: std::path::PathBuf,
-        _keep_ansi: bool,
-        _silent: bool,
-        _env_vars: Option<Vec<String>>,
-        _description: Option<String>,
-    ) -> anyhow::Result<ShellOutput> {
+    async fn execute(&self, _request: ShellExecuteRequest) -> anyhow::Result<ShellOutput> {
         let mut outputs = self.test_shell_outputs.lock().await;
         if let Some(output) = outputs.pop_front() {
             Ok(output)

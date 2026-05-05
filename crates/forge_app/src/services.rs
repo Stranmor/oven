@@ -468,18 +468,28 @@ pub trait NetFetchService: Send + Sync {
     async fn fetch(&self, url: String, raw: Option<bool>) -> anyhow::Result<HttpResponse>;
 }
 
+/// Typed request for executing a shell command through the shell service.
+pub struct ShellExecuteRequest {
+    /// Shell command text to execute.
+    pub command: String,
+    /// Working directory for command execution.
+    pub cwd: PathBuf,
+    /// Whether ANSI escape codes should be preserved.
+    pub keep_ansi: bool,
+    /// Whether command output should be suppressed from console display.
+    pub silent: bool,
+    /// Environment variable names copied from the current process.
+    pub env_vars: Option<Vec<String>>,
+    /// Synchronous wait window before background process handoff.
+    pub handoff_timeout: forge_domain::ShellHandoffTimeoutSeconds,
+    /// Human-readable command description.
+    pub description: Option<String>,
+}
+
 #[async_trait::async_trait]
 pub trait ShellService: Send + Sync {
     /// Executes a shell command and returns the output.
-    async fn execute(
-        &self,
-        command: String,
-        cwd: PathBuf,
-        keep_ansi: bool,
-        silent: bool,
-        env_vars: Option<Vec<String>>,
-        description: Option<String>,
-    ) -> anyhow::Result<ShellOutput>;
+    async fn execute(&self, request: ShellExecuteRequest) -> anyhow::Result<ShellOutput>;
 
     /// Starts a managed background process and returns its handle immediately.
     async fn process_start(
@@ -941,18 +951,8 @@ impl<I: Services> NetFetchService for I {
 
 #[async_trait::async_trait]
 impl<I: Services> ShellService for I {
-    async fn execute(
-        &self,
-        command: String,
-        cwd: PathBuf,
-        keep_ansi: bool,
-        silent: bool,
-        env_vars: Option<Vec<String>>,
-        description: Option<String>,
-    ) -> anyhow::Result<ShellOutput> {
-        self.shell_service()
-            .execute(command, cwd, keep_ansi, silent, env_vars, description)
-            .await
+    async fn execute(&self, request: ShellExecuteRequest) -> anyhow::Result<ShellOutput> {
+        self.shell_service().execute(request).await
     }
 
     async fn process_start(
