@@ -836,9 +836,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                         }
                     }
                     SelectCommand::Conversation { query } => {
-                        let max_conversations = self.config.max_conversations;
-                        let conversations =
-                            self.api.get_conversations(Some(max_conversations)).await?;
+                        let conversations = self.api.get_conversations().await?;
 
                         if !conversations.is_empty()
                             && let Some(conversation) = ConversationSelector::select_conversation(
