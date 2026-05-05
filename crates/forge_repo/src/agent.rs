@@ -99,8 +99,7 @@ impl<I: FileInfoInfra + EnvironmentInfra<Config = ForgeConfig> + DirectoryReader
 
         let mut agents = Vec::new();
         for (path, content) in files {
-            let mut agent = apply_subagent_tool_config(parse_agent_file(&content)?, &config)
-                .with_context(|| format!("Failed to parse agent: {}", path.display()))?;
+            let mut agent = parse_configured_agent_file(&path, &content, &config)?;
 
             // Store the file path
             agent.path = Some(path.display().to_string());
@@ -146,6 +145,17 @@ where
     }
 
     Ok(agents)
+}
+
+fn parse_configured_agent_file(
+    path: &std::path::Path,
+    content: &str,
+    config: &ForgeConfig,
+) -> Result<AgentDefinition> {
+    let agent = parse_agent_file(content)
+        .with_context(|| format!("Failed to parse agent: {}", path.display()))?;
+    apply_subagent_tool_config(agent, config)
+        .with_context(|| format!("Failed to parse agent: {}", path.display()))
 }
 
 fn apply_subagent_tool_config(
@@ -263,6 +273,32 @@ mod tests {
             actual.description.as_ref().unwrap(),
             "An advanced test agent with full configuration"
         );
+    }
+
+    #[test]
+    fn test_parse_configured_agent_file_reports_source_path_for_empty_file() {
+        let setup = std::path::PathBuf::from("/tmp/empty-agent.md");
+
+        let actual = parse_configured_agent_file(&setup, "", &ForgeConfig::default()).unwrap_err();
+        let expected = "Failed to parse agent: /tmp/empty-agent.md";
+
+        assert!(actual.to_string().contains(expected));
+    }
+
+    #[test]
+    fn test_parse_configured_agent_file_reports_source_path_for_invalid_frontmatter() {
+        let setup = std::path::PathBuf::from("/tmp/invalid-agent.md");
+        let fixture = r#"---
+id: [
+---
+Invalid body.
+"#;
+
+        let actual =
+            parse_configured_agent_file(&setup, fixture, &ForgeConfig::default()).unwrap_err();
+        let expected = "Failed to parse agent: /tmp/invalid-agent.md";
+
+        assert!(actual.to_string().contains(expected));
     }
 
     #[test]
