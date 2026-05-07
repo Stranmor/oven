@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 
 use anyhow::{Context, Result};
@@ -23,7 +25,7 @@ impl File {
     }
 }
 
-#[derive(Debug, Clone, Setters)]
+#[derive(Clone, Setters)]
 pub struct Walker {
     /// Base directory to start walking from
     cwd: PathBuf,
@@ -50,6 +52,42 @@ pub struct Walker {
     /// When `true` (the default), dotfiles are excluded from results.
     /// Set to `false` to include them, matching `fd --hidden`.
     hidden: bool,
+
+    #[cfg(test)]
+    #[setters(skip)]
+    traversal_observer: Option<TraversalObserver>,
+}
+
+#[cfg(test)]
+type TraversalObserver = Arc<dyn Fn() + Send + Sync>;
+
+impl std::fmt::Debug for Walker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = formatter.debug_struct("Walker");
+        debug
+            .field("cwd", &self.cwd)
+            .field("max_depth", &self.max_depth)
+            .field("max_breadth", &self.max_breadth)
+            .field("max_file_size", &self.max_file_size)
+            .field("max_files", &self.max_files)
+            .field("max_total_size", &self.max_total_size)
+            .field("skip_binary", &self.skip_binary)
+            .field("hidden", &self.hidden);
+        #[cfg(test)]
+        debug.field(
+            "traversal_observer",
+            &self.traversal_observer.as_ref().map(|_| "<observer>"),
+        );
+        debug.finish()
+    }
+}
+
+#[cfg(test)]
+impl Walker {
+    fn traversal_observer(mut self, observer: TraversalObserver) -> Self {
+        self.traversal_observer = Some(observer);
+        self
+    }
 }
 
 const DEFAULT_MAX_FILE_SIZE: u64 = 1024 * 1024; // 1MB
@@ -71,6 +109,8 @@ impl Walker {
             max_total_size: DEFAULT_MAX_TOTAL_SIZE,
             skip_binary: true,
             hidden: true,
+            #[cfg(test)]
+            traversal_observer: None,
         }
     }
 
@@ -88,6 +128,8 @@ impl Walker {
             skip_binary: false,
             // Include hidden files (dotfiles) — matches `fd --hidden`.
             hidden: false,
+            #[cfg(test)]
+            traversal_observer: None,
         }
     }
 }
@@ -185,6 +227,8 @@ impl Walker {
         let max_files = self.max_files;
         let max_total_size = self.max_total_size;
         let skip_binary = self.skip_binary;
+        #[cfg(test)]
+        let traversal_observer = self.traversal_observer.clone();
 
         for result in WalkBuilder::new(&self.cwd)
             .standard_filters(true)
@@ -259,6 +303,11 @@ impl Walker {
                 continue;
             }
 
+            #[cfg(test)]
+            if let Some(observer) = &traversal_observer {
+                observer();
+            }
+
             if !emit(File { path: path_string, file_name, size: file_size }) {
                 break;
             }
@@ -285,6 +334,8 @@ impl Walker {
         let max_files = self.max_files;
         let max_total_size = self.max_total_size;
         let skip_binary = self.skip_binary;
+        #[cfg(test)]
+        let traversal_observer = self.traversal_observer.clone();
 
         // TODO: Convert to async and return a stream
         let walk_parallel = WalkBuilder::new(&self.cwd)
@@ -306,6 +357,8 @@ impl Walker {
             let dir_entries = Arc::clone(&dir_entries);
             let global = Arc::clone(&global);
             let cwd = cwd.clone();
+            #[cfg(test)]
+            let traversal_observer = traversal_observer.clone();
 
             Box::new(move |result| {
                 // Check if a previous thread already triggered the quit signal.
@@ -414,6 +467,10 @@ impl Walker {
                 }
 
                 let file = File { path: path_string, file_name, size: file_size };
+                #[cfg(test)]
+                if let Some(observer) = &traversal_observer {
+                    observer();
+                }
                 if !emit(file) {
                     global.lock().unwrap().2 = true;
                     return ignore::WalkState::Quit;
@@ -510,31 +567,33 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_drop_after_first_item_stops_blocking_walker() -> Result<()> {
-        use futures::StreamExt;
         use tokio::time::{Duration, timeout};
 
         let fixture = fixtures::Fixture::default();
         for index in 0..256 {
             fixture.add_file(&format!("file_{index:03}.txt"), "needle")?;
         }
-        {
-            let actual = Walker::max_all()
-                .cwd(fixture.as_path().to_path_buf())
-                .stream();
-            futures::pin_mut!(actual);
+        let observed_entries = Arc::new(AtomicUsize::new(0));
+        let observer_entries = Arc::clone(&observed_entries);
+        let fixture = Walker::max_all()
+            .cwd(fixture.as_path().to_path_buf())
+            .traversal_observer(Arc::new(move || {
+                observer_entries.fetch_add(1, Ordering::SeqCst);
+            }));
+        let (sender, mut receiver) = mpsc::channel::<(File, std_mpsc::SyncSender<()>)>(1);
 
-            let first = timeout(Duration::from_secs(1), actual.next())
-                .await?
-                .context("stream should yield first walked file")??;
-            let expected = false;
+        let worker = tokio::task::spawn_blocking(move || fixture.send_blocking(sender));
+        let (first, first_ack) = timeout(Duration::from_secs(1), receiver.recv())
+            .await?
+            .context("stream should yield first walked file")?;
+        let expected = false;
 
-            assert_eq!(first.is_dir(), expected);
-        }
-        timeout(
-            Duration::from_secs(1),
-            tokio::task::spawn_blocking(|| 1usize),
-        )
-        .await??;
+        assert_eq!(first.is_dir(), expected);
+        assert_eq!(observed_entries.load(Ordering::SeqCst), 1);
+
+        drop(first_ack);
+        timeout(Duration::from_secs(1), worker).await???;
+        assert_eq!(observed_entries.load(Ordering::SeqCst), 1);
         Ok(())
     }
 
