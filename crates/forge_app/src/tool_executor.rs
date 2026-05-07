@@ -309,7 +309,10 @@ impl<
             ToolCatalog::ProcessStatus(input) => {
                 let output = self
                     .services
-                    .process_status(forge_domain::ProcessId::parse(input.process_id.clone())?)
+                    .process_status(
+                        forge_domain::ProcessId::parse(input.process_id.clone())?,
+                        input.wait_seconds,
+                    )
                     .await?;
                 ToolOperation::ProcessStatus { output }
             }
@@ -319,6 +322,7 @@ impl<
                     .process_read(
                         forge_domain::ProcessId::parse(input.process_id.clone())?,
                         forge_domain::ProcessReadCursor::new(input.cursor),
+                        input.wait_seconds,
                     )
                     .await?;
                 ToolOperation::ProcessRead { output }

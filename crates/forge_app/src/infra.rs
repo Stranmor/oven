@@ -176,13 +176,18 @@ pub trait CommandInfra: Send + Sync {
     ) -> anyhow::Result<ProcessStartOutput>;
 
     /// Returns structured status for a managed background process.
-    async fn process_status(&self, process_id: ProcessId) -> anyhow::Result<ProcessStatus>;
+    async fn process_status(
+        &self,
+        process_id: ProcessId,
+        wait: Option<forge_domain::ProcessObservationWaitSeconds>,
+    ) -> anyhow::Result<ProcessStatus>;
 
     /// Reads captured process output since the provided cursor.
     async fn read_process(
         &self,
         process_id: ProcessId,
         cursor: ProcessReadCursor,
+        wait: Option<forge_domain::ProcessObservationWaitSeconds>,
     ) -> anyhow::Result<ProcessReadOutput>;
 
     /// Lists managed background process statuses.

@@ -503,7 +503,11 @@ pub trait ShellService: Send + Sync {
     }
 
     /// Returns status for a managed background process.
-    async fn process_status(&self, _process_id: ProcessId) -> anyhow::Result<ProcessOutput> {
+    async fn process_status(
+        &self,
+        _process_id: ProcessId,
+        _wait: Option<forge_domain::ProcessObservationWaitSeconds>,
+    ) -> anyhow::Result<ProcessOutput> {
         anyhow::bail!("Managed background processes are not supported by this shell service")
     }
 
@@ -512,6 +516,7 @@ pub trait ShellService: Send + Sync {
         &self,
         _process_id: ProcessId,
         _cursor: ProcessReadCursor,
+        _wait: Option<forge_domain::ProcessObservationWaitSeconds>,
     ) -> anyhow::Result<ProcessReadServiceOutput> {
         anyhow::bail!("Managed background processes are not supported by this shell service")
     }
@@ -967,16 +972,21 @@ impl<I: Services> ShellService for I {
             .await
     }
 
-    async fn process_status(&self, process_id: ProcessId) -> anyhow::Result<ProcessOutput> {
-        self.shell_service().process_status(process_id).await
+    async fn process_status(
+        &self,
+        process_id: ProcessId,
+        wait: Option<forge_domain::ProcessObservationWaitSeconds>,
+    ) -> anyhow::Result<ProcessOutput> {
+        self.shell_service().process_status(process_id, wait).await
     }
 
     async fn process_read(
         &self,
         process_id: ProcessId,
         cursor: ProcessReadCursor,
+        wait: Option<forge_domain::ProcessObservationWaitSeconds>,
     ) -> anyhow::Result<ProcessReadServiceOutput> {
-        self.shell_service().process_read(process_id, cursor).await
+        self.shell_service().process_read(process_id, cursor, wait).await
     }
 
     async fn process_list(&self) -> anyhow::Result<Vec<ProcessStatus>> {

@@ -265,9 +265,13 @@ impl CommandInfra for ForgeInfra {
             .await
     }
 
-    async fn process_status(&self, process_id: ProcessId) -> anyhow::Result<ProcessStatus> {
+    async fn process_status(
+        &self,
+        process_id: ProcessId,
+        wait: Option<forge_domain::ProcessObservationWaitSeconds>,
+    ) -> anyhow::Result<ProcessStatus> {
         self.command_executor_service
-            .process_status(process_id)
+            .process_status(process_id, wait)
             .await
     }
 
@@ -275,9 +279,10 @@ impl CommandInfra for ForgeInfra {
         &self,
         process_id: ProcessId,
         cursor: ProcessReadCursor,
+        wait: Option<forge_domain::ProcessObservationWaitSeconds>,
     ) -> anyhow::Result<ProcessReadOutput> {
         self.command_executor_service
-            .read_process(process_id, cursor)
+            .read_process(process_id, cursor, wait)
             .await
     }
 

@@ -86,8 +86,12 @@ impl<I: CommandInfra + EnvironmentInfra> ShellService for ForgeShell<I> {
         Ok(ProcessStartServiceOutput { shell: self.env.shell.clone(), description, output })
     }
 
-    async fn process_status(&self, process_id: ProcessId) -> anyhow::Result<ProcessOutput> {
-        let status = self.infra.process_status(process_id).await?;
+    async fn process_status(
+        &self,
+        process_id: ProcessId,
+        wait: Option<forge_domain::ProcessObservationWaitSeconds>,
+    ) -> anyhow::Result<ProcessOutput> {
+        let status = self.infra.process_status(process_id, wait).await?;
         Ok(ProcessOutput { shell: self.env.shell.clone(), description: None, status })
     }
 
@@ -95,8 +99,9 @@ impl<I: CommandInfra + EnvironmentInfra> ShellService for ForgeShell<I> {
         &self,
         process_id: ProcessId,
         cursor: ProcessReadCursor,
+        wait: Option<forge_domain::ProcessObservationWaitSeconds>,
     ) -> anyhow::Result<ProcessReadServiceOutput> {
-        let output = self.infra.read_process(process_id, cursor).await?;
+        let output = self.infra.read_process(process_id, cursor, wait).await?;
         Ok(ProcessReadServiceOutput { shell: self.env.shell.clone(), output })
     }
 
@@ -239,7 +244,11 @@ mod tests {
             })
         }
 
-        async fn process_status(&self, process_id: ProcessId) -> anyhow::Result<ProcessStatus> {
+        async fn process_status(
+            &self,
+            process_id: ProcessId,
+            _wait: Option<forge_domain::ProcessObservationWaitSeconds>,
+        ) -> anyhow::Result<ProcessStatus> {
             Ok(ProcessStatus {
                 process_id,
                 status: ProcessStatusKind::Running,
@@ -252,6 +261,7 @@ mod tests {
             &self,
             process_id: ProcessId,
             cursor: ProcessReadCursor,
+            _wait: Option<forge_domain::ProcessObservationWaitSeconds>,
         ) -> anyhow::Result<ProcessReadOutput> {
             Ok(ProcessReadOutput {
                 process_id,

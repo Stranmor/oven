@@ -5,6 +5,81 @@ use std::time::Duration;
 use schemars::{JsonSchema, Schema, json_schema};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+/// Bounded wait duration for observing managed background process changes.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub struct ProcessObservationWaitSeconds(u64);
+
+impl ProcessObservationWaitSeconds {
+    /// Maximum observation wait in seconds.
+    pub const MAX_SECONDS: u64 = 30;
+
+    /// Creates an observation wait from externally provided seconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value is zero or exceeds the maximum bound.
+    pub fn new(value: u64) -> anyhow::Result<Self> {
+        if value == 0 {
+            anyhow::bail!("wait_seconds must be greater than zero");
+        }
+        if value > Self::MAX_SECONDS {
+            anyhow::bail!("wait_seconds must be at most {}", Self::MAX_SECONDS);
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the wait value as seconds.
+    pub const fn seconds(self) -> u64 {
+        self.0
+    }
+
+    /// Returns the wait as a standard duration.
+    pub const fn duration(self) -> Duration {
+        Duration::from_secs(self.0)
+    }
+}
+
+impl fmt::Display for ProcessObservationWaitSeconds {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl JsonSchema for ProcessObservationWaitSeconds {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("ProcessObservationWaitSeconds")
+    }
+
+    fn json_schema(_generator: &mut schemars::generate::SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1,
+            "maximum": Self::MAX_SECONDS
+        })
+    }
+}
+
+impl Serialize for ProcessObservationWaitSeconds {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u64(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProcessObservationWaitSeconds {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let value = u64::deserialize(deserializer)?;
+        Self::new(value).map_err(Error::custom)
+    }
+}
+
 /// Timeout before a shell command is handed off to managed background execution.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 pub struct ShellHandoffTimeoutSeconds(u64);
@@ -235,6 +310,41 @@ mod tests {
             "type": "integer",
             "format": "uint64",
             "minimum": 1
+        });
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_process_observation_wait_rejects_zero_at_json_boundary() {
+        let fixture = "0";
+
+        let actual = serde_json::from_str::<ProcessObservationWaitSeconds>(fixture);
+
+        assert!(actual.is_err());
+    }
+
+    #[test]
+    fn test_process_observation_wait_rejects_unbounded_values_at_json_boundary() {
+        let fixture = "31";
+
+        let actual = serde_json::from_str::<ProcessObservationWaitSeconds>(fixture);
+
+        assert!(actual.is_err());
+    }
+
+    #[test]
+    fn test_process_observation_wait_schema_matches_runtime_boundary() {
+        let fixture = schema_for!(ProcessObservationWaitSeconds);
+
+        let actual = fixture.to_value();
+        let expected = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "ProcessObservationWaitSeconds",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1,
+            "maximum": 30
         });
 
         assert_eq!(actual, expected);

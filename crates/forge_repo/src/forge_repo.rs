@@ -509,16 +509,21 @@ where
             .await
     }
 
-    async fn process_status(&self, process_id: ProcessId) -> anyhow::Result<ProcessStatus> {
-        self.infra.process_status(process_id).await
+    async fn process_status(
+        &self,
+        process_id: ProcessId,
+        wait: Option<forge_domain::ProcessObservationWaitSeconds>,
+    ) -> anyhow::Result<ProcessStatus> {
+        self.infra.process_status(process_id, wait).await
     }
 
     async fn read_process(
         &self,
         process_id: ProcessId,
         cursor: ProcessReadCursor,
+        wait: Option<forge_domain::ProcessObservationWaitSeconds>,
     ) -> anyhow::Result<ProcessReadOutput> {
-        self.infra.read_process(process_id, cursor).await
+        self.infra.read_process(process_id, cursor, wait).await
     }
 
     async fn list_processes(&self) -> anyhow::Result<Vec<ProcessStatus>> {

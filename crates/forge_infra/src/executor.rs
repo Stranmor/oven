@@ -3,13 +3,15 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use bstr::ByteSlice;
 use forge_app::CommandInfra;
 use forge_domain::{
     CommandExecutionOutput, CommandOutput, ConsoleWriter as OutputPrinterTrait, Environment,
-    ProcessId, ProcessLogEntry, ProcessReadCursor, ProcessReadOutput, ProcessStartOutput,
-    ProcessStatus, ProcessStatusKind, ProcessStream, ShellHandoffTimeoutSeconds,
+    ProcessId, ProcessLogEntry, ProcessObservationWaitSeconds, ProcessReadCursor,
+    ProcessReadOutput, ProcessStartOutput, ProcessStatus, ProcessStatusKind, ProcessStream,
+    ShellHandoffTimeoutSeconds,
 };
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
@@ -18,6 +20,7 @@ use tokio::sync::Mutex;
 use crate::console::StdConsoleWriter;
 
 const MAX_BACKGROUND_LOG_ENTRIES: usize = 8192;
+const PROCESS_OBSERVATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Service for executing shell commands
 #[derive(Clone)]
@@ -94,34 +97,22 @@ impl LaunchedProcess {
 }
 
 impl ManagedProcess {
-    async fn refresh_status(&mut self) -> anyhow::Result<()> {
-        self.refresh_status_with_output_join(true).await
-    }
-
     async fn refresh_status_without_output_join(&mut self) -> anyhow::Result<()> {
-        self.refresh_status_with_output_join(false).await
-    }
-
-    async fn join_output_tasks(&mut self) -> anyhow::Result<()> {
-        if let Some(stdout_task) = self.stdout_task.take() {
-            stdout_task.await?;
-        }
-        if let Some(stderr_task) = self.stderr_task.take() {
-            stderr_task.await?;
-        }
-        Ok(())
-    }
-
-    async fn refresh_status_with_output_join(&mut self, join_output: bool) -> anyhow::Result<()> {
         if matches!(self.status, ProcessStatusKind::Running)
             && let Some(status) = self.child.try_wait()?
         {
             self.status = ProcessStatusKind::Exited { exit_code: status.code() };
-            if join_output {
-                self.join_output_tasks().await?;
-            }
         }
         Ok(())
+    }
+
+    fn take_output_tasks(
+        &mut self,
+    ) -> (
+        Option<tokio::task::JoinHandle<()>>,
+        Option<tokio::task::JoinHandle<()>>,
+    ) {
+        (self.stdout_task.take(), self.stderr_task.take())
     }
 
     fn status(&self, process_id: ProcessId) -> ProcessStatus {
@@ -341,7 +332,6 @@ impl ForgeCommandExecutorService {
         self.processes.lock().await.insert(process_id, managed);
         Ok(())
     }
-
     async fn execute_command_internal(
         &self,
         command: String,
@@ -350,11 +340,10 @@ impl ForgeCommandExecutorService {
         env_vars: Option<Vec<String>>,
         handoff_timeout: ShellHandoffTimeoutSeconds,
     ) -> anyhow::Result<CommandExecutionOutput> {
-        let _ready = self.ready.lock().await;
+        let _guard = self.ready.lock().await;
         let mut launched = self.launch_process(command, working_dir, env_vars, silent)?;
-        let exit = tokio::time::timeout(handoff_timeout.duration(), launched.child.wait()).await;
-
-        match exit {
+        let status = tokio::time::timeout(handoff_timeout.duration(), launched.child.wait()).await;
+        match status {
             Ok(status) => {
                 let status = status?;
                 if let Some(stdout_task) = launched.stdout_task.take() {
@@ -399,8 +388,72 @@ impl ForgeCommandExecutorService {
             }
         }
     }
-}
 
+    async fn process_status_once(&self, process_id: ProcessId) -> anyhow::Result<ProcessStatus> {
+        let (status, stdout_task, stderr_task) = {
+            let mut processes = self.processes.lock().await;
+            let process = processes
+                .get_mut(&process_id)
+                .ok_or_else(|| anyhow::anyhow!("Unknown process id: {process_id}"))?;
+            process.refresh_status_without_output_join().await?;
+            let tasks = if matches!(process.status, ProcessStatusKind::Running) {
+                (None, None)
+            } else {
+                process.take_output_tasks()
+            };
+            (process.status(process_id), tasks.0, tasks.1)
+        };
+        join_output_tasks(stdout_task, stderr_task).await?;
+        Ok(status)
+    }
+
+    async fn read_process_once(
+        &self,
+        process_id: ProcessId,
+        cursor: ProcessReadCursor,
+    ) -> anyhow::Result<(ProcessReadOutput, ProcessStatusKind)> {
+        let (logs, dropped_before_cursor, status, stdout_task, stderr_task) = {
+            let mut processes = self.processes.lock().await;
+            let process = processes
+                .get_mut(&process_id)
+                .ok_or_else(|| anyhow::anyhow!("Unknown process id: {process_id}"))?;
+            process.refresh_status_without_output_join().await?;
+            let dropped_before_cursor = match process.dropped_before_cursor.load(Ordering::Relaxed)
+            {
+                0 => None,
+                cursor => Some(ProcessReadCursor::new(cursor)),
+            };
+            let tasks = if matches!(process.status, ProcessStatusKind::Running) {
+                (None, None)
+            } else {
+                process.take_output_tasks()
+            };
+            (
+                Arc::clone(&process.logs),
+                dropped_before_cursor,
+                process.status.clone(),
+                tasks.0,
+                tasks.1,
+            )
+        };
+        join_output_tasks(stdout_task, stderr_task).await?;
+        let logs = logs.lock().await;
+        Ok((
+            process_read_output_from_logs(process_id, cursor, &logs, dropped_before_cursor),
+            status,
+        ))
+    }
+    async fn sleep_until_next_observation(deadline: Instant) {
+        let now = Instant::now();
+        if deadline > now {
+            tokio::time::sleep(std::cmp::min(
+                PROCESS_OBSERVATION_POLL_INTERVAL,
+                deadline.duration_since(now),
+            ))
+            .await;
+        }
+    }
+}
 enum OutputSink {
     Console(OutputPrinterWriter),
     Silent(io::Sink),
@@ -497,6 +550,19 @@ fn trim_background_logs(logs: &mut VecDeque<ProcessLogEntry>, dropped_before_cur
     }
 }
 
+async fn join_output_tasks(
+    stdout_task: Option<tokio::task::JoinHandle<()>>,
+    stderr_task: Option<tokio::task::JoinHandle<()>>,
+) -> anyhow::Result<()> {
+    if let Some(stdout_task) = stdout_task {
+        stdout_task.await?;
+    }
+    if let Some(stderr_task) = stderr_task {
+        stderr_task.await?;
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 async fn kill_child_process_group(
     child: &mut Child,
@@ -591,63 +657,84 @@ impl CommandInfra for ForgeCommandExecutorService {
         Ok(output)
     }
 
-    async fn process_status(&self, process_id: ProcessId) -> anyhow::Result<ProcessStatus> {
-        let mut processes = self.processes.lock().await;
-        let process = processes
-            .get_mut(&process_id)
-            .ok_or_else(|| anyhow::anyhow!("Unknown process id: {process_id}"))?;
-        process.refresh_status().await?;
-        Ok(process.status(process_id))
+    async fn process_status(
+        &self,
+        process_id: ProcessId,
+        wait: Option<ProcessObservationWaitSeconds>,
+    ) -> anyhow::Result<ProcessStatus> {
+        let deadline = wait.map(|wait| Instant::now() + wait.duration());
+        loop {
+            let status = self.process_status_once(process_id.clone()).await?;
+            if !matches!(status.status, ProcessStatusKind::Running) {
+                return Ok(status);
+            }
+            let Some(deadline) = deadline else {
+                return Ok(status);
+            };
+            if Instant::now() >= deadline {
+                return Ok(status);
+            }
+            Self::sleep_until_next_observation(deadline).await;
+        }
     }
 
     async fn read_process(
         &self,
         process_id: ProcessId,
         cursor: ProcessReadCursor,
+        wait: Option<ProcessObservationWaitSeconds>,
     ) -> anyhow::Result<ProcessReadOutput> {
-        let processes = self.processes.lock().await;
-        let process = processes
-            .get(&process_id)
-            .ok_or_else(|| anyhow::anyhow!("Unknown process id: {process_id}"))?;
-        let logs = process.logs.lock().await;
-        let dropped_before_cursor = match process.dropped_before_cursor.load(Ordering::Relaxed) {
-            0 => None,
-            cursor => Some(ProcessReadCursor::new(cursor)),
-        };
-        Ok(process_read_output_from_logs(
-            process_id,
-            cursor,
-            &logs,
-            dropped_before_cursor,
-        ))
+        let deadline = wait.map(|wait| Instant::now() + wait.duration());
+        loop {
+            let (output, status) = self.read_process_once(process_id.clone(), cursor).await?;
+            if !output.entries.is_empty() || !matches!(status, ProcessStatusKind::Running) {
+                return Ok(output);
+            }
+            let Some(deadline) = deadline else {
+                return Ok(output);
+            };
+            if Instant::now() >= deadline {
+                return Ok(output);
+            }
+            Self::sleep_until_next_observation(deadline).await;
+        }
     }
 
     async fn list_processes(&self) -> anyhow::Result<Vec<ProcessStatus>> {
         let mut processes = self.processes.lock().await;
         let mut statuses = Vec::with_capacity(processes.len());
         for (process_id, process) in processes.iter_mut() {
-            process.refresh_status().await?;
+            process.refresh_status_without_output_join().await?;
             statuses.push(process.status(process_id.clone()));
         }
         Ok(statuses)
     }
 
     async fn kill_process(&self, process_id: ProcessId) -> anyhow::Result<ProcessStatus> {
-        let mut processes = self.processes.lock().await;
-        let process = processes
-            .get_mut(&process_id)
-            .ok_or_else(|| anyhow::anyhow!("Unknown process id: {process_id}"))?;
-        process.refresh_status_without_output_join().await?;
-        if !matches!(process.status, ProcessStatusKind::Killed) {
-            let status_before_kill = process.status.clone();
-            kill_child_process_group(&mut process.child, process.process_group_id).await?;
-            process.join_output_tasks().await?;
-            process.refresh_status().await?;
-            if matches!(status_before_kill, ProcessStatusKind::Running) {
-                process.status = ProcessStatusKind::Killed;
+        let mut process = {
+            let mut processes = self.processes.lock().await;
+            processes
+                .remove(&process_id)
+                .ok_or_else(|| anyhow::anyhow!("Unknown process id: {process_id}"))?
+        };
+        let result = async {
+            process.refresh_status_without_output_join().await?;
+            if !matches!(process.status, ProcessStatusKind::Killed) {
+                let status_before_kill = process.status.clone();
+                kill_child_process_group(&mut process.child, process.process_group_id).await?;
+                process.refresh_status_without_output_join().await?;
+                if matches!(status_before_kill, ProcessStatusKind::Running) {
+                    process.status = ProcessStatusKind::Killed;
+                }
             }
+            let status = process.status(process_id.clone());
+            let (stdout_task, stderr_task) = process.take_output_tasks();
+            join_output_tasks(stdout_task, stderr_task).await?;
+            Ok(status)
         }
-        Ok(process.status(process_id))
+        .await;
+        self.processes.lock().await.insert(process_id, process);
+        result
     }
 }
 
@@ -689,7 +776,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let output = fixture
-            .read_process(actual.process_id.clone(), ProcessReadCursor::new(0))
+            .read_process(actual.process_id.clone(), ProcessReadCursor::new(0), None)
             .await
             .unwrap();
         let status = fixture.kill_process(actual.process_id).await.unwrap();
@@ -717,12 +804,12 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let first = fixture
-            .read_process(started.process_id.clone(), ProcessReadCursor::new(0))
+            .read_process(started.process_id.clone(), ProcessReadCursor::new(0), None)
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let actual = fixture
-            .read_process(started.process_id.clone(), first.next_cursor)
+            .read_process(started.process_id.clone(), first.next_cursor, None)
             .await
             .unwrap();
         let _ = fixture.kill_process(started.process_id).await;
@@ -733,6 +820,148 @@ mod tests {
                 .iter()
                 .any(|entry| entry.content.contains("second"))
         );
+    }
+
+    #[tokio::test]
+    async fn test_process_status_wait_does_not_block_process_read() {
+        let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
+        let started = fixture
+            .start_process(
+                "sleep 0.2; printf concurrent; sleep 1".to_string(),
+                PathBuf::new().join("."),
+                None,
+            )
+            .await
+            .unwrap();
+        let process_id = started.process_id.clone();
+        let status_fixture = fixture.clone();
+
+        let status_task = tokio::spawn(async move {
+            status_fixture
+                .process_status(
+                    process_id,
+                    Some(ProcessObservationWaitSeconds::new(1).unwrap()),
+                )
+                .await
+                .unwrap()
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let actual = fixture
+            .read_process(
+                started.process_id.clone(),
+                ProcessReadCursor::new(0),
+                Some(ProcessObservationWaitSeconds::new(1).unwrap()),
+            )
+            .await
+            .unwrap();
+        let status = status_task.await.unwrap();
+        let _ = fixture.kill_process(started.process_id).await;
+        let expected = ProcessStatusKind::Running;
+
+        assert_eq!(status.status, expected);
+        assert!(
+            actual
+                .entries
+                .iter()
+                .any(|entry| entry.content.contains("concurrent"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_read_wait_returns_delayed_output_without_external_sleep() {
+        let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
+        let started = fixture
+            .start_process(
+                "sleep 0.2; printf delayed; sleep 1".to_string(),
+                PathBuf::new().join("."),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let actual = fixture
+            .read_process(
+                started.process_id.clone(),
+                ProcessReadCursor::new(0),
+                Some(ProcessObservationWaitSeconds::new(1).unwrap()),
+            )
+            .await
+            .unwrap();
+        let _ = fixture.kill_process(started.process_id).await;
+
+        assert!(
+            actual
+                .entries
+                .iter()
+                .any(|entry| entry.content.contains("delayed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_read_wait_timeout_preserves_cursor_without_output() {
+        let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
+        let started = fixture
+            .start_process("sleep 2".to_string(), PathBuf::new().join("."), None)
+            .await
+            .unwrap();
+
+        let actual = fixture
+            .read_process(
+                started.process_id.clone(),
+                ProcessReadCursor::new(7),
+                Some(ProcessObservationWaitSeconds::new(1).unwrap()),
+            )
+            .await
+            .unwrap();
+        let _ = fixture.kill_process(started.process_id).await;
+        let expected = ProcessReadOutput {
+            process_id: actual.process_id.clone(),
+            next_cursor: ProcessReadCursor::new(7),
+            first_available_cursor: None,
+            dropped_before_cursor: None,
+            entries: Vec::new(),
+        };
+
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_process_status_wait_returns_early_when_process_exits() {
+        let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
+        let started = fixture
+            .start_process("sleep 0.2".to_string(), PathBuf::new().join("."), None)
+            .await
+            .unwrap();
+
+        let actual = fixture
+            .process_status(
+                started.process_id,
+                Some(ProcessObservationWaitSeconds::new(1).unwrap()),
+            )
+            .await
+            .unwrap();
+        let expected = ProcessStatusKind::Exited { exit_code: Some(0) };
+
+        assert_eq!(actual.status, expected);
+    }
+
+    #[test]
+    fn test_process_observation_wait_rejects_unbounded_runtime_value() {
+        let fixture = 31;
+
+        let actual = ProcessObservationWaitSeconds::new(fixture);
+
+        assert!(actual.is_err());
+    }
+
+    #[test]
+    fn test_process_observation_wait_accepts_upper_bound() {
+        let fixture = 30;
+
+        let actual = ProcessObservationWaitSeconds::new(fixture).unwrap();
+        let expected = 30;
+
+        assert_eq!(actual.seconds(), expected);
     }
 
     #[test]
@@ -892,7 +1121,7 @@ mod tests {
         let status = tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 let status = fixture
-                    .process_status(started.process_id.clone())
+                    .process_status(started.process_id.clone(), None)
                     .await
                     .unwrap();
                 if !matches!(status.status, ProcessStatusKind::Running) {
@@ -906,7 +1135,7 @@ mod tests {
         let actual = tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 let output = fixture
-                    .read_process(started.process_id.clone(), ProcessReadCursor::new(0))
+                    .read_process(started.process_id.clone(), ProcessReadCursor::new(0), None)
                     .await
                     .unwrap();
                 if output
@@ -1002,7 +1231,7 @@ mod tests {
             .clone()
             .expect("long-running command should be handed off");
         let read_output = fixture
-            .read_process(process.process_id.clone(), ProcessReadCursor::new(0))
+            .read_process(process.process_id.clone(), ProcessReadCursor::new(0), None)
             .await
             .unwrap();
         let _ = fixture.kill_process(process.process_id).await;
@@ -1050,7 +1279,7 @@ mod tests {
             .clone()
             .expect("custom timeout should hand off long command");
         let read_output = fixture
-            .read_process(process.process_id.clone(), ProcessReadCursor::new(0))
+            .read_process(process.process_id.clone(), ProcessReadCursor::new(0), None)
             .await
             .unwrap();
         let _ = fixture.kill_process(process.process_id).await;

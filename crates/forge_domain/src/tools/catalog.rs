@@ -18,8 +18,8 @@ use strum::IntoEnumIterator;
 use strum_macros::{AsRefStr, Display, EnumDiscriminants, EnumIter};
 
 use crate::{
-    ConversationId, ShellHandoffTimeoutSeconds, ToolCallArguments, ToolCallFull, ToolDefinition,
-    ToolDescription, ToolName,
+    ConversationId, ProcessObservationWaitSeconds, ShellHandoffTimeoutSeconds, ToolCallArguments,
+    ToolCallFull, ToolDefinition, ToolDescription, ToolName,
 };
 
 /// Enum representing all possible tool input types.
@@ -673,6 +673,12 @@ pub struct ProcessStart {
 pub struct ProcessStatusInput {
     /// Handle returned by process_start or shell timeout handoff.
     pub process_id: String,
+
+    /// Optional bounded wait before returning status. Use this instead of immediate repeated polling.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[eserde(compat)]
+    pub wait_seconds: Option<ProcessObservationWaitSeconds>,
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema, ToolDescription, PartialEq)]
@@ -684,6 +690,12 @@ pub struct ProcessRead {
     /// Cursor returned by the previous process_read call. Defaults to 0.
     #[serde(default)]
     pub cursor: u64,
+
+    /// Optional bounded wait for new output after cursor. Use this instead of immediate repeated polling.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[eserde(compat)]
+    pub wait_seconds: Option<ProcessObservationWaitSeconds>,
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema, ToolDescription, PartialEq)]
@@ -1362,7 +1374,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use strum::IntoEnumIterator;
 
-    use super::{ProcessStart, Shell, ShellHandoffTimeoutSeconds};
+    use super::{ProcessRead, ProcessStart, ProcessStatusInput, Shell, ShellHandoffTimeoutSeconds};
     use crate::{ToolCatalog, ToolKind, ToolName};
 
     #[test]
@@ -1415,6 +1427,31 @@ mod tests {
             "Schema generation is not cached! Took {:?}",
             elapsed
         );
+    }
+
+    #[test]
+    fn test_process_observation_wait_schema_is_available_in_direct_and_cached_definitions() {
+        let fixture = [
+            ToolCatalog::ProcessStatus(ProcessStatusInput::default()),
+            ToolCatalog::ProcessRead(ProcessRead::default()),
+        ];
+        for tool in fixture {
+            let direct = serde_json::to_value(tool.build_definition().input_schema).unwrap();
+            let cached = serde_json::to_value(tool.definition().input_schema).unwrap();
+
+            let actual_direct = direct
+                .pointer("/properties/wait_seconds")
+                .expect("direct schema should include wait_seconds");
+            let actual_cached = cached
+                .pointer("/properties/wait_seconds")
+                .expect("cached schema should include wait_seconds");
+
+            assert_eq!(actual_direct.pointer("/type").unwrap(), "integer");
+            assert_eq!(actual_direct.pointer("/format").unwrap(), "uint64");
+            assert_eq!(actual_direct.pointer("/minimum").unwrap(), 1);
+            assert_eq!(actual_direct.pointer("/maximum").unwrap(), 30);
+            assert_eq!(actual_cached, actual_direct);
+        }
     }
 
     #[test]
