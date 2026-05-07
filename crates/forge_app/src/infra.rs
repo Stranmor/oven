@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
 
+use std::pin::Pin;
 use anyhow::Result;
 use bytes::Bytes;
 use forge_domain::{
@@ -10,6 +11,7 @@ use forge_domain::{
     ProcessReadOutput, ProcessStartOutput, ProcessStatus, ToolDefinition, ToolName, ToolOutput,
 };
 use forge_eventsource::EventSource;
+use futures::Stream;
 use reqwest::Response;
 use reqwest::header::HeaderMap;
 use serde::de::DeserializeOwned;
@@ -246,11 +248,17 @@ pub trait McpServerInfra: Send + Sync + 'static {
     ) -> anyhow::Result<Self::Client>;
 }
 /// Service for walking filesystem directories
+pub type WalkedFileStream = Pin<Box<dyn Stream<Item = anyhow::Result<WalkedFile>> + Send>>;
+
 #[async_trait::async_trait]
 pub trait WalkerInfra: Send + Sync {
     /// Walks the filesystem starting from the given directory with the
-    /// specified configuration
+    /// specified configuration.
     async fn walk(&self, config: Walker) -> anyhow::Result<Vec<WalkedFile>>;
+
+    /// Streams filesystem entries from the given directory with the specified
+    /// configuration so callers can stop traversal before all entries are collected.
+    async fn walk_stream(&self, config: Walker) -> anyhow::Result<WalkedFileStream>;
 }
 
 /// HTTP service trait for making HTTP requests

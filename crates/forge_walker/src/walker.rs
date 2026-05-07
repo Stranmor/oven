@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 
 use anyhow::{Context, Result};
+use async_stream::try_stream;
 use derive_setters::Setters;
+use futures::Stream;
 use ignore::WalkBuilder;
+use tokio::sync::mpsc;
 use tokio::task::spawn_blocking;
 
 #[derive(Clone, Debug)]
@@ -97,6 +100,33 @@ impl Walker {
             .context("Failed to spawn blocking task")?
     }
 
+    /// Streams filesystem entries without collecting the full traversal first.
+    ///
+    /// Dropping the returned stream signals the blocking walker to stop as soon
+    /// as the next entry is emitted.
+    pub fn stream(&self) -> impl Stream<Item = Result<File>> + Send + 'static {
+        let walker = self.clone();
+        try_stream! {
+            let (sender, mut receiver) = mpsc::channel(1);
+            let worker = spawn_blocking(move || walker.send_blocking(sender));
+            let mut previous_ack: Option<std_mpsc::SyncSender<()>> = None;
+
+            loop {
+                if let Some(ack) = previous_ack.take() {
+                    let _ = ack.send(());
+                }
+
+                let Some((item, ack)) = receiver.recv().await else {
+                    break;
+                };
+                previous_ack = Some(ack);
+                yield item;
+            }
+
+            worker.await.context("Failed to spawn blocking task")??;
+        }
+    }
+
     fn is_likely_binary(path: &std::path::Path) -> bool {
         if let Some(extension) = path.extension() {
             let ext = extension.to_string_lossy().to_lowercase();
@@ -116,8 +146,132 @@ impl Walker {
     /// Blocking function to scan filesystem. Use this when you already have
     /// a runtime or want to avoid spawning a new one.
     pub fn get_blocking(&self) -> Result<Vec<File>> {
-        // Shared state collected across parallel walker threads.
         let collected: Arc<Mutex<Vec<File>>> = Arc::new(Mutex::new(Vec::new()));
+        let collected_for_emit = Arc::clone(&collected);
+        self.walk_blocking(move |file| {
+            collected_for_emit.lock().unwrap().push(file);
+            true
+        })?;
+
+        let files = Arc::try_unwrap(collected)
+            .expect("all walker threads finished")
+            .into_inner()
+            .unwrap();
+
+        Ok(files)
+    }
+
+    fn send_blocking(&self, sender: mpsc::Sender<(File, std_mpsc::SyncSender<()>)>) -> Result<()> {
+        self.walk_blocking_sequential(move |file| {
+            let (ack_sender, ack_receiver) = std_mpsc::sync_channel(0);
+            if sender.blocking_send((file, ack_sender)).is_err() {
+                return false;
+            }
+            ack_receiver.recv().is_ok()
+        })
+    }
+
+    fn walk_blocking_sequential<F>(&self, emit: F) -> Result<()>
+    where
+        F: Fn(File) -> bool,
+    {
+        let mut dir_entries: HashMap<String, usize> = HashMap::new();
+        let mut total_size = 0u64;
+        let mut file_count = 0usize;
+        let cwd = self.cwd.clone();
+        let max_depth = self.max_depth;
+        let max_breadth = self.max_breadth;
+        let max_file_size = self.max_file_size;
+        let max_files = self.max_files;
+        let max_total_size = self.max_total_size;
+        let skip_binary = self.skip_binary;
+
+        for result in WalkBuilder::new(&self.cwd)
+            .standard_filters(true)
+            .hidden(self.hidden)
+            .require_git(false)
+            .max_depth(Some(self.max_depth))
+            .max_filesize(Some(self.max_file_size))
+            .filter_entry(|entry| entry.file_name() != ".git")
+            .build()
+        {
+            let entry = match result {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if entry.path_is_symlink() {
+                continue;
+            }
+
+            let depth = path
+                .strip_prefix(&cwd)
+                .map(|path| path.components().count())
+                .unwrap_or(0);
+            if depth == 0 || depth > max_depth {
+                continue;
+            }
+
+            if let Some(parent) = path.parent() {
+                let parent_path = parent.to_string_lossy().to_string();
+                let entry_count = dir_entries.entry(parent_path).or_insert(0);
+                *entry_count += 1;
+                if *entry_count > max_breadth {
+                    continue;
+                }
+            }
+
+            let is_dir = path.is_dir();
+            if skip_binary && !is_dir && Walker::is_likely_binary(path) {
+                continue;
+            }
+
+            let metadata = match path.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            let file_size = metadata.len();
+            if total_size + file_size > max_total_size {
+                break;
+            }
+            if !is_dir {
+                if file_count >= max_files {
+                    break;
+                }
+                file_count += 1;
+                total_size += file_size;
+            }
+
+            let relative_path = match path.strip_prefix(&cwd) {
+                Ok(path) => path,
+                Err(_) => continue,
+            };
+            let path_string = relative_path.to_string_lossy().to_string();
+            let file_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string());
+            let path_string = if is_dir {
+                format!("{path_string}/")
+            } else {
+                path_string
+            };
+            if !is_dir && file_size > max_file_size {
+                continue;
+            }
+
+            if !emit(File { path: path_string, file_name, size: file_size }) {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn walk_blocking<F>(&self, emit: F) -> Result<()>
+    where
+        F: Fn(File) -> bool + Send + Sync,
+    {
+        let emit = Arc::new(emit);
         // Per-directory entry counters for breadth limiting (shared across threads).
         let dir_entries: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
         // Global counters protected by a single mutex to enforce total limits.
@@ -148,7 +302,7 @@ impl Walker {
 
         walk_parallel.run(|| {
             // Each thread gets its own clone of the shared state.
-            let collected = Arc::clone(&collected);
+            let emit = Arc::clone(&emit);
             let dir_entries = Arc::clone(&dir_entries);
             let global = Arc::clone(&global);
             let cwd = cwd.clone();
@@ -259,22 +413,17 @@ impl Walker {
                     return ignore::WalkState::Continue;
                 }
 
-                collected.lock().unwrap().push(File {
-                    path: path_string,
-                    file_name,
-                    size: file_size,
-                });
+                let file = File { path: path_string, file_name, size: file_size };
+                if !emit(file) {
+                    global.lock().unwrap().2 = true;
+                    return ignore::WalkState::Quit;
+                }
 
                 ignore::WalkState::Continue
             })
         });
 
-        let files = Arc::try_unwrap(collected)
-            .expect("all walker threads finished")
-            .into_inner()
-            .unwrap();
-
-        Ok(files)
+        Ok(())
     }
 }
 
@@ -357,6 +506,36 @@ mod tests {
             }
             Ok((dir, files_dir))
         }
+    }
+
+    #[tokio::test]
+    async fn test_stream_drop_after_first_item_stops_blocking_walker() -> Result<()> {
+        use futures::StreamExt;
+        use tokio::time::{Duration, timeout};
+
+        let fixture = fixtures::Fixture::default();
+        for index in 0..256 {
+            fixture.add_file(&format!("file_{index:03}.txt"), "needle")?;
+        }
+        {
+            let actual = Walker::max_all()
+                .cwd(fixture.as_path().to_path_buf())
+                .stream();
+            futures::pin_mut!(actual);
+
+            let first = timeout(Duration::from_secs(1), actual.next())
+                .await?
+                .context("stream should yield first walked file")??;
+            let expected = false;
+
+            assert_eq!(first.is_dir(), expected);
+        }
+        timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking(|| 1usize),
+        )
+        .await??;
+        Ok(())
     }
 
     #[tokio::test]

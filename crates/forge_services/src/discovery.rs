@@ -63,7 +63,7 @@ mod tests {
     use std::path::PathBuf;
 
     use forge_app::domain::Environment;
-    use forge_app::{EnvironmentInfra, WalkedFile};
+    use forge_app::{EnvironmentInfra, WalkedFile, WalkedFileStream};
     use forge_domain::ConfigOperation;
     use pretty_assertions::assert_eq;
 
@@ -118,6 +118,10 @@ mod tests {
     impl WalkerInfra for MockInfra {
         async fn walk(&self, _config: Walker) -> Result<Vec<WalkedFile>> {
             Ok(vec![])
+        }
+
+        async fn walk_stream(&self, _config: Walker) -> Result<WalkedFileStream> {
+            Ok(Box::pin(futures::stream::empty()))
         }
     }
 

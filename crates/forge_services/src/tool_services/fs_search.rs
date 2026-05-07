@@ -7,13 +7,13 @@ use forge_app::{
     FileInfoInfra, FileReaderInfra, FsSearchService, Match, MatchResult, SearchResult, Walker,
     WalkerInfra,
 };
+use futures::StreamExt;
 
 use forge_domain::{FSSearch, OutputMode};
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkContext, SinkContextKind, SinkMatch};
 
-const DEFAULT_AGENT_SEARCH_VISITED_FILE_LIMIT: usize = 10_000;
 const DEFAULT_AGENT_SEARCH_MAX_FILE_SIZE: u64 = 32 * 1024 * 1024;
 
 /// A powerful search tool built on grep-matcher and grep-searcher crates.
@@ -54,7 +54,7 @@ impl<W: WalkerInfra + FileReaderInfra + FileInfoInfra> FsSearchService for Forge
             .as_ref()
             .unwrap_or(&OutputMode::FilesWithMatches);
 
-        // Execute search lazily after infra traversal so head_limit can stop file reads.
+        // Execute search lazily so head_limit can stop traversal and file reads.
         let matches = self
             .search_matching_files(&search_path, &matcher, &params, output_mode)
             .await?;
@@ -84,10 +84,6 @@ impl<W: WalkerInfra + FileReaderInfra + FileInfoInfra> ForgeFsSearch<W> {
         builder
             .build(&params.pattern)
             .with_context(|| format!("Invalid regex pattern: {}", params.pattern))
-    }
-
-    fn walker_file_limit(_params: &FSSearch, _output_mode: &OutputMode) -> usize {
-        DEFAULT_AGENT_SEARCH_VISITED_FILE_LIMIT
     }
 
     fn search_budget(&self, params: &FSSearch, _output_mode: &OutputMode) -> SearchBudget {
@@ -132,26 +128,20 @@ impl<W: WalkerInfra + FileReaderInfra + FileInfoInfra> ForgeFsSearch<W> {
             return Ok(matches);
         }
 
-        let mut visited_files = 0usize;
-        let mut traversal_limited = false;
-        let walker_file_limit = Self::walker_file_limit(params, output_mode);
-        let walked_files = self
+        let mut walked_files = self
             .infra
-            .walk(
-                Walker::unlimited()
-                    .cwd(search_path.to_path_buf())
-                    .max_files(walker_file_limit),
-            )
+            .walk_stream(Walker::unlimited().cwd(search_path.to_path_buf()))
             .await
             .with_context(|| format!("Failed to walk directory '{}'", search_path.display()))?;
-        for walked_file in walked_files {
+        loop {
             if budget.is_satisfied() {
                 break;
             }
-            if visited_files >= DEFAULT_AGENT_SEARCH_VISITED_FILE_LIMIT {
-                traversal_limited = true;
+            let Some(walked_file) = walked_files.next().await else {
                 break;
-            }
+            };
+            let walked_file = walked_file
+                .with_context(|| format!("Failed to walk directory '{}'", search_path.display()))?;
             if walked_file.is_dir() {
                 continue;
             }
@@ -161,7 +151,6 @@ impl<W: WalkerInfra + FileReaderInfra + FileInfoInfra> ForgeFsSearch<W> {
                 continue;
             }
 
-            visited_files = visited_files.saturating_add(1);
             if !Self::matches_file_filters_sync(
                 &path,
                 search_path,
@@ -180,15 +169,6 @@ impl<W: WalkerInfra + FileReaderInfra + FileInfoInfra> ForgeFsSearch<W> {
                 &mut matches,
             )
             .await?;
-        }
-
-        if traversal_limited {
-            matches.push(Match {
-                path: search_path.to_string_lossy().to_string(),
-                result: Some(MatchResult::Error(format!(
-                    "Search stopped after visiting {DEFAULT_AGENT_SEARCH_VISITED_FILE_LIMIT} files; refine path, glob, type, or head_limit"
-                ))),
-            });
         }
 
         Ok(matches)
@@ -654,7 +634,7 @@ mod test {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use forge_app::{FileReaderInfra, WalkedFile, Walker, WalkerInfra};
+    use forge_app::{FileReaderInfra, WalkedFile, WalkedFileStream, Walker, WalkerInfra};
     use forge_domain::{FSSearch, OutputMode};
     use pretty_assertions::assert_eq;
     use tokio::fs;
@@ -770,16 +750,56 @@ mod test {
         Ok(files)
     }
 
+    fn collect_walked_file_stream(root: PathBuf) -> WalkedFileStream {
+        Box::pin(async_stream::try_stream! {
+            let mut pending = vec![root.clone()];
+
+            while let Some(directory) = pending.pop() {
+                let mut entries = fs::read_dir(&directory).await?;
+                while let Some(entry) = entries.next_entry().await? {
+                    let path = entry.path();
+                    let metadata = fs::symlink_metadata(&path).await?;
+                    if metadata.file_type().is_symlink() {
+                        continue;
+                    }
+
+                    let relative_path = path.strip_prefix(&root)?.to_string_lossy().to_string();
+                    let file_name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string());
+                    if metadata.is_dir() {
+                        pending.push(path);
+                        yield WalkedFile {
+                            path: format!("{relative_path}/"),
+                            file_name,
+                            size: metadata.len(),
+                        };
+                        continue;
+                    }
+
+                    if metadata.is_file() {
+                        yield WalkedFile { path: relative_path, file_name, size: metadata.len() };
+                    }
+                }
+            }
+        })
+    }
+
     #[async_trait::async_trait]
     impl WalkerInfra for MockInfra {
         async fn walk(&self, config: Walker) -> anyhow::Result<Vec<WalkedFile>> {
             collect_walked_files(&config.cwd).await
+        }
+
+        async fn walk_stream(&self, config: Walker) -> anyhow::Result<WalkedFileStream> {
+            Ok(collect_walked_file_stream(config.cwd))
         }
     }
 
     #[derive(Clone, Default)]
     struct CountingFileInfoInfra {
         file_size_calls: Arc<AtomicUsize>,
+        walked_entries: Arc<AtomicUsize>,
     }
 
     #[async_trait::async_trait]
@@ -837,7 +857,20 @@ mod test {
     #[async_trait::async_trait]
     impl WalkerInfra for CountingFileInfoInfra {
         async fn walk(&self, config: Walker) -> anyhow::Result<Vec<WalkedFile>> {
-            collect_walked_files(&config.cwd).await
+            let files = collect_walked_files(&config.cwd).await?;
+            self.walked_entries.fetch_add(files.len(), Ordering::SeqCst);
+            Ok(files)
+        }
+
+        async fn walk_stream(&self, config: Walker) -> anyhow::Result<WalkedFileStream> {
+            let walked_entries = Arc::clone(&self.walked_entries);
+            let mut stream = collect_walked_file_stream(config.cwd);
+            Ok(Box::pin(async_stream::try_stream! {
+                while let Some(walked_file) = stream.next().await {
+                    walked_entries.fetch_add(1, Ordering::SeqCst);
+                    yield walked_file?;
+                }
+            }))
         }
     }
 
@@ -1007,6 +1040,11 @@ mod test {
                 self.walk_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(Vec::new())
             }
+
+            async fn walk_stream(&self, _config: Walker) -> anyhow::Result<WalkedFileStream> {
+                self.walk_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::pin(futures::stream::empty()))
+            }
         }
 
         let fixture = WalkCountingInfra::default();
@@ -1097,6 +1135,7 @@ mod test {
         }
         let infra = CountingFileInfoInfra::default();
         let file_size_calls = Arc::clone(&infra.file_size_calls);
+        let walked_entries = Arc::clone(&infra.walked_entries);
         let params = FSSearch {
             pattern: "needle".to_string(),
             path: Some(fixture.path().to_string_lossy().to_string()),
@@ -1115,10 +1154,122 @@ mod test {
 
         assert_eq!(actual.matches.len(), expected);
         assert_eq!(file_size_calls.load(Ordering::SeqCst), expected);
+        assert!(walked_entries.load(Ordering::SeqCst) < 151);
     }
 
     #[tokio::test]
-    async fn test_safe_traversal_cap_is_forwarded_to_walker_budget() {
+    async fn test_head_limit_one_does_not_eagerly_walk_files_after_first_match() {
+        #[derive(Default)]
+        struct EagerWalkCountingInfra {
+            walked_files: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl FileInfoInfra for EagerWalkCountingInfra {
+            async fn is_file(&self, path: &Path) -> anyhow::Result<bool> {
+                Ok(path != Path::new("/virtual"))
+            }
+
+            async fn is_binary(&self, _path: &Path) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+
+            async fn exists(&self, _path: &Path) -> anyhow::Result<bool> {
+                Ok(true)
+            }
+
+            async fn file_size(&self, _path: &Path) -> anyhow::Result<u64> {
+                Ok(7)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl FileReaderInfra for EagerWalkCountingInfra {
+            async fn read_utf8(&self, _path: &Path) -> anyhow::Result<String> {
+                unimplemented!()
+            }
+
+            fn read_batch_utf8(
+                &self,
+                _batch_size: usize,
+                _paths: Vec<PathBuf>,
+            ) -> impl futures::Stream<Item = (PathBuf, anyhow::Result<String>)> + Send {
+                futures::stream::empty()
+            }
+
+            async fn read(&self, path: &Path) -> anyhow::Result<Vec<u8>> {
+                let content = if path.ends_with("match_000.txt") {
+                    "needle\n"
+                } else {
+                    "haystack\n"
+                };
+                Ok(content.as_bytes().to_vec())
+            }
+
+            async fn range_read_utf8(
+                &self,
+                _path: &Path,
+                _start_line: u64,
+                _end_line: u64,
+            ) -> anyhow::Result<(String, forge_domain::FileInfo)> {
+                unimplemented!()
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl WalkerInfra for EagerWalkCountingInfra {
+            async fn walk(&self, _config: Walker) -> anyhow::Result<Vec<WalkedFile>> {
+                let mut files = Vec::new();
+                for index in 0..128 {
+                    self.walked_files.fetch_add(1, Ordering::SeqCst);
+                    files.push(WalkedFile {
+                        path: format!("match_{index:03}.txt"),
+                        file_name: Some(format!("match_{index:03}.txt")),
+                        size: 7,
+                    });
+                }
+                Ok(files)
+            }
+
+            async fn walk_stream(&self, _config: Walker) -> anyhow::Result<WalkedFileStream> {
+                let walked_files = Arc::clone(&self.walked_files);
+                Ok(Box::pin(async_stream::try_stream! {
+                    for index in 0..128 {
+                        walked_files.fetch_add(1, Ordering::SeqCst);
+                        yield WalkedFile {
+                            path: format!("match_{index:03}.txt"),
+                            file_name: Some(format!("match_{index:03}.txt")),
+                            size: 7,
+                        };
+                    }
+                }))
+            }
+        }
+
+        let fixture = EagerWalkCountingInfra::default();
+        let walked_files = Arc::clone(&fixture.walked_files);
+        let params = FSSearch {
+            pattern: "needle".to_string(),
+            path: Some("/virtual".to_string()),
+            glob: Some("*".to_string()),
+            output_mode: Some(OutputMode::FilesWithMatches),
+            head_limit: Some(1),
+            ..Default::default()
+        };
+
+        let actual = ForgeFsSearch::new(Arc::new(fixture))
+            .search(params)
+            .await
+            .unwrap()
+            .unwrap();
+        let expected = 1;
+
+        assert_eq!(actual.matches.len(), expected);
+        assert_eq!(walked_files.load(Ordering::SeqCst), expected);
+    }
+
+    #[tokio::test]
+    async fn test_no_head_limit_does_not_forward_silent_walker_cap() {
         #[derive(Default)]
         struct ConfigRecordingInfra {
             observed_max_files: Arc<std::sync::Mutex<Vec<Option<usize>>>>,
@@ -1180,6 +1331,14 @@ mod test {
                     .push(config.max_files);
                 Ok(Vec::new())
             }
+
+            async fn walk_stream(&self, config: Walker) -> anyhow::Result<WalkedFileStream> {
+                self.observed_max_files
+                    .lock()
+                    .unwrap()
+                    .push(config.max_files);
+                Ok(Box::pin(futures::stream::empty()))
+            }
         }
 
         let fixture = ConfigRecordingInfra::default();
@@ -1188,7 +1347,6 @@ mod test {
             pattern: "needle".to_string(),
             path: Some("/tmp".to_string()),
             output_mode: Some(OutputMode::FilesWithMatches),
-            head_limit: Some(1),
             ..Default::default()
         };
 
@@ -1196,7 +1354,7 @@ mod test {
             .search(params)
             .await
             .unwrap();
-        let expected = vec![Some(DEFAULT_AGENT_SEARCH_VISITED_FILE_LIMIT)];
+        let expected = vec![None];
         let actual = observed_max_files.lock().unwrap().clone();
 
         assert_eq!(actual, expected);

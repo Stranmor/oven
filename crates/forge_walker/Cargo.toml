@@ -9,6 +9,8 @@ ignore.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 derive_setters.workspace = true
+async-stream.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true

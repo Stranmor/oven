@@ -7,7 +7,7 @@ use bytes::Bytes;
 use forge_app::{
     CommandInfra, DirectoryReaderInfra, EnvironmentInfra, FileDirectoryInfra, FileInfoInfra,
     FileReaderInfra, FileRemoverInfra, FileWriterInfra, GrpcInfra, HttpInfra, McpServerInfra,
-    StrategyFactory, UserInfra, WalkerInfra,
+    StrategyFactory, UserInfra, WalkedFileStream, WalkerInfra,
 };
 use forge_domain::{
     AuthMethod, CommandExecutionOutput, FileInfo as FileInfoData, McpServerConfig, ProcessId,
@@ -331,6 +331,10 @@ impl McpServerInfra for ForgeInfra {
 impl WalkerInfra for ForgeInfra {
     async fn walk(&self, config: forge_app::Walker) -> anyhow::Result<Vec<forge_app::WalkedFile>> {
         self.walker_service.walk(config).await
+    }
+
+    async fn walk_stream(&self, config: forge_app::Walker) -> anyhow::Result<WalkedFileStream> {
+        Ok(self.walker_service.walk_stream(config))
     }
 }
 
