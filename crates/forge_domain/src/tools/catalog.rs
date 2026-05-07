@@ -1430,6 +1430,42 @@ mod tests {
     }
 
     #[test]
+    fn test_process_observation_wait_rejects_invalid_catalog_deserialization() {
+        use crate::{ToolCallArguments, ToolCallFull};
+
+        let fixture = ToolCallFull {
+            name: ToolKind::ProcessRead.name(),
+            call_id: None,
+            arguments: ToolCallArguments::from_json(
+                r#"{"process_id":"process-1","cursor":0,"wait_seconds":"not-a-number"}"#,
+            ),
+            thought_signature: None,
+        };
+
+        let actual = ToolCatalog::try_from(fixture);
+
+        assert!(actual.is_err());
+    }
+
+    #[test]
+    fn test_process_observation_wait_rejects_unbounded_catalog_deserialization() {
+        use crate::{ToolCallArguments, ToolCallFull};
+
+        let fixture = ToolCallFull {
+            name: ToolKind::ProcessStatus.name(),
+            call_id: None,
+            arguments: ToolCallArguments::from_json(
+                r#"{"process_id":"process-1","wait_seconds":31}"#,
+            ),
+            thought_signature: None,
+        };
+
+        let actual = ToolCatalog::try_from(fixture);
+
+        assert!(actual.is_err());
+    }
+
+    #[test]
     fn test_process_observation_wait_schema_is_available_in_direct_and_cached_definitions() {
         let fixture = [
             ToolCatalog::ProcessStatus(ProcessStatusInput::default()),

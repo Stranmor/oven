@@ -15,7 +15,7 @@ use forge_domain::{
 };
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::console::StdConsoleWriter;
 
@@ -43,6 +43,9 @@ struct ManagedProcess {
     dropped_before_cursor: Arc<AtomicU64>,
     stdout_task: Option<tokio::task::JoinHandle<()>>,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
+    output_finalizing: bool,
+    output_finalized: bool,
+    output_finalized_notify: Arc<Notify>,
 }
 
 #[derive(Clone, Copy)]
@@ -92,6 +95,9 @@ impl LaunchedProcess {
             dropped_before_cursor: self.dropped_before_cursor,
             stdout_task: self.stdout_task,
             stderr_task: self.stderr_task,
+            output_finalizing: false,
+            output_finalized: false,
+            output_finalized_notify: Arc::new(Notify::new()),
         })
     }
 }
@@ -390,20 +396,44 @@ impl ForgeCommandExecutorService {
     }
 
     async fn process_status_once(&self, process_id: ProcessId) -> anyhow::Result<ProcessStatus> {
-        let (status, stdout_task, stderr_task) = {
+        let (status, stdout_task, stderr_task, output_finalized_notify) = loop {
             let mut processes = self.processes.lock().await;
             let process = processes
                 .get_mut(&process_id)
                 .ok_or_else(|| anyhow::anyhow!("Unknown process id: {process_id}"))?;
             process.refresh_status_without_output_join().await?;
-            let tasks = if matches!(process.status, ProcessStatusKind::Running) {
-                (None, None)
-            } else {
-                process.take_output_tasks()
-            };
-            (process.status(process_id), tasks.0, tasks.1)
+            if matches!(process.status, ProcessStatusKind::Running) {
+                break (process.status(process_id), None, None, None);
+            }
+            if process.output_finalized {
+                break (process.status(process_id), None, None, None);
+            }
+            if process.output_finalizing {
+                let notify = Arc::clone(&process.output_finalized_notify);
+                let notified = notify.notified();
+                drop(processes);
+                notified.await;
+                continue;
+            }
+            process.output_finalizing = true;
+            let tasks = process.take_output_tasks();
+            break (
+                process.status(process_id),
+                tasks.0,
+                tasks.1,
+                Some(Arc::clone(&process.output_finalized_notify)),
+            );
         };
-        join_output_tasks(stdout_task, stderr_task).await?;
+        finalize_output_tasks(stdout_task, stderr_task).await?;
+        if let Some(output_finalized_notify) = output_finalized_notify {
+            let mut processes = self.processes.lock().await;
+            let process = processes
+                .get_mut(&status.process_id)
+                .ok_or_else(|| anyhow::anyhow!("Unknown process id: {}", status.process_id))?;
+            process.output_finalized = true;
+            process.output_finalized_notify.notify_waiters();
+            drop(output_finalized_notify);
+        }
         Ok(status)
     }
 
@@ -412,7 +442,14 @@ impl ForgeCommandExecutorService {
         process_id: ProcessId,
         cursor: ProcessReadCursor,
     ) -> anyhow::Result<(ProcessReadOutput, ProcessStatusKind)> {
-        let (logs, dropped_before_cursor, status, stdout_task, stderr_task) = {
+        let (
+            logs,
+            dropped_before_cursor,
+            status,
+            stdout_task,
+            stderr_task,
+            output_finalized_notify,
+        ) = loop {
             let mut processes = self.processes.lock().await;
             let process = processes
                 .get_mut(&process_id)
@@ -423,20 +460,44 @@ impl ForgeCommandExecutorService {
                 0 => None,
                 cursor => Some(ProcessReadCursor::new(cursor)),
             };
-            let tasks = if matches!(process.status, ProcessStatusKind::Running) {
-                (None, None)
-            } else {
-                process.take_output_tasks()
-            };
-            (
+            if matches!(process.status, ProcessStatusKind::Running) || process.output_finalized {
+                break (
+                    Arc::clone(&process.logs),
+                    dropped_before_cursor,
+                    process.status.clone(),
+                    None,
+                    None,
+                    None,
+                );
+            }
+            if process.output_finalizing {
+                let notify = Arc::clone(&process.output_finalized_notify);
+                let notified = notify.notified();
+                drop(processes);
+                notified.await;
+                continue;
+            }
+            process.output_finalizing = true;
+            let tasks = process.take_output_tasks();
+            break (
                 Arc::clone(&process.logs),
                 dropped_before_cursor,
                 process.status.clone(),
                 tasks.0,
                 tasks.1,
-            )
+                Some(Arc::clone(&process.output_finalized_notify)),
+            );
         };
-        join_output_tasks(stdout_task, stderr_task).await?;
+        finalize_output_tasks(stdout_task, stderr_task).await?;
+        if let Some(output_finalized_notify) = output_finalized_notify {
+            let mut processes = self.processes.lock().await;
+            let process = processes
+                .get_mut(&process_id)
+                .ok_or_else(|| anyhow::anyhow!("Unknown process id: {process_id}"))?;
+            process.output_finalized = true;
+            process.output_finalized_notify.notify_waiters();
+            drop(output_finalized_notify);
+        }
         let logs = logs.lock().await;
         Ok((
             process_read_output_from_logs(process_id, cursor, &logs, dropped_before_cursor),
@@ -561,6 +622,13 @@ async fn join_output_tasks(
         stderr_task.await?;
     }
     Ok(())
+}
+
+async fn finalize_output_tasks(
+    stdout_task: Option<tokio::task::JoinHandle<()>>,
+    stderr_task: Option<tokio::task::JoinHandle<()>>,
+) -> anyhow::Result<()> {
+    join_output_tasks(stdout_task, stderr_task).await
 }
 
 #[cfg(unix)]
@@ -711,14 +779,23 @@ impl CommandInfra for ForgeCommandExecutorService {
     }
 
     async fn kill_process(&self, process_id: ProcessId) -> anyhow::Result<ProcessStatus> {
-        let mut process = {
+        let (status, stdout_task, stderr_task, output_finalized_notify) = loop {
             let mut processes = self.processes.lock().await;
-            processes
-                .remove(&process_id)
-                .ok_or_else(|| anyhow::anyhow!("Unknown process id: {process_id}"))?
-        };
-        let result = async {
+            let process = processes
+                .get_mut(&process_id)
+                .ok_or_else(|| anyhow::anyhow!("Unknown process id: {process_id}"))?;
             process.refresh_status_without_output_join().await?;
+            if process.output_finalized {
+                let status = process.status(process_id.clone());
+                break (status, None, None, None);
+            }
+            if process.output_finalizing {
+                let notify = Arc::clone(&process.output_finalized_notify);
+                let notified = notify.notified();
+                drop(processes);
+                notified.await;
+                continue;
+            }
             if !matches!(process.status, ProcessStatusKind::Killed) {
                 let status_before_kill = process.status.clone();
                 kill_child_process_group(&mut process.child, process.process_group_id).await?;
@@ -728,13 +805,29 @@ impl CommandInfra for ForgeCommandExecutorService {
                 }
             }
             let status = process.status(process_id.clone());
+            if process.output_finalized {
+                break (status, None, None, None);
+            }
+            process.output_finalizing = true;
             let (stdout_task, stderr_task) = process.take_output_tasks();
-            join_output_tasks(stdout_task, stderr_task).await?;
-            Ok(status)
+            break (
+                status,
+                stdout_task,
+                stderr_task,
+                Some(Arc::clone(&process.output_finalized_notify)),
+            );
+        };
+        finalize_output_tasks(stdout_task, stderr_task).await?;
+        if let Some(output_finalized_notify) = output_finalized_notify {
+            let mut processes = self.processes.lock().await;
+            let process = processes
+                .get_mut(&process_id)
+                .ok_or_else(|| anyhow::anyhow!("Unknown process id: {process_id}"))?;
+            process.output_finalized = true;
+            process.output_finalized_notify.notify_waiters();
+            drop(output_finalized_notify);
         }
-        .await;
-        self.processes.lock().await.insert(process_id, process);
-        result
+        Ok(status)
     }
 }
 
@@ -1077,6 +1170,65 @@ mod tests {
         .unwrap();
         drop(writer);
         stream_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_process_read_wait_survives_concurrent_kill() {
+        let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
+        let started = fixture
+            .start_process("sleep 5".to_string(), PathBuf::new().join("."), None)
+            .await
+            .unwrap();
+        let process_id = started.process_id.clone();
+        let read_fixture = fixture.clone();
+
+        let read_task = tokio::spawn(async move {
+            read_fixture
+                .read_process(
+                    process_id,
+                    ProcessReadCursor::new(0),
+                    Some(ProcessObservationWaitSeconds::new(1).unwrap()),
+                )
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let kill_status = fixture.kill_process(started.process_id).await.unwrap();
+        let actual = read_task.await.unwrap();
+
+        assert_eq!(kill_status.status, ProcessStatusKind::Killed);
+        assert!(actual.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_process_kill_waits_for_in_progress_output_finalization() {
+        let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
+        let started = fixture
+            .start_process("sleep 5".to_string(), PathBuf::new().join("."), None)
+            .await
+            .unwrap();
+        {
+            let mut processes = fixture.processes.lock().await;
+            let process = processes.get_mut(&started.process_id).unwrap();
+            process.status = ProcessStatusKind::Exited { exit_code: Some(0) };
+            process.output_finalizing = true;
+            process.stdout_task = None;
+            process.stderr_task = None;
+        }
+        let process_id = started.process_id.clone();
+        let kill_fixture = fixture.clone();
+
+        let actual = tokio::spawn(async move { kill_fixture.kill_process(process_id).await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let expected = false;
+
+        assert_eq!(actual.is_finished(), expected);
+        {
+            let mut processes = fixture.processes.lock().await;
+            let process = processes.get_mut(&started.process_id).unwrap();
+            process.output_finalized = true;
+            process.output_finalized_notify.notify_waiters();
+        }
+        actual.await.unwrap().unwrap();
     }
 
     #[tokio::test]
