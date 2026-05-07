@@ -6,7 +6,8 @@ use bytes::Bytes;
 use forge_app::{
     AgentRepository, CommandInfra, DirectoryReaderInfra, EnvironmentInfra, FileDirectoryInfra,
     FileInfoInfra, FileReaderInfra, FileRemoverInfra, FileWriterInfra, GrpcInfra, HttpInfra,
-    KVStore, McpServerInfra, StrategyFactory, UserInfra, WalkedFile, Walker, WalkerInfra,
+    KVStore, McpServerInfra, StrategyFactory, UserInfra, WalkedFile, WalkedFileStream, Walker,
+    WalkerInfra,
 };
 use forge_config::ForgeConfig;
 use forge_domain::{
@@ -334,6 +335,10 @@ where
 {
     async fn walk(&self, config: Walker) -> anyhow::Result<Vec<WalkedFile>> {
         self.infra.walk(config).await
+    }
+
+    async fn walk_stream(&self, config: Walker) -> anyhow::Result<WalkedFileStream> {
+        self.infra.walk_stream(config).await
     }
 }
 
