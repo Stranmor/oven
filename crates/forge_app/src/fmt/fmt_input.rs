@@ -267,6 +267,27 @@ mod tests {
     }
 
     #[test]
+    fn test_process_read_formats_nonzero_cursor_without_wait_seconds() {
+        let fixture = ToolCatalog::ProcessRead(forge_domain::ProcessRead {
+            process_id: "process-174".to_string(),
+            cursor: 42,
+            wait_seconds: None,
+        });
+
+        let actual = fixture.to_content(&fixture_environment()).unwrap();
+        let ChatResponseContent::ToolInput(actual) = actual else {
+            panic!("expected tool input content");
+        };
+        let expected_title = "Read Process";
+        let expected_sub_title = Some("process-174 · cursor: 42".to_string());
+        let expected_category = Category::Debug;
+
+        assert_eq!(actual.title, expected_title);
+        assert_eq!(actual.sub_title, expected_sub_title);
+        assert_eq!(actual.category, expected_category);
+    }
+
+    #[test]
     fn test_process_read_formats_cursor_and_wait_seconds() {
         let fixture = ToolCatalog::ProcessRead(forge_domain::ProcessRead {
             process_id: "process-174".to_string(),
