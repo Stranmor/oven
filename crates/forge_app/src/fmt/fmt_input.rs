@@ -1,9 +1,31 @@
 use std::path::{Path, PathBuf};
 
-use forge_domain::{ChatResponseContent, Environment, TitleFormat, ToolCatalog};
+use forge_domain::{
+    ChatResponseContent, Environment, ProcessRead, ProcessStatusInput, TitleFormat, ToolCatalog,
+};
 
 use crate::fmt::content::FormatContent;
 use crate::utils::format_display_path;
+
+fn format_process_status_subtitle(input: &ProcessStatusInput) -> String {
+    match input.wait_seconds {
+        Some(wait_seconds) => format!("{} (wait_seconds: {wait_seconds})", input.process_id),
+        None => input.process_id.clone(),
+    }
+}
+
+fn format_process_read_subtitle(input: &ProcessRead) -> String {
+    let mut parts = vec![
+        input.process_id.clone(),
+        format!("cursor: {}", input.cursor),
+    ];
+
+    if let Some(wait_seconds) = input.wait_seconds {
+        parts.push(format!("wait_seconds: {wait_seconds}"));
+    }
+
+    parts.join(" · ")
+}
 
 impl FormatContent for ToolCatalog {
     fn to_content(&self, env: &Environment) -> Option<ChatResponseContent> {
@@ -120,12 +142,12 @@ impl FormatContent for ToolCatalog {
             ),
             ToolCatalog::ProcessStatus(input) => Some(
                 TitleFormat::debug("Process Status")
-                    .sub_title(&input.process_id)
+                    .sub_title(format_process_status_subtitle(input))
                     .into(),
             ),
             ToolCatalog::ProcessRead(input) => Some(
                 TitleFormat::debug("Read Process")
-                    .sub_title(&input.process_id)
+                    .sub_title(format_process_read_subtitle(input))
                     .into(),
             ),
             ToolCatalog::ProcessList(_) => Some(TitleFormat::debug("List Processes").into()),
@@ -158,5 +180,109 @@ impl FormatContent for ToolCatalog {
                 Some(TitleFormat::debug("Task").sub_title(&input.agent_id).into())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use forge_domain::{
+        Category, ChatResponseContent, Environment, ProcessObservationWaitSeconds, ToolCatalog,
+    };
+    use pretty_assertions::assert_eq;
+
+    use super::FormatContent;
+
+    fn fixture_environment() -> Environment {
+        Environment {
+            os: "linux".to_string(),
+            cwd: PathBuf::from("/workspace"),
+            home: Some(PathBuf::from("/home/user")),
+            shell: "/usr/bin/zsh".to_string(),
+            base_path: PathBuf::from("/home/user/.forge"),
+        }
+    }
+
+    #[test]
+    fn test_process_status_formats_wait_seconds() {
+        let fixture = ToolCatalog::ProcessStatus(forge_domain::ProcessStatusInput {
+            process_id: "process-174".to_string(),
+            wait_seconds: Some(ProcessObservationWaitSeconds::new(5).unwrap()),
+        });
+
+        let actual = fixture.to_content(&fixture_environment()).unwrap();
+        let ChatResponseContent::ToolInput(actual) = actual else {
+            panic!("expected tool input content");
+        };
+        let expected_title = "Process Status";
+        let expected_sub_title = Some("process-174 (wait_seconds: 5)".to_string());
+        let expected_category = Category::Debug;
+
+        assert_eq!(actual.title, expected_title);
+        assert_eq!(actual.sub_title, expected_sub_title);
+        assert_eq!(actual.category, expected_category);
+    }
+
+    #[test]
+    fn test_process_read_formats_cursor_without_wait_seconds() {
+        let fixture = ToolCatalog::ProcessRead(forge_domain::ProcessRead {
+            process_id: "process-174".to_string(),
+            cursor: 42,
+            wait_seconds: None,
+        });
+
+        let actual = fixture.to_content(&fixture_environment()).unwrap();
+        let ChatResponseContent::ToolInput(actual) = actual else {
+            panic!("expected tool input content");
+        };
+        let expected_title = "Read Process";
+        let expected_sub_title = Some("process-174 · cursor: 42".to_string());
+        let expected_category = Category::Debug;
+
+        assert_eq!(actual.title, expected_title);
+        assert_eq!(actual.sub_title, expected_sub_title);
+        assert_eq!(actual.category, expected_category);
+    }
+
+    #[test]
+    fn test_process_read_formats_cursor_and_wait_seconds() {
+        let fixture = ToolCatalog::ProcessRead(forge_domain::ProcessRead {
+            process_id: "process-174".to_string(),
+            cursor: 42,
+            wait_seconds: Some(ProcessObservationWaitSeconds::new(7).unwrap()),
+        });
+
+        let actual = fixture.to_content(&fixture_environment()).unwrap();
+        let ChatResponseContent::ToolInput(actual) = actual else {
+            panic!("expected tool input content");
+        };
+        let expected_title = "Read Process";
+        let expected_sub_title = Some("process-174 · cursor: 42 · wait_seconds: 7".to_string());
+        let expected_category = Category::Debug;
+
+        assert_eq!(actual.title, expected_title);
+        assert_eq!(actual.sub_title, expected_sub_title);
+        assert_eq!(actual.category, expected_category);
+    }
+
+    #[test]
+    fn test_process_status_formats_without_wait_seconds() {
+        let fixture = ToolCatalog::ProcessStatus(forge_domain::ProcessStatusInput {
+            process_id: "process-174".to_string(),
+            wait_seconds: None,
+        });
+
+        let actual = fixture.to_content(&fixture_environment()).unwrap();
+        let ChatResponseContent::ToolInput(actual) = actual else {
+            panic!("expected tool input content");
+        };
+        let expected_title = "Process Status";
+        let expected_sub_title = Some("process-174".to_string());
+        let expected_category = Category::Debug;
+
+        assert_eq!(actual.title, expected_title);
+        assert_eq!(actual.sub_title, expected_sub_title);
+        assert_eq!(actual.category, expected_category);
     }
 }
