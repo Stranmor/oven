@@ -188,7 +188,8 @@ mod tests {
     use std::path::PathBuf;
 
     use forge_domain::{
-        Category, ChatResponseContent, Environment, ProcessObservationWaitSeconds, ToolCatalog,
+        Category, ChatResponseContent, Environment, ProcessObservationWaitSeconds, TitleFormat,
+        ToolCatalog,
     };
     use pretty_assertions::assert_eq;
 
@@ -278,13 +279,14 @@ mod tests {
         let ChatResponseContent::ToolInput(actual) = actual else {
             panic!("expected tool input content");
         };
-        let expected_title = "Read Process";
-        let expected_sub_title = Some("process-174 · cursor: 42".to_string());
-        let expected_category = Category::Debug;
+        let expected = TitleFormat {
+            title: "Read Process".to_string(),
+            sub_title: Some("process-174 · cursor: 42".to_string()),
+            category: Category::Debug,
+            timestamp: actual.timestamp,
+        };
 
-        assert_eq!(actual.title, expected_title);
-        assert_eq!(actual.sub_title, expected_sub_title);
-        assert_eq!(actual.category, expected_category);
+        assert_eq!(actual, expected);
     }
 
     #[test]
