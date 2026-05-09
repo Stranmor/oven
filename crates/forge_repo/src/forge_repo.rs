@@ -6,8 +6,8 @@ use bytes::Bytes;
 use forge_app::{
     AgentRepository, CommandInfra, DirectoryReaderInfra, EnvironmentInfra, FileDirectoryInfra,
     FileInfoInfra, FileReaderInfra, FileRemoverInfra, FileWriterInfra, GrpcInfra, HttpInfra,
-    KVStore, McpServerInfra, StrategyFactory, UserInfra, WalkedFile, WalkedFileStream, Walker,
-    WalkerInfra,
+    KVStore, McpServerInfra, PdfRenderInfra, StrategyFactory, UserInfra, WalkedFile,
+    WalkedFileStream, Walker, WalkerInfra,
 };
 use forge_config::ForgeConfig;
 use forge_domain::{
@@ -249,7 +249,7 @@ impl<F: EnvironmentInfra<Config = forge_config::ForgeConfig> + Send + Sync> Envi
 impl<F: Send + Sync> KVStore for ForgeRepo<F> {
     async fn cache_get<K, V>(&self, key: &K) -> anyhow::Result<Option<V>>
     where
-        K: std::hash::Hash + Sync,
+        K: serde::Serialize + Sync,
         V: serde::Serialize + serde::de::DeserializeOwned + Send,
     {
         self.mcp_cache_repository.cache_get(key).await
@@ -257,7 +257,7 @@ impl<F: Send + Sync> KVStore for ForgeRepo<F> {
 
     async fn cache_set<K, V>(&self, key: &K, value: &V) -> anyhow::Result<()>
     where
-        K: std::hash::Hash + Sync,
+        K: serde::Serialize + Sync,
         V: serde::Serialize + Sync,
     {
         self.mcp_cache_repository.cache_set(key, value).await
@@ -325,6 +325,22 @@ where
         end_line: u64,
     ) -> anyhow::Result<(String, FileInfo)> {
         self.infra.range_read_utf8(path, start_line, end_line).await
+    }
+}
+
+#[async_trait::async_trait]
+impl<F> PdfRenderInfra for ForgeRepo<F>
+where
+    F: PdfRenderInfra + Send + Sync,
+{
+    async fn render_pdf_first_page_to_png(
+        &self,
+        path: &Path,
+        max_image_size_bytes: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.infra
+            .render_pdf_first_page_to_png(path, max_image_size_bytes)
+            .await
     }
 }
 

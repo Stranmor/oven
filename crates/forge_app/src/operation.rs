@@ -365,11 +365,10 @@ impl ToolOperation {
                         config.max_search_lines,
                         input.head_limit.unwrap_or(u32::MAX) as usize,
                     );
-                    let offset = input.offset.unwrap_or(0) as usize;
                     let search_dir = Path::new(input.path.as_deref().unwrap_or("."));
                     let truncated_output = truncate_search_output(
                         &out.matches,
-                        offset,
+                        input.offset.unwrap_or(0) as usize,
                         max_lines,
                         config.max_search_result_bytes,
                         search_dir,

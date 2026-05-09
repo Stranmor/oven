@@ -3,7 +3,7 @@ use std::sync::Arc;
 use forge_app::{
     AgentRepository, CommandInfra, DirectoryReaderInfra, EnvironmentInfra, FileDirectoryInfra,
     FileInfoInfra, FileReaderInfra, FileRemoverInfra, FileWriterInfra, HttpInfra, KVStore,
-    McpServerInfra, Services, StrategyFactory, UserInfra, WalkerInfra,
+    McpServerInfra, PdfRenderInfra, Services, StrategyFactory, UserInfra, WalkerInfra,
 };
 use forge_domain::{
     ChatRepository, ConversationRepository, FuzzySearchRepository, ProviderRepository,
@@ -12,6 +12,7 @@ use forge_domain::{
 };
 
 use crate::ForgeProviderAuthService;
+use crate::ForgeSteerService;
 use crate::agent_registry::ForgeAgentRegistryService;
 use crate::app_config::ForgeAppConfigService;
 use crate::attachment::ForgeChatRequest;
@@ -59,6 +60,7 @@ pub struct ForgeServices<
     chat_service: Arc<ForgeProviderService<F>>,
     config_service: Arc<ForgeAppConfigService<F>>,
     conversation_service: Arc<ForgeConversationService<F>>,
+    steer_service: Arc<ForgeSteerService>,
     template_service: Arc<ForgeTemplateService<F>>,
     attachment_service: Arc<ForgeChatRequest<F>>,
     discovery_service: Arc<ForgeDiscoveryService<F>>,
@@ -92,6 +94,7 @@ impl<
         + FileWriterInfra
         + FileInfoInfra
         + FileReaderInfra
+        + PdfRenderInfra
         + HttpInfra
         + WalkerInfra
         + DirectoryReaderInfra
@@ -115,6 +118,7 @@ impl<
         let attachment_service = Arc::new(ForgeChatRequest::new(infra.clone()));
         let suggestion_service = Arc::new(ForgeDiscoveryService::new(infra.clone()));
         let conversation_service = Arc::new(ForgeConversationService::new(infra.clone()));
+        let steer_service = ForgeSteerService::new();
         let auth_service = Arc::new(ForgeAuthService::new(infra.clone()));
         let chat_service = Arc::new(ForgeProviderService::new(infra.clone()));
         let config_service = Arc::new(ForgeAppConfigService::new(infra.clone()));
@@ -144,6 +148,7 @@ impl<
 
         Self {
             conversation_service,
+            steer_service,
             attachment_service,
             template_service,
             discovery_service: suggestion_service,
@@ -177,6 +182,7 @@ impl<
 
 impl<
     F: FileReaderInfra
+        + PdfRenderInfra
         + FileWriterInfra
         + CommandInfra
         + UserInfra
@@ -207,6 +213,7 @@ impl<
 {
     type AppConfigService = ForgeAppConfigService<F>;
     type ConversationService = ForgeConversationService<F>;
+    type SteerService = ForgeSteerService;
     type TemplateService = ForgeTemplateService<F>;
     type ProviderAuthService = ForgeProviderAuthService<F>;
 
@@ -243,6 +250,10 @@ impl<
 
     fn conversation_service(&self) -> &Self::ConversationService {
         &self.conversation_service
+    }
+
+    fn steer_service(&self) -> &Self::SteerService {
+        &self.steer_service
     }
 
     fn template_service(&self) -> &Self::TemplateService {

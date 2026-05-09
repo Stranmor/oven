@@ -6,8 +6,8 @@ use derive_setters::Setters;
 use forge_config::ForgeConfig;
 use forge_domain::{
     Agent, AgentId, Attachment, ChatCompletionMessage, ChatResponse, Context, Conversation,
-    Environment, Event, File, MessageEntry, Metrics, ModelId, ProviderId, Role, Template,
-    ToolCallFull, ToolDefinition, ToolResult,
+    Environment, Event, File, MessageEntry, Metrics, ModelId, ProviderId, Role, SteerMessage,
+    Template, ToolCallFull, ToolDefinition, ToolResult,
 };
 
 use crate::ShellOutput;
@@ -41,6 +41,7 @@ pub struct TestContext {
     pub agent: Agent,
     pub tools: Vec<ToolDefinition>,
     pub initial_context: Option<Context>,
+    pub steer_messages: Vec<SteerMessage>,
     /// ForgeConfig used to populate TemplateConfig for
     /// system prompt rendering in tests.
     pub config: ForgeConfig,
@@ -60,6 +61,7 @@ impl Default for TestContext {
             attachments: Default::default(),
             initial_metrics: None,
             initial_context: None,
+            steer_messages: Default::default(),
             env: Environment {
                 os: "MacOS".to_string(),
                 cwd: PathBuf::from("/Users/tushar"),

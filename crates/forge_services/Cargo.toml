@@ -42,6 +42,7 @@ merge.workspace = true
 strip-ansi-escapes.workspace = true
 bstr.workspace = true
 forge_app.workspace = true
+forge_snaps.workspace = true
 url.workspace = true
 forge_eventsource.workspace = true
 lazy_static = "1.5.0"
@@ -51,7 +52,6 @@ oauth2 = { version = "5.0", features = ["reqwest"] }
 serde_urlencoded = "0.7.1"
 http.workspace = true
 infer.workspace = true
-uuid.workspace = true
 tonic.workspace = true
 
 [dev-dependencies]

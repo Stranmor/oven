@@ -19,6 +19,7 @@ mod policy;
 mod provider_auth;
 mod provider_service;
 mod range;
+mod steer;
 mod sync;
 mod template;
 mod tool_services;
@@ -31,9 +32,11 @@ pub use context_engine::*;
 pub use discovery::*;
 pub use error::*;
 pub use forge_services::*;
+pub use forge_snaps::SnapshotService;
 pub use instructions::*;
 pub use policy::*;
 pub use provider_auth::*;
+pub use steer::*;
 
 /// Converts a type from its external representation into its domain model
 /// representation.

@@ -427,6 +427,22 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
                 message.phase,
             );
 
+            if self
+                .services
+                .is_primary_conversation(&self.conversation.id)
+                .await?
+            {
+                let steer_messages = self
+                    .services
+                    .drain_steer_messages(&self.conversation.id)
+                    .await?;
+                for steer_message in steer_messages {
+                    let content = Element::new("steer").text(steer_message.content()).render();
+                    context =
+                        context.add_message(ContextMessage::user(content, Some(model_id.clone())));
+                }
+            }
+
             if self.error_tracker.limit_reached() {
                 self.send(ChatResponse::Interrupt {
                     reason: InterruptionReason::MaxToolFailurePerTurnLimitReached {

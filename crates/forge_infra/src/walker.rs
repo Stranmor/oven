@@ -103,7 +103,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_walker_service_mixed_config_preserves_unlimited_max_files() -> anyhow::Result<()> {
+    async fn test_walker_service_mixed_config_preserves_unlimited_max_files() -> anyhow::Result<()>
+    {
         let fixture = tempdir()?;
         for index in 0..150 {
             std::fs::write(

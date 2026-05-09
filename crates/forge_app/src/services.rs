@@ -8,8 +8,8 @@ use forge_domain::{
     ChatCompletionMessage, CommandOutput, Context, Conversation, ConversationId, File, FileInfo,
     FileStatus, Image, McpConfig, McpServers, Model, ModelId, Node, ProcessId, ProcessReadCursor,
     ProcessReadOutput, ProcessStartOutput, ProcessStatus, Provider, ProviderId, ResultStream,
-    Scope, SearchParams, SyncProgress, SyntaxError, Template, ToolCallFull, ToolOutput,
-    WorkspaceAuth, WorkspaceId, WorkspaceInfo,
+    Scope, SearchParams, SteerMessage, SyncProgress, SyntaxError, Template, ToolCallFull,
+    ToolOutput, WorkspaceAuth, WorkspaceId, WorkspaceInfo,
 };
 use forge_eventsource::EventSource;
 use reqwest::Response;
@@ -290,6 +290,35 @@ pub trait ConversationService: Send + Sync {
 
     /// Permanently deletes a conversation
     async fn delete_conversation(&self, conversation_id: &ConversationId) -> anyhow::Result<()>;
+}
+
+#[async_trait::async_trait]
+pub trait SteerService: Send + Sync {
+    /// Enqueues a typed steer message for delayed main-conversation delivery.
+    ///
+    /// # Arguments
+    /// * `conversation_id` - The primary conversation receiving the message.
+    /// * `message` - The typed steer message.
+    async fn enqueue_steer(
+        &self,
+        conversation_id: &ConversationId,
+        message: SteerMessage,
+    ) -> anyhow::Result<()>;
+
+    /// Clears queued steer messages without delivering them.
+    ///
+    /// # Arguments
+    /// * `conversation_id` - The conversation whose queue should be discarded.
+    async fn clear_steer(&self, conversation_id: &ConversationId) -> anyhow::Result<()>;
+
+    /// Drains queued steer messages for a conversation in insertion order.
+    ///
+    /// # Arguments
+    /// * `conversation_id` - The conversation whose queue should be drained.
+    async fn drain_steer(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> anyhow::Result<Vec<SteerMessage>>;
 }
 
 #[async_trait::async_trait]
@@ -628,6 +657,7 @@ pub trait Services: Send + Sync + 'static + Clone + EnvironmentInfra {
     type ProviderService: ProviderService;
     type AppConfigService: AppConfigService;
     type ConversationService: ConversationService;
+    type SteerService: SteerService;
     type TemplateService: TemplateService;
     type AttachmentService: AttachmentService;
     type CustomInstructionsService: CustomInstructionsService;
@@ -656,6 +686,7 @@ pub trait Services: Send + Sync + 'static + Clone + EnvironmentInfra {
     fn provider_service(&self) -> &Self::ProviderService;
     fn config_service(&self) -> &Self::AppConfigService;
     fn conversation_service(&self) -> &Self::ConversationService;
+    fn steer_service(&self) -> &Self::SteerService;
     fn template_service(&self) -> &Self::TemplateService;
     fn attachment_service(&self) -> &Self::AttachmentService;
     fn file_discovery_service(&self) -> &Self::FileDiscoveryService;
@@ -699,9 +730,12 @@ impl<I: Services> ConversationService for I {
         id: &ConversationId,
         parent_id: Option<ConversationId>,
     ) -> anyhow::Result<Conversation> {
-        self.conversation_service()
+        let conversation = self
+            .conversation_service()
             .ensure_delegated_conversation(id, parent_id)
-            .await
+            .await?;
+        self.steer_service().clear_steer(id).await?;
+        Ok(conversation)
     }
 
     async fn modify_conversation<F, T>(&self, id: &ConversationId, f: F) -> anyhow::Result<T>
@@ -735,6 +769,30 @@ impl<I: Services> ConversationService for I {
             .await
     }
 }
+#[async_trait::async_trait]
+impl<I: Services> SteerService for I {
+    async fn enqueue_steer(
+        &self,
+        conversation_id: &ConversationId,
+        message: SteerMessage,
+    ) -> anyhow::Result<()> {
+        self.steer_service()
+            .enqueue_steer(conversation_id, message)
+            .await
+    }
+
+    async fn clear_steer(&self, conversation_id: &ConversationId) -> anyhow::Result<()> {
+        self.steer_service().clear_steer(conversation_id).await
+    }
+
+    async fn drain_steer(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> anyhow::Result<Vec<SteerMessage>> {
+        self.steer_service().drain_steer(conversation_id).await
+    }
+}
+
 #[async_trait::async_trait]
 impl<I: Services> ProviderService for I {
     async fn chat(
@@ -986,7 +1044,9 @@ impl<I: Services> ShellService for I {
         cursor: ProcessReadCursor,
         wait: Option<forge_domain::ProcessObservationWaitSeconds>,
     ) -> anyhow::Result<ProcessReadServiceOutput> {
-        self.shell_service().process_read(process_id, cursor, wait).await
+        self.shell_service()
+            .process_read(process_id, cursor, wait)
+            .await
     }
 
     async fn process_list(&self) -> anyhow::Result<Vec<ProcessStatus>> {
@@ -1203,5 +1263,762 @@ impl<I: Services> WorkspaceService for I {
 
     async fn init_workspace(&self, path: PathBuf) -> anyhow::Result<WorkspaceId> {
         self.workspace_service().init_workspace(path).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
+
+    use forge_domain::{Context, Initiator, SteerQueue};
+    use pretty_assertions::assert_eq;
+    use tokio::sync::Mutex;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct RawConversationService {
+        conversations: Mutex<HashMap<ConversationId, Conversation>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ConversationService for RawConversationService {
+        async fn find_conversation(
+            &self,
+            id: &ConversationId,
+        ) -> anyhow::Result<Option<Conversation>> {
+            Ok(self.conversations.lock().await.get(id).cloned())
+        }
+
+        async fn upsert_conversation(&self, conversation: Conversation) -> anyhow::Result<()> {
+            self.conversations
+                .lock()
+                .await
+                .insert(conversation.id, conversation);
+            Ok(())
+        }
+
+        async fn ensure_delegated_conversation(
+            &self,
+            id: &ConversationId,
+            parent_id: Option<ConversationId>,
+        ) -> anyhow::Result<Conversation> {
+            let mut conversations = self.conversations.lock().await;
+            let conversation = conversations
+                .get_mut(id)
+                .ok_or_else(|| forge_domain::Error::ConversationNotFound(*id))?;
+            conversation.ensure_delegated(parent_id);
+            Ok(conversation.clone())
+        }
+
+        async fn modify_conversation<F, T>(&self, id: &ConversationId, f: F) -> anyhow::Result<T>
+        where
+            F: FnOnce(&mut Conversation) -> T + Send,
+            T: Send,
+        {
+            let mut conversations = self.conversations.lock().await;
+            let conversation = conversations
+                .get_mut(id)
+                .ok_or_else(|| forge_domain::Error::ConversationNotFound(*id))?;
+            Ok(f(conversation))
+        }
+
+        async fn get_conversations(&self) -> anyhow::Result<Vec<Conversation>> {
+            Ok(self.conversations.lock().await.values().cloned().collect())
+        }
+
+        async fn get_sub_conversations(
+            &self,
+            parent_id: &ConversationId,
+        ) -> anyhow::Result<Vec<Conversation>> {
+            Ok(self
+                .conversations
+                .lock()
+                .await
+                .values()
+                .filter(|conversation| conversation.parent_id == Some(*parent_id))
+                .cloned()
+                .collect())
+        }
+
+        async fn last_conversation(&self) -> anyhow::Result<Option<Conversation>> {
+            Ok(self.conversations.lock().await.values().next().cloned())
+        }
+
+        async fn delete_conversation(
+            &self,
+            conversation_id: &ConversationId,
+        ) -> anyhow::Result<()> {
+            self.conversations.lock().await.remove(conversation_id);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RawSteerService {
+        queues: Mutex<HashMap<ConversationId, SteerQueue>>,
+        clear_count: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl SteerService for RawSteerService {
+        async fn enqueue_steer(
+            &self,
+            conversation_id: &ConversationId,
+            message: SteerMessage,
+        ) -> anyhow::Result<()> {
+            self.queues
+                .lock()
+                .await
+                .entry(*conversation_id)
+                .or_default()
+                .push(message);
+            Ok(())
+        }
+
+        async fn clear_steer(&self, conversation_id: &ConversationId) -> anyhow::Result<()> {
+            *self.clear_count.lock().await += 1;
+            self.queues.lock().await.remove(conversation_id);
+            Ok(())
+        }
+
+        async fn drain_steer(
+            &self,
+            conversation_id: &ConversationId,
+        ) -> anyhow::Result<Vec<SteerMessage>> {
+            Ok(self
+                .queues
+                .lock()
+                .await
+                .remove(conversation_id)
+                .map(|mut queue| queue.drain().collect())
+                .unwrap_or_default())
+        }
+    }
+
+    #[derive(Default)]
+    struct NoopService;
+
+    #[async_trait::async_trait]
+    impl ProviderService for NoopService {
+        async fn chat(
+            &self,
+            _model_id: &ModelId,
+            _context: Context,
+            _provider: Provider<Url>,
+        ) -> ResultStream<ChatCompletionMessage, anyhow::Error> {
+            Ok(Box::pin(tokio_stream::iter(std::iter::empty())))
+        }
+
+        async fn models(&self, _provider: Provider<Url>) -> anyhow::Result<Vec<Model>> {
+            anyhow::bail!("unused provider service")
+        }
+
+        async fn get_provider(&self, _id: ProviderId) -> anyhow::Result<Provider<Url>> {
+            anyhow::bail!("unused provider service")
+        }
+
+        async fn get_all_providers(&self) -> anyhow::Result<Vec<AnyProvider>> {
+            anyhow::bail!("unused provider service")
+        }
+
+        async fn upsert_credential(
+            &self,
+            _credential: forge_domain::AuthCredential,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("unused provider service")
+        }
+
+        async fn remove_credential(&self, _id: &ProviderId) -> anyhow::Result<()> {
+            anyhow::bail!("unused provider service")
+        }
+
+        async fn migrate_env_credentials(
+            &self,
+        ) -> anyhow::Result<Option<forge_domain::MigrationResult>> {
+            anyhow::bail!("unused provider service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AppConfigService for NoopService {
+        async fn get_session_config(&self) -> Option<forge_domain::ModelConfig> {
+            None
+        }
+
+        async fn get_commit_config(&self) -> anyhow::Result<Option<forge_domain::ModelConfig>> {
+            Ok(None)
+        }
+
+        async fn get_suggest_config(&self) -> anyhow::Result<Option<forge_domain::ModelConfig>> {
+            Ok(None)
+        }
+
+        async fn get_reasoning_effort(&self) -> anyhow::Result<Option<forge_domain::Effort>> {
+            Ok(None)
+        }
+
+        async fn update_config(
+            &self,
+            _ops: Vec<forge_domain::ConfigOperation>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("unused config service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TemplateService for NoopService {
+        async fn register_template(&self, _path: PathBuf) -> anyhow::Result<()> {
+            anyhow::bail!("unused template service")
+        }
+
+        async fn render_template<V: serde::Serialize + Send + Sync>(
+            &self,
+            _template: Template<V>,
+            _object: &V,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused template service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AttachmentService for NoopService {
+        async fn attachments(&self, _url: &str) -> anyhow::Result<Vec<Attachment>> {
+            anyhow::bail!("unused attachment service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CustomInstructionsService for NoopService {
+        async fn get_custom_instructions(&self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FileDiscoveryService for NoopService {
+        async fn collect_files(&self, _config: Walker) -> anyhow::Result<Vec<File>> {
+            anyhow::bail!("unused file discovery service")
+        }
+
+        async fn list_current_directory(&self) -> anyhow::Result<Vec<File>> {
+            anyhow::bail!("unused file discovery service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl McpConfigManager for NoopService {
+        async fn read_mcp_config(&self, _scope: Option<&Scope>) -> anyhow::Result<McpConfig> {
+            anyhow::bail!("unused mcp config manager")
+        }
+
+        async fn write_mcp_config(
+            &self,
+            _config: &McpConfig,
+            _scope: &Scope,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("unused mcp config manager")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FsWriteService for NoopService {
+        async fn write(
+            &self,
+            _path: String,
+            _content: String,
+            _overwrite: bool,
+        ) -> anyhow::Result<FsWriteOutput> {
+            anyhow::bail!("unused write service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PlanCreateService for NoopService {
+        async fn create_plan(
+            &self,
+            _plan_name: String,
+            _version: String,
+            _content: String,
+        ) -> anyhow::Result<PlanCreateOutput> {
+            anyhow::bail!("unused plan service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FsPatchService for NoopService {
+        async fn patch(
+            &self,
+            _path: String,
+            _search: String,
+            _content: String,
+            _replace_all: bool,
+        ) -> anyhow::Result<PatchOutput> {
+            anyhow::bail!("unused patch service")
+        }
+
+        async fn multi_patch(
+            &self,
+            _path: String,
+            _edits: Vec<forge_domain::PatchEdit>,
+        ) -> anyhow::Result<PatchOutput> {
+            anyhow::bail!("unused patch service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FsReadService for NoopService {
+        async fn read(
+            &self,
+            _path: String,
+            _start_line: Option<u64>,
+            _end_line: Option<u64>,
+        ) -> anyhow::Result<ReadOutput> {
+            anyhow::bail!("unused read service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ImageReadService for NoopService {
+        async fn read_image(&self, _path: String) -> anyhow::Result<Image> {
+            anyhow::bail!("unused image service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FsRemoveService for NoopService {
+        async fn remove(&self, _path: String) -> anyhow::Result<FsRemoveOutput> {
+            anyhow::bail!("unused remove service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FsSearchService for NoopService {
+        async fn search(
+            &self,
+            _params: forge_domain::FSSearch,
+        ) -> anyhow::Result<Option<SearchResult>> {
+            anyhow::bail!("unused search service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FollowUpService for NoopService {
+        async fn follow_up(
+            &self,
+            _question: String,
+            _options: Vec<String>,
+            _multiple: Option<bool>,
+        ) -> anyhow::Result<Option<String>> {
+            anyhow::bail!("unused follow up service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FsUndoService for NoopService {
+        async fn undo(&self, _path: String) -> anyhow::Result<FsUndoOutput> {
+            anyhow::bail!("unused undo service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl NetFetchService for NoopService {
+        async fn fetch(&self, _url: String, _raw: Option<bool>) -> anyhow::Result<HttpResponse> {
+            anyhow::bail!("unused fetch service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ShellService for NoopService {
+        async fn execute(&self, _request: ShellExecuteRequest) -> anyhow::Result<ShellOutput> {
+            anyhow::bail!("unused shell service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl McpService for NoopService {
+        async fn get_mcp_servers(&self) -> anyhow::Result<McpServers> {
+            anyhow::bail!("unused mcp service")
+        }
+
+        async fn execute_mcp(&self, _call: ToolCallFull) -> anyhow::Result<ToolOutput> {
+            anyhow::bail!("unused mcp service")
+        }
+
+        async fn reload_mcp(&self) -> anyhow::Result<()> {
+            anyhow::bail!("unused mcp service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AuthService for NoopService {
+        async fn user_info(&self, _api_key: &str) -> anyhow::Result<User> {
+            anyhow::bail!("unused auth service")
+        }
+
+        async fn user_usage(&self, _api_key: &str) -> anyhow::Result<UserUsage> {
+            anyhow::bail!("unused auth service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRegistry for NoopService {
+        async fn get_active_agent_id(&self) -> anyhow::Result<Option<AgentId>> {
+            Ok(None)
+        }
+
+        async fn set_active_agent_id(&self, _agent_id: AgentId) -> anyhow::Result<()> {
+            anyhow::bail!("unused agent registry")
+        }
+
+        async fn get_agents(&self) -> anyhow::Result<Vec<forge_domain::Agent>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_agent_infos(&self) -> anyhow::Result<Vec<forge_domain::AgentInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_agent(
+            &self,
+            _agent_id: &AgentId,
+        ) -> anyhow::Result<Option<forge_domain::Agent>> {
+            Ok(None)
+        }
+
+        async fn reload_agents(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CommandLoaderService for NoopService {
+        async fn get_commands(&self) -> anyhow::Result<Vec<forge_domain::Command>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PolicyService for NoopService {
+        async fn check_operation_permission(
+            &self,
+            _operation: &forge_domain::PermissionOperation,
+        ) -> anyhow::Result<PolicyDecision> {
+            anyhow::bail!("unused policy service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderAuthService for NoopService {
+        async fn init_provider_auth(
+            &self,
+            _provider_id: ProviderId,
+            _method: AuthMethod,
+        ) -> anyhow::Result<AuthContextRequest> {
+            anyhow::bail!("unused provider auth service")
+        }
+
+        async fn complete_provider_auth(
+            &self,
+            _provider_id: ProviderId,
+            _context: AuthContextResponse,
+            _timeout: Duration,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("unused provider auth service")
+        }
+
+        async fn refresh_provider_credential(
+            &self,
+            _provider: Provider<Url>,
+        ) -> anyhow::Result<Provider<Url>> {
+            anyhow::bail!("unused provider auth service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WorkspaceService for NoopService {
+        async fn sync_workspace(
+            &self,
+            _path: PathBuf,
+        ) -> anyhow::Result<forge_stream::MpscStream<anyhow::Result<SyncProgress>>> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn query_workspace(
+            &self,
+            _path: PathBuf,
+            _params: SearchParams<'_>,
+        ) -> anyhow::Result<Vec<Node>> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn list_workspaces(&self) -> anyhow::Result<Vec<WorkspaceInfo>> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn get_workspace_info(
+            &self,
+            _path: PathBuf,
+        ) -> anyhow::Result<Option<WorkspaceInfo>> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn delete_workspace(&self, _workspace_id: &WorkspaceId) -> anyhow::Result<()> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn delete_workspaces(&self, _workspace_ids: &[WorkspaceId]) -> anyhow::Result<()> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn is_indexed(&self, _path: &Path) -> anyhow::Result<bool> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn get_workspace_status(&self, _path: PathBuf) -> anyhow::Result<Vec<FileStatus>> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn is_authenticated(&self) -> anyhow::Result<bool> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn init_auth_credentials(&self) -> anyhow::Result<WorkspaceAuth> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn init_workspace(&self, _path: PathBuf) -> anyhow::Result<WorkspaceId> {
+            anyhow::bail!("unused workspace service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SkillFetchService for NoopService {
+        async fn fetch_skill(&self, _skill_name: String) -> anyhow::Result<forge_domain::Skill> {
+            anyhow::bail!("unused skill service")
+        }
+
+        async fn list_skills(&self) -> anyhow::Result<Vec<forge_domain::Skill>> {
+            anyhow::bail!("unused skill service")
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct FacadeFixture {
+        conversation: Arc<RawConversationService>,
+        steer: Arc<RawSteerService>,
+        noop: Arc<NoopService>,
+    }
+
+    impl EnvironmentInfra for FacadeFixture {
+        type Config = forge_config::ForgeConfig;
+
+        fn get_env_var(&self, _key: &str) -> Option<String> {
+            None
+        }
+
+        fn get_env_vars(&self) -> BTreeMap<String, String> {
+            BTreeMap::new()
+        }
+
+        fn get_environment(&self) -> forge_domain::Environment {
+            forge_domain::Environment {
+                os: "test".to_string(),
+                cwd: PathBuf::from("/tmp"),
+                home: None,
+                shell: "sh".to_string(),
+                base_path: PathBuf::from("/tmp/.forge"),
+            }
+        }
+
+        fn get_config(&self) -> anyhow::Result<Self::Config> {
+            Ok(forge_config::ForgeConfig::default())
+        }
+
+        async fn update_environment(
+            &self,
+            _ops: Vec<forge_domain::ConfigOperation>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("unused environment infra")
+        }
+    }
+
+    impl Services for FacadeFixture {
+        type ProviderService = NoopService;
+        type AppConfigService = NoopService;
+        type ConversationService = RawConversationService;
+        type SteerService = RawSteerService;
+        type TemplateService = NoopService;
+        type AttachmentService = NoopService;
+        type CustomInstructionsService = NoopService;
+        type FileDiscoveryService = NoopService;
+        type McpConfigManager = NoopService;
+        type FsWriteService = NoopService;
+        type PlanCreateService = NoopService;
+        type FsPatchService = NoopService;
+        type FsReadService = NoopService;
+        type ImageReadService = NoopService;
+        type FsRemoveService = NoopService;
+        type FsSearchService = NoopService;
+        type FollowUpService = NoopService;
+        type FsUndoService = NoopService;
+        type NetFetchService = NoopService;
+        type ShellService = NoopService;
+        type McpService = NoopService;
+        type AuthService = NoopService;
+        type AgentRegistry = NoopService;
+        type CommandLoaderService = NoopService;
+        type PolicyService = NoopService;
+        type ProviderAuthService = NoopService;
+        type WorkspaceService = NoopService;
+        type SkillFetchService = NoopService;
+
+        fn provider_service(&self) -> &Self::ProviderService {
+            &self.noop
+        }
+
+        fn config_service(&self) -> &Self::AppConfigService {
+            &self.noop
+        }
+
+        fn conversation_service(&self) -> &Self::ConversationService {
+            &self.conversation
+        }
+
+        fn steer_service(&self) -> &Self::SteerService {
+            &self.steer
+        }
+
+        fn template_service(&self) -> &Self::TemplateService {
+            &self.noop
+        }
+
+        fn attachment_service(&self) -> &Self::AttachmentService {
+            &self.noop
+        }
+
+        fn file_discovery_service(&self) -> &Self::FileDiscoveryService {
+            &self.noop
+        }
+
+        fn mcp_config_manager(&self) -> &Self::McpConfigManager {
+            &self.noop
+        }
+
+        fn fs_create_service(&self) -> &Self::FsWriteService {
+            &self.noop
+        }
+
+        fn plan_create_service(&self) -> &Self::PlanCreateService {
+            &self.noop
+        }
+
+        fn fs_patch_service(&self) -> &Self::FsPatchService {
+            &self.noop
+        }
+
+        fn fs_read_service(&self) -> &Self::FsReadService {
+            &self.noop
+        }
+
+        fn image_read_service(&self) -> &Self::ImageReadService {
+            &self.noop
+        }
+
+        fn fs_remove_service(&self) -> &Self::FsRemoveService {
+            &self.noop
+        }
+
+        fn fs_search_service(&self) -> &Self::FsSearchService {
+            &self.noop
+        }
+
+        fn follow_up_service(&self) -> &Self::FollowUpService {
+            &self.noop
+        }
+
+        fn fs_undo_service(&self) -> &Self::FsUndoService {
+            &self.noop
+        }
+
+        fn net_fetch_service(&self) -> &Self::NetFetchService {
+            &self.noop
+        }
+
+        fn shell_service(&self) -> &Self::ShellService {
+            &self.noop
+        }
+
+        fn mcp_service(&self) -> &Self::McpService {
+            &self.noop
+        }
+
+        fn custom_instructions_service(&self) -> &Self::CustomInstructionsService {
+            &self.noop
+        }
+
+        fn auth_service(&self) -> &Self::AuthService {
+            &self.noop
+        }
+
+        fn agent_registry(&self) -> &Self::AgentRegistry {
+            &self.noop
+        }
+
+        fn command_loader_service(&self) -> &Self::CommandLoaderService {
+            &self.noop
+        }
+
+        fn policy_service(&self) -> &Self::PolicyService {
+            &self.noop
+        }
+
+        fn provider_auth_service(&self) -> &Self::ProviderAuthService {
+            &self.noop
+        }
+
+        fn workspace_service(&self) -> &Self::WorkspaceService {
+            &self.noop
+        }
+
+        fn skill_fetch_service(&self) -> &Self::SkillFetchService {
+            &self.noop
+        }
+    }
+
+    #[tokio::test]
+    async fn test_services_facade_clears_steer_queue_when_promoting_delegated_conversation() {
+        let setup = FacadeFixture::default();
+        let conversation = Conversation::generate().context(Context::default());
+        let parent_id = ConversationId::generate();
+        ConversationService::upsert_conversation(&setup, conversation.clone())
+            .await
+            .unwrap();
+        SteerService::enqueue_steer(
+            &setup,
+            &conversation.id,
+            SteerMessage::new("stale main steer").unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let promoted = ConversationService::ensure_delegated_conversation(
+            &setup,
+            &conversation.id,
+            Some(parent_id),
+        )
+        .await
+        .unwrap();
+        let actual = (
+            (promoted.initiator, promoted.parent_id),
+            *setup.steer.clear_count.lock().await,
+            SteerService::drain_steer(&setup, &conversation.id)
+                .await
+                .unwrap(),
+        );
+        let expected = ((Initiator::Agent, Some(parent_id)), 1, Vec::new());
+
+        assert_eq!(actual, expected);
     }
 }

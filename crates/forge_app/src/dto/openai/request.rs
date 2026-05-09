@@ -968,8 +968,7 @@ mod tests {
             let schema_value = serde_json::json!({
                 "$schema": "http://json-schema.org/draft-07/schema#",
                 "title": "Null",
-                "type": "object",
-                "properties": {}
+                "type": "object"
             });
             let schema = schemars::Schema::try_from(schema_value).unwrap();
 

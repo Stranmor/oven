@@ -15,8 +15,12 @@ use crate::hooks::{
 };
 use crate::init_conversation_metrics::InitConversationMetrics;
 use crate::orch::Orchestrator;
-use crate::services::{AgentRegistry, CustomInstructionsService, ProviderAuthService};
+use crate::services::{
+    AgentRegistry, CustomInstructionsService, ProviderAuthService, SteerService,
+};
+
 use crate::set_conversation_id::SetConversationId;
+use crate::steer::SteerHandle;
 use crate::system_prompt::SystemPrompt;
 use crate::tool_registry::ToolRegistry;
 use crate::tool_resolver::ToolResolver;
@@ -49,10 +53,25 @@ pub struct ForgeApp<S> {
     tool_registry: ToolRegistry<S>,
 }
 
-impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ForgeApp<S> {
+impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig> + SteerService>
+    ForgeApp<S>
+{
     /// Creates a new ForgeApp instance with the provided services.
     pub fn new(services: Arc<S>) -> Self {
         Self { tool_registry: ToolRegistry::new(services.clone()), services }
+    }
+
+    /// Accepts a typed steer message for delayed primary-conversation delivery.
+    ///
+    /// # Arguments
+    /// * `request` - The typed steer request to validate and queue.
+    ///
+    /// # Errors
+    /// Returns an error when the conversation is missing or is not primary.
+    pub async fn steer(&self, request: SteerRequest) -> anyhow::Result<()> {
+        SteerHandle::<S>::new(self.services.clone())
+            .accept(request)
+            .await
     }
 
     /// Executes a chat request and returns a stream of responses.

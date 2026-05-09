@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
-use std::hash::Hash;
 use std::path::{Path, PathBuf};
 
 use std::pin::Pin;
+
 use anyhow::Result;
 use bytes::Bytes;
 use forge_domain::{
@@ -105,6 +105,25 @@ pub trait FileReaderInfra: Send + Sync {
         start_line: u64,
         end_line: u64,
     ) -> anyhow::Result<(String, FileInfo)>;
+}
+
+#[async_trait::async_trait]
+pub trait PdfRenderInfra: Send + Sync {
+    /// Renders the first PDF page as PNG bytes suitable for image-only model providers.
+    ///
+    /// # Arguments
+    /// * `path` - Absolute PDF path to render
+    /// * `max_image_size_bytes` - Maximum allowed PNG preview size
+    ///
+    /// # Errors
+    /// Returns an error when the renderer cannot start, the PDF cannot be rendered,
+    /// the preview cannot be read, cleanup fails after successful rendering, or the
+    /// preview exceeds the configured size limit.
+    async fn render_pdf_first_page_to_png(
+        &self,
+        path: &Path,
+        max_image_size_bytes: u64,
+    ) -> anyhow::Result<Vec<u8>>;
 }
 
 #[async_trait::async_trait]
@@ -311,9 +330,9 @@ pub trait DirectoryReaderInfra: Send + Sync {
 /// Generic cache repository for content-addressable storage.
 ///
 /// This trait provides an abstraction over caching operations with support for
-/// arbitrary key and value types. Keys must be hashable and serializable, while
-/// values must be serializable. The trait is designed to work with
-/// content-addressable storage systems like cacache.
+/// arbitrary key and value types. Keys must be serializable, while values must
+/// be serializable. The trait is designed to work with content-addressable
+/// storage systems like cacache.
 ///
 /// All operations return `anyhow::Result` for consistent error handling across
 /// the infrastructure layer.
@@ -328,7 +347,7 @@ pub trait KVStore: Send + Sync {
     /// Returns an error if the cache operation fails
     async fn cache_get<K, V>(&self, key: &K) -> Result<Option<V>>
     where
-        K: Hash + Sync,
+        K: serde::Serialize + Sync,
         V: serde::Serialize + DeserializeOwned + Send;
 
     /// Stores a value in the cache with the given key.
@@ -344,7 +363,7 @@ pub trait KVStore: Send + Sync {
     /// Returns an error if the cache operation fails
     async fn cache_set<K, V>(&self, key: &K, value: &V) -> Result<()>
     where
-        K: Hash + Sync,
+        K: serde::Serialize + Sync,
         V: serde::Serialize + Sync;
 
     /// Clears all entries from the cache.

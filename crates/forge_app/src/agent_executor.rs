@@ -11,7 +11,7 @@ use futures::StreamExt;
 use tokio::sync::RwLock;
 
 use crate::error::Error;
-use crate::{AgentRegistry, ConversationService, EnvironmentInfra, Services};
+use crate::{AgentRegistry, ConversationService, EnvironmentInfra, Services, SteerService};
 #[derive(Clone)]
 pub struct AgentExecutor<S> {
     services: Arc<S>,
@@ -58,7 +58,6 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> AgentEx
         let parent_id = ctx.conversation_id;
         let conversation = if let Some(conversation_id) = conversation_id {
             self.services
-                .conversation_service()
                 .ensure_delegated_conversation(&conversation_id, parent_id)
                 .await?
         } else {
@@ -73,6 +72,7 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> AgentEx
                 .await?;
             conversation
         };
+        self.services.clear_steer(&conversation.id).await?;
         // Execute the request through the ForgeApp
         let app = crate::ForgeApp::new(self.services.clone());
         let mut response_stream = app

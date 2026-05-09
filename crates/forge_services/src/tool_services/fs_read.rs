@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use forge_app::{
     Content, EnvironmentInfra, FileInfoInfra, FileReaderInfra as InfraFsReadService, FsReadService,
-    ReadOutput, compute_hash,
+    PdfRenderInfra, ReadOutput, compute_hash,
 };
 use forge_domain::{FileInfo, Image};
 use regex::Regex;
@@ -211,8 +211,12 @@ impl<F> ForgeFsRead<F> {
 }
 
 #[async_trait::async_trait]
-impl<F: FileInfoInfra + EnvironmentInfra<Config = forge_config::ForgeConfig> + InfraFsReadService>
-    FsReadService for ForgeFsRead<F>
+impl<
+    F: FileInfoInfra
+        + EnvironmentInfra<Config = forge_config::ForgeConfig>
+        + InfraFsReadService
+        + PdfRenderInfra,
+> FsReadService for ForgeFsRead<F>
 {
     async fn read(
         &self,
@@ -253,8 +257,15 @@ impl<F: FileInfoInfra + EnvironmentInfra<Config = forge_config::ForgeConfig> + I
                     }
                 })?;
 
-            // Convert to base64 image
-            let image = Image::new_bytes(raw_content, mime_type.clone());
+            let image = if mime_type == "application/pdf" {
+                let preview = self
+                    .infra
+                    .render_pdf_first_page_to_png(path, config.max_image_size_bytes)
+                    .await?;
+                Image::new_bytes(preview, "image/png")
+            } else {
+                Image::new_bytes(raw_content, mime_type.clone())
+            };
             let hash = compute_hash(image.url());
 
             return Ok(ReadOutput {
@@ -337,6 +348,10 @@ mod tests {
 
     use super::*;
     use crate::attachment::tests::{MockCompositeService, MockFileService};
+
+    fn fixture_pdf_bytes() -> Vec<u8> {
+        b"%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj\n4 0 obj << /Length 44 >> stream\nBT /F1 18 Tf 20 50 Td (PDF visual test) Tj ET\nendstream endobj\n5 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\nxref\n0 6\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \n0000000234 00000 n \n0000000328 00000 n \ntrailer << /Root 1 0 R /Size 6 >>\nstartxref\n398\n%%EOF\n".to_vec()
+    }
 
     // Helper to create a temporary file with specific content size
     async fn create_test_file_with_size(size: usize) -> anyhow::Result<NamedTempFile> {
@@ -503,6 +518,50 @@ mod tests {
         assert!(!is_visual_content("text/plain"));
         assert!(!is_visual_content("application/json"));
         assert!(!is_visual_content("text/html"));
+    }
+
+    #[tokio::test]
+    async fn test_read_pdf_png_preview_has_openai_compatible_data_url() {
+        let fixture = NamedTempFile::with_suffix(".pdf").unwrap();
+        let pdf_bytes = fixture_pdf_bytes();
+        fs::write(fixture.path(), &pdf_bytes).await.unwrap();
+        let infra = Arc::new(MockCompositeService::new());
+        let read_service = ForgeFsRead::new(infra.clone());
+        infra.add_file(
+            fixture.path().to_path_buf(),
+            String::from_utf8(pdf_bytes).unwrap(),
+        );
+
+        let actual = read_service
+            .read(fixture.path().to_string_lossy().to_string(), None, None)
+            .await
+            .unwrap();
+        let actual = actual.content.as_image().unwrap();
+
+        assert_eq!(actual.mime_type(), "image/png");
+        assert!(actual.url().starts_with("data:image/png;base64,"));
+        assert!(actual.canonical_data_url().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_read_pdf_returns_png_preview_for_image_only_models() {
+        let fixture = NamedTempFile::with_suffix(".pdf").unwrap();
+        let pdf_bytes = fixture_pdf_bytes();
+        fs::write(fixture.path(), &pdf_bytes).await.unwrap();
+        let infra = Arc::new(MockCompositeService::new());
+        let read_service = ForgeFsRead::new(infra.clone());
+        infra.add_file(
+            fixture.path().to_path_buf(),
+            String::from_utf8(pdf_bytes).unwrap(),
+        );
+
+        let actual = read_service
+            .read(fixture.path().to_string_lossy().to_string(), None, None)
+            .await
+            .unwrap();
+        let actual = actual.content.as_image().unwrap();
+        let expected = "image/png";
+        assert_eq!(actual.mime_type(), expected);
     }
 
     #[test]

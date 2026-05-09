@@ -148,6 +148,10 @@ impl<
         self.app().chat(agent_id, chat).await
     }
 
+    async fn steer(&self, request: SteerRequest) -> anyhow::Result<()> {
+        self.app().steer(request).await
+    }
+
     async fn upsert_conversation(&self, conversation: Conversation) -> anyhow::Result<()> {
         self.services.upsert_conversation(conversation).await
     }

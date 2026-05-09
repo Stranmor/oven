@@ -143,7 +143,7 @@ pub mod tests {
     use forge_app::utils::compute_hash;
     use forge_app::{
         AttachmentService, DirectoryReaderInfra, EnvironmentInfra, FileDirectoryInfra,
-        FileInfoInfra, FileReaderInfra, FileRemoverInfra, FileWriterInfra,
+        FileInfoInfra, FileReaderInfra, FileRemoverInfra, FileWriterInfra, PdfRenderInfra,
     };
     use forge_domain::{ConfigOperation, FileInfo};
     use futures::stream;
@@ -546,6 +546,17 @@ pub mod tests {
 
         fn get_env_vars(&self) -> BTreeMap<String, String> {
             self.env_service.get_env_vars()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PdfRenderInfra for MockCompositeService {
+        async fn render_pdf_first_page_to_png(
+            &self,
+            _path: &Path,
+            _max_image_size_bytes: u64,
+        ) -> anyhow::Result<Vec<u8>> {
+            Ok(b"\x89PNG\r\n\x1a\n".to_vec())
         }
     }
 

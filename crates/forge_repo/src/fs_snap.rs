@@ -5,13 +5,13 @@ use anyhow::Result;
 use forge_domain::{Environment, Snapshot, SnapshotRepository};
 
 pub struct ForgeFileSnapshotService {
-    inner: Arc<forge_snaps::SnapshotService>,
+    inner: Arc<forge_services::SnapshotService>,
 }
 
 impl ForgeFileSnapshotService {
     pub fn new(env: Environment) -> Self {
         Self {
-            inner: Arc::new(forge_snaps::SnapshotService::new(env.snapshot_path())),
+            inner: Arc::new(forge_services::SnapshotService::new(env.snapshot_path())),
         }
     }
 }

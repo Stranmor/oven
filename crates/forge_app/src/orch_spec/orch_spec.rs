@@ -1,7 +1,7 @@
 use forge_domain::{
     ChatCompletionMessage, ChatResponse, Content, Context, ContextMessage, EventValue,
-    FinishReason, MessageEntry, ReasoningConfig, Role, TextMessage, ToolCallArguments,
-    ToolCallFull, ToolOutput, ToolResult,
+    FinishReason, MessageEntry, ReasoningConfig, Role, SteerMessage, TextMessage,
+    ToolCallArguments, ToolCallFull, ToolOutput, ToolResult,
 };
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -196,6 +196,147 @@ async fn test_tool_call_start_end_responses_for_non_agent_tools() {
         "ToolCallEnd should contain the tool result"
     );
     assert!(!ctx.output.tools().is_empty(), "Context should've tools.");
+}
+
+#[tokio::test]
+async fn test_steer_is_delivered_after_tool_batch_completion() {
+    let first_call = ToolCallFull::new("fs_read")
+        .arguments(ToolCallArguments::from(json!({"path": "first.txt"})));
+    let second_call = ToolCallFull::new("fs_write").arguments(ToolCallArguments::from(
+        json!({"path": "second.txt", "content": "ok"}),
+    ));
+    let first_result = ToolResult::new("fs_read").output(Ok(ToolOutput::text("first content")));
+    let second_result = ToolResult::new("fs_write").output(Ok(ToolOutput::text("written")));
+
+    let mut ctx = TestContext::default()
+        .steer_messages(vec![SteerMessage::new("adjust after tools").unwrap()])
+        .mock_tool_call_responses(vec![
+            (first_call.clone(), first_result.clone()),
+            (second_call.clone(), second_result.clone()),
+        ])
+        .mock_assistant_responses(vec![
+            ChatCompletionMessage::assistant("Running tools")
+                .tool_calls(vec![first_call.into(), second_call.into()]),
+            ChatCompletionMessage::assistant("Steer handled").finish_reason(FinishReason::Stop),
+        ]);
+
+    ctx.run("Run a batch").await.unwrap();
+
+    let actual = ctx.output.chat_contexts[1]
+        .messages
+        .iter()
+        .filter_map(|message| message.content())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let assistant_index = actual
+        .iter()
+        .position(|content| content == "Running tools")
+        .unwrap();
+    let steer_index = actual
+        .iter()
+        .position(|content| content == "<steer>adjust after tools</steer>")
+        .unwrap();
+    let expected = true;
+
+    assert_eq!(steer_index > assistant_index, expected);
+}
+
+#[tokio::test]
+async fn test_steer_is_not_visible_mid_tool_batch() {
+    let tool_call = ToolCallFull::new("fs_read")
+        .arguments(ToolCallArguments::from(json!({"path": "test.txt"})));
+    let tool_result = ToolResult::new("fs_read").output(Ok(ToolOutput::text("file content")));
+
+    let mut ctx = TestContext::default()
+        .steer_messages(vec![SteerMessage::new("late steer").unwrap()])
+        .mock_tool_call_responses(vec![(tool_call.clone(), tool_result)])
+        .mock_assistant_responses(vec![
+            ChatCompletionMessage::assistant("Reading file").tool_calls(vec![tool_call.into()]),
+            ChatCompletionMessage::assistant("Steer handled").finish_reason(FinishReason::Stop),
+        ]);
+
+    ctx.run("Read a file").await.unwrap();
+
+    let actual = ctx.output.chat_contexts[0]
+        .messages
+        .iter()
+        .filter_map(|message| message.content())
+        .any(|content| content.contains("late steer"));
+    let expected = false;
+
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn test_steer_is_not_visible_to_delegated_subagent_contexts() {
+    let task_call = ToolCallFull::new("task").arguments(ToolCallArguments::from(
+        json!({"agent_id": "forge", "tasks": ["delegate"]}),
+    ));
+    let task_result = ToolResult::new("task").output(Ok(ToolOutput::text("delegated result")));
+
+    let mut ctx = TestContext::default()
+        .steer_messages(vec![SteerMessage::new("main only steer").unwrap()])
+        .mock_tool_call_responses(vec![(task_call.clone(), task_result)])
+        .mock_assistant_responses(vec![
+            ChatCompletionMessage::assistant("Delegating").tool_calls(vec![task_call.into()]),
+            ChatCompletionMessage::assistant("Steer handled").finish_reason(FinishReason::Stop),
+        ]);
+
+    ctx.run("Delegate work").await.unwrap();
+
+    let delegated_context_has_steer = ctx.output.chat_contexts[0]
+        .messages
+        .iter()
+        .filter_map(|message| message.content())
+        .any(|content| content.contains("main only steer"));
+    let main_context_has_steer = ctx.output.chat_contexts[1]
+        .messages
+        .iter()
+        .filter_map(|message| message.content())
+        .any(|content| content.contains("main only steer"));
+    let actual = (delegated_context_has_steer, main_context_has_steer);
+    let expected = (false, true);
+
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn test_steer_drain_does_not_duplicate_delivery_across_repeated_tool_batches() {
+    let first_call = ToolCallFull::new("fs_read")
+        .arguments(ToolCallArguments::from(json!({"path": "first.txt"})));
+    let second_call = ToolCallFull::new("fs_write").arguments(ToolCallArguments::from(
+        json!({"path": "second.txt", "content": "ok"}),
+    ));
+    let first_result = ToolResult::new("fs_read").output(Ok(ToolOutput::text("first content")));
+    let second_result = ToolResult::new("fs_write").output(Ok(ToolOutput::text("written")));
+
+    let mut ctx = TestContext::default()
+        .steer_messages(vec![SteerMessage::new("single delivery").unwrap()])
+        .mock_tool_call_responses(vec![
+            (first_call.clone(), first_result),
+            (second_call.clone(), second_result),
+        ])
+        .mock_assistant_responses(vec![
+            ChatCompletionMessage::assistant("First batch").tool_calls(vec![first_call.into()]),
+            ChatCompletionMessage::assistant("Second batch").tool_calls(vec![second_call.into()]),
+            ChatCompletionMessage::assistant("Done").finish_reason(FinishReason::Stop),
+        ]);
+
+    ctx.run("Run repeated batches").await.unwrap();
+
+    let actual = ctx
+        .output
+        .chat_contexts
+        .last()
+        .unwrap()
+        .messages
+        .iter()
+        .filter_map(|message| message.content())
+        .filter(|content| content.contains("single delivery"))
+        .count();
+    let expected = 1;
+
+    assert_eq!(actual, expected);
 }
 
 #[tokio::test]

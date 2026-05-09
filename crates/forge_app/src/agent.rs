@@ -3,12 +3,12 @@ use std::sync::Arc;
 use forge_config::ForgeConfig;
 use forge_domain::{
     Agent, ChatCompletionMessage, Compact, Context, Conversation, Effort, MaxTokens, ModelId,
-    ProviderId, ReasoningConfig, ResultStream, Temperature, ToolCallContext, ToolCallFull,
-    ToolResult, TopK, TopP,
+    ProviderId, ReasoningConfig, ResultStream, SteerMessage, Temperature, ToolCallContext,
+    ToolCallFull, ToolResult, TopK, TopP,
 };
 use merge::Merge;
 
-use crate::services::AppConfigService;
+use crate::services::{AppConfigService, SteerService};
 use crate::tool_registry::ToolRegistry;
 use crate::{ConversationService, EnvironmentInfra, ProviderService, Services};
 
@@ -34,6 +34,30 @@ pub trait AgentService: Send + Sync + 'static {
 
     /// Synchronize the on-going conversation
     async fn update(&self, conversation: Conversation) -> anyhow::Result<()>;
+
+    /// Returns whether a conversation is currently primary.
+    ///
+    /// # Arguments
+    /// * `conversation_id` - The conversation to inspect.
+    async fn is_primary_conversation(
+        &self,
+        conversation_id: &forge_domain::ConversationId,
+    ) -> anyhow::Result<bool> {
+        let _ = conversation_id;
+        Ok(true)
+    }
+
+    /// Drains typed steer messages for the current conversation.
+    ///
+    /// # Arguments
+    /// * `conversation_id` - The conversation whose steer queue should be drained.
+    async fn drain_steer_messages(
+        &self,
+        conversation_id: &forge_domain::ConversationId,
+    ) -> anyhow::Result<Vec<SteerMessage>> {
+        let _ = conversation_id;
+        Ok(Vec::new())
+    }
 }
 
 /// Blanket implementation of AgentService for any type that implements Services
@@ -70,6 +94,23 @@ impl<T: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> AgentSe
 
     async fn update(&self, conversation: Conversation) -> anyhow::Result<()> {
         self.upsert_conversation(conversation).await
+    }
+
+    async fn is_primary_conversation(
+        &self,
+        conversation_id: &forge_domain::ConversationId,
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .find_conversation(conversation_id)
+            .await?
+            .is_some_and(|conversation| conversation.is_primary_user_conversation()))
+    }
+
+    async fn drain_steer_messages(
+        &self,
+        conversation_id: &forge_domain::ConversationId,
+    ) -> anyhow::Result<Vec<SteerMessage>> {
+        self.drain_steer(conversation_id).await
     }
 }
 

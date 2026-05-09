@@ -345,7 +345,7 @@ mod tests {
     impl KVStore for MockInfra {
         async fn cache_get<K, V>(&self, _key: &K) -> anyhow::Result<Option<V>>
         where
-            K: std::hash::Hash + Sync,
+            K: serde::Serialize + Sync,
             V: serde::Serialize + DeserializeOwned + Send,
         {
             Ok(None)
@@ -353,7 +353,7 @@ mod tests {
 
         async fn cache_set<K, V>(&self, _key: &K, _value: &V) -> anyhow::Result<()>
         where
-            K: std::hash::Hash + Sync,
+            K: serde::Serialize + Sync,
             V: serde::Serialize + Sync,
         {
             Ok(())

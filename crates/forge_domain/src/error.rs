@@ -59,6 +59,9 @@ pub enum Error {
     #[error("Conversation with ID '{0}' not found")]
     ConversationNotFound(ConversationId),
 
+    #[error("Steer messages are accepted only for primary user conversations")]
+    SteerRejectedNonPrimaryConversation,
+
     #[error("Missing description for agent: {0}")]
     #[from(skip)]
     MissingAgentDescription(AgentId),

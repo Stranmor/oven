@@ -1,17 +1,8 @@
 use forge_config::ForgeConfig;
-use forge_domain::AgentId;
-use insta::{assert_snapshot, assert_yaml_snapshot, with_settings};
+use forge_domain::{AgentId, ToolName};
 use pretty_assertions::assert_eq;
 
 use super::*;
-
-macro_rules! assert_agent_snapshot {
-    ($assertion:expr) => {
-        with_settings!({snapshot_path => "../snapshots"}, {
-            $assertion;
-        });
-    };
-}
 
 #[tokio::test]
 async fn test_parse_basic_agent() {
@@ -132,16 +123,19 @@ Body keeps {{tool_names.read}} untouched.
     let config = ForgeConfig { subagents: true, ..Default::default() };
 
     let actual = apply_subagent_tool_config(parse_agent_file(fixture).unwrap(), &config).unwrap();
+    let actual_tools = actual.tools.unwrap();
+    let expected_tools = vec![
+        ToolName::new("read"),
+        ToolName::new("task"),
+        ToolName::new("mcp_*"),
+    ];
 
     assert_eq!(actual.id, AgentId::new("forge"));
     assert_eq!(
         actual.system_prompt.unwrap().template,
         "Body keeps {{tool_names.read}} untouched."
     );
-    assert_agent_snapshot!(assert_yaml_snapshot!(
-        "parse_agent_file_subagents_enabled_tools",
-        actual.tools
-    ));
+    assert_eq!(actual_tools, expected_tools);
 }
 
 #[test]
@@ -159,49 +153,63 @@ Body keeps {{tool_names.read}} untouched.
     let config = ForgeConfig { subagents: false, ..Default::default() };
 
     let actual = apply_subagent_tool_config(parse_agent_file(fixture).unwrap(), &config).unwrap();
+    let actual_prompt = actual.system_prompt.unwrap().template;
+    let actual_tools = actual.tools.unwrap();
+    let expected_tools = vec![ToolName::new("read"), ToolName::new("mcp_*")];
 
     assert_eq!(actual.id, AgentId::new("forge"));
-    assert_agent_snapshot!(assert_snapshot!(
-        "parse_agent_file_subagents_disabled_prompt",
-        actual.system_prompt.unwrap().template
-    ));
-    assert_agent_snapshot!(assert_yaml_snapshot!(
-        "parse_agent_file_subagents_disabled_tools",
-        actual.tools
-    ));
+    assert_eq!(actual_prompt, "Body keeps {{tool_names.read}} untouched.");
+    assert_eq!(actual_tools, expected_tools);
 }
 
 #[test]
-fn test_parse_agent_file_preserves_runtime_user_prompt_variables() {
+fn test_parse_agent_file_inserts_task_before_mcp_regardless_of_original_task_position() {
     let fixture = r#"---
 id: "forge"
 tools:
   - read
+  - mcp_*
   - task
   - sage
+  - write
+---
+Body keeps {{tool_names.read}} untouched.
+"#;
+    let config = ForgeConfig { subagents: true, ..Default::default() };
+
+    let actual = apply_subagent_tool_config(parse_agent_file(fixture).unwrap(), &config).unwrap();
+    let actual_tools = actual.tools.unwrap();
+    let expected_tools = vec![
+        ToolName::new("read"),
+        ToolName::new("task"),
+        ToolName::new("mcp_*"),
+        ToolName::new("write"),
+    ];
+
+    assert_eq!(actual_tools, expected_tools);
+}
+
+#[test]
+fn test_parse_configured_agent_file_preserves_runtime_user_prompt_variables_after_tool_config() {
+    let setup = std::path::PathBuf::from("/tmp/runtime-user-prompt-agent.md");
+    let fixture = r#"---
+id: "forge"
+tools:
+  - read
   - mcp_*
+  - task
 user_prompt: |-
   <{{event.name}}>{{event.value}}</{{event.name}}>
   <system_date>{{current_date}}</system_date>
 ---
 Body keeps {{tool_names.read}} untouched.
 "#;
+    let config = ForgeConfig { subagents: false, ..Default::default() };
 
-    let actual = parse_agent_file(fixture).unwrap();
-    let actual_user_prompt = actual.user_prompt.clone().unwrap().template;
+    let actual = parse_configured_agent_file(&setup, fixture, &config).unwrap();
+    let actual_user_prompt = actual.user_prompt.unwrap().template;
+    let expected_user_prompt = "<{{event.name}}>{{event.value}}</{{event.name}}>
+<system_date>{{current_date}}</system_date>";
 
-    assert_eq!(actual.id, AgentId::new("forge"));
-    assert_agent_snapshot!(assert_snapshot!(
-        "parse_agent_file_preserves_runtime_user_prompt_variables",
-        actual_user_prompt
-    ));
-    assert_agent_snapshot!(assert_yaml_snapshot!(
-        "parse_agent_file_preserves_runtime_user_prompt_variables_tools",
-        apply_subagent_tool_config(
-            actual,
-            &ForgeConfig { subagents: true, ..Default::default() }
-        )
-        .unwrap()
-        .tools
-    ));
+    assert_eq!(actual_user_prompt, expected_user_prompt);
 }

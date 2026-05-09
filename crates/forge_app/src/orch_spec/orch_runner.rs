@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use forge_domain::{
     Attachment, ChatCompletionMessage, ChatResponse, Conversation, ConversationId, Environment,
-    Event, Hook, ProviderId, ToolCallFull, ToolErrorTracker, ToolResult,
+    Event, Hook, ProviderId, SteerMessage, ToolCallFull, ToolErrorTracker, ToolResult,
 };
 use handlebars::{Handlebars, no_escape};
 use include_dir::{Dir, include_dir};
@@ -20,7 +20,7 @@ use crate::system_prompt::SystemPrompt;
 use crate::user_prompt::UserPromptGenerator;
 use crate::{
     AgentExt, AgentService, AttachmentService, EnvironmentInfra, ShellExecuteRequest, ShellOutput,
-    ShellService, SkillFetchService, TemplateService,
+    ShellService, SkillFetchService, SteerService, TemplateService,
 };
 
 static TEMPLATE_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../templates");
@@ -41,6 +41,8 @@ pub struct Runner {
 
     // Mock shell command outputs
     test_shell_outputs: Mutex<VecDeque<ShellOutput>>,
+
+    steer_messages: Mutex<Vec<SteerMessage>>,
 
     attachments: Vec<Attachment>,
     config: forge_config::ForgeConfig,
@@ -69,6 +71,7 @@ impl Runner {
             test_tool_calls: Mutex::new(VecDeque::from(setup.mock_tool_call_responses.clone())),
             test_completions: Mutex::new(VecDeque::from(setup.mock_assistant_responses.clone())),
             test_shell_outputs: Mutex::new(VecDeque::from(setup.mock_shell_outputs.clone())),
+            steer_messages: Mutex::new(setup.steer_messages.clone()),
         }
     }
 
@@ -216,6 +219,37 @@ impl AgentService for Runner {
     async fn update(&self, conversation: Conversation) -> anyhow::Result<()> {
         self.conversation_history.lock().await.push(conversation);
         Ok(())
+    }
+
+    async fn drain_steer_messages(
+        &self,
+        _conversation_id: &ConversationId,
+    ) -> anyhow::Result<Vec<SteerMessage>> {
+        Ok(self.steer_messages.lock().await.drain(..).collect())
+    }
+}
+
+#[async_trait::async_trait]
+impl SteerService for Runner {
+    async fn enqueue_steer(
+        &self,
+        _conversation_id: &ConversationId,
+        message: SteerMessage,
+    ) -> anyhow::Result<()> {
+        self.steer_messages.lock().await.push(message);
+        Ok(())
+    }
+
+    async fn clear_steer(&self, _conversation_id: &ConversationId) -> anyhow::Result<()> {
+        self.steer_messages.lock().await.clear();
+        Ok(())
+    }
+
+    async fn drain_steer(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> anyhow::Result<Vec<SteerMessage>> {
+        self.drain_steer_messages(conversation_id).await
     }
 }
 

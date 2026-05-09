@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,7 +7,7 @@ use anyhow::Context;
 use console::style;
 use forge_domain::{
     Agent, AgentId, AgentInput, ChatResponse, ChatResponseContent, Environment, InputModality,
-    Model, SystemContext, TemplateConfig, ToolCallContext, ToolCallFull, ToolCatalog,
+    McpServers, Model, SystemContext, TemplateConfig, ToolCallContext, ToolCallFull, ToolCatalog,
     ToolDefinition, ToolKind, ToolName, ToolOutput, ToolResult,
 };
 use forge_template::Element;
@@ -40,6 +41,15 @@ struct ToolDefinitionsCacheKey {
     max_stdout_prefix_lines: usize,
     max_stdout_suffix_lines: usize,
     max_stdout_line_chars: usize,
+    mcp_tools_fingerprint: String,
+    agent_tools_fingerprint: String,
+    agents_fingerprint: String,
+}
+
+struct ToolDefinitionsCacheSources {
+    mcp_tools: McpServers,
+    agent_tools: Vec<ToolDefinition>,
+    agents: Vec<Agent>,
 }
 
 #[derive(Clone, Debug)]
@@ -245,12 +255,52 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
         ToolResult::new(tool_name).call_id(call_id).output(output)
     }
 
-    async fn tool_definitions_cache_key(&self) -> anyhow::Result<ToolDefinitionsCacheKey> {
-        let active_agent_id = self.services.get_active_agent_id().await.unwrap_or(None);
+    async fn tool_definitions_cache_sources(&self) -> anyhow::Result<ToolDefinitionsCacheSources> {
+        let mcp_tools = self.services.get_mcp_servers().await?;
+        let agent_tools = self.agent_executor.agent_definitions().await?;
+        let agents = self.services.get_agents().await?;
+        Ok(ToolDefinitionsCacheSources { mcp_tools, agent_tools, agents })
+    }
+
+    fn cache_fingerprint<T: serde::Serialize>(value: &T) -> anyhow::Result<String> {
+        let canonical_value = Self::canonicalize_cache_fingerprint(
+            serde_json::to_value(value)
+                .context("Failed to build canonical tool definition cache source")?,
+        );
+        serde_json::to_string(&canonical_value)
+            .context("Failed to fingerprint tool definition cache source")
+    }
+
+    fn canonicalize_cache_fingerprint(value: Value) -> Value {
+        match value {
+            Value::Array(values) => {
+                let mut values = values
+                    .into_iter()
+                    .map(Self::canonicalize_cache_fingerprint)
+                    .collect::<Vec<_>>();
+                values.sort_by_key(|value| serde_json::to_string(value).unwrap_or_default());
+                Value::Array(values)
+            }
+            Value::Object(map) => {
+                let sorted = map
+                    .into_iter()
+                    .map(|(key, value)| (key, Self::canonicalize_cache_fingerprint(value)))
+                    .collect::<BTreeMap<_, _>>();
+                Value::Object(Map::from_iter(sorted))
+            }
+            value => value,
+        }
+    }
+
+    async fn tool_definitions_cache_key(
+        &self,
+        sources: &ToolDefinitionsCacheSources,
+    ) -> anyhow::Result<ToolDefinitionsCacheKey> {
+        let active_agent_id = self.services.get_active_agent_id().await?;
         let environment = self.services.get_environment();
         let cwd = environment.cwd;
-        let indexed = self.services.is_indexed(&cwd).await.unwrap_or(false);
-        let authenticated = self.services.is_authenticated().await.unwrap_or(false);
+        let indexed = self.services.is_indexed(&cwd).await?;
+        let authenticated = self.services.is_authenticated().await?;
         let config = self.services.get_config()?;
         Ok(ToolDefinitionsCacheKey {
             cwd,
@@ -264,18 +314,23 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
             max_stdout_prefix_lines: config.max_stdout_prefix_lines,
             max_stdout_suffix_lines: config.max_stdout_suffix_lines,
             max_stdout_line_chars: config.max_stdout_line_chars,
+            mcp_tools_fingerprint: Self::cache_fingerprint(&sources.mcp_tools)?,
+            agent_tools_fingerprint: Self::cache_fingerprint(&sources.agent_tools)?,
+            agents_fingerprint: Self::cache_fingerprint(&sources.agents)?,
         })
     }
 
     pub async fn list(&self) -> anyhow::Result<Vec<ToolDefinition>> {
-        let key = self.tool_definitions_cache_key().await?;
+        let sources = self.tool_definitions_cache_sources().await?;
+        let key = self.tool_definitions_cache_key(&sources).await?;
         if let Some(cached) = self.tool_definitions_cache.lock().await.as_ref()
             && cached.key == key
         {
             return Ok(cached.definitions.clone());
         }
 
-        let definitions: Vec<ToolDefinition> = self.tools_overview().await?.into();
+        let definitions: Vec<ToolDefinition> =
+            self.tools_overview_from_sources(sources).await?.into();
         *self.tool_definitions_cache.lock().await =
             Some(CachedToolDefinitions { key, definitions: definitions.clone() });
         Ok(definitions)
@@ -299,17 +354,21 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
     }
 
     pub async fn tools_overview(&self) -> anyhow::Result<ToolsOverview> {
-        let mcp_tools = self.services.get_mcp_servers().await?;
-        let agent_tools = self.agent_executor.agent_definitions().await?;
+        let sources = self.tool_definitions_cache_sources().await?;
+        self.tools_overview_from_sources(sources).await
+    }
 
-        // Get agents for template rendering in Task tool description
-        let mut agents = self.services.get_agents().await?;
+    async fn tools_overview_from_sources(
+        &self,
+        sources: ToolDefinitionsCacheSources,
+    ) -> anyhow::Result<ToolsOverview> {
+        let ToolDefinitionsCacheSources { mcp_tools, agent_tools, mut agents } = sources;
 
         // Check if current working directory is indexed
         let environment = self.services.get_environment();
         let cwd = environment.cwd.clone();
-        let is_indexed = self.services.is_indexed(&cwd).await.unwrap_or(false);
-        let is_authenticated = self.services.is_authenticated().await.unwrap_or(false);
+        let is_indexed = self.services.is_indexed(&cwd).await?;
+        let is_authenticated = self.services.is_authenticated().await?;
 
         // Get current model for dynamic tool descriptions
         let model = self.get_current_model().await;

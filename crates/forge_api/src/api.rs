@@ -46,6 +46,9 @@ pub trait API: Sync + Send {
     /// Executes a chat request and returns a stream of responses
     async fn chat(&self, chat: ChatRequest) -> Result<MpscStream<Result<ChatResponse>>>;
 
+    /// Queues a typed steer message for the current primary conversation run
+    async fn steer(&self, request: SteerRequest) -> Result<()>;
+
     /// Commits changes with an AI-generated commit message
     async fn commit(
         &self,

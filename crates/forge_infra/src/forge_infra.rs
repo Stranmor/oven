@@ -7,7 +7,7 @@ use bytes::Bytes;
 use forge_app::{
     CommandInfra, DirectoryReaderInfra, EnvironmentInfra, FileDirectoryInfra, FileInfoInfra,
     FileReaderInfra, FileRemoverInfra, FileWriterInfra, GrpcInfra, HttpInfra, McpServerInfra,
-    StrategyFactory, UserInfra, WalkedFileStream, WalkerInfra,
+    PdfRenderInfra, StrategyFactory, UserInfra, WalkedFileStream, WalkerInfra,
 };
 use forge_domain::{
     AuthMethod, CommandExecutionOutput, FileInfo as FileInfoData, McpServerConfig, ProcessId,
@@ -175,6 +175,19 @@ impl FileReaderInfra for ForgeInfra {
     ) -> anyhow::Result<(String, FileInfoData)> {
         self.file_read_service
             .range_read_utf8(path, start_line, end_line)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl PdfRenderInfra for ForgeInfra {
+    async fn render_pdf_first_page_to_png(
+        &self,
+        path: &Path,
+        max_image_size_bytes: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.file_read_service
+            .render_pdf_first_page_to_png(path, max_image_size_bytes)
             .await
     }
 }
