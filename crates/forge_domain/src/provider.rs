@@ -218,6 +218,12 @@ impl From<String> for ProviderId {
     }
 }
 
+impl fake::Dummy<fake::Faker> for ProviderId {
+    fn dummy_with_rng<R: fake::rand::Rng + ?Sized>(_: &fake::Faker, _: &mut R) -> Self {
+        Self::FORGE
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ProviderResponse {
     OpenAI,

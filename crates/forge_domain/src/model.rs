@@ -1,5 +1,6 @@
 use derive_more::derive::Display;
 use derive_setters::Setters;
+use fake::Dummy;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use strum_macros::EnumString;
@@ -7,7 +8,9 @@ use strum_macros::EnumString;
 use crate::ProviderId;
 
 /// Represents input modalities that a model can accept
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, EnumString)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, EnumString, JsonSchema, Dummy,
+)]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 pub enum InputModality {
@@ -22,7 +25,8 @@ fn default_input_modalities() -> Vec<InputModality> {
     vec![InputModality::Text]
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Setters)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Setters, JsonSchema, Dummy)]
+#[setters(strip_option)]
 pub struct Model {
     pub id: ModelId,
     pub provider_id: ProviderId,
@@ -50,13 +54,31 @@ impl Parameters {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, Hash, Eq, Display, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, Hash, Eq, Display, JsonSchema, Dummy)]
 #[serde(transparent)]
 pub struct ModelId(String);
 
 impl ModelId {
     pub fn new<T: Into<String>>(id: T) -> Self {
         Self(id.into())
+    }
+}
+
+impl Model {
+    /// Creates a new `Model` with the given id and default values for all other
+    /// fields.
+    pub fn new(id: impl Into<ModelId>) -> Self {
+        Self {
+            id: id.into(),
+            provider_id: ProviderId::FORGE,
+            name: None,
+            description: None,
+            context_length: None,
+            tools_supported: None,
+            supports_parallel_tool_calls: None,
+            supports_reasoning: None,
+            input_modalities: default_input_modalities(),
+        }
     }
 }
 
