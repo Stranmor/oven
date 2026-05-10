@@ -130,11 +130,13 @@ Always verify changes by running tests and linting the codebase
 
 The active local `forge` binary is protected infrastructure. Its updater-consumed source MUST be the user's fork `Stranmor/oven` on `origin/main`, because that branch integrates upstream Forge changes with local regression fixes. Upstream input MUST be `tailcallhq/forgecode` `main`; stale `antinomyhq/forgecode` upstream remotes are historical drift and must not drive automation. Directly tracking or consuming upstream `main` for the active local binary is forbidden: it can overwrite local patches and reintroduce fixed regressions.
 
-Correct update flow: merge or port upstream changes into `origin/main` first, verify the integrated fork, then let the updater consume that fork state. The updater MUST also preserve wrapper symlinks: a freshly built binary must never replace `~/.local/bin/forge` when that path is a wrapper/symlink entry point.
+Correct update flow: merge or port upstream changes into `origin/main` first, verify the integrated fork, then let the updater consume that fork state. The updater MUST install the real executable to `/home/stranmor/.local/lib/forge/forge-real` and preserve wrapper symlinks: a freshly built binary must never replace `~/.local/bin/forge` when that path is a wrapper/symlink entry point.
 
-Detection: About to point a local Forge auto-updater at upstream/main, install a built binary directly over `~/.local/bin/forge`, or bypass the fork integration branch → STOP → update `origin/main` first and preserve the wrapper/symlink boundary.
+Verification must prove the active command path, not only the installed target state. After any local Forge update or deployment, resolve the PATH entrypoint actually used by `forge` (for example `/home/stranmor/.local/bin/forge -> /home/stranmor/configs/bin/forge`), inspect the full wrapper/symlink chain, and prove that executing `forge --version` reaches the intended `/home/stranmor/.local/lib/forge/forge-real`. A successful updater state, changed `forge-real` timestamp, or installed-source revision is insufficient if the active PATH entrypoint still resolves to an old ELF binary or any wrapper that does not delegate to `forge-real`.
 
-Mnemonic: The fork is the update source; upstream is input, not the installed truth.
+Detection: About to point a local Forge auto-updater at upstream/main, install a built binary directly over `~/.local/bin/forge`, bypass the fork integration branch, or report a Forge update as verified from `forge-real`/updater state alone → STOP → update `origin/main` first, preserve the wrapper/symlink boundary, trace the active PATH command through every wrapper/symlink hop, and verify the active `forge --version` executes the intended real binary.
+
+Mnemonic: The fork is the update source; upstream is input, not the installed truth. The active PATH command is the proof, not the payload file.
 
 ## Service Implementation Guidelines
 
