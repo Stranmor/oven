@@ -25,13 +25,19 @@ pub use ingestion::{ingest_external_facts, ingest_typed_external_facts};
 pub use lexical::{LexicalIndex, documents_from_manifest};
 pub use retrieval::{retrieve, retrieve_with_boundaries};
 pub use types::{
-    EdgeConfidence, ExternalFactSource, ExternalFacts, ExternalReferenceFact, ExternalSymbolFact,
-    FileNode, FileNodeKind, FreshnessEvalReport, FreshnessState, FutureVectorRetrievalScaffold,
-    GraphCoverageReport, GraphEdge, GraphEdgeKind, Language, LexicalDocument, LexicalDocumentKind,
-    LexicalSearchHit, ProjectManifest, Provenance, ProvenanceCompletenessReport, RerankCandidate,
-    RerankScore, RetrievalEvalCase, RetrievalEvalReport, RetrievalQuery, RetrievalResult,
-    ShardManifest, SourceFile, SymbolKind, SymbolNode, ToolEpisode, TypedExternalFacts,
+    ContextPack, ContextPackEvidence, ContextPackEvidenceSource, ContextPackSelection,
+    DecisionGraphNode, EdgeConfidence, EvalCaseGraphNode, EvidenceFreshness, ExternalFactSource,
+    ExternalFacts, ExternalReferenceFact, ExternalSymbolFact, FileGraphNode, FileNode,
+    FileNodeKind, FreshnessEvalReport, FreshnessState, FutureVectorRetrievalScaffold,
+    GraphCoverageReport, GraphEdge, GraphEdgeKind, KnowledgeGraph, KnowledgeGraphEdge,
+    KnowledgeGraphNode, KnowledgeGraphNodeId, KnowledgeGraphNodeKind, Language, LexicalDocument,
+    LexicalDocumentKind, LexicalSearchHit, ProjectManifest, Provenance,
+    ProvenanceCompletenessReport, RerankCandidate, RerankScore, RetrievalEvalCase,
+    RetrievalEvalReport, RetrievalQuery, RetrievalResult, RetrievedEvidenceGraphNode,
+    ShardGraphNode, ShardManifest, SourceFile, StaleEvidencePolicy, SymbolGraphNode, SymbolKind,
+    SymbolNode, TaskGraphNode, ToolEpisode, ToolEpisodeGraphNode, TypedExternalFacts,
     TypedExternalReferenceFact, TypedExternalSymbolFact, VectorQuery, VectorSearchHit,
+    classify_evidence_freshness,
 };
 pub use util::fingerprint;
 pub use vector::{DeterministicReranker, DeterministicVectorIndex, Reranker, VectorIndex};

@@ -1,6 +1,8 @@
 //! Public project-model DTOs and type surfaces.
 
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -158,9 +160,664 @@ pub enum GraphEdgeKind {
     Calls,
     /// Symbol or file references another symbol.
     References,
+    /// Task depends on file, symbol, shard, decision, retrieved evidence, tool episode, or eval evidence.
+    TaskDependsOn,
+    /// Decision is supported by file, symbol, shard, task, retrieved evidence, tool episode, or eval evidence.
+    DecisionSupportedBy,
+    /// Retrieved evidence cites a file, symbol, or shard.
+    EvidenceCites,
+    /// Tool episode produced or consumed a graph node.
+    ToolEpisodeRelates,
+    /// Eval case covers a graph node or relationship.
+    EvalCovers,
     /// Retrieval expansion relationship.
     #[default]
     Related,
+}
+
+/// Stable typed identifier for a knowledge graph node.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum KnowledgeGraphNodeId {
+    /// Source file node keyed by relative path.
+    File(String),
+    /// Source symbol node keyed by stable symbol identifier.
+    Symbol(String),
+    /// Retrieval shard node keyed by stable shard identifier.
+    Shard(String),
+    /// Agent task node keyed by durable task identifier.
+    Task(String),
+    /// Architecture or product decision node keyed by durable decision identifier.
+    Decision(String),
+    /// Retrieved external or internal evidence node keyed by durable evidence identifier.
+    RetrievedEvidence(String),
+    /// Tool episode node keyed by durable tool episode identifier.
+    ToolEpisode(String),
+    /// Evaluation case node keyed by durable eval case identifier.
+    EvalCase(String),
+}
+
+impl KnowledgeGraphNodeId {
+    /// Returns a stable string representation suitable for legacy edge interop.
+    pub fn as_legacy_id(&self) -> String {
+        match self {
+            Self::File(value) => value.clone(),
+            Self::Symbol(value)
+            | Self::Shard(value)
+            | Self::Task(value)
+            | Self::Decision(value)
+            | Self::RetrievedEvidence(value)
+            | Self::ToolEpisode(value)
+            | Self::EvalCase(value) => value.clone(),
+        }
+    }
+}
+
+impl Default for KnowledgeGraphNodeId {
+    fn default() -> Self {
+        Self::File(String::new())
+    }
+}
+
+/// Typed knowledge graph node kind.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum KnowledgeGraphNodeKind {
+    /// Source file node.
+    #[default]
+    File,
+    /// Source symbol node.
+    Symbol,
+    /// Retrieval shard node.
+    Shard,
+    /// Agent task node.
+    Task,
+    /// Architecture or product decision node.
+    Decision,
+    /// Retrieved evidence node.
+    RetrievedEvidence,
+    /// Tool episode node.
+    ToolEpisode,
+    /// Evaluation case node.
+    EvalCase,
+}
+
+/// Stable file node payload for the knowledge graph.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileGraphNode {
+    /// Stable typed node identifier.
+    pub id: KnowledgeGraphNodeId,
+    /// Relative source path.
+    pub path: String,
+    /// File content hash at graph construction time.
+    pub content_hash: String,
+    /// Provenance for the file evidence.
+    pub provenance: Provenance,
+}
+
+/// Stable symbol node payload for the knowledge graph.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolGraphNode {
+    /// Stable typed node identifier.
+    pub id: KnowledgeGraphNodeId,
+    /// Stable symbol identifier.
+    pub symbol_id: String,
+    /// Symbol display name.
+    pub name: String,
+    /// Containing relative source path.
+    pub path: String,
+    /// Provenance for the symbol evidence.
+    pub provenance: Provenance,
+}
+
+/// Stable shard node payload for the knowledge graph.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardGraphNode {
+    /// Stable typed node identifier.
+    pub id: KnowledgeGraphNodeId,
+    /// Stable shard identifier.
+    pub shard_id: String,
+    /// Relative source path.
+    pub path: String,
+    /// Shard content hash at graph construction time.
+    pub content_hash: String,
+    /// Provenance for the shard evidence.
+    pub provenance: Provenance,
+}
+
+/// Agent task node payload for the knowledge graph.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskGraphNode {
+    /// Stable typed node identifier.
+    pub id: KnowledgeGraphNodeId,
+    /// Human-readable task title.
+    pub title: String,
+    /// Current task status label supplied by the caller.
+    pub status: String,
+    /// Provenance for the task record.
+    pub provenance: Provenance,
+}
+
+/// Decision node payload for the knowledge graph.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionGraphNode {
+    /// Stable typed node identifier.
+    pub id: KnowledgeGraphNodeId,
+    /// Human-readable decision title.
+    pub title: String,
+    /// Decision outcome or selected option.
+    pub outcome: String,
+    /// Provenance for the decision record.
+    pub provenance: Provenance,
+}
+
+/// Retrieved evidence node payload for the knowledge graph.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievedEvidenceGraphNode {
+    /// Stable typed node identifier.
+    pub id: KnowledgeGraphNodeId,
+    /// Retrieval result identifier or external evidence key.
+    pub evidence_id: String,
+    /// Relative source path associated with the evidence.
+    pub path: String,
+    /// Evidence freshness state at graph construction time.
+    pub freshness: EvidenceFreshness,
+    /// Provenance for the retrieved evidence.
+    pub provenance: Provenance,
+}
+
+/// Tool episode node payload for the knowledge graph.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolEpisodeGraphNode {
+    /// Stable typed node identifier.
+    pub id: KnowledgeGraphNodeId,
+    /// Tool name or capability label.
+    pub tool: String,
+    /// Tool episode status label.
+    pub status: String,
+    /// Provenance for the tool episode.
+    pub provenance: Provenance,
+}
+
+/// Evaluation case node payload for the knowledge graph.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvalCaseGraphNode {
+    /// Stable typed node identifier.
+    pub id: KnowledgeGraphNodeId,
+    /// Evaluation case title.
+    pub title: String,
+    /// Stable expected identifiers covered by this case.
+    pub expected_ids: BTreeSet<String>,
+    /// Provenance for the eval case.
+    pub provenance: Provenance,
+}
+
+/// Typed knowledge graph node payload.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KnowledgeGraphNode {
+    /// Source file node.
+    File(FileGraphNode),
+    /// Source symbol node.
+    Symbol(SymbolGraphNode),
+    /// Retrieval shard node.
+    Shard(ShardGraphNode),
+    /// Agent task node.
+    Task(TaskGraphNode),
+    /// Architecture or product decision node.
+    Decision(DecisionGraphNode),
+    /// Retrieved evidence node.
+    RetrievedEvidence(RetrievedEvidenceGraphNode),
+    /// Tool episode node.
+    ToolEpisode(ToolEpisodeGraphNode),
+    /// Evaluation case node.
+    EvalCase(EvalCaseGraphNode),
+}
+
+impl KnowledgeGraphNode {
+    /// Returns the stable typed identifier for this node.
+    pub fn id(&self) -> &KnowledgeGraphNodeId {
+        match self {
+            Self::File(node) => &node.id,
+            Self::Symbol(node) => &node.id,
+            Self::Shard(node) => &node.id,
+            Self::Task(node) => &node.id,
+            Self::Decision(node) => &node.id,
+            Self::RetrievedEvidence(node) => &node.id,
+            Self::ToolEpisode(node) => &node.id,
+            Self::EvalCase(node) => &node.id,
+        }
+    }
+
+    /// Returns the typed node kind for this node.
+    pub fn kind(&self) -> KnowledgeGraphNodeKind {
+        match self {
+            Self::File(_) => KnowledgeGraphNodeKind::File,
+            Self::Symbol(_) => KnowledgeGraphNodeKind::Symbol,
+            Self::Shard(_) => KnowledgeGraphNodeKind::Shard,
+            Self::Task(_) => KnowledgeGraphNodeKind::Task,
+            Self::Decision(_) => KnowledgeGraphNodeKind::Decision,
+            Self::RetrievedEvidence(_) => KnowledgeGraphNodeKind::RetrievedEvidence,
+            Self::ToolEpisode(_) => KnowledgeGraphNodeKind::ToolEpisode,
+            Self::EvalCase(_) => KnowledgeGraphNodeKind::EvalCase,
+        }
+    }
+
+    /// Returns provenance for this node.
+    pub fn provenance(&self) -> &Provenance {
+        match self {
+            Self::File(node) => &node.provenance,
+            Self::Symbol(node) => &node.provenance,
+            Self::Shard(node) => &node.provenance,
+            Self::Task(node) => &node.provenance,
+            Self::Decision(node) => &node.provenance,
+            Self::RetrievedEvidence(node) => &node.provenance,
+            Self::ToolEpisode(node) => &node.provenance,
+            Self::EvalCase(node) => &node.provenance,
+        }
+    }
+}
+
+/// Typed edge connecting knowledge graph nodes.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct KnowledgeGraphEdge {
+    /// Stable typed source node identifier.
+    pub from: KnowledgeGraphNodeId,
+    /// Stable typed target node identifier.
+    pub to: KnowledgeGraphNodeId,
+    /// Edge kind.
+    pub kind: GraphEdgeKind,
+    /// Confidence from 0.0 to 1.0.
+    pub confidence: f32,
+    /// Semantic confidence class used to prevent overclaiming heuristic facts.
+    pub confidence_kind: EdgeConfidence,
+    /// Provenance for the edge.
+    pub provenance: Provenance,
+}
+
+/// Typed knowledge graph with validated node endpoints and deterministic ordering.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct KnowledgeGraph {
+    /// Graph nodes in deterministic identifier order.
+    pub nodes: Vec<KnowledgeGraphNode>,
+    /// Graph edges in deterministic source-target-kind-confidence-provenance order.
+    pub edges: Vec<KnowledgeGraphEdge>,
+}
+
+impl KnowledgeGraph {
+    /// Builds a validated knowledge graph from typed nodes and edges.
+    ///
+    /// # Arguments
+    ///
+    /// * `nodes` - Candidate typed graph nodes.
+    /// * `edges` - Candidate typed graph edges.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an edge endpoint is absent from the node set, a node identifier is
+    /// duplicated, or an edge confidence is outside the closed 0.0 to 1.0 range.
+    pub fn new(
+        mut nodes: Vec<KnowledgeGraphNode>,
+        mut edges: Vec<KnowledgeGraphEdge>,
+    ) -> Result<Self> {
+        nodes.sort_by(|left, right| left.id().cmp(right.id()));
+        for pair in nodes.windows(2) {
+            if let [left, right] = pair
+                && left.id() == right.id()
+            {
+                bail!("knowledge graph node id is duplicated: {:?}", left.id());
+            }
+        }
+        let node_ids = nodes
+            .iter()
+            .map(|node| node.id().clone())
+            .collect::<BTreeSet<_>>();
+        for edge in &edges {
+            if !(0.0..=1.0).contains(&edge.confidence) || !edge.confidence.is_finite() {
+                bail!(
+                    "knowledge graph edge confidence is invalid: {}",
+                    edge.confidence
+                );
+            }
+            if !node_ids.contains(&edge.from) {
+                bail!("knowledge graph edge source is missing: {:?}", edge.from);
+            }
+            if !node_ids.contains(&edge.to) {
+                bail!("knowledge graph edge target is missing: {:?}", edge.to);
+            }
+        }
+        edges.sort_by(compare_knowledge_graph_edges);
+        Ok(Self { nodes, edges })
+    }
+
+    /// Builds file, symbol, shard, and legacy graph edges from a project manifest.
+    ///
+    /// # Arguments
+    ///
+    /// * `manifest` - Project manifest used as source evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when manifest edges point to nodes absent from the graph surface.
+    pub fn from_manifest(manifest: &ProjectManifest) -> Result<Self> {
+        let mut nodes = Vec::new();
+        for file in &manifest.files {
+            nodes.push(KnowledgeGraphNode::File(FileGraphNode {
+                id: KnowledgeGraphNodeId::File(file.path.clone()),
+                path: file.path.clone(),
+                content_hash: file.content_hash.clone(),
+                provenance: file.provenance.clone(),
+            }));
+        }
+        for symbol in &manifest.symbols {
+            nodes.push(KnowledgeGraphNode::Symbol(SymbolGraphNode {
+                id: KnowledgeGraphNodeId::Symbol(symbol.id.clone()),
+                symbol_id: symbol.id.clone(),
+                name: symbol.name.clone(),
+                path: symbol.path.clone(),
+                provenance: symbol.provenance.clone(),
+            }));
+        }
+        for shard in &manifest.shards {
+            nodes.push(KnowledgeGraphNode::Shard(ShardGraphNode {
+                id: KnowledgeGraphNodeId::Shard(shard.id.clone()),
+                shard_id: shard.id.clone(),
+                path: shard.path.clone(),
+                content_hash: shard.content_hash.clone(),
+                provenance: shard.provenance.clone(),
+            }));
+        }
+        let mut node_ids = nodes
+            .iter()
+            .map(|node| node.id().clone())
+            .collect::<BTreeSet<_>>();
+        let mut external_nodes = BTreeMap::<KnowledgeGraphNodeId, KnowledgeGraphNode>::new();
+        let edges = manifest
+            .edges
+            .iter()
+            .map(|edge| {
+                let from = typed_legacy_node_id_or_external(&edge.from, &node_ids);
+                let to = typed_legacy_node_id_or_external(&edge.to, &node_ids);
+                for node_id in [from.clone(), to.clone()] {
+                    if !node_ids.contains(&node_id) {
+                        external_nodes.insert(
+                            node_id.clone(),
+                            KnowledgeGraphNode::RetrievedEvidence(RetrievedEvidenceGraphNode {
+                                id: node_id.clone(),
+                                evidence_id: node_id.as_legacy_id(),
+                                path: edge.provenance.path.clone(),
+                                freshness: EvidenceFreshness::Fresh,
+                                provenance: edge.provenance.clone(),
+                            }),
+                        );
+                        node_ids.insert(node_id);
+                    }
+                }
+                KnowledgeGraphEdge {
+                    from,
+                    to,
+                    kind: edge.kind.clone(),
+                    confidence: edge.confidence,
+                    confidence_kind: edge.confidence_kind.clone(),
+                    provenance: edge.provenance.clone(),
+                }
+            })
+            .collect();
+        nodes.extend(external_nodes.into_values());
+        Self::new(nodes, edges)
+    }
+}
+
+fn typed_legacy_node_id_or_external(
+    value: &str,
+    known_ids: &BTreeSet<KnowledgeGraphNodeId>,
+) -> KnowledgeGraphNodeId {
+    typed_legacy_node_id(value, known_ids)
+        .unwrap_or_else(|| KnowledgeGraphNodeId::RetrievedEvidence(value.to_string()))
+}
+
+fn compare_knowledge_graph_edges(
+    left: &KnowledgeGraphEdge,
+    right: &KnowledgeGraphEdge,
+) -> Ordering {
+    left.from
+        .cmp(&right.from)
+        .then_with(|| left.to.cmp(&right.to))
+        .then_with(|| left.kind.cmp(&right.kind))
+        .then_with(|| left.confidence_kind.cmp(&right.confidence_kind))
+        .then_with(|| compare_f32_total(left.confidence, right.confidence))
+        .then_with(|| compare_provenance(&left.provenance, &right.provenance))
+}
+
+fn compare_context_pack_evidence(
+    left: &ContextPackEvidence,
+    right: &ContextPackEvidence,
+) -> Ordering {
+    left.freshness
+        .cmp(&right.freshness)
+        .then_with(|| left.path.cmp(&right.path))
+        .then_with(|| left.id.cmp(&right.id))
+        .then_with(|| left.source.cmp(&right.source))
+        .then_with(|| compare_f32_total(left.score, right.score))
+        .then_with(|| compare_provenance(&left.provenance, &right.provenance))
+}
+
+fn compare_provenance(left: &Provenance, right: &Provenance) -> Ordering {
+    left.path
+        .cmp(&right.path)
+        .then_with(|| left.start_line.cmp(&right.start_line))
+        .then_with(|| left.end_line.cmp(&right.end_line))
+        .then_with(|| left.source.cmp(&right.source))
+        .then_with(|| left.fingerprint.cmp(&right.fingerprint))
+}
+
+fn compare_f32_total(left: f32, right: f32) -> Ordering {
+    left.total_cmp(&right)
+}
+
+fn typed_legacy_node_id(
+    value: &str,
+    known_ids: &BTreeSet<KnowledgeGraphNodeId>,
+) -> Option<KnowledgeGraphNodeId> {
+    let candidates = [
+        KnowledgeGraphNodeId::File(value.to_string()),
+        KnowledgeGraphNodeId::Symbol(value.to_string()),
+        KnowledgeGraphNodeId::Shard(value.to_string()),
+    ];
+    candidates
+        .into_iter()
+        .find(|candidate| known_ids.contains(candidate))
+}
+
+/// Freshness classification for evidence included in context packaging or graph evidence.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum EvidenceFreshness {
+    /// Evidence path is absent from the freshness state or explicitly unchanged.
+    #[default]
+    Fresh,
+    /// Evidence path was added after the baseline and should be treated as fresh current evidence.
+    Added,
+    /// Evidence path changed relative to the baseline and must be reviewed before use.
+    Changed,
+    /// Evidence path was deleted relative to the baseline and cannot be used as current evidence.
+    Deleted,
+}
+
+/// Policy for stale evidence during context pack construction.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum StaleEvidencePolicy {
+    /// Reject context pack construction if stale evidence is selected.
+    Reject,
+    /// Include selected evidence while marking stale state explicitly.
+    #[default]
+    Mark,
+}
+
+/// Selected retrieval result, shard, or ad-hoc evidence used to build a context pack.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContextPackSelection {
+    /// Retrieved results selected by the retrieval layer.
+    pub retrieval_results: Vec<RetrievalResult>,
+    /// Shard manifests selected by structural or graph expansion.
+    pub shards: Vec<ShardManifest>,
+    /// Additional typed evidence selected by external evaluators or integrations.
+    pub evidence: Vec<ContextPackEvidence>,
+    /// Freshness state used to classify included paths.
+    pub freshness: FreshnessState,
+    /// Policy for stale evidence.
+    pub stale_policy: StaleEvidencePolicy,
+}
+
+/// Evidence item included in a context pack.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContextPackEvidence {
+    /// Stable evidence identifier.
+    pub id: String,
+    /// Relative file path associated with the evidence.
+    pub path: String,
+    /// Optional symbol display name associated with the evidence.
+    pub symbol: Option<String>,
+    /// Evidence source class.
+    pub source: ContextPackEvidenceSource,
+    /// Freshness classification for this evidence.
+    pub freshness: EvidenceFreshness,
+    /// Provenance for the evidence.
+    pub provenance: Provenance,
+    /// Deterministic score or priority supplied by retrieval.
+    pub score: f32,
+}
+
+/// Source class for context-pack evidence.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ContextPackEvidenceSource {
+    /// Evidence derived from a retrieval result.
+    #[default]
+    RetrievalResult,
+    /// Evidence derived from a structural shard.
+    Shard,
+    /// Evidence supplied directly by a typed caller.
+    DirectEvidence,
+}
+
+/// Deterministic context package consumed by model-context assembly layers.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContextPack {
+    /// Format version for deterministic serialization.
+    pub version: u32,
+    /// Manifest hash used to build this context pack.
+    pub manifest_hash: String,
+    /// Evidence entries sorted deterministically by freshness, path, identifier, source, score, and provenance.
+    pub evidence: Vec<ContextPackEvidence>,
+    /// All provenance records required to audit the pack.
+    pub provenance: Vec<Provenance>,
+}
+
+impl ContextPack {
+    /// Builds a deterministic context pack from selected retrieval, shard, and direct evidence.
+    ///
+    /// # Arguments
+    ///
+    /// * `manifest` - Manifest that owns current project evidence.
+    /// * `selection` - Selected evidence and freshness policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when provenance is incomplete, a score is not finite, or stale evidence is
+    /// rejected by policy.
+    pub fn from_selection(
+        manifest: &ProjectManifest,
+        selection: ContextPackSelection,
+    ) -> Result<Self> {
+        let mut evidence = Vec::new();
+        for result in selection.retrieval_results {
+            evidence.push(ContextPackEvidence {
+                id: result.id,
+                path: result.path.clone(),
+                symbol: result.symbol,
+                source: ContextPackEvidenceSource::RetrievalResult,
+                freshness: classify_evidence_freshness(&result.path, &selection.freshness),
+                provenance: result.provenance,
+                score: result.score,
+            });
+        }
+        for shard in selection.shards {
+            evidence.push(ContextPackEvidence {
+                id: shard.id,
+                path: shard.path.clone(),
+                symbol: None,
+                source: ContextPackEvidenceSource::Shard,
+                freshness: classify_evidence_freshness(&shard.path, &selection.freshness),
+                provenance: shard.provenance,
+                score: 0.0,
+            });
+        }
+        for mut direct in selection.evidence {
+            direct.freshness = classify_evidence_freshness(&direct.path, &selection.freshness);
+            evidence.push(direct);
+        }
+        for item in &evidence {
+            if !item.score.is_finite() {
+                bail!("context pack evidence score is invalid: {}", item.id);
+            }
+            if !item.provenance.is_complete() {
+                bail!(
+                    "context pack evidence has incomplete provenance: {}",
+                    item.id
+                );
+            }
+            if selection.stale_policy == StaleEvidencePolicy::Reject
+                && matches!(
+                    item.freshness,
+                    EvidenceFreshness::Changed | EvidenceFreshness::Deleted
+                )
+            {
+                bail!("context pack evidence is stale: {}", item.id);
+            }
+        }
+        evidence.sort_by(compare_context_pack_evidence);
+        let mut provenance = evidence
+            .iter()
+            .map(|item| item.provenance.clone())
+            .collect::<Vec<_>>();
+        provenance.sort_by(compare_provenance);
+        Ok(Self {
+            version: 1,
+            manifest_hash: manifest.manifest_hash.clone(),
+            evidence,
+            provenance,
+        })
+    }
+
+    /// Serializes this context pack as stable pretty JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when JSON serialization fails.
+    pub fn to_stable_json(&self) -> Result<String> {
+        Ok(serde_json::to_string_pretty(self)?)
+    }
+}
+
+impl Provenance {
+    /// Returns true when the provenance contains source, path, and fingerprint.
+    pub fn is_complete(&self) -> bool {
+        !self.path.is_empty() && !self.source.is_empty() && !self.fingerprint.is_empty()
+    }
+}
+
+/// Classifies a path against a typed freshness state.
+///
+/// # Arguments
+///
+/// * `path` - Relative path to classify.
+/// * `freshness` - Freshness state generated from manifest comparison.
+pub fn classify_evidence_freshness(path: &str, freshness: &FreshnessState) -> EvidenceFreshness {
+    if freshness.deleted.iter().any(|value| value == path) {
+        EvidenceFreshness::Deleted
+    } else if freshness.changed.iter().any(|value| value == path) {
+        EvidenceFreshness::Changed
+    } else if freshness.added.iter().any(|value| value == path) {
+        EvidenceFreshness::Added
+    } else {
+        EvidenceFreshness::Fresh
+    }
 }
 
 /// A deterministic retrieval shard descriptor.
@@ -555,4 +1212,472 @@ pub struct FutureVectorRetrievalScaffold {
     pub reranker_model: Option<String>,
     /// Whether vector lookup was requested by an outer layer.
     pub requested: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ProjectIndexer;
+    use crate::indexer::tests::fixture_project;
+    use crate::retrieve;
+    use crate::util::{fingerprint, provenance};
+    use anyhow::Result;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn knowledge_graph_connects_tasks_decisions_and_retrieved_evidence_to_code_evidence()
+    -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let file = manifest
+            .files
+            .iter()
+            .find(|file| file.path == "src/lib.rs")
+            .expect("fixture should include src/lib.rs");
+        let symbol = manifest
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "Root")
+            .expect("fixture should include Root symbol");
+        let nodes = vec![
+            KnowledgeGraphNode::File(FileGraphNode {
+                id: KnowledgeGraphNodeId::File(file.path.clone()),
+                path: file.path.clone(),
+                content_hash: file.content_hash.clone(),
+                provenance: file.provenance.clone(),
+            }),
+            KnowledgeGraphNode::Symbol(SymbolGraphNode {
+                id: KnowledgeGraphNodeId::Symbol(symbol.id.clone()),
+                symbol_id: symbol.id.clone(),
+                name: symbol.name.clone(),
+                path: symbol.path.clone(),
+                provenance: symbol.provenance.clone(),
+            }),
+            KnowledgeGraphNode::Task(TaskGraphNode {
+                id: KnowledgeGraphNodeId::Task("task:final-gate".to_string()),
+                title: "Implement final gate fixes".to_string(),
+                status: "completed".to_string(),
+                provenance: provenance("gate", Some(1), Some(1), "test", "task"),
+            }),
+            KnowledgeGraphNode::Decision(DecisionGraphNode {
+                id: KnowledgeGraphNodeId::Decision("decision:typed-context-pack".to_string()),
+                title: "Use typed context packaging".to_string(),
+                outcome: "ContextPack".to_string(),
+                provenance: provenance("gate", Some(2), Some(2), "test", "decision"),
+            }),
+            KnowledgeGraphNode::RetrievedEvidence(RetrievedEvidenceGraphNode {
+                id: KnowledgeGraphNodeId::RetrievedEvidence("evidence:root-symbol".to_string()),
+                evidence_id: symbol.id.clone(),
+                path: symbol.path.clone(),
+                freshness: EvidenceFreshness::Fresh,
+                provenance: symbol.provenance.clone(),
+            }),
+        ];
+        let edges = vec![
+            KnowledgeGraphEdge {
+                from: KnowledgeGraphNodeId::Task("task:final-gate".to_string()),
+                to: KnowledgeGraphNodeId::File(file.path.clone()),
+                kind: GraphEdgeKind::TaskDependsOn,
+                confidence: 1.0,
+                confidence_kind: EdgeConfidence::ExactCompiler,
+                provenance: provenance("gate", Some(3), Some(3), "test", "task-file-edge"),
+            },
+            KnowledgeGraphEdge {
+                from: KnowledgeGraphNodeId::Decision("decision:typed-context-pack".to_string()),
+                to: KnowledgeGraphNodeId::Symbol(symbol.id.clone()),
+                kind: GraphEdgeKind::DecisionSupportedBy,
+                confidence: 1.0,
+                confidence_kind: EdgeConfidence::ExactCompiler,
+                provenance: provenance("gate", Some(4), Some(4), "test", "decision-symbol-edge"),
+            },
+            KnowledgeGraphEdge {
+                from: KnowledgeGraphNodeId::RetrievedEvidence("evidence:root-symbol".to_string()),
+                to: KnowledgeGraphNodeId::Symbol(symbol.id.clone()),
+                kind: GraphEdgeKind::EvidenceCites,
+                confidence: 1.0,
+                confidence_kind: EdgeConfidence::ExactCompiler,
+                provenance: provenance("gate", Some(5), Some(5), "test", "evidence-symbol-edge"),
+            },
+        ];
+
+        let actual = KnowledgeGraph::new(nodes, edges)?;
+        let expected = BTreeSet::from([
+            GraphEdgeKind::DecisionSupportedBy,
+            GraphEdgeKind::EvidenceCites,
+            GraphEdgeKind::TaskDependsOn,
+        ]);
+        assert_eq!(
+            actual
+                .edges
+                .iter()
+                .map(|edge| edge.kind.clone())
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+        assert_eq!(
+            actual
+                .edges
+                .iter()
+                .all(|edge| edge.provenance.is_complete()),
+            true
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn knowledge_graph_promotes_manifest_edges_without_silent_drops() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+
+        let actual = KnowledgeGraph::from_manifest(&manifest)?;
+        let expected = manifest.edges.len();
+        assert_eq!(actual.edges.len(), expected);
+        assert_eq!(
+            actual
+                .nodes
+                .iter()
+                .all(|node| node.provenance().is_complete()),
+            true
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn knowledge_graph_rejects_missing_typed_edge_endpoint() {
+        let nodes = vec![KnowledgeGraphNode::Task(TaskGraphNode {
+            id: KnowledgeGraphNodeId::Task("task:only".to_string()),
+            title: "Only task".to_string(),
+            status: "open".to_string(),
+            provenance: provenance("task", None, None, "test", "task"),
+        })];
+        let edges = vec![KnowledgeGraphEdge {
+            from: KnowledgeGraphNodeId::Task("task:only".to_string()),
+            to: KnowledgeGraphNodeId::File("src/lib.rs".to_string()),
+            kind: GraphEdgeKind::TaskDependsOn,
+            confidence: 1.0,
+            confidence_kind: EdgeConfidence::HeuristicHigh,
+            provenance: provenance("task", None, None, "test", "missing"),
+        }];
+
+        let actual = KnowledgeGraph::new(nodes, edges).is_err();
+        let expected = true;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn knowledge_graph_rejects_duplicate_node_ids() {
+        let nodes = vec![
+            KnowledgeGraphNode::Task(TaskGraphNode {
+                id: KnowledgeGraphNodeId::Task("task:duplicate".to_string()),
+                title: "First task".to_string(),
+                status: "open".to_string(),
+                provenance: provenance("task", None, None, "test", "first"),
+            }),
+            KnowledgeGraphNode::Task(TaskGraphNode {
+                id: KnowledgeGraphNodeId::Task("task:duplicate".to_string()),
+                title: "Second task".to_string(),
+                status: "open".to_string(),
+                provenance: provenance("task", None, None, "test", "second"),
+            }),
+        ];
+
+        let actual = KnowledgeGraph::new(nodes, Vec::new()).is_err();
+        let expected = true;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn knowledge_graph_rejects_invalid_confidence() {
+        let nodes = vec![
+            KnowledgeGraphNode::Task(TaskGraphNode {
+                id: KnowledgeGraphNodeId::Task("task:source".to_string()),
+                title: "Source task".to_string(),
+                status: "open".to_string(),
+                provenance: provenance("task", None, None, "test", "source"),
+            }),
+            KnowledgeGraphNode::Decision(DecisionGraphNode {
+                id: KnowledgeGraphNodeId::Decision("decision:target".to_string()),
+                title: "Target decision".to_string(),
+                outcome: "target".to_string(),
+                provenance: provenance("decision", None, None, "test", "target"),
+            }),
+        ];
+        let edges = vec![KnowledgeGraphEdge {
+            from: KnowledgeGraphNodeId::Task("task:source".to_string()),
+            to: KnowledgeGraphNodeId::Decision("decision:target".to_string()),
+            kind: GraphEdgeKind::TaskDependsOn,
+            confidence: f32::NAN,
+            confidence_kind: EdgeConfidence::HeuristicHigh,
+            provenance: provenance("task", None, None, "test", "nan"),
+        }];
+
+        let actual = KnowledgeGraph::new(nodes, edges).is_err();
+        let expected = true;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn knowledge_graph_sorts_edges_deterministically_for_same_endpoints_and_kind() -> Result<()> {
+        let nodes = vec![
+            KnowledgeGraphNode::Task(TaskGraphNode {
+                id: KnowledgeGraphNodeId::Task("task:source".to_string()),
+                title: "Source task".to_string(),
+                status: "open".to_string(),
+                provenance: provenance("task", None, None, "test", "source"),
+            }),
+            KnowledgeGraphNode::Decision(DecisionGraphNode {
+                id: KnowledgeGraphNodeId::Decision("decision:target".to_string()),
+                title: "Target decision".to_string(),
+                outcome: "target".to_string(),
+                provenance: provenance("decision", None, None, "test", "target"),
+            }),
+        ];
+        let edges = vec![
+            KnowledgeGraphEdge {
+                from: KnowledgeGraphNodeId::Task("task:source".to_string()),
+                to: KnowledgeGraphNodeId::Decision("decision:target".to_string()),
+                kind: GraphEdgeKind::TaskDependsOn,
+                confidence: 0.7,
+                confidence_kind: EdgeConfidence::HeuristicLow,
+                provenance: provenance("task", None, None, "test", "b"),
+            },
+            KnowledgeGraphEdge {
+                from: KnowledgeGraphNodeId::Task("task:source".to_string()),
+                to: KnowledgeGraphNodeId::Decision("decision:target".to_string()),
+                kind: GraphEdgeKind::TaskDependsOn,
+                confidence: 0.9,
+                confidence_kind: EdgeConfidence::HeuristicHigh,
+                provenance: provenance("task", None, None, "test", "a"),
+            },
+        ];
+
+        let actual = KnowledgeGraph::new(nodes, edges)?;
+        let expected = vec![EdgeConfidence::HeuristicHigh, EdgeConfidence::HeuristicLow];
+        assert_eq!(
+            actual
+                .edges
+                .iter()
+                .map(|edge| edge.confidence_kind.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn context_pack_constructs_from_retrieval_shards_and_direct_evidence_with_freshness()
+    -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let results = retrieve(
+            &manifest,
+            &RetrievalQuery {
+                text: Some("Root".to_string()),
+                path: None,
+                symbol: None,
+                limit: 2,
+                include_graph_expansion: false,
+            },
+        );
+        let shard = manifest
+            .shards
+            .iter()
+            .find(|shard| shard.path == "src/model.rs")
+            .expect("fixture should include model shard")
+            .clone();
+        let selection = ContextPackSelection {
+            retrieval_results: results,
+            shards: vec![shard],
+            evidence: vec![ContextPackEvidence {
+                id: "evidence:decision".to_string(),
+                path: "src/lib.rs".to_string(),
+                symbol: Some("Root".to_string()),
+                source: ContextPackEvidenceSource::DirectEvidence,
+                freshness: EvidenceFreshness::Fresh,
+                provenance: provenance("src/lib.rs", Some(1), Some(1), "test", "direct"),
+                score: 10.0,
+            }],
+            freshness: FreshnessState {
+                changed: vec!["src/model.rs".to_string()],
+                deleted: Vec::new(),
+                added: Vec::new(),
+                unchanged: vec!["src/lib.rs".to_string()],
+                fresh: false,
+            },
+            stale_policy: StaleEvidencePolicy::Mark,
+        };
+
+        let actual = ContextPack::from_selection(&manifest, selection)?;
+        let expected = true;
+        assert_eq!(
+            actual
+                .evidence
+                .iter()
+                .any(|evidence| evidence.path == "src/model.rs"
+                    && evidence.freshness == EvidenceFreshness::Changed),
+            expected
+        );
+        assert_eq!(
+            actual.provenance.iter().all(Provenance::is_complete),
+            expected
+        );
+        assert_eq!(actual.manifest_hash, manifest.manifest_hash);
+        Ok(())
+    }
+
+    #[test]
+    fn context_pack_rejects_stale_evidence_when_policy_requires_current_evidence() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let selection = ContextPackSelection {
+            retrieval_results: Vec::new(),
+            shards: Vec::new(),
+            evidence: vec![ContextPackEvidence {
+                id: "evidence:stale".to_string(),
+                path: "src/lib.rs".to_string(),
+                symbol: None,
+                source: ContextPackEvidenceSource::DirectEvidence,
+                freshness: EvidenceFreshness::Fresh,
+                provenance: provenance("src/lib.rs", Some(1), Some(1), "test", "stale"),
+                score: 1.0,
+            }],
+            freshness: FreshnessState {
+                changed: vec!["src/lib.rs".to_string()],
+                deleted: Vec::new(),
+                added: Vec::new(),
+                unchanged: Vec::new(),
+                fresh: false,
+            },
+            stale_policy: StaleEvidencePolicy::Reject,
+        };
+
+        let actual = ContextPack::from_selection(&manifest, selection).is_err();
+        let expected = true;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn context_pack_rejects_incomplete_provenance() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let selection = ContextPackSelection {
+            retrieval_results: Vec::new(),
+            shards: Vec::new(),
+            evidence: vec![ContextPackEvidence {
+                id: "evidence:incomplete".to_string(),
+                path: "src/lib.rs".to_string(),
+                symbol: None,
+                source: ContextPackEvidenceSource::DirectEvidence,
+                freshness: EvidenceFreshness::Fresh,
+                provenance: Provenance {
+                    path: "src/lib.rs".to_string(),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                    source: String::new(),
+                    fingerprint: fingerprint("incomplete"),
+                },
+                score: 1.0,
+            }],
+            freshness: FreshnessState::default(),
+            stale_policy: StaleEvidencePolicy::Mark,
+        };
+
+        let actual = ContextPack::from_selection(&manifest, selection).is_err();
+        let expected = true;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn context_pack_rejects_non_finite_scores() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let selection = ContextPackSelection {
+            retrieval_results: Vec::new(),
+            shards: Vec::new(),
+            evidence: vec![ContextPackEvidence {
+                id: "evidence:nan".to_string(),
+                path: "src/lib.rs".to_string(),
+                symbol: None,
+                source: ContextPackEvidenceSource::DirectEvidence,
+                freshness: EvidenceFreshness::Fresh,
+                provenance: provenance("src/lib.rs", Some(1), Some(1), "test", "nan"),
+                score: f32::NAN,
+            }],
+            freshness: FreshnessState::default(),
+            stale_policy: StaleEvidencePolicy::Mark,
+        };
+
+        let actual = ContextPack::from_selection(&manifest, selection).is_err();
+        let expected = true;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn context_pack_serializes_deterministically_with_stable_ordering() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let left = context_pack_ordering_fixture(&manifest, false)?;
+        let right = context_pack_ordering_fixture(&manifest, true)?;
+
+        let actual = left.to_stable_json()?;
+        let expected = right.to_stable_json()?;
+        assert_eq!(actual, expected);
+        assert_eq!(
+            left.evidence
+                .iter()
+                .map(|evidence| evidence.id.clone())
+                .collect::<Vec<_>>(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        Ok(())
+    }
+
+    fn context_pack_ordering_fixture(
+        manifest: &ProjectManifest,
+        reversed: bool,
+    ) -> Result<ContextPack> {
+        let mut evidence = vec![
+            ContextPackEvidence {
+                id: "b".to_string(),
+                path: "src/model.rs".to_string(),
+                symbol: None,
+                source: ContextPackEvidenceSource::DirectEvidence,
+                freshness: EvidenceFreshness::Fresh,
+                provenance: provenance("src/model.rs", Some(1), Some(1), "test", "b"),
+                score: 1.0,
+            },
+            ContextPackEvidence {
+                id: "a".to_string(),
+                path: "src/lib.rs".to_string(),
+                symbol: None,
+                source: ContextPackEvidenceSource::DirectEvidence,
+                freshness: EvidenceFreshness::Fresh,
+                provenance: provenance("src/lib.rs", Some(1), Some(1), "test", "a"),
+                score: 1.0,
+            },
+        ];
+        if reversed {
+            evidence.reverse();
+        }
+        ContextPack::from_selection(
+            manifest,
+            ContextPackSelection {
+                retrieval_results: Vec::new(),
+                shards: Vec::new(),
+                evidence,
+                freshness: FreshnessState::default(),
+                stale_policy: StaleEvidencePolicy::Mark,
+            },
+        )
+    }
 }
