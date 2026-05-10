@@ -62,6 +62,16 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Creates snapshot metadata for a file path.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Absolute or canonicalizable file path to snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a relative path cannot be canonicalized or when
+    /// the current system time is earlier than the Unix epoch.
     pub fn create(path: PathBuf) -> anyhow::Result<Self> {
         let path = match path.canonicalize() {
             Ok(p) => p,

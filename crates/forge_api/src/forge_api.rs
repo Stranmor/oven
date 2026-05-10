@@ -320,7 +320,16 @@ impl<
 
     async fn get_agent_model(&self, agent_id: AgentId) -> Option<ModelId> {
         let agent_provider_resolver = AgentProviderResolver::new(self.services.clone());
-        agent_provider_resolver.get_model(Some(agent_id)).await.ok()
+        match agent_provider_resolver
+            .get_model(Some(agent_id.clone()))
+            .await
+        {
+            Ok(model_id) => Some(model_id),
+            Err(error) => {
+                tracing::warn!(%agent_id, %error, "failed to resolve agent model");
+                None
+            }
+        }
     }
 
     async fn reload_mcp(&self) -> Result<()> {

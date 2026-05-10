@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use derive_setters::Setters;
 use fake::Dummy;
+use forge_domain::{InputModality, ModelId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +64,53 @@ pub struct ProviderUrlParam {
     pub optional: bool,
 }
 
+/// Provider-local model configuration for inline provider entries.
+///
+/// The owning provider supplies the final `provider_id` during repository
+/// conversion, so inline model declarations cannot encode a stale or mismatched
+/// provider association.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Setters, JsonSchema, Dummy)]
+#[setters(strip_option)]
+pub struct ProviderModelConfig {
+    /// Provider-local model identifier.
+    pub id: ModelId,
+    /// Optional display name for the model.
+    pub name: Option<String>,
+    /// Optional human-readable model description.
+    pub description: Option<String>,
+    /// Optional maximum context length in tokens.
+    pub context_length: Option<u64>,
+    /// Optional tool-calling support flag.
+    pub tools_supported: Option<bool>,
+    /// Optional parallel tool-calling support flag.
+    pub supports_parallel_tool_calls: Option<bool>,
+    /// Optional reasoning support flag.
+    pub supports_reasoning: Option<bool>,
+    /// Input modalities supported by the model.
+    #[serde(default = "default_input_modalities")]
+    pub input_modalities: Vec<InputModality>,
+}
+
+impl ProviderModelConfig {
+    /// Creates a provider-local model config with the given id.
+    pub fn new(id: impl Into<ModelId>) -> Self {
+        Self {
+            id: id.into(),
+            name: None,
+            description: None,
+            context_length: None,
+            tools_supported: None,
+            supports_parallel_tool_calls: None,
+            supports_reasoning: None,
+            input_modalities: default_input_modalities(),
+        }
+    }
+}
+
+fn default_input_modalities() -> Vec<InputModality> {
+    vec![InputModality::Text]
+}
+
 /// Source of models for a provider: either a URL to fetch them from or a
 /// static list defined inline.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Dummy)]
@@ -71,7 +119,7 @@ pub enum ModelListConfig {
     /// URL template used to fetch the model list dynamically.
     Url(String),
     /// A static list of models defined directly in the configuration.
-    Hardcoded(Vec<forge_domain::Model>),
+    Hardcoded(Vec<ProviderModelConfig>),
 }
 
 /// A single provider entry defined inline in `forge.toml`.
@@ -449,7 +497,7 @@ input_modalities = ["text"]
             response_type: Some(ProviderResponseType::OpenAI),
             auth_methods: vec![ProviderAuthMethod::ApiKey],
             models: Some(ModelListConfig::Hardcoded(vec![
-                forge_domain::Model::new("Qwen3.6-35B-A3b-q3-mlx")
+                ProviderModelConfig::new("Qwen3.6-35B-A3b-q3-mlx")
                     .name("Qwen3.5-35B".to_string())
                     .description(
                         "Qwen local reasoning model with advanced problem-solving capabilities"
@@ -460,7 +508,7 @@ input_modalities = ["text"]
                     .supports_parallel_tool_calls(true)
                     .supports_reasoning(true)
                     .input_modalities(vec![forge_domain::InputModality::Text]),
-                forge_domain::Model::new("llama3.2-3b")
+                ProviderModelConfig::new("llama3.2-3b")
                     .name("Llama 3.2 3B".to_string())
                     .description("Meta Llama 3.2 3B lightweight local model".to_string())
                     .context_length(131072)

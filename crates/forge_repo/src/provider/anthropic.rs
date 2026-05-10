@@ -7,7 +7,7 @@ use forge_app::domain::{
 use forge_app::dto::anthropic::{
     AuthSystemMessage, CapitalizeToolNames, DropInvalidToolUse, EnforceStrictObjectSchema,
     EventData, ListModelResponse, McpToolNames, ReasoningTransform, RemoveOutputFormat, Request,
-    SanitizeToolIds,
+    SanitizeToolIds, SetCache,
 };
 use forge_app::{EnvironmentInfra, HttpInfra};
 use forge_domain::{ChatRepository, Provider, ProviderId};
@@ -101,6 +101,26 @@ fn interleaved_thinking_required(model: Option<&ModelId>) -> bool {
     !(id.contains("opus-4-7") || id.contains("opus-4-6") || id.contains("sonnet-4-6"))
 }
 
+fn transform_chat_request(
+    request: Request,
+    use_oauth: bool,
+    is_vertex_ai_anthropic: bool,
+) -> Request {
+    let pipeline = AuthSystemMessage::default()
+        .when(|_| use_oauth)
+        .pipe(McpToolNames.when(|_| use_oauth))
+        .pipe(CapitalizeToolNames)
+        .pipe(DropInvalidToolUse)
+        .pipe(SanitizeToolIds)
+        .pipe(SetCache);
+
+    if is_vertex_ai_anthropic {
+        pipeline.pipe(RemoveOutputFormat).transform(request)
+    } else {
+        pipeline.pipe(EnforceStrictObjectSchema).transform(request)
+    }
+}
+
 impl<T: HttpInfra> Anthropic<T> {
     /// Determines whether this provider should bypass reqwest-eventsource
     /// content-type validation and parse SSE from raw bytes instead.
@@ -126,20 +146,11 @@ impl<T: HttpInfra> Anthropic<T> {
             request = request.model(model.as_str().to_string());
         }
 
-        let pipeline = AuthSystemMessage::default()
-            .when(|_| self.use_oauth)
-            .pipe(McpToolNames.when(|_| self.use_oauth))
-            .pipe(CapitalizeToolNames)
-            .pipe(DropInvalidToolUse)
-            .pipe(SanitizeToolIds);
-
-        // Vertex AI does not support output_format, so we skip schema enforcement
-        // and remove any output_format field
-        let request = if self.provider.id == ProviderId::VERTEX_AI_ANTHROPIC {
-            pipeline.pipe(RemoveOutputFormat).transform(request)
-        } else {
-            pipeline.pipe(EnforceStrictObjectSchema).transform(request)
-        };
+        let request = transform_chat_request(
+            request,
+            self.use_oauth,
+            self.provider.id == ProviderId::VERTEX_AI_ANTHROPIC,
+        );
 
         let url = if self.provider.id == ProviderId::VERTEX_AI_ANTHROPIC {
             // For Vertex AI, we need to append the model ID and streamRawPredict to the URL
@@ -961,13 +972,7 @@ mod tests {
         request = request.anthropic_version("vertex-2023-10-16".to_string());
 
         // Apply the transformer pipeline (same as in chat method)
-        let pipeline = AuthSystemMessage::default()
-            .when(|_| false) // Not using OAuth
-            .pipe(CapitalizeToolNames)
-            .pipe(DropInvalidToolUse)
-            .pipe(SanitizeToolIds);
-
-        let request = pipeline.pipe(RemoveOutputFormat).transform(request);
+        let request = transform_chat_request(request, false, true);
 
         // Verify output_format is None for Vertex AI
         assert_eq!(
@@ -980,6 +985,39 @@ mod tests {
             request.anthropic_version,
             Some("vertex-2023-10-16".to_string()),
             "Vertex AI requests should include anthropic_version"
+        );
+    }
+
+    #[test]
+    fn test_chat_request_pipeline_caches_last_tool_definition() {
+        let fixture = Request {
+            tools: vec![
+                forge_app::dto::anthropic::ToolDefinition {
+                    name: "first".to_string(),
+                    description: Some("first tool".to_string()),
+                    cache_control: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+                forge_app::dto::anthropic::ToolDefinition {
+                    name: "last".to_string(),
+                    description: Some("last tool".to_string()),
+                    cache_control: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+            ],
+            ..Request::default()
+        };
+
+        let actual = transform_chat_request(fixture, false, false);
+        let expected = vec![false, true];
+
+        assert_eq!(
+            actual
+                .tools
+                .iter()
+                .map(|tool| tool.cache_control.is_some())
+                .collect::<Vec<_>>(),
+            expected
         );
     }
 }

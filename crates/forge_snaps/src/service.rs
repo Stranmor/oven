@@ -4,16 +4,33 @@ use anyhow::{Context, Result};
 use forge_domain::Snapshot;
 use forge_fs::ForgeFS;
 
+/// Coordinates durable file snapshot creation and restoration.
 #[derive(Debug)]
 pub struct SnapshotService {
     snapshots_directory: PathBuf,
 }
 
 impl SnapshotService {
+    /// Creates a snapshot service rooted at the supplied snapshot directory.
+    ///
+    /// # Arguments
+    ///
+    /// * `snapshot_base_dir` - Directory where snapshot files are stored.
     pub fn new(snapshot_base_dir: PathBuf) -> Self {
         Self { snapshots_directory: snapshot_base_dir }
     }
 
+    /// Creates and persists a snapshot for a file path.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - File path whose current content should be snapshotted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the snapshot metadata cannot be created, the
+    /// snapshot directory cannot be created, or the source file cannot be read
+    /// or written to the snapshot location.
     pub async fn create_snapshot(&self, path: PathBuf) -> Result<Snapshot> {
         let snapshot = Snapshot::create(path)?;
         let snapshot_path = snapshot.snapshot_path(Some(self.snapshots_directory.clone()));
@@ -47,6 +64,16 @@ impl SnapshotService {
         Ok(latest_path)
     }
 
+    /// Restores the most recent snapshot for a file path and removes it.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - File path whose newest snapshot should be restored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no snapshot exists, no valid snapshot file can be
+    /// found, or file read/write/removal operations fail.
     pub async fn undo_snapshot(&self, path: PathBuf) -> Result<()> {
         let snapshot = Snapshot::create(path.clone())?;
         let snapshot_dir = self.snapshots_directory.join(snapshot.path_hash());

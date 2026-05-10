@@ -75,19 +75,28 @@ impl<R> ForgeProviderService<R> {
         )?;
 
         // Render model source URLs
-        let models = template_provider.models.as_ref().and_then(|m| match m {
-            ModelSource::Url(template) => {
-                let model_url = self
-                    .render_url_template(
-                        &template.template,
-                        &credential.url_params,
-                        &template_provider.url_params,
-                    )
-                    .ok();
-                model_url.map(ModelSource::Url)
-            }
-            ModelSource::Hardcoded(list) => Some(ModelSource::Hardcoded(list.clone())),
-        });
+        let models = template_provider
+            .models
+            .as_ref()
+            .map(|model_source| -> Result<_> {
+                match model_source {
+                    ModelSource::Url(template) => self
+                        .render_url_template(
+                            &template.template,
+                            &credential.url_params,
+                            &template_provider.url_params,
+                        )
+                        .map(ModelSource::Url)
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "failed to render model list URL for provider '{}': {error}",
+                                template_provider.id
+                            )
+                        }),
+                    ModelSource::Hardcoded(list) => Ok(ModelSource::Hardcoded(list.clone())),
+                }
+            })
+            .transpose()?;
 
         Ok(Provider {
             id: template_provider.id,
@@ -323,6 +332,27 @@ mod tests {
                 "https://api.openai.com/v1/chat/completions"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_get_all_providers_propagates_model_url_render_errors() {
+        let configured = Provider {
+            models: Some(ModelSource::Url(
+                Template::<forge_domain::URLParameters>::new("{{MISSING_MODEL_URL}}/models"),
+            )),
+            ..test_template_provider()
+        };
+
+        let repository = Arc::new(
+            MockProviderRepository::new(vec![])
+                .with_providers(vec![AnyProvider::Template(configured)]),
+        );
+
+        let service = ForgeProviderService::new(repository);
+        let actual = service.get_all_providers().await;
+        let expected = "failed to render model list URL for provider 'OpenAI': Error rendering \"Unnamed template\" line 1, col 1: Failed to access variable in strict mode Some(\"MISSING_MODEL_URL\")";
+
+        assert_eq!(actual.unwrap_err().to_string(), expected);
     }
 
     #[test]

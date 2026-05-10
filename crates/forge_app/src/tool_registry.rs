@@ -44,6 +44,7 @@ struct ToolDefinitionsCacheKey {
     mcp_tools_fingerprint: String,
     agent_tools_fingerprint: String,
     agents_fingerprint: String,
+    current_model_fingerprint: String,
 }
 
 struct ToolDefinitionsCacheSources {
@@ -184,7 +185,7 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
             // Only resolve the current model when modality validation is needed.
             if matches!(&tool_input, ToolCatalog::Read(input) if Self::has_image_extension(&input.file_path))
             {
-                let model = self.get_current_model().await;
+                let model = self.get_current_model().await?;
                 Self::validate_tool_modality(&tool_input, model.as_ref())?;
             }
 
@@ -292,6 +293,11 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
         }
     }
 
+    async fn current_model_cache_fingerprint(&self) -> anyhow::Result<String> {
+        let model = self.get_current_model().await?;
+        Self::cache_fingerprint(&model)
+    }
+
     async fn tool_definitions_cache_key(
         &self,
         sources: &ToolDefinitionsCacheSources,
@@ -317,6 +323,7 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
             mcp_tools_fingerprint: Self::cache_fingerprint(&sources.mcp_tools)?,
             agent_tools_fingerprint: Self::cache_fingerprint(&sources.agent_tools)?,
             agents_fingerprint: Self::cache_fingerprint(&sources.agents)?,
+            current_model_fingerprint: self.current_model_cache_fingerprint().await?,
         })
     }
 
@@ -339,18 +346,30 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
     /// Gets the model for the currently active agent by looking up the agent
     /// and fetching its model from the provider's model list.
     ///
-    /// Returns None if no active agent, agent not found, or model not in
-    /// provider list.
-    async fn get_current_model(&self) -> Option<Model> {
-        let agent_id = self.services.get_active_agent_id().await.ok()??;
-        let agent = self.services.get_agent(&agent_id).await.ok()??;
-        let provider = self
-            .services
-            .get_provider(agent.provider.clone())
-            .await
-            .ok()?;
-        let models = self.services.models(provider).await.ok()?;
-        Self::model_for_agent(&agent, &models).cloned()
+    /// Returns `Ok(None)` when no active agent is selected. Resolution failures
+    /// for a selected agent are propagated so dynamic tool descriptions and
+    /// modality checks do not silently degrade.
+    async fn get_current_model(&self) -> anyhow::Result<Option<Model>> {
+        let Some(agent_id) = self.services.get_active_agent_id().await? else {
+            return Ok(None);
+        };
+        let agent =
+            self.services.get_agent(&agent_id).await?.ok_or_else(|| {
+                anyhow::anyhow!("active agent '{}' was not found", agent_id.as_str())
+            })?;
+        let provider = self.services.get_provider(agent.provider.clone()).await?;
+        let models = self.services.models(provider).await?;
+        Self::model_for_agent(&agent, &models)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "active agent '{}' model '{}' was not found for provider '{}'",
+                    agent.id.as_str(),
+                    agent.model.as_str(),
+                    agent.provider
+                )
+            })
     }
 
     pub async fn tools_overview(&self) -> anyhow::Result<ToolsOverview> {
@@ -371,7 +390,7 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
         let is_authenticated = self.services.is_authenticated().await?;
 
         // Get current model for dynamic tool descriptions
-        let model = self.get_current_model().await;
+        let model = self.get_current_model().await?;
 
         // Build TemplateConfig from ForgeConfig for tool description templates
         let config = self.services.get_config()?;
@@ -600,8 +619,8 @@ mod tests {
             ModelId::new("shared-model"),
         );
         let models = vec![
-            provider_model("shared-model", ProviderId::OPENAI).tools_supported(Some(false)),
-            provider_model("shared-model", ProviderId::ANTHROPIC).tools_supported(Some(true)),
+            provider_model("shared-model", ProviderId::OPENAI).tools_supported(false),
+            provider_model("shared-model", ProviderId::ANTHROPIC).tools_supported(true),
         ];
 
         let actual = ToolRegistry::<()>::model_for_agent(&fixture, &models);

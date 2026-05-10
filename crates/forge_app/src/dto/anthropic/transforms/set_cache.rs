@@ -21,6 +21,10 @@ impl Transformer for SetCache {
         let len = request.get_messages().len();
         let sys_len = request.system.as_ref().map_or(0, |msgs| msgs.len());
 
+        if let Some(last_tool) = request.tools.last_mut() {
+            last_tool.cache_control = Some(crate::dto::anthropic::CacheControl::Ephemeral);
+        }
+
         if len == 0 && sys_len == 0 {
             return request;
         }
@@ -49,12 +53,6 @@ impl Transformer for SetCache {
 
         if let Some(message) = request.get_messages_mut().last_mut() {
             *message = std::mem::take(message).cached(true);
-        }
-
-        // Add cache control to last tool definition (Tool definition caching tech debt
-        // item)
-        if let Some(last_tool) = request.tools.last_mut() {
-            last_tool.cache_control = None;
         }
 
         request
@@ -268,5 +266,39 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
         assert!(request.get_messages()[0].is_cached());
+    }
+
+    #[test]
+    fn test_last_tool_definition_is_cached() {
+        let fixture = Request {
+            tools: vec![
+                crate::dto::anthropic::ToolDefinition {
+                    name: "first".to_string(),
+                    description: Some("first tool".to_string()),
+                    cache_control: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+                crate::dto::anthropic::ToolDefinition {
+                    name: "last".to_string(),
+                    description: Some("last tool".to_string()),
+                    cache_control: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+            ],
+            ..Request::default()
+        };
+        let mut transformer = SetCache;
+
+        let actual = transformer.transform(fixture);
+        let expected = vec![false, true];
+
+        assert_eq!(
+            actual
+                .tools
+                .iter()
+                .map(|tool| tool.cache_control.is_some())
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
 }

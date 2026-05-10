@@ -248,11 +248,10 @@ impl Agent {
     /// the context window (default 70%). This preserves headroom for tool
     /// outputs and follow-up messages.
     ///
-    /// When the model's `context_length` is **unknown** (model not found in
-    /// the provider's list, or the provider doesn't report context length),
-    /// the configured threshold is used as-is without clamping. Applying a
-    /// percentage cap against a guessed default would silently override
-    /// explicit user configuration.
+    /// When the model's `context_length` is **unknown** because the selected
+    /// model does not report context length, the configured threshold is used
+    /// as-is without clamping. Applying a percentage cap against a guessed
+    /// default would silently override explicit user configuration.
     ///
     /// # Arguments
     /// * `selected_model` - The model that will be used for this agent

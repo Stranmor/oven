@@ -55,6 +55,21 @@ impl HardcodedModelConfig {
     }
 }
 
+impl From<forge_config::ProviderModelConfig> for HardcodedModelConfig {
+    fn from(model: forge_config::ProviderModelConfig) -> Self {
+        Self {
+            id: model.id,
+            name: model.name,
+            description: model.description,
+            context_length: model.context_length,
+            tools_supported: model.tools_supported,
+            supports_parallel_tool_calls: model.supports_parallel_tool_calls,
+            supports_reasoning: model.supports_reasoning,
+            input_modalities: model.input_modalities,
+        }
+    }
+}
+
 impl From<Model> for HardcodedModelConfig {
     fn from(model: Model) -> Self {
         Self {
@@ -872,7 +887,9 @@ mod tests {
             id: "url-provider".to_string(),
             api_key_var: Some("URL_PROVIDER_API_KEY".to_string()),
             url: "https://example.com/v1/chat/completions".to_string(),
-            models: Some("https://example.com/v1/models".to_string()),
+            models: Some(forge_config::ModelListConfig::Url(
+                "https://example.com/v1/models".to_string(),
+            )),
             response_type: Some(forge_config::ProviderResponseType::OpenAI),
             url_param_vars: vec![],
             custom_headers: None,
@@ -1092,7 +1109,7 @@ mod tests {
 
     #[test]
     fn test_provider_entry_with_static_models_converts_to_hardcoded() {
-        let model = forge_domain::Model::new("Qwen3.6-35B-A3b-q3-mlx")
+        let model_config = forge_config::ProviderModelConfig::new("Qwen3.6-35B-A3b-q3-mlx")
             .name("Qwen3.5-35B".to_string())
             .description(
                 "Qwen local reasoning model with advanced problem-solving capabilities".to_string(),
@@ -1103,18 +1120,37 @@ mod tests {
             .supports_reasoning(true)
             .input_modalities(vec![forge_domain::InputModality::Text]);
 
+        let expected_model = forge_domain::Model {
+            id: forge_domain::ModelId::from("Qwen3.6-35B-A3b-q3-mlx"),
+            provider_id: forge_domain::ProviderId::from("ollama".to_string()),
+            name: Some("Qwen3.5-35B".to_string()),
+            description: Some(
+                "Qwen local reasoning model with advanced problem-solving capabilities".to_string(),
+            ),
+            context_length: Some(262144),
+            tools_supported: Some(true),
+            supports_parallel_tool_calls: Some(true),
+            supports_reasoning: Some(true),
+            input_modalities: vec![forge_domain::InputModality::Text],
+        };
+
         let entry = forge_config::ProviderEntry {
             id: "ollama".to_string(),
             url: "http://127.0.0.1:8000/v1/chat/completions".to_string(),
             response_type: Some(forge_config::ProviderResponseType::OpenAI),
             auth_methods: vec![forge_config::ProviderAuthMethod::ApiKey],
             models: Some(forge_config::ModelListConfig::Hardcoded(vec![
-                model.clone(),
+                model_config.clone(),
             ])),
             ..Default::default()
         };
 
         let actual = ProviderConfig::from(entry);
+        let actual_template = forge_domain::ProviderTemplate::from(&actual);
+        let forge_domain::ModelSource::Hardcoded(actual_models) = actual_template.models.unwrap()
+        else {
+            panic!("Expected hardcoded models");
+        };
 
         let expected = ProviderConfig {
             id: ProviderId::from("ollama".to_string()),
@@ -1123,12 +1159,15 @@ mod tests {
             url_param_vars: vec![],
             response_type: Some(forge_app::domain::ProviderResponse::OpenAI),
             url: "http://127.0.0.1:8000/v1/chat/completions".to_string(),
-            models: Some(Models::Hardcoded(vec![model])),
+            models: Some(Models::Hardcoded(vec![HardcodedModelConfig::from(
+                model_config,
+            )])),
             auth_methods: vec![forge_domain::AuthMethod::ApiKey],
             custom_headers: None,
         };
 
         assert_eq!(actual, expected);
+        assert_eq!(actual_models, vec![expected_model]);
     }
 
     #[test]

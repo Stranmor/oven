@@ -65,12 +65,12 @@ impl ModelId {
 }
 
 impl Model {
-    /// Creates a new `Model` with the given id and default values for all other
-    /// fields.
-    pub fn new(id: impl Into<ModelId>) -> Self {
+    /// Creates a new `Model` for the given provider with default values for
+    /// all optional metadata fields.
+    pub fn new(provider_id: impl Into<ProviderId>, id: impl Into<ModelId>) -> Self {
         Self {
             id: id.into(),
-            provider_id: ProviderId::FORGE,
+            provider_id: provider_id.into(),
             name: None,
             description: None,
             context_length: None,

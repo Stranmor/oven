@@ -604,6 +604,18 @@ mod tests {
     struct StubTextPatchRepository;
 
     #[async_trait::async_trait]
+    impl forge_domain::FuzzySearchRepository for StubTextPatchRepository {
+        async fn fuzzy_search(
+            &self,
+            _needle: &str,
+            _haystack: &str,
+            _mode: forge_domain::SearchMode,
+        ) -> anyhow::Result<Vec<forge_domain::SearchMatch>> {
+            Ok(vec![])
+        }
+    }
+
+    #[async_trait::async_trait]
     impl forge_domain::TextPatchRepository for StubTextPatchRepository {
         async fn build_text_patch(
             &self,
@@ -630,6 +642,7 @@ mod tests {
             "missing text",
             "replacement",
             &operation,
+            true,
         )
         .await
         .unwrap();
@@ -650,6 +663,7 @@ mod tests {
             "missing text",
             "replacement",
             &operation,
+            true,
         )
         .await;
         let expected = "Could not find match for search text: 'missing text'. File may have changed externally, consider reading the file again.";
@@ -669,6 +683,7 @@ mod tests {
             "missing text",
             "replacement",
             &operation,
+            true,
         )
         .await;
         let expected = "Could not find match for search text: 'missing text'. File may have changed externally, consider reading the file again.";

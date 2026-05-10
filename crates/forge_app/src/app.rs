@@ -119,8 +119,9 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig> + SteerS
         let models = services.models(agent_provider).await?;
         let selected_model = models
             .iter()
-            .find(|model| model.id == agent.model && model.provider_id == agent.provider);
-        let agent = agent.compaction_threshold(selected_model);
+            .find(|model| model.id == agent.model && model.provider_id == agent.provider)
+            .ok_or_else(|| forge_domain::Error::MissingModel(agent.id.clone()))?;
+        let agent = agent.compaction_threshold(Some(selected_model));
 
         // Get system and mcp tool definitions and resolve them for the agent
         let all_tool_definitions = self.tool_registry.list().await?;
