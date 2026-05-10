@@ -357,7 +357,98 @@ pub struct RerankScore {
     pub score: f32,
 }
 
+/// Typed external fact source accepted at the compiler/LSP/SCIP ingestion boundary.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ExternalFactSource {
+    /// Language Server Protocol facts.
+    Lsp,
+    /// Sourcegraph SCIP facts.
+    Scip,
+    /// Rust compiler or rust-analyzer compiler-derived facts.
+    Compiler,
+    /// Custom compatibility source label retained from older public DTOs.
+    Custom(String),
+    /// Unknown typed source with no legacy label.
+    #[default]
+    Unknown,
+}
+
+impl ExternalFactSource {
+    /// Converts a legacy source label into a typed source boundary.
+    ///
+    /// # Arguments
+    ///
+    /// * `label` - Legacy external source label.
+    pub fn from_label(label: &str) -> Self {
+        match label.to_ascii_lowercase().as_str() {
+            "lsp" | "rust-analyzer" | "rust_analyzer" => Self::Lsp,
+            "scip" => Self::Scip,
+            "compiler" | "rustc" => Self::Compiler,
+            _ if label.is_empty() => Self::Unknown,
+            _ => Self::Custom(label.to_string()),
+        }
+    }
+
+    /// Returns a stable provenance label for this typed source.
+    pub fn provenance_label(&self) -> String {
+        match self {
+            Self::Lsp => "lsp".to_string(),
+            Self::Scip => "scip".to_string(),
+            Self::Compiler => "compiler".to_string(),
+            Self::Custom(label) => label.clone(),
+            Self::Unknown => "external-unknown".to_string(),
+        }
+    }
+}
+
 /// External compiler, LSP, or SCIP symbol fact accepted by the typed importer.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedExternalSymbolFact {
+    /// Stable external symbol identifier.
+    pub id: String,
+    /// Symbol display name.
+    pub name: String,
+    /// Symbol kind.
+    pub kind: SymbolKind,
+    /// Relative file path containing the symbol.
+    pub path: String,
+    /// One-based inclusive start line.
+    pub start_line: u32,
+    /// One-based inclusive end line.
+    pub end_line: u32,
+    /// Typed external source boundary.
+    pub source: ExternalFactSource,
+}
+
+/// External compiler, LSP, or SCIP relationship fact accepted by the typed importer.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedExternalReferenceFact {
+    /// Stable source node identifier.
+    pub from: String,
+    /// Stable target node identifier.
+    pub to: String,
+    /// Relationship kind.
+    pub kind: GraphEdgeKind,
+    /// Relative file path containing the reference.
+    pub path: String,
+    /// Optional one-based inclusive start line.
+    pub start_line: Option<u32>,
+    /// Optional one-based inclusive end line.
+    pub end_line: Option<u32>,
+    /// Typed external source boundary.
+    pub source: ExternalFactSource,
+}
+
+/// Typed external facts bundle imported through a compiler/LSP/SCIP boundary.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedExternalFacts {
+    /// Symbol facts to merge into the project model.
+    pub symbols: Vec<TypedExternalSymbolFact>,
+    /// Reference or call facts to merge into the graph.
+    pub references: Vec<TypedExternalReferenceFact>,
+}
+
+/// Legacy external compiler, LSP, or SCIP symbol fact accepted for public API compatibility.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalSymbolFact {
     /// Stable external symbol identifier.
@@ -376,7 +467,7 @@ pub struct ExternalSymbolFact {
     pub source: String,
 }
 
-/// External compiler, LSP, or SCIP relationship fact accepted by the typed importer.
+/// Legacy external compiler, LSP, or SCIP relationship fact accepted for public API compatibility.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalReferenceFact {
     /// Stable source node identifier.
@@ -395,7 +486,7 @@ pub struct ExternalReferenceFact {
     pub source: String,
 }
 
-/// External facts bundle imported through a compiler/LSP/SCIP boundary.
+/// Legacy external facts bundle imported through a compiler/LSP/SCIP boundary.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalFacts {
     /// Symbol facts to merge into the project model.

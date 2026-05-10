@@ -179,23 +179,29 @@ pub fn documents_from_manifest(manifest: &ProjectManifest) -> Vec<LexicalDocumen
 }
 
 pub(crate) fn tokenize(text: &str) -> Vec<String> {
-    text.to_lowercase()
-        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+    text.split(|ch: char| !ch.is_alphanumeric() && ch != '_')
         .filter(|part| !part.is_empty())
         .flat_map(split_identifier)
+        .map(|token| token.to_lowercase())
         .collect()
 }
 
 fn split_identifier(part: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
+    let mut previous_lowercase_or_digit = false;
     for ch in part.chars() {
         if ch == '_' {
             if !current.is_empty() {
                 tokens.push(std::mem::take(&mut current));
             }
+            previous_lowercase_or_digit = false;
             continue;
         }
+        if ch.is_uppercase() && previous_lowercase_or_digit && !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+        previous_lowercase_or_digit = ch.is_lowercase() || ch.is_ascii_digit();
         current.push(ch);
     }
     if !current.is_empty() {
@@ -240,6 +246,86 @@ mod tests {
         }]);
         let actual = setup.search("cat");
         let expected: Vec<LexicalSearchHit> = Vec::new();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn lexical_index_uses_term_frequency_for_repeated_tokens() {
+        let setup = LexicalIndex::new(vec![
+            LexicalDocument {
+                id: "frequent".to_string(),
+                path: "src/frequent.rs".to_string(),
+                symbol: None,
+                kind: LexicalDocumentKind::Shard,
+                text: "cache cache cache invalidation".to_string(),
+                provenance: Default::default(),
+            },
+            LexicalDocument {
+                id: "single".to_string(),
+                path: "src/single.rs".to_string(),
+                symbol: None,
+                kind: LexicalDocumentKind::Shard,
+                text: "cache boundary unrelated tokens".to_string(),
+                provenance: Default::default(),
+            },
+        ]);
+        let actual = setup.search("cache");
+        let expected = vec!["frequent".to_string(), "single".to_string()];
+        assert_eq!(
+            actual.into_iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn lexical_index_uses_idf_to_rank_rare_terms_over_common_only_matches() {
+        let setup = LexicalIndex::new(vec![
+            LexicalDocument {
+                id: "rare".to_string(),
+                path: "src/rare.rs".to_string(),
+                symbol: None,
+                kind: LexicalDocumentKind::Shard,
+                text: "context compiler".to_string(),
+                provenance: Default::default(),
+            },
+            LexicalDocument {
+                id: "common-a".to_string(),
+                path: "src/a.rs".to_string(),
+                symbol: None,
+                kind: LexicalDocumentKind::Shard,
+                text: "context repeated".to_string(),
+                provenance: Default::default(),
+            },
+            LexicalDocument {
+                id: "common-b".to_string(),
+                path: "src/b.rs".to_string(),
+                symbol: None,
+                kind: LexicalDocumentKind::Shard,
+                text: "context another".to_string(),
+                provenance: Default::default(),
+            },
+        ]);
+        let actual = setup.search("context compiler");
+        let expected = Some("rare".to_string());
+        assert_eq!(actual.first().map(|hit| hit.id.clone()), expected);
+    }
+
+    #[test]
+    fn lexical_tokenizer_is_unicode_case_insensitive() {
+        let setup = LexicalIndex::new(vec![LexicalDocument {
+            id: "unicode".to_string(),
+            path: "src/unicode.rs".to_string(),
+            symbol: None,
+            kind: LexicalDocumentKind::Shard,
+            text: "Приветствие".to_string(),
+            provenance: Default::default(),
+        }]);
+        let actual = setup
+            .search("приветствие")
+            .into_iter()
+            .map(|hit| hit.id)
+            .collect::<Vec<_>>();
+        let expected = vec!["unicode".to_string()];
         assert_eq!(actual, expected);
     }
 }

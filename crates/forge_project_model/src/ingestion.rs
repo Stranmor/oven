@@ -1,18 +1,29 @@
 //! Typed ingestion boundary for external compiler, LSP, or SCIP facts.
 
 use crate::types::{
-    EdgeConfidence, ExternalFacts, GraphEdge, ProjectManifest, Provenance, SymbolNode,
+    EdgeConfidence, ExternalFactSource, ExternalFacts, GraphEdge, ProjectManifest, Provenance,
+    SymbolNode, TypedExternalFacts, TypedExternalReferenceFact, TypedExternalSymbolFact,
 };
 use crate::util::{edge, edge_sort_key, fingerprint, provenance};
 use std::collections::BTreeSet;
 
-/// Imports external compiler/LSP/SCIP facts into an in-memory project manifest.
+/// Imports legacy external compiler/LSP/SCIP facts into an in-memory project manifest.
+///
+/// # Arguments
+///
+/// * `manifest` - Manifest updated in place.
+/// * `facts` - Legacy external facts to merge.
+pub fn ingest_external_facts(manifest: &mut ProjectManifest, facts: ExternalFacts) {
+    ingest_typed_external_facts(manifest, facts.into());
+}
+
+/// Imports typed external compiler/LSP/SCIP facts into an in-memory project manifest.
 ///
 /// # Arguments
 ///
 /// * `manifest` - Manifest updated in place.
 /// * `facts` - Typed external facts to merge.
-pub fn ingest_external_facts(manifest: &mut ProjectManifest, facts: ExternalFacts) {
+pub fn ingest_typed_external_facts(manifest: &mut ProjectManifest, facts: TypedExternalFacts) {
     for symbol in facts.symbols {
         let node = SymbolNode {
             id: symbol.id.clone(),
@@ -26,7 +37,7 @@ pub fn ingest_external_facts(manifest: &mut ProjectManifest, facts: ExternalFact
                 &symbol.path,
                 Some(symbol.start_line),
                 Some(symbol.end_line),
-                &symbol.source,
+                &symbol.source.provenance_label(),
                 &symbol.id,
             ),
         };
@@ -44,7 +55,7 @@ pub fn ingest_external_facts(manifest: &mut ProjectManifest, facts: ExternalFact
                 path: reference.path.clone(),
                 start_line: reference.start_line,
                 end_line: reference.end_line,
-                source: reference.source.clone(),
+                source: reference.source.provenance_label(),
                 fingerprint: fingerprint(&format!(
                     "{}:{}:{}:{:?}:{:?}",
                     reference.from,
@@ -85,56 +96,123 @@ fn deduplicate_edges(edges: &mut Vec<GraphEdge>) {
     });
 }
 
+impl From<ExternalFacts> for TypedExternalFacts {
+    fn from(facts: ExternalFacts) -> Self {
+        Self {
+            symbols: facts.symbols.into_iter().map(Into::into).collect(),
+            references: facts.references.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<crate::types::ExternalSymbolFact> for TypedExternalSymbolFact {
+    fn from(fact: crate::types::ExternalSymbolFact) -> Self {
+        Self {
+            id: fact.id,
+            name: fact.name,
+            kind: fact.kind,
+            path: fact.path,
+            start_line: fact.start_line,
+            end_line: fact.end_line,
+            source: ExternalFactSource::from_label(&fact.source),
+        }
+    }
+}
+
+impl From<crate::types::ExternalReferenceFact> for TypedExternalReferenceFact {
+    fn from(fact: crate::types::ExternalReferenceFact) -> Self {
+        Self {
+            from: fact.from,
+            to: fact.to,
+            kind: fact.kind,
+            path: fact.path,
+            start_line: fact.start_line,
+            end_line: fact.end_line,
+            source: ExternalFactSource::from_label(&fact.source),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::indexer::tests::fixture_project;
     use crate::{
-        ExternalReferenceFact, ExternalSymbolFact, GraphEdgeKind, ProjectIndexer, SymbolKind,
+        ExternalFactSource, ExternalReferenceFact, GraphEdgeKind, ProjectIndexer, SymbolKind,
+        TypedExternalFacts, TypedExternalReferenceFact, TypedExternalSymbolFact,
     };
     use anyhow::Result;
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn imports_external_symbols_and_exact_compiler_edges() -> Result<()> {
+    fn imports_typed_lsp_and_scip_facts_as_exact_compiler_edges() -> Result<()> {
         let (fixture, root) = fixture_project()?;
         let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
         let mut manifest = setup.index()?;
-        let facts = ExternalFacts {
-            symbols: vec![ExternalSymbolFact {
-                id: "scip:src/lib.rs:Root::run".to_string(),
-                name: "run".to_string(),
+        let facts = TypedExternalFacts {
+            symbols: vec![TypedExternalSymbolFact {
+                id: "lsp:src/lib.rs:Root::new".to_string(),
+                name: "new".to_string(),
                 kind: SymbolKind::Method,
                 path: "src/lib.rs".to_string(),
                 start_line: 10,
                 end_line: 12,
-                source: "scip".to_string(),
+                source: ExternalFactSource::Lsp,
             }],
+            references: vec![TypedExternalReferenceFact {
+                from: "lsp:src/lib.rs:Root::new".to_string(),
+                to: "symbol:src/lib.rs:Struct:Root".to_string(),
+                kind: GraphEdgeKind::References,
+                path: "src/lib.rs".to_string(),
+                start_line: Some(10),
+                end_line: Some(10),
+                source: ExternalFactSource::Scip,
+            }],
+        };
+        ingest_typed_external_facts(&mut manifest, facts);
+        let actual = manifest
+            .edges
+            .iter()
+            .find(|edge| edge.from == "lsp:src/lib.rs:Root::new")
+            .map(|edge| (edge.confidence_kind.clone(), edge.provenance.source.clone()));
+        let expected = Some((EdgeConfidence::ExactCompiler, "scip".to_string()));
+        assert_eq!(actual, expected);
+        assert_eq!(
+            manifest
+                .symbols
+                .iter()
+                .find(|symbol| symbol.id == "lsp:src/lib.rs:Root::new")
+                .map(|symbol| symbol.provenance.source.clone()),
+            Some("lsp".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_external_facts_preserve_unknown_source_labels() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let mut manifest = setup.index()?;
+        let facts = ExternalFacts {
+            symbols: Vec::new(),
             references: vec![ExternalReferenceFact {
-                from: "scip:src/lib.rs:Root::run".to_string(),
-                to: "symbol:src/lib.rs:Function:helper".to_string(),
+                from: "legacy:custom:caller".to_string(),
+                to: "legacy:custom:callee".to_string(),
                 kind: GraphEdgeKind::Calls,
                 path: "src/lib.rs".to_string(),
-                start_line: Some(11),
-                end_line: Some(11),
-                source: "scip".to_string(),
+                start_line: Some(1),
+                end_line: Some(1),
+                source: "bespoke-indexer".to_string(),
             }],
         };
         ingest_external_facts(&mut manifest, facts);
         let actual = manifest
             .edges
             .iter()
-            .find(|edge| edge.from == "scip:src/lib.rs:Root::run")
-            .map(|edge| edge.confidence_kind.clone());
-        let expected = Some(EdgeConfidence::ExactCompiler);
+            .find(|edge| edge.from == "legacy:custom:caller")
+            .map(|edge| edge.provenance.source.clone());
+        let expected = Some("bespoke-indexer".to_string());
         assert_eq!(actual, expected);
-        assert_eq!(
-            manifest
-                .symbols
-                .iter()
-                .any(|symbol| symbol.id == "scip:src/lib.rs:Root::run"),
-            true
-        );
         Ok(())
     }
 }

@@ -21,16 +21,17 @@ pub use extraction::{
 };
 pub use freshness::compare_freshness;
 pub use indexer::ProjectIndexer;
-pub use ingestion::ingest_external_facts;
+pub use ingestion::{ingest_external_facts, ingest_typed_external_facts};
 pub use lexical::{LexicalIndex, documents_from_manifest};
 pub use retrieval::{retrieve, retrieve_with_boundaries};
 pub use types::{
-    EdgeConfidence, ExternalFacts, ExternalReferenceFact, ExternalSymbolFact, FileNode,
-    FileNodeKind, FreshnessEvalReport, FreshnessState, FutureVectorRetrievalScaffold,
+    EdgeConfidence, ExternalFactSource, ExternalFacts, ExternalReferenceFact, ExternalSymbolFact,
+    FileNode, FileNodeKind, FreshnessEvalReport, FreshnessState, FutureVectorRetrievalScaffold,
     GraphCoverageReport, GraphEdge, GraphEdgeKind, Language, LexicalDocument, LexicalDocumentKind,
     LexicalSearchHit, ProjectManifest, Provenance, ProvenanceCompletenessReport, RerankCandidate,
     RerankScore, RetrievalEvalCase, RetrievalEvalReport, RetrievalQuery, RetrievalResult,
-    ShardManifest, SourceFile, SymbolKind, SymbolNode, ToolEpisode, VectorQuery, VectorSearchHit,
+    ShardManifest, SourceFile, SymbolKind, SymbolNode, ToolEpisode, TypedExternalFacts,
+    TypedExternalReferenceFact, TypedExternalSymbolFact, VectorQuery, VectorSearchHit,
 };
 pub use util::fingerprint;
 pub use vector::{DeterministicReranker, DeterministicVectorIndex, Reranker, VectorIndex};
