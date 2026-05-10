@@ -261,4 +261,20 @@ let service = BadUserService::<PostgresRepo, RedisCache, FileLogger>::new(...);
 
 ## TARGET GOAL
 
-Resolve 5 immediate tech debt items: Tool definition caching, OpenAI Tool DTO type safety, Agent provider resolver strict fallback, Snapshot service promotion, and Provider association in Model.
+Implement a separated Project Representation / Model Context layer as the active architecture goal. The preferred crate/folder boundary is `crates/forge_project_model`; if empirical integration constraints require a different name or placement, preserve the same separation and document the concrete reason in code review/commit context. This layer must own project/model-context representation rather than scattering it across providers, UI, tool-call code, or prompt assembly.
+
+The layer should implement current SOTA project/model-context representation methods as typed Rust surfaces, including:
+
+- repository manifest and workspace metadata;
+- AST, LSP, and symbol indexes;
+- dependency graph and call graph;
+- knowledge graph linking files, symbols, tasks, decisions, and retrieved evidence;
+- hybrid retrieval across lexical, semantic, structural, and graph signals;
+- episodic memory and tool-use traces for agent workflows;
+- shard manifests for context packaging and incremental loading;
+- freshness, provenance, invalidation, and source-of-truth metadata;
+- evals/regression fixtures proving retrieval quality, freshness behavior, and context-pack construction.
+
+Architectural boundary: project/model-context construction, indexing, retrieval, provenance, freshness, and context-pack assembly belong behind this dedicated crate/folder boundary. Existing crates may consume the layer through typed APIs, but must not reimplement parallel context models, ad-hoc prompt-context builders, untyped JSON blobs, duplicated indexes, or provider-specific project-memory logic. Detection: About to add model/project context logic outside the dedicated boundary → STOP → either move it into `crates/forge_project_model` or add only a thin typed adapter that depends on that boundary.
+
+Mnemonic: Project context is a product model, not prompt glue; one typed layer owns it.
