@@ -116,7 +116,7 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig> + SteerS
             .refresh_provider_credential(agent_provider)
             .await?;
 
-        let models = services.models(agent_provider).await?;
+        let models = services.models(agent_provider.clone()).await?;
         let selected_model = models
             .iter()
             .find(|model| model.id == agent.model && model.provider_id == agent.provider)
@@ -124,7 +124,10 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig> + SteerS
         let agent = agent.compaction_threshold(Some(selected_model));
 
         // Get system and mcp tool definitions and resolve them for the agent
-        let all_tool_definitions = self.tool_registry.list().await?;
+        let all_tool_definitions = self
+            .tool_registry
+            .list(&agent.id, selected_model, &agent_provider)
+            .await?;
         let tool_resolver = ToolResolver::new(all_tool_definitions);
         let tool_definitions: Vec<ToolDefinition> =
             tool_resolver.resolve(&agent).into_iter().cloned().collect();

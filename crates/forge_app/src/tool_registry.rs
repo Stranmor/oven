@@ -7,8 +7,8 @@ use anyhow::Context;
 use console::style;
 use forge_domain::{
     Agent, AgentId, AgentInput, ChatResponse, ChatResponseContent, Environment, InputModality,
-    McpServers, Model, SystemContext, TemplateConfig, ToolCallContext, ToolCallFull, ToolCatalog,
-    ToolDefinition, ToolKind, ToolName, ToolOutput, ToolResult,
+    McpServers, Model, Provider, SystemContext, TemplateConfig, ToolCallContext, ToolCallFull,
+    ToolCatalog, ToolDefinition, ToolKind, ToolName, ToolOutput, ToolResult,
 };
 use forge_template::Element;
 use futures::future::join_all;
@@ -16,6 +16,7 @@ use serde_json::{Map, Value, json};
 use strum::IntoEnumIterator;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
+use url::Url;
 
 use crate::agent_executor::AgentExecutor;
 use crate::dto::ToolsOverview;
@@ -31,7 +32,7 @@ use crate::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ToolDefinitionsCacheKey {
     cwd: PathBuf,
-    active_agent_id: Option<AgentId>,
+    agent_id: AgentId,
     indexed: bool,
     authenticated: bool,
     research_subagent: bool,
@@ -45,6 +46,7 @@ struct ToolDefinitionsCacheKey {
     agent_tools_fingerprint: String,
     agents_fingerprint: String,
     current_model_fingerprint: String,
+    current_provider_fingerprint: String,
 }
 
 struct ToolDefinitionsCacheSources {
@@ -185,8 +187,8 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
             // Only resolve the current model when modality validation is needed.
             if matches!(&tool_input, ToolCatalog::Read(input) if Self::has_image_extension(&input.file_path))
             {
-                let model = self.get_current_model().await?;
-                Self::validate_tool_modality(&tool_input, model.as_ref())?;
+                let model = self.current_chat_model_for_agent(agent).await?;
+                Self::validate_tool_modality(&tool_input, Some(&model))?;
             }
 
             if matches!(tool_input, ToolCatalog::Shell(_)) {
@@ -272,6 +274,25 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
             .context("Failed to fingerprint tool definition cache source")
     }
 
+    fn provider_cache_fingerprint(provider: &Provider<Url>) -> anyhow::Result<String> {
+        let custom_header_names = provider
+            .custom_headers
+            .as_ref()
+            .map(|headers| headers.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        Self::cache_fingerprint(&json!({
+            "id": provider.id.clone(),
+            "provider_type": provider.provider_type.clone(),
+            "response": provider.response.clone(),
+            "url": provider.url.clone(),
+            "models": provider.models.clone(),
+            "auth_methods": provider.auth_methods.clone(),
+            "url_params": provider.url_params.clone(),
+            "credential_present": provider.credential.is_some(),
+            "custom_header_names": custom_header_names,
+        }))
+    }
+
     fn canonicalize_cache_fingerprint(value: Value) -> Value {
         match value {
             Value::Array(values) => {
@@ -293,16 +314,28 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
         }
     }
 
-    async fn current_model_cache_fingerprint(&self) -> anyhow::Result<String> {
-        let model = self.get_current_model().await?;
-        Self::cache_fingerprint(&model)
+    async fn current_chat_model_for_agent(&self, agent: &Agent) -> anyhow::Result<Model> {
+        let provider = self.services.get_provider(agent.provider.clone()).await?;
+        let models = self.services.models(provider).await?;
+        Self::model_for_agent(agent, &models)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "agent '{}' model '{}' was not found for provider '{}'",
+                    agent.id.as_str(),
+                    agent.model.as_str(),
+                    agent.provider
+                )
+            })
     }
 
     async fn tool_definitions_cache_key(
         &self,
+        agent_id: &AgentId,
+        model: &Model,
+        provider: &Provider<Url>,
         sources: &ToolDefinitionsCacheSources,
     ) -> anyhow::Result<ToolDefinitionsCacheKey> {
-        let active_agent_id = self.services.get_active_agent_id().await?;
         let environment = self.services.get_environment();
         let cwd = environment.cwd;
         let indexed = self.services.is_indexed(&cwd).await?;
@@ -310,7 +343,7 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
         let config = self.services.get_config()?;
         Ok(ToolDefinitionsCacheKey {
             cwd,
-            active_agent_id,
+            agent_id: agent_id.clone(),
             indexed,
             authenticated,
             research_subagent: config.research_subagent,
@@ -323,62 +356,59 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
             mcp_tools_fingerprint: Self::cache_fingerprint(&sources.mcp_tools)?,
             agent_tools_fingerprint: Self::cache_fingerprint(&sources.agent_tools)?,
             agents_fingerprint: Self::cache_fingerprint(&sources.agents)?,
-            current_model_fingerprint: self.current_model_cache_fingerprint().await?,
+            current_model_fingerprint: Self::cache_fingerprint(model)?,
+            current_provider_fingerprint: Self::provider_cache_fingerprint(provider)?,
         })
     }
 
-    pub async fn list(&self) -> anyhow::Result<Vec<ToolDefinition>> {
+    pub async fn list(
+        &self,
+        agent_id: &AgentId,
+        model: &Model,
+        provider: &Provider<Url>,
+    ) -> anyhow::Result<Vec<ToolDefinition>> {
         let sources = self.tool_definitions_cache_sources().await?;
-        let key = self.tool_definitions_cache_key(&sources).await?;
+        let key = self
+            .tool_definitions_cache_key(agent_id, model, provider, &sources)
+            .await?;
         if let Some(cached) = self.tool_definitions_cache.lock().await.as_ref()
             && cached.key == key
         {
             return Ok(cached.definitions.clone());
         }
 
-        let definitions: Vec<ToolDefinition> =
-            self.tools_overview_from_sources(sources).await?.into();
+        let definitions: Vec<ToolDefinition> = self
+            .tools_overview_from_sources(Some(model.clone()), sources)
+            .await?
+            .into();
         *self.tool_definitions_cache.lock().await =
             Some(CachedToolDefinitions { key, definitions: definitions.clone() });
         Ok(definitions)
     }
 
-    /// Gets the model for the currently active agent by looking up the agent
-    /// and fetching its model from the provider's model list.
+    /// Builds a tools overview for UI/list-tools callers.
     ///
-    /// Returns `Ok(None)` when no active agent is selected. Resolution failures
-    /// for a selected agent are propagated so dynamic tool descriptions and
-    /// modality checks do not silently degrade.
-    async fn get_current_model(&self) -> anyhow::Result<Option<Model>> {
-        let Some(agent_id) = self.services.get_active_agent_id().await? else {
-            return Ok(None);
-        };
-        let agent =
-            self.services.get_agent(&agent_id).await?.ok_or_else(|| {
-                anyhow::anyhow!("active agent '{}' was not found", agent_id.as_str())
-            })?;
-        let provider = self.services.get_provider(agent.provider.clone()).await?;
-        let models = self.services.models(provider).await?;
-        Self::model_for_agent(&agent, &models)
-            .cloned()
-            .map(Some)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "active agent '{}' model '{}' was not found for provider '{}'",
-                    agent.id.as_str(),
-                    agent.model.as_str(),
-                    agent.provider
-                )
-            })
-    }
+    /// This path may use global active-agent state because it is not the chat
+    /// execution path. Chat execution must call [`Self::list`] with the
+    /// already resolved chat model and provider.
 
     pub async fn tools_overview(&self) -> anyhow::Result<ToolsOverview> {
         let sources = self.tool_definitions_cache_sources().await?;
-        self.tools_overview_from_sources(sources).await
+        let model = match self.services.get_active_agent_id().await? {
+            Some(agent_id) => {
+                let agent = self.services.get_agent(&agent_id).await?.ok_or_else(|| {
+                    anyhow::anyhow!("active agent '{}' was not found", agent_id.as_str())
+                })?;
+                Some(self.current_chat_model_for_agent(&agent).await?)
+            }
+            None => None,
+        };
+        self.tools_overview_from_sources(model, sources).await
     }
 
     async fn tools_overview_from_sources(
         &self,
+        model: Option<Model>,
         sources: ToolDefinitionsCacheSources,
     ) -> anyhow::Result<ToolsOverview> {
         let ToolDefinitionsCacheSources { mcp_tools, agent_tools, mut agents } = sources;
@@ -389,8 +419,9 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
         let is_indexed = self.services.is_indexed(&cwd).await?;
         let is_authenticated = self.services.is_authenticated().await?;
 
-        // Get current model for dynamic tool descriptions
-        let model = self.get_current_model().await?;
+        // Use the caller-provided model so chat-scoped descriptions share the
+        // same selected model as orchestration.
+        let model = model;
 
         // Build TemplateConfig from ForgeConfig for tool description templates
         let config = self.services.get_config()?;
@@ -579,13 +610,15 @@ impl<S> ToolRegistry<S> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use forge_domain::{
         Agent, AgentId, Environment, ModelId, ProviderId, TemplateConfig, ToolCatalog, ToolName,
     };
     use pretty_assertions::assert_eq;
 
     use crate::error::Error;
-    use crate::tool_registry::{ToolRegistry, create_test_agents};
+    use crate::tool_registry::{ToolDefinitionsCacheKey, ToolRegistry, create_test_agents};
 
     fn agent() -> Agent {
         // only allow read and search tools for this agent
@@ -609,6 +642,72 @@ mod tests {
             supports_reasoning: None,
             input_modalities: vec![],
         }
+    }
+
+    fn cache_key_fixture() -> ToolDefinitionsCacheKey {
+        ToolDefinitionsCacheKey {
+            cwd: PathBuf::from("/workspace"),
+            agent_id: AgentId::new("chat-agent"),
+            indexed: true,
+            authenticated: true,
+            research_subagent: true,
+            max_read_lines: 2000,
+            max_line_chars: 2000,
+            max_image_size_bytes: 5000,
+            max_stdout_prefix_lines: 200,
+            max_stdout_suffix_lines: 200,
+            max_stdout_line_chars: 2000,
+            mcp_tools_fingerprint: "[]".to_string(),
+            agent_tools_fingerprint: "[]".to_string(),
+            agents_fingerprint: "[]".to_string(),
+            current_model_fingerprint: "openai/shared-model".to_string(),
+            current_provider_fingerprint: "openai".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_tool_definition_cache_key_is_scoped_to_chat_agent() {
+        let setup = cache_key_fixture();
+        let mut actual = setup.clone();
+        actual.agent_id = AgentId::new("other-chat-agent");
+        let expected = false;
+
+        assert_eq!(actual == setup, expected);
+    }
+
+    #[test]
+    fn test_tool_definition_cache_key_is_scoped_to_selected_model() {
+        let setup = cache_key_fixture();
+        let mut actual = setup.clone();
+        actual.current_model_fingerprint = "openai/other-model".to_string();
+        let expected = false;
+
+        assert_eq!(actual == setup, expected);
+    }
+
+    #[test]
+    fn test_tool_definition_cache_key_is_scoped_to_resolved_provider() {
+        let setup = cache_key_fixture();
+        let mut actual = setup.clone();
+        actual.current_provider_fingerprint = "anthropic".to_string();
+        let expected = false;
+
+        assert_eq!(actual == setup, expected);
+    }
+
+    #[test]
+    fn test_model_for_agent_requires_provider_match() {
+        let fixture = Agent::new(
+            AgentId::new("test_agent"),
+            ProviderId::ANTHROPIC,
+            ModelId::new("shared-model"),
+        );
+        let models = vec![provider_model("shared-model", ProviderId::OPENAI)];
+
+        let actual = ToolRegistry::<()>::model_for_agent(&fixture, &models);
+        let expected = None;
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
