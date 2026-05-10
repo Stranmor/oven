@@ -1,7 +1,8 @@
 //! Rust AST symbol extraction.
 
+use super::call_graph::extract_calls_into;
 use super::range::SymbolRangeResolver;
-use crate::types::{GraphEdge, GraphEdgeKind, SymbolKind, SymbolNode};
+use crate::types::{EdgeConfidence, GraphEdge, GraphEdgeKind, SymbolKind, SymbolNode};
 use crate::util::{edge, edge_sort_key, provenance};
 use anyhow::{Context, Result};
 use syn::Item;
@@ -37,6 +38,7 @@ pub fn extract_rust_symbols(path: &str, content: &str) -> Result<RustExtraction>
         &mut extraction,
         &mut ranges,
     )?;
+    extract_calls_into(path, content, &mut extraction)?;
     extraction
         .symbols
         .sort_by(|left, right| left.id.cmp(&right.id));
@@ -190,6 +192,7 @@ fn push_symbol(
         &id,
         GraphEdgeKind::Contains,
         1.0,
+        EdgeConfidence::HeuristicHigh,
         provenance(
             path,
             Some(start_line),
@@ -204,6 +207,7 @@ fn push_symbol(
             &parent,
             GraphEdgeKind::ChildOf,
             1.0,
+            EdgeConfidence::HeuristicHigh,
             provenance(
                 path,
                 Some(start_line),

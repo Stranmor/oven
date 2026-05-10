@@ -1,6 +1,6 @@
 //! Rust import and Cargo dependency graph extraction.
 
-use crate::types::{GraphEdge, GraphEdgeKind};
+use crate::types::{EdgeConfidence, GraphEdge, GraphEdgeKind};
 use crate::util::{edge, edge_sort_key, provenance};
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
@@ -34,6 +34,7 @@ pub fn extract_rust_import_edges(path: &str, content: &str) -> Result<Vec<GraphE
                         &target,
                         GraphEdgeKind::Imports,
                         0.9,
+                        EdgeConfidence::HeuristicHigh,
                         provenance(path, None, None, visibility, &format!("{path}->{target}")),
                     ));
                 }
@@ -45,6 +46,7 @@ pub fn extract_rust_import_edges(path: &str, content: &str) -> Result<Vec<GraphE
                     &name,
                     GraphEdgeKind::ModuleDeclares,
                     0.95,
+                    EdgeConfidence::HeuristicHigh,
                     provenance(path, None, None, "mod", &format!("{path}->{name}")),
                 ));
             }
@@ -55,6 +57,7 @@ pub fn extract_rust_import_edges(path: &str, content: &str) -> Result<Vec<GraphE
                     &name,
                     GraphEdgeKind::ExternCrate,
                     0.95,
+                    EdgeConfidence::HeuristicHigh,
                     provenance(path, None, None, "extern crate", &format!("{path}->{name}")),
                 ));
             }
@@ -88,6 +91,7 @@ pub fn extract_cargo_dependency_edges(path: &str, content: &str) -> Result<Vec<G
                     name,
                     GraphEdgeKind::CargoDependency,
                     1.0,
+                    EdgeConfidence::ExactCompiler,
                     provenance(path, None, None, section, &format!("{path}->{name}")),
                 ));
             }

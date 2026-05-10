@@ -1,6 +1,6 @@
 //! Shared deterministic helpers for project-model modules.
 
-use crate::types::{GraphEdge, GraphEdgeKind, Language, Provenance, SourceFile};
+use crate::types::{EdgeConfidence, GraphEdge, GraphEdgeKind, Language, Provenance, SourceFile};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
@@ -18,6 +18,7 @@ pub(crate) fn edge(
     to: &str,
     kind: GraphEdgeKind,
     confidence: f32,
+    confidence_kind: EdgeConfidence,
     provenance: Provenance,
 ) -> GraphEdge {
     GraphEdge {
@@ -25,6 +26,7 @@ pub(crate) fn edge(
         to: to.to_string(),
         kind,
         confidence,
+        confidence_kind,
         provenance,
     }
 }
