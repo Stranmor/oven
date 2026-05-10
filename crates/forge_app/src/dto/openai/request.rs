@@ -149,18 +149,25 @@ pub enum CacheControlType {
     Ephemeral,
 }
 
+/// Describes an OpenAI-compatible function tool.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct FunctionDescription {
+    /// Optional natural-language function description sent to the provider.
     pub description: Option<String>,
+    /// Function name used by the model in tool calls.
     pub name: ToolName,
+    /// JSON schema for accepted function arguments.
     pub parameters: schemars::Schema,
 }
 
+/// Tool definition encoded for OpenAI-compatible chat/completions requests.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(tag = "type")]
 pub enum Tool {
+    /// Function tool with a JSON-schema argument contract.
     #[serde(rename = "function")]
     Function { function: FunctionDescription },
+    /// Provider-native code interpreter tool marker.
     #[serde(rename = "code_interpreter")]
     CodeInterpreter,
 }

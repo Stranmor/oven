@@ -423,6 +423,22 @@ mod tests {
         assert_eq!(actual.compact.token_threshold, expected);
     }
 
+    #[test]
+    fn test_compaction_threshold_caps_antigravity_230k_threshold_for_266k_window() {
+        let fixture = Agent::new(
+            AgentId::new("test"),
+            ProviderId::OPENAI,
+            ModelId::new("gpt-5.5"),
+        )
+        .compact(Compact::new().token_threshold(230_000_usize));
+        let selected_model = model_fixture("gpt-5.5", Some(266_300));
+
+        let actual = fixture.compaction_threshold(Some(&selected_model));
+        let expected = Some(186_410);
+
+        assert_eq!(actual.compact.token_threshold, expected);
+    }
+
     /// When no token_threshold is configured, the default (100K) is used.
     /// If the model's context window is known, that default is capped to
     /// 70% of the context window.

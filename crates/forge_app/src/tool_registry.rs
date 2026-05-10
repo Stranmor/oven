@@ -361,6 +361,16 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
         })
     }
 
+    /// Returns tool definitions for a chat execution using the resolved agent, model, and provider.
+    ///
+    /// # Arguments
+    /// * `agent_id` - Agent whose tool allow-list and agent-tools are being resolved.
+    /// * `model` - Selected model metadata for the current provider-bound chat turn.
+    /// * `provider` - Provider that will receive the chat request.
+    ///
+    /// # Errors
+    /// Returns an error when MCP, agent, indexing, authentication, configuration, or cache-key
+    /// source discovery fails.
     pub async fn list(
         &self,
         agent_id: &AgentId,
@@ -391,7 +401,6 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
     /// This path may use global active-agent state because it is not the chat
     /// execution path. Chat execution must call [`Self::list`] with the
     /// already resolved chat model and provider.
-
     pub async fn tools_overview(&self) -> anyhow::Result<ToolsOverview> {
         let sources = self.tool_definitions_cache_sources().await?;
         let model = match self.services.get_active_agent_id().await? {
@@ -418,10 +427,6 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
         let cwd = environment.cwd.clone();
         let is_indexed = self.services.is_indexed(&cwd).await?;
         let is_authenticated = self.services.is_authenticated().await?;
-
-        // Use the caller-provided model so chat-scoped descriptions share the
-        // same selected model as orchestration.
-        let model = model;
 
         // Build TemplateConfig from ForgeConfig for tool description templates
         let config = self.services.get_config()?;

@@ -58,8 +58,8 @@ impl CompactionStrategy {
                     });
 
                 match range {
-                    Some((i, _)) => i,
-                    None => context.messages.len().saturating_sub(1),
+                    Some((i, _)) => context.messages.len().saturating_sub(i).saturating_sub(1),
+                    None => 0,
                 }
             }
             CompactionStrategy::Retain(fixed) => *fixed,
@@ -90,11 +90,11 @@ fn find_sequence_preserving_last_n(
     // len will be always > 0
     let length = messages.len();
 
-    // Find the first assistant message index
+    // Find the first non-system message index
     let start = messages
         .iter()
         .enumerate()
-        .find(|(_, message)| message.has_role(Role::Assistant))
+        .find(|(_, message)| !message.has_role(Role::System))
         .map(|(index, _)| index)?;
 
     // Don't compact if there's no assistant message
@@ -181,53 +181,53 @@ mod tests {
     fn test_sequence_finding() {
         // Basic compaction scenarios
         let actual = seq("suaaau", 0);
-        let expected = "su[aaau]";
+        let expected = "s[uaaau]";
         assert_eq!(actual, expected);
 
         let actual = seq("sua", 0);
-        let expected = "su[a]";
+        let expected = "s[ua]";
         assert_eq!(actual, expected);
 
         let actual = seq("suauaa", 0);
-        let expected = "su[auaa]";
+        let expected = "s[uauaa]";
         assert_eq!(actual, expected);
 
         // Tool call scenarios
         let actual = seq("suttu", 0);
-        let expected = "su[ttu]";
+        let expected = "s[uttu]";
         assert_eq!(actual, expected);
 
         let actual = seq("sutraau", 0);
-        let expected = "su[traau]";
+        let expected = "s[utraau]";
         assert_eq!(actual, expected);
 
         let actual = seq("utrutru", 0);
-        let expected = "u[trutru]";
+        let expected = "[utrutru]";
         assert_eq!(actual, expected);
 
         let actual = seq("uttarru", 0);
-        let expected = "u[ttarru]";
+        let expected = "[uttarru]";
         assert_eq!(actual, expected);
 
         let actual = seq("urru", 0);
-        let expected = "urru";
+        let expected = "[urru]";
         assert_eq!(actual, expected);
 
         let actual = seq("uturu", 0);
-        let expected = "u[turu]";
+        let expected = "[uturu]";
         assert_eq!(actual, expected);
 
         // Preservation window scenarios
         let actual = seq("suaaaauaa", 0);
-        let expected = "su[aaaauaa]";
+        let expected = "s[uaaaauaa]";
         assert_eq!(actual, expected);
 
         let actual = seq("suaaaauaa", 3);
-        let expected = "su[aaaa]uaa";
+        let expected = "s[uaaaa]uaa";
         assert_eq!(actual, expected);
 
         let actual = seq("suaaaauaa", 5);
-        let expected = "su[aa]aauaa";
+        let expected = "s[uaa]aauaa";
         assert_eq!(actual, expected);
 
         let actual = seq("suaaaauaa", 8);
@@ -235,66 +235,66 @@ mod tests {
         assert_eq!(actual, expected);
 
         let actual = seq("suauaaa", 0);
-        let expected = "su[auaaa]";
+        let expected = "s[uauaaa]";
         assert_eq!(actual, expected);
 
         let actual = seq("suauaaa", 2);
-        let expected = "su[aua]aa";
+        let expected = "s[uaua]aa";
         assert_eq!(actual, expected);
 
         let actual = seq("suauaaa", 1);
-        let expected = "su[auaa]a";
+        let expected = "s[uauaa]a";
         assert_eq!(actual, expected);
 
         // Tool call atomicity preservation
         let actual = seq("sutrtrtra", 0);
-        let expected = "su[trtrtra]";
+        let expected = "s[utrtrtra]";
         assert_eq!(actual, expected);
 
         let actual = seq("sutrtrtra", 1);
-        let expected = "su[trtrtr]a";
+        let expected = "s[utrtrtr]a";
         assert_eq!(actual, expected);
 
         let actual = seq("sutrtrtra", 2);
-        let expected = "su[trtr]tra";
+        let expected = "s[utrtr]tra";
         assert_eq!(actual, expected);
 
         // Parallel tool calls
         let actual = seq("sutrtrtrra", 2);
-        let expected = "su[trtr]trra";
+        let expected = "s[utrtr]trra";
         assert_eq!(actual, expected);
 
         let actual = seq("sutrtrtrra", 3);
-        let expected = "su[trtr]trra";
+        let expected = "s[utrtr]trra";
         assert_eq!(actual, expected);
 
         let actual = seq("sutrrtrrtrra", 5);
-        let expected = "su[trr]trrtrra";
+        let expected = "s[utrr]trrtrra";
         assert_eq!(actual, expected);
 
         let actual = seq("sutrrrrrra", 2);
-        let expected = "sutrrrrrra"; // No compaction due to tool preservation logic
+        let expected = "s[u]trrrrrra"; // Compacts user message but preserves tools
         assert_eq!(actual, expected);
 
         // Conversation patterns
         let actual = seq("suauauaua", 0);
-        let expected = "su[auauaua]";
+        let expected = "s[uauauaua]";
         assert_eq!(actual, expected);
 
         let actual = seq("suauauaua", 2);
-        let expected = "su[auaua]ua";
+        let expected = "s[uauaua]ua";
         assert_eq!(actual, expected);
 
         let actual = seq("suauauaua", 6);
-        let expected = "su[a]uauaua";
+        let expected = "s[ua]uauaua";
         assert_eq!(actual, expected);
 
         let actual = seq("sutruaua", 0);
-        let expected = "su[truaua]";
+        let expected = "s[utruaua]";
         assert_eq!(actual, expected);
 
         let actual = seq("sutruaua", 3);
-        let expected = "su[tru]aua";
+        let expected = "s[utru]aua";
         assert_eq!(actual, expected);
 
         // Special cases
@@ -303,7 +303,7 @@ mod tests {
         assert_eq!(actual, expected);
 
         let actual = seq("suaut", 0);
-        let expected = "su[au]t";
+        let expected = "s[uau]t";
         assert_eq!(actual, expected);
 
         // Edge cases
@@ -320,19 +320,19 @@ mod tests {
         assert_eq!(actual, expected);
 
         let actual = seq("ut", 0);
-        let expected = "ut"; // No compaction due to tool preservation
+        let expected = "[u]t"; // Compacting user is fine
         assert_eq!(actual, expected);
 
         let actual = seq("suuu", 0);
-        let expected = "suuu"; // No assistant messages, so no compaction
+        let expected = "s[uuu]"; // Should compact Users
         assert_eq!(actual, expected);
 
         let actual = seq("ut", 1);
-        let expected = "ut";
+        let expected = "[u]t"; // Compacting user is fine
         assert_eq!(actual, expected);
 
         let actual = seq("ua", 0);
-        let expected = "u[a]";
+        let expected = "[ua]";
         assert_eq!(actual, expected);
     }
 
@@ -347,11 +347,11 @@ mod tests {
         // Strategy skips system messages, so calculation for non-system messages:
         // - User message (index 1): 3 tokens → budget: 4 - 3 = 1 token remaining
         // - Assistant message (index 2): 3 tokens → budget: 1 - 3 = 0 (saturating_sub)
-        // Result: Eviction budget exhausted at index 2 (Assistant), so to_fixed returns
-        // 2
+        // Result: Eviction budget exhausted at index 2 (Assistant), so we want to preserve
+        // length (3) - index (2) - 1 = 0 messages.
         let percentage_strategy = CompactionStrategy::evict(0.4);
         let actual = percentage_strategy.to_fixed(&fixture);
-        let expected = 2;
+        let expected = 0;
         assert_eq!(actual, expected);
 
         // Test PreserveLastN strategy
@@ -366,7 +366,7 @@ mod tests {
         // index 2
         let invalid_strategy = CompactionStrategy::evict(1.5);
         let actual = invalid_strategy.to_fixed(&fixture);
-        let expected = 2; // Returns index 2 (last message) when all messages fit in budget
+        let expected = 0; // Returns 0 when all messages are evicted
         assert_eq!(actual, expected);
     }
 
@@ -394,11 +394,10 @@ mod tests {
         let percentage_strategy = CompactionStrategy::evict(0.4);
         percentage_strategy.to_fixed(&fixture);
 
-        // Use fixed window strategy - preserve last 1 message, starting from first
-        // assistant
+        // Use fixed window strategy - preserve last 1 message
         let preserve_strategy = CompactionStrategy::retain(1);
         let actual_sequence = preserve_strategy.eviction_range(&fixture);
-        let expected = Some((1, 2)); // Start from first assistant at index 1
+        let expected = Some((0, 2)); // Start from index 0 (first user message), end at 2 (preserve last 1 out of 4)
         assert_eq!(actual_sequence, expected);
     }
 

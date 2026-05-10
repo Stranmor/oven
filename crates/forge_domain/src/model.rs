@@ -25,14 +25,21 @@ fn default_input_modalities() -> Vec<InputModality> {
     vec![InputModality::Text]
 }
 
+/// Describes a model exposed by a specific provider.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Setters, JsonSchema, Dummy)]
 #[setters(strip_option)]
 pub struct Model {
+    /// Provider-local model identifier used in requests.
     pub id: ModelId,
+    /// Provider that owns this model metadata.
     pub provider_id: ProviderId,
+    /// Optional human-readable model name.
     pub name: Option<String>,
+    /// Optional provider-supplied model description.
     pub description: Option<String>,
+    /// Optional maximum context window reported by the provider.
     pub context_length: Option<u64>,
+    /// Optional flag indicating whether tools are supported.
     pub tools_supported: Option<bool>,
     /// Whether the model supports parallel tool calls
     pub supports_parallel_tool_calls: Option<bool>,
