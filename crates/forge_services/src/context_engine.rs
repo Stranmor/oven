@@ -455,18 +455,7 @@ impl<
     }
 
     async fn is_indexed(&self, path: &std::path::Path) -> Result<bool> {
-        let credentials = match self.get_workspace_credentials().await {
-            Ok(creds) => creds,
-            Err(_) => return Ok(local_workspace_has_project_model(path)),
-        };
-        let (token, _user_id) = credentials;
-        match self
-            .find_workspace_by_path(path.to_path_buf(), &token)
-            .await
-        {
-            Ok(workspace) => Ok(workspace.is_some()),
-            Err(_) => Ok(local_workspace_has_project_model(path)),
-        }
+        Ok(local_workspace_has_project_model(path))
     }
 
     async fn get_workspace_status(&self, path: PathBuf) -> Result<Vec<forge_domain::FileStatus>> {
@@ -567,6 +556,8 @@ mod tests {
     use tempfile::TempDir;
     struct LocalSearchInfra {
         cwd: PathBuf,
+        credential: Option<AuthCredential>,
+        workspaces: Vec<WorkspaceInfo>,
         remote_search_called: Arc<AtomicBool>,
         range_read_called: Arc<AtomicBool>,
     }
@@ -625,7 +616,7 @@ mod tests {
         }
 
         async fn get_credential(&self, _id: &ProviderId) -> Result<Option<AuthCredential>> {
-            Ok(None)
+            Ok(self.credential.clone())
         }
 
         async fn remove_credential(&self, _id: &ProviderId) -> Result<()> {
@@ -682,7 +673,7 @@ mod tests {
             &self,
             _auth_token: &forge_domain::ApiKey,
         ) -> Result<Vec<WorkspaceInfo>> {
-            bail!("unused remote workspace listing")
+            Ok(self.workspaces.clone())
         }
 
         async fn get_workspace(
@@ -872,6 +863,8 @@ mod tests {
         let setup = ForgeWorkspaceService::new(
             Arc::new(LocalSearchInfra {
                 cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
                 remote_search_called: Arc::clone(&remote_search_called),
                 range_read_called: Arc::clone(&range_read_called),
             }),
@@ -909,6 +902,8 @@ mod tests {
         let setup = ForgeWorkspaceService::new(
             Arc::new(LocalSearchInfra {
                 cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
                 remote_search_called,
                 range_read_called,
             }),
@@ -923,12 +918,59 @@ mod tests {
         Ok(())
     }
 
+    fn workspace_auth_credential() -> AuthCredential {
+        let mut url_params = HashMap::new();
+        url_params.insert(
+            "user_id".to_string().into(),
+            UserId::generate().to_string().into(),
+        );
+        AuthCredential {
+            id: ProviderId::FORGE_SERVICES,
+            auth_details: AuthDetails::ApiKey(forge_domain::ApiKey::from("test-token".to_string())),
+            url_params,
+        }
+    }
+
+    fn remote_workspace(root: &Path) -> WorkspaceInfo {
+        WorkspaceInfo {
+            workspace_id: WorkspaceId::generate(),
+            working_dir: root.to_string_lossy().to_string(),
+            node_count: Some(1),
+            relation_count: Some(0),
+            last_updated: Some(chrono::Utc::now()),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn is_indexed_rejects_remote_workspace_without_local_project_model_manifest() -> Result<()>
+    {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: Some(workspace_auth_credential()),
+                workspaces: vec![remote_workspace(&root)],
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::new(AtomicBool::new(false)),
+            }),
+            Arc::new(NoopDiscovery),
+        );
+        let actual = WorkspaceService::is_indexed(&setup, &root).await?;
+        let expected = false;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn query_workspace_requires_persisted_project_model_manifest() -> Result<()> {
         let (_fixture, root) = fixture_workspace()?;
         let setup = ForgeWorkspaceService::new(
             Arc::new(LocalSearchInfra {
                 cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
                 remote_search_called: Arc::new(AtomicBool::new(false)),
                 range_read_called: Arc::new(AtomicBool::new(false)),
             }),
