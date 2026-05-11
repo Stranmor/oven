@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -217,11 +216,19 @@ impl<
 
         Ok((is_new_workspace, workspace_id))
     }
-    fn query_local_workspace(&self, path: PathBuf, params: SearchParams<'_>) -> Result<Vec<Node>> {
+    async fn query_local_workspace(
+        &self,
+        path: PathBuf,
+        params: SearchParams<'_>,
+    ) -> Result<Vec<Node>> {
         let root = canonicalize_path(path)?;
-        let model_dir = root.join(".forge_project_model");
-        let indexer = ProjectIndexer::new(&root, model_dir);
-        let manifest = indexer.index()?;
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+        let manifest = indexer.read_manifest().with_context(|| {
+            format!(
+                "Workspace project model is not indexed at {}. Run project-model indexing first.",
+                local_project_model_manifest(&root).display()
+            )
+        })?;
         let retrieval_query = RetrievalQuery {
             text: Some(params.query.to_string()),
             path: params.starts_with.clone(),
@@ -239,12 +246,12 @@ impl<
                 freshness: FreshnessState {
                     changed: Vec::new(),
                     deleted: Vec::new(),
-                    added: manifest
+                    added: Vec::new(),
+                    unchanged: manifest
                         .files
                         .iter()
                         .map(|file| file.path.clone())
                         .collect(),
-                    unchanged: Vec::new(),
                     fresh: true,
                 },
                 stale_policy: StaleEvidencePolicy::Mark,
@@ -259,7 +266,11 @@ impl<
                 continue;
             };
             let absolute_path = root.join(&evidence.path);
-            let content = read_line_range(&absolute_path, start_line, end_line)?;
+            let (content, _) = self
+                .infra
+                .range_read_utf8(&absolute_path, u64::from(start_line), u64::from(end_line))
+                .await
+                .with_context(|| format!("read {}", absolute_path.display()))?;
             nodes.push(Node {
                 node_id: NodeId::new(evidence.id),
                 node: NodeData::FileChunk(FileChunk {
@@ -322,20 +333,16 @@ fn evidence_line_range(
         })
 }
 
-fn read_line_range(path: &Path, start_line: u32, end_line: u32) -> Result<String> {
-    let content = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let start = start_line.saturating_sub(1) as usize;
-    let count = end_line.saturating_sub(start_line).saturating_add(1) as usize;
-    Ok(content
-        .lines()
-        .skip(start)
-        .take(count)
-        .collect::<Vec<_>>()
-        .join("\n"))
+fn local_project_model_dir(path: &Path) -> PathBuf {
+    path.join(".forge_project_model")
+}
+
+fn local_project_model_manifest(path: &Path) -> PathBuf {
+    local_project_model_dir(path).join("project_manifest.json")
 }
 
 fn local_workspace_has_project_model(path: &Path) -> bool {
-    path.is_dir()
+    path.is_dir() && local_project_model_manifest(path).is_file()
 }
 
 #[async_trait]
@@ -380,7 +387,7 @@ impl<
         path: PathBuf,
         params: forge_domain::SearchParams<'_>,
     ) -> Result<Vec<forge_domain::Node>> {
-        self.query_local_workspace(path, params)
+        self.query_local_workspace(path, params).await
     }
 
     /// Lists all workspaces.
@@ -543,6 +550,7 @@ impl<
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::fs;
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -560,6 +568,7 @@ mod tests {
     struct LocalSearchInfra {
         cwd: PathBuf,
         remote_search_called: Arc<AtomicBool>,
+        range_read_called: Arc<AtomicBool>,
     }
 
     struct NoopDiscovery;
@@ -736,6 +745,7 @@ mod tests {
             start_line: u64,
             end_line: u64,
         ) -> Result<(String, forge_domain::FileInfo)> {
+            self.range_read_called.store(true, Ordering::SeqCst);
             let content = fs::read_to_string(path)?;
             let selected = content
                 .lines()
@@ -847,14 +857,23 @@ mod tests {
         Ok((fixture, root))
     }
 
+    fn write_fixture_project_model(root: &Path) -> Result<PathBuf> {
+        let setup = ProjectIndexer::new(root, local_project_model_dir(root));
+        let manifest = setup.index()?;
+        setup.write_manifest(&manifest)
+    }
+
     #[tokio::test]
     async fn query_workspace_uses_local_project_model_and_returns_file_chunks() -> Result<()> {
         let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
         let remote_search_called = Arc::new(AtomicBool::new(false));
+        let range_read_called = Arc::new(AtomicBool::new(false));
         let setup = ForgeWorkspaceService::new(
             Arc::new(LocalSearchInfra {
                 cwd: root.clone(),
                 remote_search_called: Arc::clone(&remote_search_called),
+                range_read_called: Arc::clone(&range_read_called),
             }),
             Arc::new(NoopDiscovery),
         );
@@ -878,6 +897,54 @@ mod tests {
         assert!(chunk.1.end_line >= 7);
         assert!(chunk.0.contains("src/lib.rs"));
         assert!(!remote_search_called.load(Ordering::SeqCst));
+        assert!(range_read_called.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn is_indexed_requires_project_model_manifest_without_remote_credentials() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let remote_search_called = Arc::new(AtomicBool::new(false));
+        let range_read_called = Arc::new(AtomicBool::new(false));
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                remote_search_called,
+                range_read_called,
+            }),
+            Arc::new(NoopDiscovery),
+        );
+        let actual_before = WorkspaceService::is_indexed(&setup, &root).await?;
+        write_fixture_project_model(&root)?;
+        let actual_after = WorkspaceService::is_indexed(&setup, &root).await?;
+        let expected = (false, true);
+
+        assert_eq!((actual_before, actual_after), expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_workspace_requires_persisted_project_model_manifest() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::new(AtomicBool::new(false)),
+            }),
+            Arc::new(NoopDiscovery),
+        );
+        let params = SearchParams::new("build runtime needle", "runtime integration proof");
+        let actual = WorkspaceService::query_workspace(&setup, root, params).await;
+        let expected = "Workspace project model is not indexed";
+        let actual_error = match actual {
+            Ok(nodes) => {
+                anyhow::bail!("expected missing manifest error, got {} nodes", nodes.len())
+            }
+            Err(error) => error.to_string(),
+        };
+
+        assert!(actual_error.contains(expected));
         Ok(())
     }
 
