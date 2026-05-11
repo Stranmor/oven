@@ -66,14 +66,99 @@ struct LaunchedProcess {
     cwd: String,
     logs: Arc<Mutex<VecDeque<ProcessLogEntry>>>,
     dropped_before_cursor: Arc<AtomicU64>,
-    stdout: Arc<Mutex<Vec<u8>>>,
-    stderr: Arc<Mutex<Vec<u8>>>,
+    stdout: OutputCapture,
+    stderr: OutputCapture,
     stdout_task: Option<tokio::task::JoinHandle<()>>,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
     output_mirror: OutputMirrorControl,
 }
 
+#[derive(Clone, Copy)]
+enum LaunchCaptureMode {
+    ForegroundSnapshot,
+    ManagedOnly,
+}
+
+impl LaunchCaptureMode {
+    fn output_capture(self) -> OutputCapture {
+        match self {
+            Self::ForegroundSnapshot => OutputCapture::snapshot(),
+            Self::ManagedOnly => OutputCapture::managed(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct OutputCapture {
+    mode: Arc<OutputCaptureMode>,
+}
+
+enum OutputCaptureMode {
+    Snapshot {
+        bytes: Mutex<Vec<u8>>,
+        enabled: AtomicBool,
+    },
+    Managed,
+}
+
+impl OutputCapture {
+    fn snapshot() -> Self {
+        Self {
+            mode: Arc::new(OutputCaptureMode::Snapshot {
+                bytes: Mutex::new(Vec::new()),
+                enabled: AtomicBool::new(true),
+            }),
+        }
+    }
+
+    fn managed() -> Self {
+        Self { mode: Arc::new(OutputCaptureMode::Managed) }
+    }
+
+    async fn disable_snapshot_capture(&self) {
+        if let OutputCaptureMode::Snapshot { bytes, enabled } = self.mode.as_ref() {
+            enabled.store(false, Ordering::Relaxed);
+            drop(bytes.lock().await);
+        }
+    }
+
+    async fn push(&self, bytes: &[u8]) {
+        if let OutputCaptureMode::Snapshot { bytes: output, enabled } = self.mode.as_ref() {
+            let mut output = output.lock().await;
+            if enabled.load(Ordering::Relaxed) {
+                output.extend_from_slice(bytes);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn is_managed(&self) -> bool {
+        matches!(self.mode.as_ref(), OutputCaptureMode::Managed)
+    }
+
+    #[cfg(test)]
+    async fn captured_len(&self) -> usize {
+        match self.mode.as_ref() {
+            OutputCaptureMode::Snapshot { bytes, .. } => bytes.lock().await.len(),
+            OutputCaptureMode::Managed => 0,
+        }
+    }
+
+    async fn snapshot_output(&self) -> String {
+        match self.mode.as_ref() {
+            OutputCaptureMode::Snapshot { bytes, .. } => {
+                bytes.lock().await.to_str_lossy().into_owned()
+            }
+            OutputCaptureMode::Managed => String::new(),
+        }
+    }
+}
+
 impl LaunchedProcess {
+    async fn disable_foreground_capture(&self) {
+        self.stdout.disable_snapshot_capture().await;
+        self.stderr.disable_snapshot_capture().await;
+    }
     fn disable_output_mirroring(&self) {
         self.output_mirror.disable();
     }
@@ -238,6 +323,7 @@ where
         working_dir: &Path,
         env_vars: Option<Vec<String>>,
         silent: bool,
+        capture_mode: LaunchCaptureMode,
     ) -> anyhow::Result<LaunchedProcess> {
         let mut prepared_command = self.prepare_command(&command, working_dir, env_vars);
         prepared_command.stdin(std::process::Stdio::null());
@@ -245,8 +331,8 @@ where
         let logs = Arc::new(Mutex::new(VecDeque::new()));
         let next_cursor = Arc::new(AtomicU64::new(1));
         let dropped_before_cursor = Arc::new(AtomicU64::new(0));
-        let stdout = Arc::new(Mutex::new(Vec::new()));
-        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let stdout = capture_mode.output_capture();
+        let stderr = capture_mode.output_capture();
 
         let output_mirror = OutputMirrorControl::new(!silent);
         let stdout_task = child.stdout.take().map(|stdout_pipe| {
@@ -293,7 +379,7 @@ where
         logs: Arc<Mutex<VecDeque<ProcessLogEntry>>>,
         next_cursor: Arc<AtomicU64>,
         dropped_before_cursor: Arc<AtomicU64>,
-        output: Arc<Mutex<Vec<u8>>>,
+        output: OutputCapture,
         mut writer: W,
     ) -> tokio::task::JoinHandle<()>
     where
@@ -313,7 +399,7 @@ where
                 let Some(bytes) = buffer.get(..count) else {
                     break;
                 };
-                output.lock().await.extend_from_slice(bytes);
+                output.push(bytes).await;
                 let content = bytes.to_str_lossy().into_owned();
                 let mut logs = logs.lock().await;
                 let cursor = next_cursor.fetch_add(1, Ordering::Relaxed);
@@ -341,8 +427,8 @@ where
         })
     }
 
-    async fn snapshot_output(output: &Arc<Mutex<Vec<u8>>>) -> String {
-        output.lock().await.to_str_lossy().into_owned()
+    async fn snapshot_output(output: &OutputCapture) -> String {
+        output.snapshot_output().await
     }
 
     async fn register_launched_process(&self, launched: LaunchedProcess) -> anyhow::Result<()> {
@@ -360,7 +446,13 @@ where
         handoff_timeout: ShellHandoffTimeoutSeconds,
     ) -> anyhow::Result<CommandExecutionOutput> {
         let _guard = self.ready.lock().await;
-        let mut launched = self.launch_process(command, working_dir, env_vars, silent)?;
+        let mut launched = self.launch_process(
+            command,
+            working_dir,
+            env_vars,
+            silent,
+            LaunchCaptureMode::ForegroundSnapshot,
+        )?;
         let status = tokio::time::timeout(handoff_timeout.duration(), launched.child.wait()).await;
         match status {
             Ok(status) => {
@@ -392,6 +484,7 @@ where
             Err(_) => {
                 launched.disable_output_mirroring();
                 let process = launched.start_output();
+                launched.disable_foreground_capture().await;
                 let stdout = Self::snapshot_output(&launched.stdout).await;
                 let captured_stderr = Self::snapshot_output(&launched.stderr).await;
                 let stderr = format!(
@@ -763,7 +856,13 @@ where
         working_dir: PathBuf,
         env_vars: Option<Vec<String>>,
     ) -> anyhow::Result<ProcessStartOutput> {
-        let launched = self.launch_process(command, &working_dir, env_vars, true)?;
+        let launched = self.launch_process(
+            command,
+            &working_dir,
+            env_vars,
+            true,
+            LaunchCaptureMode::ManagedOnly,
+        )?;
         let output = launched.start_output();
         self.register_launched_process(launched).await?;
         Ok(output)
@@ -774,7 +873,7 @@ where
         process_id: ProcessId,
         wait: Option<ProcessObservationWaitSeconds>,
     ) -> anyhow::Result<ProcessStatus> {
-        let deadline = wait.map(|wait| Instant::now() + wait.duration());
+        let deadline = wait.and_then(|wait| Instant::now().checked_add(wait.duration()));
         loop {
             let status = self.process_status_once(process_id.clone()).await?;
             if !matches!(status.status, ProcessStatusKind::Running) {
@@ -796,7 +895,7 @@ where
         cursor: ProcessReadCursor,
         wait: Option<ProcessObservationWaitSeconds>,
     ) -> anyhow::Result<ProcessReadOutput> {
-        let deadline = wait.map(|wait| Instant::now() + wait.duration());
+        let deadline = wait.and_then(|wait| Instant::now().checked_add(wait.duration()));
         loop {
             let (output, status) = self.read_process_once(process_id.clone(), cursor).await?;
             if !output.entries.is_empty() || !matches!(status, ProcessStatusKind::Running) {
@@ -1039,6 +1138,106 @@ mod tests {
                 .entries
                 .iter()
                 .any(|entry| entry.content.contains("after-handoff-err"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_start_uses_managed_capture_without_snapshot_buffer() {
+        let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
+        let mut launched = fixture
+            .launch_process(
+                "printf managed-output; sleep 1".to_string(),
+                &PathBuf::new().join("."),
+                None,
+                true,
+                LaunchCaptureMode::ManagedOnly,
+            )
+            .unwrap();
+
+        let actual = (launched.stdout.is_managed(), launched.stderr.is_managed());
+        let expected = (true, true);
+
+        assert_eq!(actual, expected);
+        let _ = launched.child.kill().await;
+        let _ = join_output_tasks(launched.stdout_task.take(), launched.stderr_task.take()).await;
+    }
+
+    #[tokio::test]
+    async fn test_disabled_snapshot_capture_does_not_grow_after_handoff() {
+        let fixture = OutputCapture::snapshot();
+        fixture.push(b"before").await;
+        fixture.disable_snapshot_capture().await;
+        let before_late_output = fixture.captured_len().await;
+
+        fixture.push(b"after").await;
+        let actual = fixture.captured_len().await;
+        let expected = before_late_output;
+
+        assert_eq!(actual, expected);
+        assert_eq!(fixture.snapshot_output().await, "before");
+    }
+
+    #[tokio::test]
+    async fn test_disabled_snapshot_capture_blocks_in_flight_push_after_flag_check() {
+        let fixture = OutputCapture::snapshot();
+        let OutputCaptureMode::Snapshot { bytes, enabled } = fixture.mode.as_ref() else {
+            panic!("fixture should use snapshot capture");
+        };
+        let guard = bytes.lock().await;
+        let push_fixture = fixture.clone();
+        let push_task = tokio::spawn(async move {
+            push_fixture.push(b"late").await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        enabled.store(false, Ordering::Relaxed);
+        drop(guard);
+        push_task.await.unwrap();
+        let actual = fixture.captured_len().await;
+        let expected = 0;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_shell_handoff_stops_snapshot_capture_after_timeout() {
+        let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
+
+        let actual = fixture
+            .execute_command(
+                "printf before-snapshot; sleep 1.05; printf after-snapshot; sleep 2".to_string(),
+                PathBuf::new().join("."),
+                true,
+                None,
+                ShellHandoffTimeoutSeconds::new(1).unwrap(),
+            )
+            .await
+            .unwrap();
+        let process = actual
+            .process
+            .clone()
+            .expect("long-running command should be handed off");
+        let initial_output = fixture
+            .read_process(process.process_id.clone(), ProcessReadCursor::new(0), None)
+            .await
+            .unwrap();
+        let process_output = fixture
+            .read_process(
+                process.process_id.clone(),
+                initial_output.next_cursor,
+                Some(ProcessObservationWaitSeconds::new(3).unwrap()),
+            )
+            .await
+            .unwrap();
+        let _ = fixture.kill_process(process.process_id).await;
+        let expected = "before-snapshot";
+
+        assert_eq!(actual.output.stdout, expected);
+        assert!(
+            process_output
+                .entries
+                .iter()
+                .any(|entry| entry.content.contains("after-snapshot"))
         );
     }
 
@@ -1324,7 +1523,7 @@ mod tests {
         let (mut writer, reader) = tokio::io::duplex(64);
         let log_guard = logs.lock().await;
 
-        let output = Arc::new(Mutex::new(Vec::new()));
+        let output = OutputCapture::snapshot();
         let stream_task = ForgeCommandExecutorService::<Stdout, Stderr>::capture_stream(
             reader,
             ProcessStream::Stdout,
