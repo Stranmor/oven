@@ -2802,6 +2802,7 @@ dependencies = [
  "forge_domain",
  "forge_eventsource",
  "forge_fs",
+ "forge_project_model",
  "forge_snaps",
  "forge_stream",
  "forge_test_kit",

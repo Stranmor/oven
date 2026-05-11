@@ -1,13 +1,18 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use forge_app::{CommandInfra, EnvironmentInfra, FileReaderInfra, WalkerInfra, WorkspaceService};
 use forge_domain::{
-    AuthCredential, AuthDetails, ProviderId, ProviderRepository, SyncProgress, UserId, WorkspaceId,
-    WorkspaceIndexRepository,
+    AuthCredential, AuthDetails, CodeSearchQuery, FileChunk, Node, NodeData, NodeId, ProviderId,
+    ProviderRepository, SearchParams, SyncProgress, UserId, WorkspaceId, WorkspaceIndexRepository,
+};
+use forge_project_model::{
+    ContextPack, ContextPackSelection, FreshnessState, ProjectIndexer, RetrievalQuery,
+    StaleEvidencePolicy, retrieve,
 };
 use forge_stream::MpscStream;
 use futures::future::join_all;
@@ -212,6 +217,147 @@ impl<
 
         Ok((is_new_workspace, workspace_id))
     }
+    fn query_local_workspace(&self, path: PathBuf, params: SearchParams<'_>) -> Result<Vec<Node>> {
+        let root = canonicalize_path(path)?;
+        let model_dir = root.join(".forge_project_model");
+        let indexer = ProjectIndexer::new(&root, model_dir);
+        let manifest = indexer.index()?;
+        let query =
+            CodeSearchQuery::new(UserId::generate(), WorkspaceId::generate(), params.clone());
+        let retrieval_query = RetrievalQuery {
+            text: Some(query.data.query.to_string()),
+            path: query.data.starts_with.clone(),
+            symbol: None,
+            limit: query.data.limit.unwrap_or(10),
+            include_graph_expansion: true,
+        };
+        let results = retrieve(&manifest, &retrieval_query);
+        let pack = ContextPack::from_selection(
+            &manifest,
+            ContextPackSelection {
+                retrieval_results: results,
+                shards: Vec::new(),
+                evidence: Vec::new(),
+                freshness: FreshnessState {
+                    changed: Vec::new(),
+                    deleted: Vec::new(),
+                    added: manifest
+                        .files
+                        .iter()
+                        .map(|file| file.path.clone())
+                        .collect(),
+                    unchanged: Vec::new(),
+                    fresh: true,
+                },
+                stale_policy: StaleEvidencePolicy::Mark,
+            },
+        )?;
+        let mut nodes = Vec::new();
+        for evidence in pack.evidence {
+            if !matches_path_filters(&evidence.path, &query.data) {
+                continue;
+            }
+            let Some((start_line, end_line)) = evidence_line_range(&manifest, &evidence.id) else {
+                continue;
+            };
+            let absolute_path = root.join(&evidence.path);
+            let content = read_line_range(&absolute_path, start_line, end_line)?;
+            nodes.push(Node {
+                node_id: NodeId::new(evidence.id),
+                node: NodeData::FileChunk(FileChunk {
+                    file_path: evidence.path,
+                    content,
+                    start_line,
+                    end_line,
+                }),
+                relevance: Some(evidence.score),
+                distance: None,
+            });
+        }
+        Ok(nodes)
+    }
+
+    async fn query_remote_workspace(
+        &self,
+        path: PathBuf,
+        params: SearchParams<'_>,
+    ) -> Result<Vec<Node>> {
+        let (token, user_id) = self.get_workspace_credentials().await?;
+
+        let workspace = self
+            .find_workspace_by_path(path, &token)
+            .await?
+            .ok_or(forge_domain::Error::WorkspaceNotFound)?;
+
+        let search_query = CodeSearchQuery::new(user_id, workspace.workspace_id.clone(), params);
+
+        let results = self
+            .infra
+            .search(&search_query, &token)
+            .await
+            .context("Failed to search")?;
+
+        Ok(results)
+    }
+}
+
+fn matches_path_filters(path: &str, params: &SearchParams<'_>) -> bool {
+    if let Some(prefix) = &params.starts_with
+        && !path.starts_with(prefix)
+    {
+        return false;
+    }
+    if let Some(suffixes) = &params.ends_with
+        && !suffixes.iter().any(|suffix| path.ends_with(suffix))
+    {
+        return false;
+    }
+    true
+}
+
+fn evidence_line_range(
+    manifest: &forge_project_model::ProjectManifest,
+    evidence_id: &str,
+) -> Option<(u32, u32)> {
+    manifest
+        .symbols
+        .iter()
+        .find(|symbol| symbol.id == evidence_id)
+        .map(|symbol| (symbol.start_line, symbol.end_line))
+        .or_else(|| {
+            manifest
+                .shards
+                .iter()
+                .find(|shard| shard.id == evidence_id)
+                .map(|shard| (shard.start_line, shard.end_line))
+        })
+        .or_else(|| {
+            manifest
+                .files
+                .iter()
+                .find(|file| file.path == evidence_id)
+                .map(|file| (1, file.lines))
+        })
+}
+
+fn read_line_range(path: &Path, start_line: u32, end_line: u32) -> Result<String> {
+    let content = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let start = start_line.saturating_sub(1) as usize;
+    let count = end_line.saturating_sub(start_line).saturating_add(1) as usize;
+    Ok(content
+        .lines()
+        .skip(start)
+        .take(count)
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+fn local_workspace_has_project_model(path: &Path) -> bool {
+    path.exists()
+        && ProjectIndexer::new(path, path.join(".forge_project_model"))
+            .index()
+            .map(|manifest| !manifest.files.is_empty())
+            .unwrap_or(false)
 }
 
 #[async_trait]
@@ -256,23 +402,17 @@ impl<
         path: PathBuf,
         params: forge_domain::SearchParams<'_>,
     ) -> Result<Vec<forge_domain::Node>> {
-        let (token, user_id) = self.get_workspace_credentials().await?;
-
-        let workspace = self
-            .find_workspace_by_path(path, &token)
-            .await?
-            .ok_or(forge_domain::Error::WorkspaceNotFound)?;
-
-        let search_query =
-            forge_domain::CodeBase::new(user_id, workspace.workspace_id.clone(), params);
-
-        let results = self
-            .infra
-            .search(&search_query, &token)
-            .await
-            .context("Failed to search")?;
-
-        Ok(results)
+        let remote_results = self
+            .query_remote_workspace(path.clone(), params.clone())
+            .await;
+        match remote_results {
+            Ok(results) => Ok(results),
+            Err(remote_error) => self.query_local_workspace(path, params).with_context(|| {
+                format!(
+                    "local project-model search fallback after remote search failed: {remote_error}"
+                )
+            }),
+        }
     }
 
     /// Lists all workspaces.
@@ -340,13 +480,17 @@ impl<
     }
 
     async fn is_indexed(&self, path: &std::path::Path) -> Result<bool> {
-        let (token, _user_id) = self.get_workspace_credentials().await?;
+        let credentials = match self.get_workspace_credentials().await {
+            Ok(creds) => creds,
+            Err(_) => return Ok(local_workspace_has_project_model(path)),
+        };
+        let (token, _user_id) = credentials;
         match self
             .find_workspace_by_path(path.to_path_buf(), &token)
             .await
         {
             Ok(workspace) => Ok(workspace.is_some()),
-            Err(_) => Ok(false), // Path doesn't exist or other error, so it can't be indexed
+            Err(_) => Ok(local_workspace_has_project_model(path)),
         }
     }
 
@@ -375,11 +519,16 @@ impl<
     }
 
     async fn is_authenticated(&self) -> Result<bool> {
-        Ok(self
+        if self
             .infra
             .get_credential(&ProviderId::FORGE_SERVICES)
             .await?
-            .is_some())
+            .is_some()
+        {
+            return Ok(true);
+        }
+        let cwd = self.infra.get_environment().cwd;
+        Ok(local_workspace_has_project_model(&cwd))
     }
 
     async fn init_auth_credentials(&self) -> Result<forge_domain::WorkspaceAuth> {
@@ -419,5 +568,390 @@ impl<
         } else {
             Err(forge_domain::Error::WorkspaceAlreadyInitialized(workspace_id).into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::pin::Pin;
+
+    use anyhow::{Result, bail};
+    use forge_app::{WalkedFile, WalkedFileStream, Walker};
+    use forge_domain::{
+        AnyProvider, AuthCredential, CommandExecutionOutput, CommandOutput, ConfigOperation,
+        Environment, FileHash, ProcessId, ProcessReadCursor, ProcessReadOutput, ProcessStartOutput,
+        ProcessStatus, ProviderTemplate, ShellHandoffTimeoutSeconds, WorkspaceFiles, WorkspaceInfo,
+    };
+    use futures::Stream;
+    use pretty_assertions::assert_eq;
+    use tempfile::TempDir;
+
+    #[derive(Clone)]
+    struct LocalSearchInfra {
+        cwd: PathBuf,
+    }
+
+    struct NoopDiscovery;
+
+    #[async_trait]
+    impl FileDiscovery for NoopDiscovery {
+        async fn discover(&self, _dir_path: &Path) -> Result<Vec<PathBuf>> {
+            bail!("unused discovery")
+        }
+    }
+
+    impl EnvironmentInfra for LocalSearchInfra {
+        type Config = forge_config::ForgeConfig;
+
+        fn get_env_var(&self, _key: &str) -> Option<String> {
+            None
+        }
+
+        fn get_env_vars(&self) -> BTreeMap<String, String> {
+            BTreeMap::new()
+        }
+
+        fn get_environment(&self) -> Environment {
+            Environment {
+                os: "test".to_string(),
+                cwd: self.cwd.clone(),
+                home: None,
+                shell: "sh".to_string(),
+                base_path: self.cwd.join(".forge"),
+            }
+        }
+
+        fn get_config(&self) -> Result<Self::Config> {
+            Ok(forge_config::ForgeConfig::default())
+        }
+
+        async fn update_environment(&self, _ops: Vec<ConfigOperation>) -> Result<()> {
+            bail!("unused environment update")
+        }
+    }
+
+    #[async_trait]
+    impl ProviderRepository for LocalSearchInfra {
+        async fn get_all_providers(&self) -> Result<Vec<AnyProvider>> {
+            bail!("unused provider listing")
+        }
+
+        async fn get_provider(&self, _id: ProviderId) -> Result<ProviderTemplate> {
+            bail!("unused provider lookup")
+        }
+
+        async fn upsert_credential(&self, _credential: AuthCredential) -> Result<()> {
+            bail!("unused credential write")
+        }
+
+        async fn get_credential(&self, _id: &ProviderId) -> Result<Option<AuthCredential>> {
+            Ok(None)
+        }
+
+        async fn remove_credential(&self, _id: &ProviderId) -> Result<()> {
+            bail!("unused credential removal")
+        }
+
+        async fn migrate_env_credentials(&self) -> Result<Option<forge_domain::MigrationResult>> {
+            Ok(None)
+        }
+    }
+
+    #[async_trait]
+    impl WorkspaceIndexRepository for LocalSearchInfra {
+        async fn authenticate(&self) -> Result<forge_domain::WorkspaceAuth> {
+            bail!("unused remote authentication")
+        }
+
+        async fn create_workspace(
+            &self,
+            _working_dir: &Path,
+            _auth_token: &forge_domain::ApiKey,
+        ) -> Result<WorkspaceId> {
+            bail!("unused remote workspace creation")
+        }
+
+        async fn upload_files(
+            &self,
+            _upload: &forge_domain::FileUpload,
+            _auth_token: &forge_domain::ApiKey,
+        ) -> Result<forge_domain::FileUploadInfo> {
+            bail!("unused remote upload")
+        }
+
+        async fn search(
+            &self,
+            _query: &CodeSearchQuery<'_>,
+            _auth_token: &forge_domain::ApiKey,
+        ) -> Result<Vec<Node>> {
+            bail!("unused remote search")
+        }
+
+        async fn list_workspaces(
+            &self,
+            _auth_token: &forge_domain::ApiKey,
+        ) -> Result<Vec<WorkspaceInfo>> {
+            bail!("unused remote workspace listing")
+        }
+
+        async fn get_workspace(
+            &self,
+            _workspace_id: &WorkspaceId,
+            _auth_token: &forge_domain::ApiKey,
+        ) -> Result<Option<WorkspaceInfo>> {
+            bail!("unused remote workspace lookup")
+        }
+
+        async fn list_workspace_files(
+            &self,
+            _workspace: &WorkspaceFiles,
+            _auth_token: &forge_domain::ApiKey,
+        ) -> Result<Vec<FileHash>> {
+            bail!("unused remote file listing")
+        }
+
+        async fn delete_files(
+            &self,
+            _deletion: &forge_domain::FileDeletion,
+            _auth_token: &forge_domain::ApiKey,
+        ) -> Result<()> {
+            bail!("unused remote deletion")
+        }
+
+        async fn delete_workspace(
+            &self,
+            _workspace_id: &WorkspaceId,
+            _auth_token: &forge_domain::ApiKey,
+        ) -> Result<()> {
+            bail!("unused remote workspace deletion")
+        }
+    }
+
+    #[async_trait]
+    impl FileReaderInfra for LocalSearchInfra {
+        async fn read_utf8(&self, path: &Path) -> Result<String> {
+            Ok(fs::read_to_string(path)?)
+        }
+
+        fn read_batch_utf8(
+            &self,
+            _batch_size: usize,
+            paths: Vec<PathBuf>,
+        ) -> impl Stream<Item = (PathBuf, Result<String>)> + Send {
+            futures::stream::iter(paths.into_iter().map(|path| {
+                let content = fs::read_to_string(&path).map_err(anyhow::Error::from);
+                (path, content)
+            }))
+        }
+
+        async fn read(&self, path: &Path) -> Result<Vec<u8>> {
+            Ok(fs::read(path)?)
+        }
+
+        async fn range_read_utf8(
+            &self,
+            path: &Path,
+            start_line: u64,
+            end_line: u64,
+        ) -> Result<(String, forge_domain::FileInfo)> {
+            let content = fs::read_to_string(path)?;
+            let selected = content
+                .lines()
+                .skip(start_line.saturating_sub(1) as usize)
+                .take(end_line.saturating_sub(start_line).saturating_add(1) as usize)
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok((
+                selected,
+                forge_domain::FileInfo::new(
+                    start_line,
+                    end_line,
+                    content.lines().count() as u64,
+                    String::new(),
+                ),
+            ))
+        }
+    }
+
+    #[async_trait]
+    impl CommandInfra for LocalSearchInfra {
+        async fn execute_command(
+            &self,
+            _command: String,
+            _working_dir: PathBuf,
+            _silent: bool,
+            _env_vars: Option<Vec<String>>,
+            _handoff_timeout: ShellHandoffTimeoutSeconds,
+        ) -> Result<CommandExecutionOutput> {
+            Ok(CommandExecutionOutput {
+                output: CommandOutput {
+                    command: String::new(),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: Some(0),
+                },
+                process: None,
+            })
+        }
+
+        async fn execute_command_raw(
+            &self,
+            _command: &str,
+            _working_dir: PathBuf,
+            _env_vars: Option<Vec<String>>,
+        ) -> Result<std::process::ExitStatus> {
+            bail!("unused raw command")
+        }
+
+        async fn start_process(
+            &self,
+            _command: String,
+            _working_dir: PathBuf,
+            _env_vars: Option<Vec<String>>,
+        ) -> Result<ProcessStartOutput> {
+            bail!("unused process start")
+        }
+
+        async fn process_status(
+            &self,
+            _process_id: ProcessId,
+            _wait: Option<forge_domain::ProcessObservationWaitSeconds>,
+        ) -> Result<ProcessStatus> {
+            bail!("unused process status")
+        }
+
+        async fn read_process(
+            &self,
+            _process_id: ProcessId,
+            _cursor: ProcessReadCursor,
+            _wait: Option<forge_domain::ProcessObservationWaitSeconds>,
+        ) -> Result<ProcessReadOutput> {
+            bail!("unused process read")
+        }
+
+        async fn list_processes(&self) -> Result<Vec<ProcessStatus>> {
+            bail!("unused process list")
+        }
+
+        async fn kill_process(&self, _process_id: ProcessId) -> Result<ProcessStatus> {
+            bail!("unused process kill")
+        }
+    }
+
+    #[async_trait]
+    impl WalkerInfra for LocalSearchInfra {
+        async fn walk(&self, _config: Walker) -> Result<Vec<WalkedFile>> {
+            bail!("unused walker")
+        }
+
+        async fn walk_stream(&self, _config: Walker) -> Result<WalkedFileStream> {
+            let stream = futures::stream::empty::<Result<WalkedFile>>();
+            Ok(Pin::from(Box::new(stream)))
+        }
+    }
+
+    fn fixture_workspace() -> Result<(TempDir, PathBuf)> {
+        let fixture = TempDir::new()?;
+        let root = fixture.path().join("workspace");
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"runtime_fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )?;
+        fs::write(
+            root.join("src").join("lib.rs"),
+            "pub struct RuntimeNeedle {\n    pub value: usize,\n}\n\npub fn build_runtime_needle() -> RuntimeNeedle {\n    RuntimeNeedle { value: 7 }\n}\n",
+        )?;
+        Ok((fixture, root))
+    }
+
+    #[tokio::test]
+    async fn query_workspace_uses_local_project_model_and_returns_file_chunks() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra { cwd: root.clone() }),
+            Arc::new(NoopDiscovery),
+        );
+        let params = SearchParams::new("build runtime needle", "runtime integration proof")
+            .limit(5usize)
+            .ends_with(vec![".rs".to_string()]);
+        let actual = WorkspaceService::query_workspace(&setup, root, params).await?;
+        let chunk = actual
+            .iter()
+            .find_map(|node| match &node.node {
+                NodeData::FileChunk(chunk) if chunk.content.contains("build_runtime_needle") => {
+                    Some((node.node_id.as_str().to_string(), chunk.clone()))
+                }
+                _ => None,
+            })
+            .expect("local project-model search should return the Rust function chunk");
+        let expected = "src/lib.rs".to_string();
+
+        assert_eq!(chunk.1.file_path, expected);
+        assert!(chunk.1.start_line <= 5);
+        assert!(chunk.1.end_line >= 7);
+        assert!(chunk.0.contains("src/lib.rs"));
+        Ok(())
+    }
+
+    #[test]
+    fn context_pack_preserves_retrieval_provenance_for_runtime_fixture() -> Result<()> {
+        let (fixture, root) = fixture_workspace()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let query = RetrievalQuery {
+            text: Some("build runtime needle".to_string()),
+            path: None,
+            symbol: None,
+            limit: 5,
+            include_graph_expansion: true,
+        };
+        let results = retrieve(&manifest, &query);
+        let pack = ContextPack::from_selection(
+            &manifest,
+            ContextPackSelection {
+                retrieval_results: results,
+                shards: Vec::new(),
+                evidence: Vec::new(),
+                freshness: FreshnessState {
+                    changed: Vec::new(),
+                    deleted: Vec::new(),
+                    added: Vec::new(),
+                    unchanged: manifest
+                        .files
+                        .iter()
+                        .map(|file| file.path.clone())
+                        .collect(),
+                    fresh: true,
+                },
+                stale_policy: StaleEvidencePolicy::Mark,
+            },
+        )?;
+        let actual = pack
+            .evidence
+            .iter()
+            .find(|evidence| {
+                evidence.path == "src/lib.rs" && evidence.provenance.source == "rust-ast"
+            })
+            .map(|evidence| {
+                (
+                    evidence.path.clone(),
+                    evidence.provenance.path.clone(),
+                    evidence.provenance.source.clone(),
+                    evidence.provenance.start_line,
+                )
+            })
+            .expect("context pack should include Rust source provenance");
+        let expected = (
+            "src/lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "rust-ast".to_string(),
+            Some(5),
+        );
+
+        assert_eq!(actual, expected);
+        Ok(())
     }
 }
