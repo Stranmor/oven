@@ -7,8 +7,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use forge_app::{CommandInfra, EnvironmentInfra, FileReaderInfra, WalkerInfra, WorkspaceService};
 use forge_domain::{
-    AuthCredential, AuthDetails, CodeSearchQuery, FileChunk, Node, NodeData, NodeId, ProviderId,
-    ProviderRepository, SearchParams, SyncProgress, UserId, WorkspaceId, WorkspaceIndexRepository,
+    AuthCredential, AuthDetails, FileChunk, Node, NodeData, NodeId, ProviderId, ProviderRepository,
+    SearchParams, SyncProgress, UserId, WorkspaceId, WorkspaceIndexRepository,
 };
 use forge_project_model::{
     ContextPack, ContextPackSelection, FreshnessState, ProjectIndexer, RetrievalQuery,
@@ -222,13 +222,11 @@ impl<
         let model_dir = root.join(".forge_project_model");
         let indexer = ProjectIndexer::new(&root, model_dir);
         let manifest = indexer.index()?;
-        let query =
-            CodeSearchQuery::new(UserId::generate(), WorkspaceId::generate(), params.clone());
         let retrieval_query = RetrievalQuery {
-            text: Some(query.data.query.to_string()),
-            path: query.data.starts_with.clone(),
+            text: Some(params.query.to_string()),
+            path: params.starts_with.clone(),
             symbol: None,
-            limit: query.data.limit.unwrap_or(10),
+            limit: params.limit.unwrap_or(10),
             include_graph_expansion: true,
         };
         let results = retrieve(&manifest, &retrieval_query);
@@ -254,7 +252,7 @@ impl<
         )?;
         let mut nodes = Vec::new();
         for evidence in pack.evidence {
-            if !matches_path_filters(&evidence.path, &query.data) {
+            if !matches_path_filters(&evidence.path, &params) {
                 continue;
             }
             let Some((start_line, end_line)) = evidence_line_range(&manifest, &evidence.id) else {
@@ -274,30 +272,14 @@ impl<
                 distance: None,
             });
         }
+        nodes.sort_by(|left, right| {
+            right
+                .relevance
+                .unwrap_or_default()
+                .total_cmp(&left.relevance.unwrap_or_default())
+                .then_with(|| left.node_id.as_str().cmp(right.node_id.as_str()))
+        });
         Ok(nodes)
-    }
-
-    async fn query_remote_workspace(
-        &self,
-        path: PathBuf,
-        params: SearchParams<'_>,
-    ) -> Result<Vec<Node>> {
-        let (token, user_id) = self.get_workspace_credentials().await?;
-
-        let workspace = self
-            .find_workspace_by_path(path, &token)
-            .await?
-            .ok_or(forge_domain::Error::WorkspaceNotFound)?;
-
-        let search_query = CodeSearchQuery::new(user_id, workspace.workspace_id.clone(), params);
-
-        let results = self
-            .infra
-            .search(&search_query, &token)
-            .await
-            .context("Failed to search")?;
-
-        Ok(results)
     }
 }
 
@@ -353,11 +335,7 @@ fn read_line_range(path: &Path, start_line: u32, end_line: u32) -> Result<String
 }
 
 fn local_workspace_has_project_model(path: &Path) -> bool {
-    path.exists()
-        && ProjectIndexer::new(path, path.join(".forge_project_model"))
-            .index()
-            .map(|manifest| !manifest.files.is_empty())
-            .unwrap_or(false)
+    path.is_dir()
 }
 
 #[async_trait]
@@ -402,17 +380,7 @@ impl<
         path: PathBuf,
         params: forge_domain::SearchParams<'_>,
     ) -> Result<Vec<forge_domain::Node>> {
-        let remote_results = self
-            .query_remote_workspace(path.clone(), params.clone())
-            .await;
-        match remote_results {
-            Ok(results) => Ok(results),
-            Err(remote_error) => self.query_local_workspace(path, params).with_context(|| {
-                format!(
-                    "local project-model search fallback after remote search failed: {remote_error}"
-                )
-            }),
-        }
+        self.query_local_workspace(path, params)
     }
 
     /// Lists all workspaces.
@@ -576,21 +544,22 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use anyhow::{Result, bail};
     use forge_app::{WalkedFile, WalkedFileStream, Walker};
     use forge_domain::{
-        AnyProvider, AuthCredential, CommandExecutionOutput, CommandOutput, ConfigOperation,
-        Environment, FileHash, ProcessId, ProcessReadCursor, ProcessReadOutput, ProcessStartOutput,
-        ProcessStatus, ProviderTemplate, ShellHandoffTimeoutSeconds, WorkspaceFiles, WorkspaceInfo,
+        AnyProvider, AuthCredential, CodeSearchQuery, CommandExecutionOutput, CommandOutput,
+        ConfigOperation, Environment, FileHash, ProcessId, ProcessReadCursor, ProcessReadOutput,
+        ProcessStartOutput, ProcessStatus, ProviderTemplate, ShellHandoffTimeoutSeconds,
+        WorkspaceFiles, WorkspaceInfo,
     };
     use futures::Stream;
-    use pretty_assertions::assert_eq;
     use tempfile::TempDir;
-
-    #[derive(Clone)]
     struct LocalSearchInfra {
         cwd: PathBuf,
+        remote_search_called: Arc<AtomicBool>,
     }
 
     struct NoopDiscovery;
@@ -686,7 +655,18 @@ mod tests {
             _query: &CodeSearchQuery<'_>,
             _auth_token: &forge_domain::ApiKey,
         ) -> Result<Vec<Node>> {
-            bail!("unused remote search")
+            self.remote_search_called.store(true, Ordering::SeqCst);
+            Ok(vec![Node {
+                node_id: NodeId::new("remote-search-result"),
+                node: NodeData::FileChunk(FileChunk {
+                    file_path: "remote.rs".to_string(),
+                    content: "remote search should not be used".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                }),
+                relevance: Some(1.0),
+                distance: None,
+            }])
         }
 
         async fn list_workspaces(
@@ -870,8 +850,12 @@ mod tests {
     #[tokio::test]
     async fn query_workspace_uses_local_project_model_and_returns_file_chunks() -> Result<()> {
         let (_fixture, root) = fixture_workspace()?;
+        let remote_search_called = Arc::new(AtomicBool::new(false));
         let setup = ForgeWorkspaceService::new(
-            Arc::new(LocalSearchInfra { cwd: root.clone() }),
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                remote_search_called: Arc::clone(&remote_search_called),
+            }),
             Arc::new(NoopDiscovery),
         );
         let params = SearchParams::new("build runtime needle", "runtime integration proof")
@@ -893,6 +877,7 @@ mod tests {
         assert!(chunk.1.start_line <= 5);
         assert!(chunk.1.end_line >= 7);
         assert!(chunk.0.contains("src/lib.rs"));
+        assert!(!remote_search_called.load(Ordering::SeqCst));
         Ok(())
     }
 
