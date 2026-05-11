@@ -1,8 +1,8 @@
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, Write};
+use std::io::{self, Stderr, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bstr::ByteSlice;
@@ -23,10 +23,9 @@ const MAX_BACKGROUND_LOG_ENTRIES: usize = 8192;
 const PROCESS_OBSERVATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Service for executing shell commands
-#[derive(Clone)]
-pub struct ForgeCommandExecutorService {
+pub struct ForgeCommandExecutorService<O = Stdout, E = Stderr> {
     env: Environment,
-    output_printer: Arc<StdConsoleWriter>,
+    output_printer: Arc<StdConsoleWriter<O, E>>,
 
     // Mutex to ensure that only one command is executed at a time
     ready: Arc<Mutex<()>>,
@@ -71,9 +70,14 @@ struct LaunchedProcess {
     stderr: Arc<Mutex<Vec<u8>>>,
     stdout_task: Option<tokio::task::JoinHandle<()>>,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
+    output_mirror: OutputMirrorControl,
 }
 
 impl LaunchedProcess {
+    fn disable_output_mirroring(&self) {
+        self.output_mirror.disable();
+    }
+
     fn start_output(&self) -> ProcessStartOutput {
         ProcessStartOutput {
             process_id: self.process_id.clone(),
@@ -131,8 +135,23 @@ impl ManagedProcess {
     }
 }
 
-impl ForgeCommandExecutorService {
-    pub fn new(env: Environment, output_printer: Arc<StdConsoleWriter>) -> Self {
+impl<O, E> Clone for ForgeCommandExecutorService<O, E> {
+    fn clone(&self) -> Self {
+        Self {
+            env: self.env.clone(),
+            output_printer: self.output_printer.clone(),
+            ready: self.ready.clone(),
+            processes: self.processes.clone(),
+        }
+    }
+}
+
+impl<O, E> ForgeCommandExecutorService<O, E>
+where
+    O: Write + Send + 'static,
+    E: Write + Send + 'static,
+{
+    pub fn new(env: Environment, output_printer: Arc<StdConsoleWriter<O, E>>) -> Self {
         Self {
             env,
             output_printer,
@@ -229,6 +248,7 @@ impl ForgeCommandExecutorService {
         let stdout = Arc::new(Mutex::new(Vec::new()));
         let stderr = Arc::new(Mutex::new(Vec::new()));
 
+        let output_mirror = OutputMirrorControl::new(!silent);
         let stdout_task = child.stdout.take().map(|stdout_pipe| {
             Self::capture_stream(
                 stdout_pipe,
@@ -237,11 +257,7 @@ impl ForgeCommandExecutorService {
                 next_cursor.clone(),
                 dropped_before_cursor.clone(),
                 stdout.clone(),
-                if silent {
-                    OutputSink::silent()
-                } else {
-                    OutputSink::stdout(self.output_printer.clone())
-                },
+                OutputSink::stdout(self.output_printer.clone(), output_mirror.clone()),
             )
         });
         let stderr_task = child.stderr.take().map(|stderr_pipe| {
@@ -252,11 +268,7 @@ impl ForgeCommandExecutorService {
                 next_cursor,
                 dropped_before_cursor.clone(),
                 stderr.clone(),
-                if silent {
-                    OutputSink::silent()
-                } else {
-                    OutputSink::stderr(self.output_printer.clone())
-                },
+                OutputSink::stderr(self.output_printer.clone(), output_mirror.clone()),
             )
         });
 
@@ -271,6 +283,7 @@ impl ForgeCommandExecutorService {
             stderr,
             stdout_task,
             stderr_task,
+            output_mirror,
         })
     }
 
@@ -377,6 +390,7 @@ impl ForgeCommandExecutorService {
                 })
             }
             Err(_) => {
+                launched.disable_output_mirroring();
                 let process = launched.start_output();
                 let stdout = Self::snapshot_output(&launched.stdout).await;
                 let captured_stderr = Self::snapshot_output(&launched.stderr).await;
@@ -515,57 +529,83 @@ impl ForgeCommandExecutorService {
         }
     }
 }
-enum OutputSink {
-    Console(OutputPrinterWriter),
-    Silent(io::Sink),
+enum OutputSink<O = Stdout, E = Stderr> {
+    Console(OutputPrinterWriter<O, E>, OutputMirrorControl),
 }
 
-impl OutputSink {
-    fn stdout(printer: Arc<StdConsoleWriter>) -> Self {
-        Self::Console(OutputPrinterWriter::stdout(printer))
+#[derive(Clone)]
+struct OutputMirrorControl {
+    enabled: Arc<AtomicBool>,
+}
+
+impl OutputMirrorControl {
+    fn new(enabled: bool) -> Self {
+        Self { enabled: Arc::new(AtomicBool::new(enabled)) }
     }
 
-    fn stderr(printer: Arc<StdConsoleWriter>) -> Self {
-        Self::Console(OutputPrinterWriter::stderr(printer))
+    fn disable(&self) {
+        self.enabled.store(false, Ordering::Relaxed);
     }
 
-    fn silent() -> Self {
-        Self::Silent(io::sink())
+    fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
     }
 }
 
-impl Write for OutputSink {
+impl<O, E> OutputSink<O, E>
+where
+    O: Write + Send,
+    E: Write + Send,
+{
+    fn stdout(printer: Arc<StdConsoleWriter<O, E>>, mirror: OutputMirrorControl) -> Self {
+        Self::Console(OutputPrinterWriter::stdout(printer), mirror)
+    }
+
+    fn stderr(printer: Arc<StdConsoleWriter<O, E>>, mirror: OutputMirrorControl) -> Self {
+        Self::Console(OutputPrinterWriter::stderr(printer), mirror)
+    }
+}
+
+impl<O, E> Write for OutputSink<O, E>
+where
+    O: Write + Send,
+    E: Write + Send,
+{
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
-            Self::Console(writer) => writer.write(buf),
-            Self::Silent(writer) => writer.write(buf),
+            Self::Console(writer, mirror) if mirror.enabled() => writer.write(buf),
+            Self::Console(_, _) => Ok(buf.len()),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
         match self {
-            Self::Console(writer) => writer.flush(),
-            Self::Silent(writer) => writer.flush(),
+            Self::Console(writer, mirror) if mirror.enabled() => writer.flush(),
+            Self::Console(_, _) => Ok(()),
         }
     }
 }
 
-struct OutputPrinterWriter {
-    printer: Arc<StdConsoleWriter>,
+struct OutputPrinterWriter<O = Stdout, E = Stderr> {
+    printer: Arc<StdConsoleWriter<O, E>>,
     is_stdout: bool,
 }
 
-impl OutputPrinterWriter {
-    fn stdout(printer: Arc<StdConsoleWriter>) -> Self {
+impl<O, E> OutputPrinterWriter<O, E> {
+    fn stdout(printer: Arc<StdConsoleWriter<O, E>>) -> Self {
         Self { printer, is_stdout: true }
     }
 
-    fn stderr(printer: Arc<StdConsoleWriter>) -> Self {
+    fn stderr(printer: Arc<StdConsoleWriter<O, E>>) -> Self {
         Self { printer, is_stdout: false }
     }
 }
 
-impl Write for OutputPrinterWriter {
+impl<O, E> Write for OutputPrinterWriter<O, E>
+where
+    O: Write + Send,
+    E: Write + Send,
+{
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.is_stdout {
             self.printer.write(buf)
@@ -686,7 +726,11 @@ fn process_read_output_from_logs(
 
 /// The implementation for CommandExecutorService
 #[async_trait::async_trait]
-impl CommandInfra for ForgeCommandExecutorService {
+impl<O, E> CommandInfra for ForgeCommandExecutorService<O, E>
+where
+    O: Write + Send + 'static,
+    E: Write + Send + 'static,
+{
     async fn execute_command(
         &self,
         command: String,
@@ -719,7 +763,7 @@ impl CommandInfra for ForgeCommandExecutorService {
         working_dir: PathBuf,
         env_vars: Option<Vec<String>>,
     ) -> anyhow::Result<ProcessStartOutput> {
-        let launched = self.launch_process(command, &working_dir, env_vars, false)?;
+        let launched = self.launch_process(command, &working_dir, env_vars, true)?;
         let output = launched.start_output();
         self.register_launched_process(launched).await?;
         Ok(output)
@@ -834,9 +878,57 @@ impl CommandInfra for ForgeCommandExecutorService {
 #[cfg(test)]
 mod tests {
 
+    use std::sync::Mutex as StdMutex;
+
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[derive(Clone)]
+    struct CapturedWriter(Arc<StdMutex<Vec<u8>>>);
+
+    impl CapturedWriter {
+        fn new() -> Self {
+            Self(Arc::new(StdMutex::new(Vec::new())))
+        }
+
+        fn output(&self) -> String {
+            self.0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_slice()
+                .to_str_lossy()
+                .into_owned()
+        }
+    }
+
+    impl Write for CapturedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn captured_printer() -> (
+        Arc<StdConsoleWriter<CapturedWriter, CapturedWriter>>,
+        CapturedWriter,
+        CapturedWriter,
+    ) {
+        let stdout = CapturedWriter::new();
+        let stderr = CapturedWriter::new();
+        let printer = Arc::new(StdConsoleWriter::with_writers(
+            stdout.clone(),
+            stderr.clone(),
+        ));
+        (printer, stdout, stderr)
+    }
 
     fn test_env() -> Environment {
         use fake::{Fake, Faker};
@@ -853,6 +945,101 @@ mod tests {
 
     fn test_printer() -> Arc<StdConsoleWriter> {
         Arc::new(StdConsoleWriter::default())
+    }
+
+    #[tokio::test]
+    async fn test_process_start_captures_output_without_console_mirroring() {
+        let (printer, stdout, stderr) = captured_printer();
+        let fixture = ForgeCommandExecutorService::new(test_env(), printer);
+        let started = fixture
+            .start_process(
+                "printf hidden-stdout; printf hidden-stderr >&2".to_string(),
+                PathBuf::new().join("."),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let actual = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let output = fixture
+                    .read_process(started.process_id.clone(), ProcessReadCursor::new(0), None)
+                    .await
+                    .unwrap();
+                if output.entries.len() >= 2 {
+                    return output;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let expected = (String::new(), String::new());
+
+        assert!(
+            actual
+                .entries
+                .iter()
+                .any(|entry| entry.content.contains("hidden-stdout"))
+        );
+        assert!(
+            actual
+                .entries
+                .iter()
+                .any(|entry| entry.content.contains("hidden-stderr"))
+        );
+        assert_eq!((stdout.output(), stderr.output()), expected);
+    }
+
+    #[tokio::test]
+    async fn test_shell_timeout_handoff_disables_later_console_mirroring() {
+        let (printer, stdout, stderr) = captured_printer();
+        let fixture = ForgeCommandExecutorService::new(test_env(), printer);
+
+        let execution = fixture
+            .execute_command(
+                "printf before-handoff; sleep 1.05; printf after-handoff; printf after-handoff-err >&2; sleep 2".to_string(),
+                PathBuf::new().join("."),
+                false,
+                None,
+                ShellHandoffTimeoutSeconds::new(1).unwrap(),
+            )
+            .await
+            .unwrap();
+        let process = execution
+            .process
+            .clone()
+            .expect("long-running command should be handed off");
+        let initial_output = fixture
+            .read_process(process.process_id.clone(), ProcessReadCursor::new(0), None)
+            .await
+            .unwrap();
+        let actual = fixture
+            .read_process(
+                process.process_id.clone(),
+                initial_output.next_cursor,
+                Some(ProcessObservationWaitSeconds::new(3).unwrap()),
+            )
+            .await
+            .unwrap();
+        let _ = fixture.kill_process(process.process_id).await;
+        let expected_stdout = "before-handoff".to_string();
+        let expected_stderr = String::new();
+
+        assert_eq!(stdout.output(), expected_stdout);
+        assert_eq!(stderr.output(), expected_stderr);
+        assert!(
+            actual
+                .entries
+                .iter()
+                .any(|entry| entry.content.contains("after-handoff"))
+        );
+        assert!(
+            actual
+                .entries
+                .iter()
+                .any(|entry| entry.content.contains("after-handoff-err"))
+        );
     }
 
     #[tokio::test]
@@ -1138,14 +1325,14 @@ mod tests {
         let log_guard = logs.lock().await;
 
         let output = Arc::new(Mutex::new(Vec::new()));
-        let stream_task = ForgeCommandExecutorService::capture_stream(
+        let stream_task = ForgeCommandExecutorService::<Stdout, Stderr>::capture_stream(
             reader,
             ProcessStream::Stdout,
             logs.clone(),
             next_cursor.clone(),
             dropped_before_cursor,
             output,
-            OutputSink::silent(),
+            io::sink(),
         );
         writer.write_all(b"pending").await.unwrap();
         writer.flush().await.unwrap();
