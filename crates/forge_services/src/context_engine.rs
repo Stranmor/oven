@@ -80,6 +80,8 @@ impl<
         // base, even when `path` is a subdirectory of an ancestor workspace.
         let workspace_root = PathBuf::from(&workspace.working_dir);
 
+        self.write_local_project_model_manifest(&workspace_root)?;
+
         WorkspaceSyncEngine::new(
             Arc::clone(&self.infra),
             Arc::clone(&self.discovery),
@@ -91,6 +93,12 @@ impl<
         )
         .run(emit)
         .await
+    }
+
+    fn write_local_project_model_manifest(&self, root: &Path) -> Result<PathBuf> {
+        let indexer = ProjectIndexer::new(root, local_project_model_dir(root));
+        let manifest = indexer.index()?;
+        indexer.write_manifest(&manifest)
     }
 
     /// Gets the ForgeCode services credential and extracts workspace auth
@@ -552,7 +560,7 @@ mod tests {
         ProcessStartOutput, ProcessStatus, ProviderTemplate, ShellHandoffTimeoutSeconds,
         WorkspaceFiles, WorkspaceInfo,
     };
-    use futures::Stream;
+    use futures::{Stream, StreamExt};
     use tempfile::TempDir;
     struct LocalSearchInfra {
         cwd: PathBuf,
@@ -987,6 +995,29 @@ mod tests {
         };
 
         assert!(actual_error.contains(expected));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_workspace_writes_local_project_model_manifest_before_remote_file_sync()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: Some(workspace_auth_credential()),
+                workspaces: vec![remote_workspace(&root)],
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::new(AtomicBool::new(false)),
+            }),
+            Arc::new(NoopDiscovery),
+        );
+        let mut stream = WorkspaceService::sync_workspace(&setup, root.clone()).await?;
+        while let Some(_event) = stream.next().await {}
+        let actual = local_project_model_manifest(&root).is_file();
+        let expected = true;
+
+        assert_eq!(actual, expected);
         Ok(())
     }
 

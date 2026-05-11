@@ -732,7 +732,7 @@ fn max_preview_scroll_offset(
 }
 
 fn bottom_preview_height(height: u16, body_height: u16, percent: u16) -> u16 {
-    let requested = ((height as u32 * percent as u32) / 100) as u16;
+    let requested = u16::try_from((height as u32 * percent as u32) / 100).unwrap_or(u16::MAX);
     let minimum_preview_height = 3;
     let minimum_list_height = (body_height / 3).clamp(3, 8);
     let maximum_preview_height = body_height.saturating_sub(minimum_list_height);

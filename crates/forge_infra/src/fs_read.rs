@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use bstr::ByteSlice;
 use forge_app::{FileReaderInfra, PdfRenderInfra};
 use futures::{StreamExt, stream};
 use tokio::process::Command;
@@ -98,7 +99,7 @@ impl PdfRenderInfra for ForgeFileReadService {
                 .context("Failed to start pdftoppm. Install poppler to inspect PDFs visually.")?;
 
             if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stderr = output.stderr.as_slice().to_str_lossy();
                 anyhow::bail!("Failed to render PDF first page with pdftoppm: {stderr}");
             }
 

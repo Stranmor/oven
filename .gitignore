@@ -35,6 +35,7 @@ jobs/**
 *.new
 .vscode/
 .fastembed_cache/
+.forge_project_model/
 *.log*
 *-dump.json
 *-dump.html

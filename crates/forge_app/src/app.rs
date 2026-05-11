@@ -5,6 +5,7 @@ use chrono::Local;
 use forge_config::ForgeConfig;
 use forge_domain::*;
 use forge_stream::MpscStream;
+use forge_template::Element;
 
 use crate::apply_tunable_parameters::ApplyTunableParameters;
 use crate::changed_files::ChangedFiles;
@@ -27,7 +28,7 @@ use crate::tool_resolver::ToolResolver;
 use crate::user_prompt::UserPromptGenerator;
 use crate::{
     AgentExt, AgentProviderResolver, ConversationService, EnvironmentInfra, ProviderService,
-    Services,
+    Services, WorkspaceService,
 };
 
 /// Builds a [`TemplateConfig`] from a [`ForgeConfig`].
@@ -43,6 +44,160 @@ pub(crate) fn build_template_config(config: &ForgeConfig) -> forge_domain::Templ
         stdout_max_suffix_length: config.max_stdout_suffix_lines,
         stdout_max_line_length: config.max_stdout_line_chars,
     }
+}
+
+struct ProjectContextInjection<S> {
+    services: Arc<S>,
+    agent: Agent,
+}
+
+impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
+    ProjectContextInjection<S>
+{
+    fn new(services: Arc<S>, agent: Agent) -> Self {
+        Self { services, agent }
+    }
+
+    async fn inject(&self, mut conversation: Conversation) -> Conversation {
+        let cwd = self.services.get_environment().cwd;
+        let is_indexed = match self.services.is_indexed(&cwd).await {
+            Ok(indexed) => indexed,
+            Err(error) => {
+                tracing::debug!(error = ?error, path = %cwd.display(), "Skipping project-model context injection because index availability could not be checked");
+                return conversation;
+            }
+        };
+        if !is_indexed {
+            return conversation;
+        }
+
+        let Some(query) = Self::query_from_conversation(&conversation) else {
+            return conversation;
+        };
+        let params =
+            SearchParams::new(&query, "automatic project-model context injection").limit(5usize);
+        let nodes = match self.services.query_workspace(cwd.clone(), params).await {
+            Ok(nodes) => nodes,
+            Err(error) => {
+                tracing::debug!(error = ?error, path = %cwd.display(), "Skipping project-model context injection because local retrieval failed");
+                return conversation;
+            }
+        };
+        if nodes.is_empty() {
+            return conversation;
+        }
+
+        let content = Self::render_context(&cwd, nodes);
+        let mut context = conversation.context.take().unwrap_or_default();
+        let message = TextMessage::new(Role::User, content)
+            .model(self.agent.model.clone())
+            .droppable(true);
+        context = context.add_message(ContextMessage::Text(message));
+        conversation.context(context)
+    }
+
+    fn query_from_conversation(conversation: &Conversation) -> Option<String> {
+        conversation
+            .context
+            .as_ref()?
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.has_role(Role::User) && !message.is_droppable())
+            .and_then(|message| message.content())
+            .map(str::trim)
+            .filter(|content| !content.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
+    fn render_context(workspace_root: &std::path::Path, nodes: Vec<Node>) -> String {
+        let manifest_path = workspace_root.join(".forge_project_model/project_manifest.json");
+        Element::new("project_model_context")
+            .attr("workspace_root", xml_attr(workspace_root.display()))
+            .attr("manifest_path", xml_attr(manifest_path.display()))
+            .attr("freshness", "local_manifest_available")
+            .attr("provenance", "WorkspaceService::query_workspace")
+            .append(nodes.into_iter().filter_map(Self::render_node))
+            .render()
+    }
+
+    fn render_node(node: Node) -> Option<Element> {
+        match node.node {
+            NodeData::FileChunk(chunk) => Some(
+                Element::new("source")
+                    .attr("path", xml_attr(chunk.file_path))
+                    .attr("start_line", chunk.start_line)
+                    .attr("end_line", chunk.end_line)
+                    .attr(
+                        "score",
+                        node.relevance
+                            .map(|score| format!("{score:.6}"))
+                            .unwrap_or_else(|| "unknown".to_string()),
+                    )
+                    .attr("freshness", "manifest_snapshot")
+                    .attr("provenance", "local_project_model_manifest")
+                    .attr("node_id", xml_attr(node.node_id.as_str()))
+                    .append(Element::new("symbol_or_content").cdata(xml_cdata(chunk.content))),
+            ),
+            NodeData::File(file) => Some(
+                Element::new("source")
+                    .attr("path", xml_attr(file.file_path))
+                    .attr("start_line", 1)
+                    .attr("end_line", "unknown")
+                    .attr("score", "unknown")
+                    .attr("freshness", "manifest_snapshot")
+                    .attr("provenance", "local_project_model_manifest")
+                    .attr("node_id", xml_attr(node.node_id.as_str()))
+                    .append(Element::new("symbol_or_content").cdata(xml_cdata(file.content))),
+            ),
+            NodeData::FileRef(file_ref) => Some(
+                Element::new("source")
+                    .attr("path", xml_attr(file_ref.file_path))
+                    .attr("start_line", "unknown")
+                    .attr("end_line", "unknown")
+                    .attr("score", "unknown")
+                    .attr("freshness", "manifest_snapshot")
+                    .attr("provenance", "local_project_model_manifest")
+                    .attr("content_hash", xml_attr(file_ref.file_hash))
+                    .attr("node_id", xml_attr(node.node_id.as_str())),
+            ),
+            NodeData::Note(note) => Some(
+                Element::new("source")
+                    .attr("path", "note")
+                    .attr("start_line", "unknown")
+                    .attr("end_line", "unknown")
+                    .attr("score", "unknown")
+                    .attr("freshness", "manifest_snapshot")
+                    .attr("provenance", "local_project_model_manifest")
+                    .attr("node_id", xml_attr(node.node_id.as_str()))
+                    .append(Element::new("symbol_or_content").cdata(xml_cdata(note.content))),
+            ),
+            NodeData::Task(task) => Some(
+                Element::new("source")
+                    .attr("path", "task")
+                    .attr("start_line", "unknown")
+                    .attr("end_line", "unknown")
+                    .attr("score", "unknown")
+                    .attr("freshness", "manifest_snapshot")
+                    .attr("provenance", "local_project_model_manifest")
+                    .attr("node_id", xml_attr(node.node_id.as_str()))
+                    .append(Element::new("symbol_or_content").cdata(xml_cdata(task.task))),
+            ),
+        }
+    }
+}
+
+fn xml_attr(value: impl ToString) -> String {
+    value
+        .to_string()
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn xml_cdata(value: impl ToString) -> String {
+    value.to_string().replace("]]>", "]]]]><![CDATA[>")
 }
 
 /// ForgeApp handles the core chat functionality by orchestrating various
@@ -155,6 +310,13 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig> + SteerS
         )
         .add_user_prompt(conversation)
         .await?;
+
+        // Inject local project-model context after the user prompt, before the
+        // provider sees the request. This is a best-effort, manifest-gated read
+        // path and never triggers hot-path indexing.
+        let conversation = ProjectContextInjection::new(self.services.clone(), agent.clone())
+            .inject(conversation)
+            .await;
 
         // Detect and render externally changed files notification
         let conversation = ChangedFiles::new(services.clone(), agent.clone())
@@ -379,14 +541,238 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig> + SteerS
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use anyhow::Result;
+    use forge_domain::{
+        Agent, AgentId, ChatCompletionMessage, Content, Context, ContextMessage, Conversation,
+        Environment, FileChunk, FileStatus, FinishReason, Model, ModelId, Node, NodeData, NodeId,
+        ProviderId, ResultStream, SearchParams, SteerMessage, SyncProgress, ToolCallContext,
+        ToolCallFull, ToolResult, WorkspaceAuth, WorkspaceId, WorkspaceInfo,
+    };
+    use pretty_assertions::assert_eq;
+    use tempfile::TempDir;
+    use tokio::sync::Mutex;
+
+    use super::*;
+    use crate::agent::AgentService;
+    use crate::orch::Orchestrator;
+
+    struct ProjectContextHarness {
+        cwd: PathBuf,
+        captured_context: Mutex<Option<Context>>,
+        workspace_queries: AtomicUsize,
+    }
+
+    impl ProjectContextHarness {
+        fn new(cwd: PathBuf) -> Arc<Self> {
+            Arc::new(Self {
+                cwd,
+                captured_context: Mutex::new(None),
+                workspace_queries: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl EnvironmentInfra for ProjectContextHarness {
+        type Config = ForgeConfig;
+
+        fn get_env_var(&self, _key: &str) -> Option<String> {
+            None
+        }
+
+        fn get_env_vars(&self) -> BTreeMap<String, String> {
+            BTreeMap::new()
+        }
+
+        fn get_environment(&self) -> Environment {
+            Environment {
+                os: "test".to_string(),
+                cwd: self.cwd.clone(),
+                home: None,
+                shell: "sh".to_string(),
+                base_path: self.cwd.join(".forge"),
+            }
+        }
+
+        fn get_config(&self) -> Result<Self::Config> {
+            Ok(ForgeConfig::default())
+        }
+
+        async fn update_environment(&self, _ops: Vec<forge_domain::ConfigOperation>) -> Result<()> {
+            anyhow::bail!("unused environment update")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WorkspaceService for ProjectContextHarness {
+        async fn sync_workspace(
+            &self,
+            _path: PathBuf,
+        ) -> Result<forge_stream::MpscStream<Result<SyncProgress>>> {
+            anyhow::bail!("unused workspace sync")
+        }
+
+        async fn query_workspace(
+            &self,
+            _path: PathBuf,
+            params: SearchParams<'_>,
+        ) -> Result<Vec<Node>> {
+            self.workspace_queries.fetch_add(1, Ordering::SeqCst);
+            assert!(params.query.contains("automatic injection needle"));
+            Ok(vec![Node {
+                node_id: NodeId::new("symbol:src/lib.rs:automatic_injection_needle"),
+                node: NodeData::FileChunk(FileChunk {
+                    file_path: "src/lib.rs".to_string(),
+                    content: "pub fn automatic_injection_needle() -> usize { 42 }".to_string(),
+                    start_line: 3,
+                    end_line: 3,
+                }),
+                relevance: Some(0.875),
+                distance: None,
+            }])
+        }
+
+        async fn list_workspaces(&self) -> Result<Vec<WorkspaceInfo>> {
+            anyhow::bail!("unused workspace list")
+        }
+
+        async fn get_workspace_info(&self, _path: PathBuf) -> Result<Option<WorkspaceInfo>> {
+            anyhow::bail!("unused workspace info")
+        }
+
+        async fn delete_workspace(&self, _workspace_id: &WorkspaceId) -> Result<()> {
+            anyhow::bail!("unused workspace delete")
+        }
+
+        async fn delete_workspaces(&self, _workspace_ids: &[WorkspaceId]) -> Result<()> {
+            anyhow::bail!("unused workspace deletes")
+        }
+
+        async fn is_indexed(&self, path: &Path) -> Result<bool> {
+            Ok(path
+                .join(".forge_project_model/project_manifest.json")
+                .is_file())
+        }
+
+        async fn get_workspace_status(&self, _path: PathBuf) -> Result<Vec<FileStatus>> {
+            anyhow::bail!("unused workspace status")
+        }
+
+        async fn is_authenticated(&self) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn init_auth_credentials(&self) -> Result<WorkspaceAuth> {
+            anyhow::bail!("unused workspace auth")
+        }
+
+        async fn init_workspace(&self, _path: PathBuf) -> Result<WorkspaceId> {
+            anyhow::bail!("unused workspace init")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentService for ProjectContextHarness {
+        async fn chat_agent(
+            &self,
+            _id: &ModelId,
+            context: Context,
+            _provider_id: Option<ProviderId>,
+        ) -> ResultStream<ChatCompletionMessage, anyhow::Error> {
+            *self.captured_context.lock().await = Some(context);
+            let message = ChatCompletionMessage::assistant(Content::full("done"))
+                .finish_reason(FinishReason::Stop);
+            Ok(Box::pin(tokio_stream::iter(std::iter::once(Ok(message)))))
+        }
+
+        async fn call(
+            &self,
+            _agent: &Agent,
+            _context: &ToolCallContext,
+            call: ToolCallFull,
+        ) -> ToolResult {
+            ToolResult::new(call.name)
+                .failure(anyhow::anyhow!("tool calls are not expected in this test"))
+        }
+
+        async fn update(&self, _conversation: Conversation) -> Result<()> {
+            Ok(())
+        }
+
+        async fn drain_steer_messages(
+            &self,
+            _conversation_id: &forge_domain::ConversationId,
+        ) -> Result<Vec<SteerMessage>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn fixture_workspace() -> Result<(TempDir, PathBuf)> {
+        let fixture = TempDir::new()?;
+        let root = fixture.path().join("workspace");
+        fs::create_dir_all(root.join("src"))?;
+        fs::create_dir_all(root.join(".forge_project_model"))?;
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn unrelated() {}\n\npub fn automatic_injection_needle() -> usize { 42 }\n",
+        )?;
+        fs::write(
+            root.join(".forge_project_model/project_manifest.json"),
+            r#"{"version":1,"root":"fixture","files":[],"file_nodes":[],"symbols":[],"edges":[],"shards":[],"manifest_hash":"fixture"}"#,
+        )?;
+        Ok((fixture, root))
+    }
+
     #[tokio::test]
-    async fn test_chat_missing_db_record_does_not_panic() {
-        // The panic in `ForgeApp::chat` was caused by
-        // `unwrap_or_default().expect(...)` when `find_conversation`
-        // returned `Ok(None)`. This has been replaced with
-        // `.ok_or_else(|| anyhow::anyhow!(...))?`, safely returning an
-        // error without panicking. Due to the complexity of mocking
-        // `Services`, we rely on static analysis to verify that the
-        // unwrap is removed.
+    async fn project_model_context_is_injected_into_provider_request_without_sem_search_tool_call()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root.clone());
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone())
+            .tool_supported(false)
+            .max_requests_per_turn(1usize);
+        let conversation = Conversation::generate().context(Context::default().add_message(
+            ContextMessage::user("find automatic injection needle", Some(model_id.clone())),
+        ));
+        let conversation = ProjectContextInjection::new(setup.clone(), agent.clone())
+            .inject(conversation)
+            .await;
+        let mut orch =
+            Orchestrator::new(setup.clone(), conversation, agent, ForgeConfig::default())
+                .models(vec![Model::new(ProviderId::OPENAI, model_id)])
+                .tool_definitions(Vec::new());
+
+        orch.run().await?;
+        let captured_context = setup.captured_context.lock().await.clone().unwrap();
+        let actual = captured_context
+            .messages
+            .iter()
+            .filter_map(|message| message.content())
+            .find(|content| content.contains("<project_model_context"))
+            .unwrap()
+            .to_string();
+        let expected = (true, true, true, true, 1usize, false);
+
+        assert_eq!(
+            (
+                actual.contains("manifest_path"),
+                actual.contains("src/lib.rs"),
+                actual.contains("start_line=\"3\""),
+                actual.contains("score=\"0.875000\""),
+                setup.workspace_queries.load(Ordering::SeqCst),
+                captured_context
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name.as_str().eq_ignore_ascii_case("sem_search")),
+            ),
+            expected
+        );
+        Ok(())
     }
 }
