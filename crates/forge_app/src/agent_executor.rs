@@ -253,6 +253,13 @@ fn guard_delegated_resume_ownership(
             parent_id
         );
     }
+    if existing.status.is_active() {
+        anyhow::bail!(
+            "Subagent session {} is already {:?}; refusing duplicate resume that would start concurrent work. Wait for completion or use explicit recovery for stale active sessions.",
+            conversation_id,
+            existing.status
+        );
+    }
     Ok(())
 }
 
@@ -262,6 +269,89 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn test_guard_delegated_resume_ownership_rejects_created_session_duplicate_work() {
+        let conversation_id = ConversationId::generate();
+        let parent_id = ConversationId::generate();
+        let existing = SubagentTaskSession::new(
+            AgentId::new("forge"),
+            conversation_id,
+            Some(parent_id),
+            Some(parent_id),
+            "created delegated task",
+        );
+
+        let actual =
+            guard_delegated_resume_ownership(&conversation_id, Some(parent_id), Some(&existing));
+        let expected = SubagentTaskStatus::Created;
+
+        assert!(actual.is_err());
+        assert_eq!(existing.status, expected);
+    }
+
+    #[test]
+    fn test_guard_delegated_resume_ownership_rejects_active_session_duplicate_work() {
+        let conversation_id = ConversationId::generate();
+        let parent_id = ConversationId::generate();
+        let mut existing = SubagentTaskSession::new(
+            AgentId::new("forge"),
+            conversation_id,
+            Some(parent_id),
+            Some(parent_id),
+            "active delegated task",
+        );
+        existing.mark_running();
+
+        let actual =
+            guard_delegated_resume_ownership(&conversation_id, Some(parent_id), Some(&existing));
+        let expected = SubagentTaskStatus::Running;
+
+        assert!(actual.is_err());
+        assert_eq!(existing.status, expected);
+    }
+
+    #[test]
+    fn test_guard_delegated_resume_ownership_rejects_zombie_session_duplicate_work() {
+        let conversation_id = ConversationId::generate();
+        let parent_id = ConversationId::generate();
+        let mut existing = SubagentTaskSession::new(
+            AgentId::new("forge"),
+            conversation_id,
+            Some(parent_id),
+            Some(parent_id),
+            "zombie delegated task",
+        );
+        existing.status = SubagentTaskStatus::Zombie;
+
+        let actual =
+            guard_delegated_resume_ownership(&conversation_id, Some(parent_id), Some(&existing));
+        let expected = SubagentTaskStatus::Zombie;
+
+        assert!(actual.is_err());
+        assert_eq!(existing.status, expected);
+    }
+
+    #[test]
+    fn test_guard_delegated_resume_ownership_allows_terminal_session_new_attempt() {
+        let conversation_id = ConversationId::generate();
+        let parent_id = ConversationId::generate();
+        let mut existing = SubagentTaskSession::new(
+            AgentId::new("forge"),
+            conversation_id,
+            Some(parent_id),
+            Some(parent_id),
+            "completed delegated task",
+        );
+        existing.mark_completed("done");
+
+        let actual =
+            guard_delegated_resume_ownership(&conversation_id, Some(parent_id), Some(&existing));
+        let expected = SubagentTaskStatus::Completed;
+
+        assert!(actual.is_ok());
+        assert_eq!(existing.status, expected);
+    }
 
     #[test]
     fn test_guard_delegated_resume_ownership_rejects_ledger_owned_parentless_conversation() {
