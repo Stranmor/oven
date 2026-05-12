@@ -94,13 +94,13 @@ impl IntoDomain for oai::ResponseUsage {
     type Domain = Usage;
 
     fn into_domain(self) -> Self::Domain {
-        Usage {
-            prompt_tokens: TokenCount::Actual(self.input_tokens as usize),
-            completion_tokens: TokenCount::Actual(self.output_tokens as usize),
-            total_tokens: TokenCount::Actual(self.total_tokens as usize),
-            cached_tokens: TokenCount::Actual(self.input_tokens_details.cached_tokens as usize),
-            cost: None,
-        }
+        Usage::new(
+            TokenCount::Actual(self.input_tokens as usize),
+            TokenCount::Actual(self.output_tokens as usize),
+            TokenCount::Actual(self.total_tokens as usize),
+            TokenCount::Actual(self.input_tokens_details.cached_tokens as usize),
+            None,
+        )
     }
 }
 

@@ -50,8 +50,11 @@ impl Transformer for ProviderPipeline<'_> {
             .pipe(SetMinimaxParams.when(when_model("minimax")))
             .pipe(DropToolCalls.when(when_model("mistral")))
             .pipe(SetToolChoice::new(ToolChoice::Auto).when(when_model("gemini")))
-            .pipe(SetCache.when(when_model("gemini|anthropic|minimax")))
             .when(move |_| supports_open_router_params(provider));
+
+        let openai_compatible_cache = SetCache.when(move |request: &Request| {
+            supports_openai_compatible_cache_control(provider, request)
+        });
 
         // Strip thought signatures for all models except gemini-3
         let strip_thought_signature =
@@ -100,6 +103,7 @@ impl Transformer for ProviderPipeline<'_> {
 
         let mut combined = zai_thinking
             .pipe(or_transformers)
+            .pipe(openai_compatible_cache)
             .pipe(strip_thought_signature)
             .pipe(set_reasoning_effort)
             .pipe(open_ai_compat)
@@ -162,11 +166,24 @@ fn supports_open_router_params(provider: &Provider<Url>) -> bool {
         || provider.id == ProviderId::ZAI_CODING
 }
 
+/// Checks whether the route accepts OpenAI-compatible `cache_control` markers.
+fn supports_openai_compatible_cache_control(provider: &Provider<Url>, request: &Request) -> bool {
+    if provider.id == ProviderId::OPEN_ROUTER {
+        return when_model("gemini|anthropic|minimax")(request);
+    }
+
+    if provider.id == ProviderId::FORGE {
+        return when_model("gemini|anthropic|minimax|gpt-5\\.5")(request);
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
-    use forge_domain::ModelId;
+    use forge_domain::{Context, ContextMessage, ModelId, Role, TextMessage};
     use url::Url;
 
     use super::*;
@@ -369,6 +386,32 @@ mod tests {
         }
     }
 
+    fn cached_message_flags(provider: &Provider<Url>, model: &str, context: Context) -> Vec<bool> {
+        let fixture = Request::from(context).model(ModelId::new(model));
+        let mut pipeline = ProviderPipeline::new(provider);
+        let actual = pipeline.transform(fixture);
+
+        actual
+            .messages
+            .unwrap()
+            .into_iter()
+            .map(|message| {
+                message
+                    .content
+                    .as_ref()
+                    .is_some_and(crate::dto::openai::MessageContent::is_cached)
+            })
+            .collect()
+    }
+
+    fn text_message(role: Role, content: &str) -> ContextMessage {
+        ContextMessage::Text(TextMessage::new(role, content))
+    }
+
+    fn dynamic_user_message(content: &str) -> ContextMessage {
+        ContextMessage::Text(TextMessage::new(Role::User, content).cacheable(false))
+    }
+
     #[test]
     fn test_supports_open_router_params() {
         assert!(supports_open_router_params(&forge("forge")));
@@ -378,6 +421,61 @@ mod tests {
         assert!(!supports_open_router_params(&openai("openai")));
         assert!(!supports_open_router_params(&xai("xai")));
         assert!(!supports_open_router_params(&anthropic("claude")));
+    }
+
+    #[test]
+    fn test_forge_gpt55_applies_cache_control_to_static_and_rolling_messages() {
+        let provider = forge("forge");
+        let fixture = Context::default()
+            .add_message(text_message(Role::System, "stable system"))
+            .add_message(text_message(Role::User, "real user turn"))
+            .add_message(dynamic_user_message(
+                "<project_model_context>dynamic</project_model_context>",
+            ));
+
+        let actual = cached_message_flags(&provider, "gpt-5.5", fixture);
+
+        let expected = vec![true, true, false];
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_forge_gpt55_skips_changed_files_dynamic_message() {
+        let provider = forge("forge");
+        let fixture = Context::default()
+            .add_message(text_message(Role::User, "real user turn"))
+            .add_message(dynamic_user_message("Changed files:\n- crates/example.rs"));
+
+        let actual = cached_message_flags(&provider, "gpt-5.5", fixture);
+
+        let expected = vec![true, false];
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_plain_openai_gpt55_does_not_receive_cache_control() {
+        let provider = openai("openai");
+        let fixture = Context::default()
+            .add_message(text_message(Role::System, "stable system"))
+            .add_message(text_message(Role::User, "real user turn"));
+
+        let actual = cached_message_flags(&provider, "gpt-5.5", fixture);
+
+        let expected = vec![false, false];
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_openrouter_openai_gpt_model_still_does_not_receive_cache_control() {
+        let provider = open_router("open-router");
+        let fixture = Context::default()
+            .add_message(text_message(Role::System, "stable system"))
+            .add_message(text_message(Role::User, "real user turn"));
+
+        let actual = cached_message_flags(&provider, "openai/gpt-5.5", fixture);
+
+        let expected = vec![false, false];
+        assert_eq!(actual, expected);
     }
 
     #[test]

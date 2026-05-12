@@ -830,6 +830,17 @@ impl TokenCount {
             (Approx(a), Approx(b)) => Approx(a.max(b)),
         }
     }
+
+    /// Subtracts two token counts without underflowing below zero.
+    pub fn saturating_sub(self, other: TokenCount) -> TokenCount {
+        use TokenCount::*;
+        match (self, other) {
+            (Actual(a), Actual(b)) => Actual(a.saturating_sub(b)),
+            (Actual(a), Approx(b)) => Approx(a.saturating_sub(b)),
+            (Approx(a), Actual(b)) => Approx(a.saturating_sub(b)),
+            (Approx(a), Approx(b)) => Approx(a.saturating_sub(b)),
+        }
+    }
 }
 
 impl Deref for TokenCount {

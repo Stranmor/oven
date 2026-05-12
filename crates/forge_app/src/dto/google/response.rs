@@ -368,13 +368,13 @@ impl From<UsageMetadata> for forge_domain::Usage {
         let cached_tokens = usage.cached_content_token_count.unwrap_or_default() as usize;
         let total_tokens = usage.total_token_count.unwrap_or_default() as usize;
 
-        forge_domain::Usage {
-            prompt_tokens: TokenCount::Actual(prompt_tokens),
-            completion_tokens: TokenCount::Actual(completion_tokens),
-            total_tokens: TokenCount::Actual(total_tokens),
-            cached_tokens: TokenCount::Actual(cached_tokens),
-            ..Default::default()
-        }
+        forge_domain::Usage::new(
+            TokenCount::Actual(prompt_tokens),
+            TokenCount::Actual(completion_tokens),
+            TokenCount::Actual(total_tokens),
+            TokenCount::Actual(cached_tokens),
+            None,
+        )
     }
 }
 

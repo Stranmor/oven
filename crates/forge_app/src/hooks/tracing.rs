@@ -71,6 +71,7 @@ impl EventHandle<EventData<ResponsePayload>> for TracingHandler {
                 token_usage = format!("{}", message.usage.prompt_tokens),
                 total_tokens = format!("{}", message.usage.total_tokens),
                 cached_tokens = format!("{}", message.usage.cached_tokens),
+                uncached_tokens = format!("{}", message.usage.uncached_tokens()),
                 cost = message.usage.cost.unwrap_or_default(),
                 finish_reason = message.finish_reason.as_ref().map_or("", |reason| reason.into()),
                 "Processing usage information"

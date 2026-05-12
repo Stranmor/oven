@@ -295,16 +295,18 @@ impl From<ResponseUsage> for Usage {
             })
             .filter(is_non_zero_cost);
 
-        Usage {
-            prompt_tokens: TokenCount::Actual(usage.prompt_tokens),
-            completion_tokens: TokenCount::Actual(usage.completion_tokens),
-            total_tokens: TokenCount::Actual(usage.total_tokens),
-            cached_tokens: usage
-                .prompt_tokens_details
-                .map(|token_details| TokenCount::Actual(token_details.cached_tokens))
-                .unwrap_or_default(),
+        let cached_tokens = usage
+            .prompt_tokens_details
+            .map(|token_details| TokenCount::Actual(token_details.cached_tokens))
+            .unwrap_or_default();
+
+        Usage::new(
+            TokenCount::Actual(usage.prompt_tokens),
+            TokenCount::Actual(usage.completion_tokens),
+            TokenCount::Actual(usage.total_tokens),
+            cached_tokens,
             cost,
-        }
+        )
     }
 }
 
@@ -1070,6 +1072,23 @@ mod tests {
 
         let actual: Usage = fixture.into();
         assert_eq!(actual.cost, Some(0.005));
+    }
+
+    #[test]
+    fn test_openai_usage_conversion_derives_uncached_tokens() {
+        let fixture = ResponseUsage {
+            prompt_tokens: 1000,
+            completion_tokens: 50,
+            total_tokens: 1050,
+            cost: None,
+            prompt_tokens_details: Some(PromptTokenDetails { cached_tokens: 400 }),
+            cost_details: None,
+        };
+
+        let actual: Usage = fixture.into();
+
+        let expected = TokenCount::Actual(600);
+        assert_eq!(actual.uncached_tokens(), expected);
     }
 
     #[test]

@@ -180,13 +180,13 @@ impl From<Usage> for forge_domain::Usage {
 
         let total_tokens = prompt_tokens + completion_tokens;
 
-        forge_domain::Usage {
+        forge_domain::Usage::new(
             prompt_tokens,
             completion_tokens,
             total_tokens,
             cached_tokens,
-            ..Default::default()
-        }
+            None,
+        )
     }
 }
 

@@ -31,6 +31,27 @@ pub struct Usage {
 }
 
 impl Usage {
+    /// Builds usage from provider-reported token counts.
+    pub fn new(
+        prompt_tokens: TokenCount,
+        completion_tokens: TokenCount,
+        total_tokens: TokenCount,
+        cached_tokens: TokenCount,
+        cost: Option<f64>,
+    ) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cached_tokens,
+            cost,
+        }
+    }
+
+    /// Returns prompt tokens that did not benefit from cache reads.
+    pub fn uncached_tokens(&self) -> TokenCount {
+        self.prompt_tokens.saturating_sub(self.cached_tokens)
+    }
     /// Accumulates usage from another Usage instance by summing all fields.
     ///
     /// Use this for aggregating usage across **independent** requests (e.g.,
@@ -235,6 +256,54 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+    #[test]
+    fn test_usage_uncached_tokens_subtracts_cached_from_prompt() {
+        let fixture = Usage::new(
+            TokenCount::Actual(1000),
+            TokenCount::Actual(100),
+            TokenCount::Actual(1100),
+            TokenCount::Actual(250),
+            None,
+        );
+
+        let actual = fixture.uncached_tokens();
+
+        let expected = TokenCount::Actual(750);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_usage_uncached_tokens_saturates_at_zero() {
+        let fixture = Usage::new(
+            TokenCount::Actual(100),
+            TokenCount::Actual(10),
+            TokenCount::Actual(110),
+            TokenCount::Actual(250),
+            None,
+        );
+
+        let actual = fixture.uncached_tokens();
+
+        let expected = TokenCount::Actual(0);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_usage_uncached_tokens_preserves_approximate_kind() {
+        let fixture = Usage::new(
+            TokenCount::Approx(1000),
+            TokenCount::Actual(100),
+            TokenCount::Approx(1100),
+            TokenCount::Actual(250),
+            None,
+        );
+
+        let actual = fixture.uncached_tokens();
+
+        let expected = TokenCount::Approx(750);
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn test_usage_accumulate_with_both_costs() {
         let fixture_usage_1 = Usage {
