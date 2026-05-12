@@ -471,7 +471,11 @@ impl ConversationRepository for ConversationRepositoryImpl {
             let record: Option<SubagentTaskSessionRecord> = subagent_task_sessions::table
                 .filter(subagent_task_sessions::workspace_id.eq(workspace_id))
                 .filter(subagent_task_sessions::conversation_id.eq(conversation_id.into_string()))
-                .order(subagent_task_sessions::updated_at.desc())
+                .order((
+                    subagent_task_sessions::updated_at.desc(),
+                    subagent_task_sessions::created_at.desc(),
+                    subagent_task_sessions::task_id.desc(),
+                ))
                 .first(connection)
                 .optional()?;
             record
@@ -2370,6 +2374,53 @@ mod tests {
             .await?
             .expect("conversation should remain persisted");
         assert_eq!(persisted.parent_id, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_subagent_task_session_by_conversation_breaks_ties_by_newest_attempt()
+    -> anyhow::Result<()> {
+        let repo = repository()?;
+        let conversation_id = ConversationId::generate();
+        let parent_id = ConversationId::generate();
+        let root_id = ConversationId::generate();
+        let shared_updated_at = Utc::now();
+        let mut previous = SubagentTaskSession::new(
+            forge_domain::AgentId::new("forge"),
+            conversation_id,
+            Some(parent_id),
+            Some(root_id),
+            "previous task",
+        );
+        previous.created_at = shared_updated_at - Duration::seconds(1);
+        previous.updated_at = shared_updated_at;
+        previous.heartbeat_at = shared_updated_at;
+        previous.mark_completed("previous result");
+        previous.updated_at = shared_updated_at;
+        previous.heartbeat_at = shared_updated_at;
+        let mut latest = SubagentTaskSession::new(
+            forge_domain::AgentId::new("forge"),
+            conversation_id,
+            Some(parent_id),
+            Some(root_id),
+            "latest task",
+        );
+        latest.created_at = shared_updated_at;
+        latest.updated_at = shared_updated_at;
+        latest.heartbeat_at = shared_updated_at;
+        latest.mark_running();
+        latest.updated_at = shared_updated_at;
+        latest.heartbeat_at = shared_updated_at;
+
+        repo.upsert_subagent_task_session(previous).await?;
+        repo.upsert_subagent_task_session(latest.clone()).await?;
+        let actual = repo
+            .get_subagent_task_session_by_conversation(&conversation_id)
+            .await?
+            .expect("latest attempt should be selected deterministically");
+        let expected = latest.task_id;
+
+        assert_eq!(actual.task_id, expected);
         Ok(())
     }
 
