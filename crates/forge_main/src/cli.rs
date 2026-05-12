@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use forge_domain::{AgentId, ConversationId, Effort, ModelId, ProviderId};
+use forge_domain::{AgentId, ConversationId, Effort, ModelId, ProviderId, SubagentTaskId};
 
 use crate::version::VERSION_WITH_LAST_UPDATED;
 
@@ -111,6 +111,10 @@ pub enum TopLevelCommand {
     /// Manage conversation history and state.
     #[command(alias = "session")]
     Conversation(ConversationCommandGroup),
+
+    /// Inspect durable delegated subagent task/session lifecycle records.
+    #[command(alias = "tasks")]
+    Task(TaskCommandGroup),
 
     /// Generate and optionally commit changes with AI-generated message
     Commit(CommitCommandGroup),
@@ -323,6 +327,7 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         init: bool,
     },
+
     /// List all workspaces.
     List {
         /// Output in machine-readable format
@@ -700,6 +705,37 @@ pub enum ConfigGetField {
     Suggest,
     /// Get the reasoning effort level.
     ReasoningEffort,
+}
+
+/// Command group for durable subagent task-session lifecycle records.
+#[derive(Parser, Debug, Clone)]
+pub struct TaskCommandGroup {
+    #[command(subcommand)]
+    pub command: TaskCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum TaskCommand {
+    /// List durable task-session lifecycle records.
+    List {
+        /// Include terminal completed, failed, and interrupted records.
+        #[arg(long)]
+        all: bool,
+
+        /// Output in machine-readable format.
+        #[arg(long)]
+        porcelain: bool,
+    },
+
+    /// Show one durable task-session lifecycle record.
+    Show {
+        /// Durable task ID to display.
+        id: SubagentTaskId,
+
+        /// Output in machine-readable format.
+        #[arg(long)]
+        porcelain: bool,
+    },
 }
 
 /// Command group for conversation management.

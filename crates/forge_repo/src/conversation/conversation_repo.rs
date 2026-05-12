@@ -1,11 +1,22 @@
 use std::sync::Arc;
 
+use chrono::{Duration, Utc};
 use diesel::prelude::*;
-use forge_domain::{Conversation, ConversationId, ConversationRepository, WorkspaceHash};
+use forge_domain::{
+    Conversation, ConversationId, ConversationRepository, SubagentTaskId, SubagentTaskSession,
+    SubagentTaskSessionFilter, WorkspaceHash,
+};
 
 use crate::conversation::conversation_record::ConversationRecord;
-use crate::database::schema::conversations;
+use crate::conversation::subagent_task_record::SubagentTaskSessionRecord;
+use crate::database::schema::{conversations, subagent_task_sessions};
 use crate::database::{DatabasePool, PooledSqliteConnection};
+
+const SUBAGENT_TASK_HEARTBEAT_TIMEOUT: Duration = Duration::minutes(5);
+
+fn classify_subagent_task_session(session: SubagentTaskSession) -> SubagentTaskSession {
+    session.classify_with_heartbeat(Utc::now(), SUBAGENT_TASK_HEARTBEAT_TIMEOUT)
+}
 
 pub struct ConversationRepositoryImpl {
     pool: Arc<DatabasePool>,
@@ -154,6 +165,133 @@ impl ConversationRepository for ConversationRepositoryImpl {
             let conversations: Result<Vec<Conversation>, _> =
                 records.into_iter().map(Conversation::try_from).collect();
             conversations
+        })
+        .await
+    }
+
+    async fn upsert_subagent_task_session(
+        &self,
+        session: SubagentTaskSession,
+    ) -> anyhow::Result<()> {
+        self.run_with_connection(move |connection, wid| {
+            let workspace_id = workspace_db_id(wid);
+            let record = SubagentTaskSessionRecord::new(session, workspace_id);
+            let changed_rows = diesel::sql_query(
+                "INSERT INTO subagent_task_sessions (
+                    task_id, agent_id, conversation_id, parent_conversation_id,
+                    root_conversation_id, workspace_id, status, task, created_at,
+                    updated_at, heartbeat_at, final_result, final_error, delivered_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    agent_id = excluded.agent_id,
+                    conversation_id = excluded.conversation_id,
+                    parent_conversation_id = excluded.parent_conversation_id,
+                    root_conversation_id = excluded.root_conversation_id,
+                    status = excluded.status,
+                    task = excluded.task,
+                    updated_at = excluded.updated_at,
+                    heartbeat_at = excluded.heartbeat_at,
+                    final_result = excluded.final_result,
+                    final_error = excluded.final_error,
+                    delivered_at = excluded.delivered_at
+                WHERE subagent_task_sessions.workspace_id = excluded.workspace_id",
+            )
+            .bind::<diesel::sql_types::Text, _>(&record.task_id)
+            .bind::<diesel::sql_types::Text, _>(&record.agent_id)
+            .bind::<diesel::sql_types::Text, _>(&record.conversation_id)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                &record.parent_conversation_id,
+            )
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                &record.root_conversation_id,
+            )
+            .bind::<diesel::sql_types::BigInt, _>(record.workspace_id)
+            .bind::<diesel::sql_types::Text, _>(&record.status)
+            .bind::<diesel::sql_types::Text, _>(&record.task)
+            .bind::<diesel::sql_types::Timestamp, _>(record.created_at)
+            .bind::<diesel::sql_types::Timestamp, _>(record.updated_at)
+            .bind::<diesel::sql_types::Timestamp, _>(record.heartbeat_at)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.final_result)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.final_error)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamp>, _>(
+                record.delivered_at,
+            )
+            .execute(connection)?;
+            if changed_rows == 0 {
+                anyhow::bail!(
+                    "Subagent task session {} belongs to a different workspace",
+                    record.task_id
+                );
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_subagent_task_session(
+        &self,
+        task_id: &SubagentTaskId,
+    ) -> anyhow::Result<Option<SubagentTaskSession>> {
+        let task_id = *task_id;
+        self.run_with_connection(move |connection, wid| {
+            let workspace_id = workspace_db_id(wid);
+            let record: Option<SubagentTaskSessionRecord> = subagent_task_sessions::table
+                .filter(subagent_task_sessions::workspace_id.eq(workspace_id))
+                .filter(subagent_task_sessions::task_id.eq(task_id.into_string()))
+                .first(connection)
+                .optional()?;
+            record
+                .map(SubagentTaskSession::try_from)
+                .transpose()
+                .map(|session| session.map(classify_subagent_task_session))
+        })
+        .await
+    }
+
+    async fn get_subagent_task_session_by_conversation(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> anyhow::Result<Option<SubagentTaskSession>> {
+        let conversation_id = *conversation_id;
+        self.run_with_connection(move |connection, wid| {
+            let workspace_id = workspace_db_id(wid);
+            let record: Option<SubagentTaskSessionRecord> = subagent_task_sessions::table
+                .filter(subagent_task_sessions::workspace_id.eq(workspace_id))
+                .filter(subagent_task_sessions::conversation_id.eq(conversation_id.into_string()))
+                .first(connection)
+                .optional()?;
+            record
+                .map(SubagentTaskSession::try_from)
+                .transpose()
+                .map(|session| session.map(classify_subagent_task_session))
+        })
+        .await
+    }
+
+    async fn list_subagent_task_sessions(
+        &self,
+        filter: SubagentTaskSessionFilter,
+    ) -> anyhow::Result<Vec<SubagentTaskSession>> {
+        self.run_with_connection(move |connection, wid| {
+            let workspace_id = workspace_db_id(wid);
+            let mut query = subagent_task_sessions::table
+                .filter(subagent_task_sessions::workspace_id.eq(workspace_id))
+                .order(subagent_task_sessions::updated_at.desc())
+                .into_boxed();
+            if filter == SubagentTaskSessionFilter::Active {
+                query = query.filter(
+                    subagent_task_sessions::status
+                        .eq("created")
+                        .or(subagent_task_sessions::status.eq("running"))
+                        .or(subagent_task_sessions::status.eq("zombie")),
+                );
+            }
+            let records: Vec<SubagentTaskSessionRecord> = query.load(connection)?;
+            records
+                .into_iter()
+                .map(SubagentTaskSession::try_from)
+                .map(|session| session.map(classify_subagent_task_session))
+                .collect()
         })
         .await
     }
@@ -1722,6 +1860,155 @@ mod tests {
             "Grandchild should be deleted"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_subagent_task_session_lifecycle_persists_final_result() -> anyhow::Result<()> {
+        let repo = repository()?;
+        let mut fixture = SubagentTaskSession::new(
+            forge_domain::AgentId::new("forge"),
+            ConversationId::generate(),
+            Some(ConversationId::generate()),
+            Some(ConversationId::generate()),
+            "inspect repository",
+        );
+        fixture.mark_completed("done");
+
+        repo.upsert_subagent_task_session(fixture.clone()).await?;
+        let actual = repo
+            .get_subagent_task_session(&fixture.task_id)
+            .await?
+            .expect("task session should be persisted");
+        let expected = (
+            fixture.task_id,
+            forge_domain::SubagentTaskStatus::Completed,
+            Some("done".to_string()),
+            fixture.conversation_id,
+        );
+
+        assert_eq!(
+            (
+                actual.task_id,
+                actual.status,
+                actual.final_result,
+                actual.conversation_id,
+            ),
+            expected
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_subagent_task_sessions_active_and_all() -> anyhow::Result<()> {
+        let repo = repository()?;
+        let mut active = SubagentTaskSession::new(
+            forge_domain::AgentId::new("forge"),
+            ConversationId::generate(),
+            Some(ConversationId::generate()),
+            Some(ConversationId::generate()),
+            "active task",
+        );
+        active.mark_running();
+        let mut completed = SubagentTaskSession::new(
+            forge_domain::AgentId::new("forge"),
+            ConversationId::generate(),
+            Some(ConversationId::generate()),
+            Some(ConversationId::generate()),
+            "completed task",
+        );
+        completed.mark_completed("done");
+
+        repo.upsert_subagent_task_session(active.clone()).await?;
+        repo.upsert_subagent_task_session(completed.clone()).await?;
+        let actual_active = repo
+            .list_subagent_task_sessions(SubagentTaskSessionFilter::Active)
+            .await?;
+        let actual_all = repo
+            .list_subagent_task_sessions(SubagentTaskSessionFilter::All)
+            .await?;
+        let expected = (vec![active.task_id], 2usize);
+
+        assert_eq!(
+            (
+                actual_active
+                    .into_iter()
+                    .map(|session| session.task_id)
+                    .collect::<Vec<_>>(),
+                actual_all.len(),
+            ),
+            expected
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_subagent_task_sessions_classifies_stale_active_as_zombie()
+    -> anyhow::Result<()> {
+        let repo = repository()?;
+        let mut fixture = SubagentTaskSession::new(
+            forge_domain::AgentId::new("forge"),
+            ConversationId::generate(),
+            Some(ConversationId::generate()),
+            Some(ConversationId::generate()),
+            "stale task",
+        );
+        fixture.mark_running();
+        fixture.heartbeat_at = Utc::now() - Duration::minutes(20);
+
+        repo.upsert_subagent_task_session(fixture.clone()).await?;
+        let actual = repo
+            .list_subagent_task_sessions(SubagentTaskSessionFilter::Active)
+            .await?
+            .into_iter()
+            .find(|session| session.task_id == fixture.task_id)
+            .expect("stale task should be listed as active zombie");
+        let expected = forge_domain::SubagentTaskStatus::Zombie;
+
+        assert_eq!(actual.status, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_upsert_subagent_task_session_rejects_cross_workspace_task_id_collision()
+    -> anyhow::Result<()> {
+        let pool = Arc::new(DatabasePool::in_memory()?);
+        let repo = repository_with_pool(pool.clone(), WorkspaceHash::new(1));
+        let foreign_repo = repository_with_pool(pool, WorkspaceHash::new(2));
+        let fixture = SubagentTaskSession::new(
+            forge_domain::AgentId::new("forge"),
+            ConversationId::generate(),
+            Some(ConversationId::generate()),
+            Some(ConversationId::generate()),
+            "workspace task",
+        );
+
+        repo.upsert_subagent_task_session(fixture.clone()).await?;
+        let actual = foreign_repo.upsert_subagent_task_session(fixture).await;
+
+        assert!(actual.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_subagent_task_session_by_conversation() -> anyhow::Result<()> {
+        let repo = repository()?;
+        let fixture = SubagentTaskSession::new(
+            forge_domain::AgentId::new("forge"),
+            ConversationId::generate(),
+            Some(ConversationId::generate()),
+            Some(ConversationId::generate()),
+            "resume task",
+        );
+
+        repo.upsert_subagent_task_session(fixture.clone()).await?;
+        let actual = repo
+            .get_subagent_task_session_by_conversation(&fixture.conversation_id)
+            .await?
+            .expect("task session should be found by conversation");
+        let expected = fixture.task_id;
+
+        assert_eq!(actual.task_id, expected);
         Ok(())
     }
 }

@@ -278,6 +278,7 @@ mod tests {
                     values: vec![ToolValue::AI {
                         value: "Agent result".to_string(),
                         conversation_id: agent_conv_id_1,
+                        task_id: None,
                     }],
                 }),
             )))
@@ -288,6 +289,7 @@ mod tests {
                     values: vec![ToolValue::AI {
                         value: "Another agent result".to_string(),
                         conversation_id: agent_conv_id_2,
+                        task_id: None,
                     }],
                 })),
             ));
@@ -315,6 +317,7 @@ mod tests {
                     values: vec![ToolValue::AI {
                         value: "Agent result".to_string(),
                         conversation_id: agent_conv_id,
+                        task_id: None,
                     }],
                 }),
             )))

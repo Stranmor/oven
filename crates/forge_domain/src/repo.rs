@@ -6,7 +6,8 @@ use url::Url;
 use crate::{
     AnyProvider, AuthCredential, ChatCompletionMessage, Context, Conversation, ConversationId,
     MigrationResult, Model, ModelId, Provider, ProviderId, ProviderTemplate, ResultStream,
-    SearchMatch, Skill, Snapshot, WorkspaceAuth, WorkspaceId,
+    SearchMatch, Skill, Snapshot, SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter,
+    WorkspaceAuth, WorkspaceId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,7 +74,59 @@ pub trait ConversationRepository: Send + Sync {
     /// Returns an error if the operation fails
     async fn get_all_conversations(&self) -> Result<Vec<Conversation>>;
 
+    /// Retrieves sub-conversations for a parent conversation.
+    ///
+    /// # Arguments
+    /// * `parent_id` - The parent conversation ID.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     async fn get_sub_conversations(&self, parent_id: &ConversationId) -> Result<Vec<Conversation>>;
+
+    /// Creates or updates a durable subagent task-session lifecycle record.
+    ///
+    /// # Arguments
+    /// * `session` - The lifecycle record to persist.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    async fn upsert_subagent_task_session(&self, session: SubagentTaskSession) -> Result<()>;
+
+    /// Retrieves a durable subagent task-session lifecycle record by task ID.
+    ///
+    /// # Arguments
+    /// * `task_id` - The task-session ID to retrieve.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    async fn get_subagent_task_session(
+        &self,
+        task_id: &SubagentTaskId,
+    ) -> Result<Option<SubagentTaskSession>>;
+
+    /// Retrieves the lifecycle record that owns a delegated conversation.
+    ///
+    /// # Arguments
+    /// * `conversation_id` - The delegated conversation ID to resolve.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    async fn get_subagent_task_session_by_conversation(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> Result<Option<SubagentTaskSession>>;
+
+    /// Lists durable subagent task-session lifecycle records.
+    ///
+    /// # Arguments
+    /// * `filter` - Whether active or all task sessions should be returned.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    async fn list_subagent_task_sessions(
+        &self,
+        filter: SubagentTaskSessionFilter,
+    ) -> Result<Vec<SubagentTaskSession>>;
 
     /// Retrieves the most recent conversation
     ///

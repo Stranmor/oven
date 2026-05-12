@@ -194,6 +194,20 @@ impl<
         Ok(self.services.get_sub_conversations(parent_id).await?)
     }
 
+    async fn list_subagent_task_sessions(
+        &self,
+        filter: forge_domain::SubagentTaskSessionFilter,
+    ) -> anyhow::Result<Vec<forge_domain::SubagentTaskSession>> {
+        self.services.list_subagent_task_sessions(filter).await
+    }
+
+    async fn subagent_task_session(
+        &self,
+        task_id: &forge_domain::SubagentTaskId,
+    ) -> anyhow::Result<Option<forge_domain::SubagentTaskSession>> {
+        self.services.get_subagent_task_session(task_id).await
+    }
+
     async fn last_conversation(&self) -> anyhow::Result<Option<Conversation>> {
         self.services.last_conversation().await
     }

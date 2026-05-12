@@ -97,10 +97,10 @@ pub struct TaskInput {
     /// "sage")
     pub agent_id: String,
 
-    /// Optional session ID to continue an existing agent session. If not
-    /// provided, a new stateless session will be created. Use this to
-    /// maintain context across multiple task invocations with the same
-    /// agent.
+    /// Optional compatibility session ID to continue an existing agent
+    /// conversation. Pass the `conversation_id` returned from a previous task
+    /// result. Ownership is guarded by the durable lifecycle ledger so
+    /// unrelated parent sessions cannot silently reparent this conversation.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[eserde(compat)]
     #[schemars(with = "Option<String>")]

@@ -375,6 +375,8 @@ pub(super) enum ToolValueRecord {
     AI {
         value: String,
         conversation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
     },
     Image(ImageRecord),
     Empty,
@@ -400,9 +402,10 @@ impl From<&forge_domain::ToolValue> for ToolValueRecord {
     fn from(value: &forge_domain::ToolValue) -> Self {
         match value {
             forge_domain::ToolValue::Text(text) => Self::Text(text.clone()),
-            forge_domain::ToolValue::AI { value, conversation_id } => Self::AI {
+            forge_domain::ToolValue::AI { value, conversation_id, task_id } => Self::AI {
                 value: value.clone(),
                 conversation_id: conversation_id.into_string(),
+                task_id: task_id.map(|id| id.into_string()),
             },
             forge_domain::ToolValue::Image(img) => Self::Image(ImageRecord::from(img)),
             forge_domain::ToolValue::Empty => Self::Empty,
@@ -416,9 +419,12 @@ impl TryFrom<ToolValueRecord> for forge_domain::ToolValue {
     fn try_from(record: ToolValueRecord) -> anyhow::Result<Self> {
         Ok(match record {
             ToolValueRecord::Text(text) => Self::Text(text),
-            ToolValueRecord::AI { value, conversation_id } => Self::AI {
+            ToolValueRecord::AI { value, conversation_id, task_id } => Self::AI {
                 value,
                 conversation_id: ConversationId::parse(conversation_id)?,
+                task_id: task_id
+                    .map(forge_domain::SubagentTaskId::parse)
+                    .transpose()?,
             },
             ToolValueRecord::Image(img) => Self::Image(img.into()),
             ToolValueRecord::Empty => Self::Empty,

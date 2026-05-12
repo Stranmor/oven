@@ -175,6 +175,34 @@ mod tests {
                 .collect())
         }
 
+        async fn upsert_subagent_task_session(
+            &self,
+            _session: forge_domain::SubagentTaskSession,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn get_subagent_task_session(
+            &self,
+            _task_id: &forge_domain::SubagentTaskId,
+        ) -> anyhow::Result<Option<forge_domain::SubagentTaskSession>> {
+            Ok(None)
+        }
+
+        async fn get_subagent_task_session_by_conversation(
+            &self,
+            _conversation_id: &ConversationId,
+        ) -> anyhow::Result<Option<forge_domain::SubagentTaskSession>> {
+            Ok(None)
+        }
+
+        async fn list_subagent_task_sessions(
+            &self,
+            _filter: forge_domain::SubagentTaskSessionFilter,
+        ) -> anyhow::Result<Vec<forge_domain::SubagentTaskSession>> {
+            Ok(Vec::new())
+        }
+
         async fn last_conversation(&self) -> anyhow::Result<Option<Conversation>> {
             Ok(self.conversations.lock().await.values().next().cloned())
         }

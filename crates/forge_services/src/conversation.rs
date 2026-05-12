@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use forge_app::ConversationService;
-use forge_app::domain::{Conversation, ConversationId};
+use forge_app::domain::{
+    Conversation, ConversationId, SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter,
+};
 use forge_domain::ConversationRepository;
 
 /// Service for managing conversations, including creation, retrieval, and
@@ -61,6 +63,13 @@ impl<S: ConversationRepository> ConversationService for ForgeConversationService
             .get_conversation(id)
             .await?
             .ok_or_else(|| forge_app::domain::Error::ConversationNotFound(*id))?;
+        if conversation.parent_id.is_some() && conversation.parent_id != parent_id {
+            anyhow::bail!(
+                "Conversation {id} is already owned by parent {:?}; refusing silent reparent to {:?}",
+                conversation.parent_id,
+                parent_id
+            );
+        }
         conversation.ensure_delegated(parent_id);
         self.conversation_repository
             .upsert_conversation(conversation.clone())
@@ -75,6 +84,39 @@ impl<S: ConversationRepository> ConversationService for ForgeConversationService
     async fn get_sub_conversations(&self, parent_id: &ConversationId) -> Result<Vec<Conversation>> {
         self.conversation_repository
             .get_sub_conversations(parent_id)
+            .await
+    }
+
+    async fn upsert_subagent_task_session(&self, session: SubagentTaskSession) -> Result<()> {
+        self.conversation_repository
+            .upsert_subagent_task_session(session)
+            .await
+    }
+
+    async fn get_subagent_task_session(
+        &self,
+        task_id: &SubagentTaskId,
+    ) -> Result<Option<SubagentTaskSession>> {
+        self.conversation_repository
+            .get_subagent_task_session(task_id)
+            .await
+    }
+
+    async fn get_subagent_task_session_by_conversation(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> Result<Option<SubagentTaskSession>> {
+        self.conversation_repository
+            .get_subagent_task_session_by_conversation(conversation_id)
+            .await
+    }
+
+    async fn list_subagent_task_sessions(
+        &self,
+        filter: SubagentTaskSessionFilter,
+    ) -> Result<Vec<SubagentTaskSession>> {
+        self.conversation_repository
+            .list_subagent_task_sessions(filter)
             .await
     }
 
@@ -151,6 +193,34 @@ mod tests {
                 .collect())
         }
 
+        async fn upsert_subagent_task_session(
+            &self,
+            _session: SubagentTaskSession,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn get_subagent_task_session(
+            &self,
+            _task_id: &SubagentTaskId,
+        ) -> anyhow::Result<Option<SubagentTaskSession>> {
+            Ok(None)
+        }
+
+        async fn get_subagent_task_session_by_conversation(
+            &self,
+            _conversation_id: &ConversationId,
+        ) -> anyhow::Result<Option<SubagentTaskSession>> {
+            Ok(None)
+        }
+
+        async fn list_subagent_task_sessions(
+            &self,
+            _filter: SubagentTaskSessionFilter,
+        ) -> anyhow::Result<Vec<SubagentTaskSession>> {
+            Ok(Vec::new())
+        }
+
         async fn get_last_conversation(&self) -> anyhow::Result<Option<Conversation>> {
             Ok(self.conversations.lock().unwrap().values().next().cloned())
         }
@@ -213,24 +283,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ensure_delegated_conversation_reparents_already_agent_session()
-    -> anyhow::Result<()> {
+    async fn test_ensure_delegated_conversation_rejects_unrelated_reparent() -> anyhow::Result<()> {
         let repository = Arc::new(FixtureRepository::default());
         let service = ForgeConversationService::new(repository.clone());
-        let parent_id = ConversationId::generate();
+        let original_parent_id = ConversationId::generate();
+        let unrelated_parent_id = ConversationId::generate();
         let conversation = Conversation::new(ConversationId::generate())
             .initiator(Initiator::Agent)
+            .parent_id(original_parent_id)
             .context(Some(
                 Context::default().messages(vec![ContextMessage::user("Agent chat", None).into()]),
             ));
 
         repository.upsert_conversation(conversation.clone()).await?;
         let actual = service
-            .ensure_delegated_conversation(&conversation.id, Some(parent_id))
-            .await?;
-        let expected = (Initiator::Agent, Some(parent_id));
+            .ensure_delegated_conversation(&conversation.id, Some(unrelated_parent_id))
+            .await;
+        let expected = original_parent_id;
 
-        assert_eq!((actual.initiator, actual.parent_id), expected);
+        assert!(actual.is_err());
+        let persisted = repository
+            .get_conversation(&conversation.id)
+            .await?
+            .expect("conversation should remain persisted");
+        assert_eq!(persisted.parent_id, Some(expected));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ensure_delegated_conversation_rejects_parented_session_from_parentless_resume()
+    -> anyhow::Result<()> {
+        let repository = Arc::new(FixtureRepository::default());
+        let service = ForgeConversationService::new(repository.clone());
+        let original_parent_id = ConversationId::generate();
+        let conversation = Conversation::new(ConversationId::generate())
+            .initiator(Initiator::Agent)
+            .parent_id(original_parent_id)
+            .context(Some(
+                Context::default().messages(vec![ContextMessage::user("Agent chat", None).into()]),
+            ));
+
+        repository.upsert_conversation(conversation.clone()).await?;
+        let actual = service
+            .ensure_delegated_conversation(&conversation.id, None)
+            .await;
+        let expected = original_parent_id;
+
+        assert!(actual.is_err());
+        let persisted = repository
+            .get_conversation(&conversation.id)
+            .await?
+            .expect("conversation should remain persisted");
+        assert_eq!(persisted.parent_id, Some(expected));
         Ok(())
     }
 }

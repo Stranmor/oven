@@ -4,7 +4,7 @@ use anyhow::Context;
 use convert_case::{Case, Casing};
 use forge_domain::{
     AgentId, ChatRequest, ChatResponse, ChatResponseContent, Conversation, ConversationId, Event,
-    TitleFormat, ToolCallContext, ToolDefinition, ToolName, ToolOutput,
+    SubagentTaskSession, TitleFormat, ToolCallContext, ToolDefinition, ToolName, ToolOutput,
 };
 use forge_template::Element;
 use futures::StreamExt;
@@ -35,10 +35,9 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> AgentEx
     }
 
     /// Executes an agent tool call by creating a new chat request for the
-    /// Executes an agent tool call by creating a new chat request for the
     /// specified agent. If conversation_id is provided, the agent will reuse
-    /// that conversation, maintaining context across invocations. Otherwise,
-    /// a new conversation is created.
+    /// that conversation only when it is already owned by the same parent or is
+    /// parentless compatibility state. Otherwise, a new conversation is created.
     pub async fn execute(
         &self,
         agent_id: AgentId,
@@ -73,22 +72,81 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> AgentEx
             conversation
         };
         self.services.clear_steer(&conversation.id).await?;
+        let root_id = match parent_id {
+            Some(parent_id) => self
+                .services
+                .find_conversation(&parent_id)
+                .await?
+                .and_then(|parent| parent.parent_id)
+                .or(Some(parent_id)),
+            None => None,
+        };
+        let mut task_session = if let Some(existing) = self
+            .services
+            .get_subagent_task_session_by_conversation(&conversation.id)
+            .await?
+        {
+            if existing.parent_conversation_id.is_some()
+                && existing.parent_conversation_id != parent_id
+            {
+                anyhow::bail!(
+                    "Subagent session {} belongs to parent {:?}; refusing silent reparent to {:?}",
+                    conversation.id,
+                    existing.parent_conversation_id,
+                    parent_id
+                );
+            }
+            existing.task(task.clone()).agent_id(agent_id.clone())
+        } else {
+            SubagentTaskSession::new(
+                agent_id.clone(),
+                conversation.id,
+                parent_id,
+                root_id,
+                task.clone(),
+            )
+        };
+        task_session.mark_running();
+        self.services
+            .upsert_subagent_task_session(task_session.clone())
+            .await?;
         // Execute the request through the ForgeApp
         let app = crate::ForgeApp::new(self.services.clone());
-        let mut response_stream = app
+        let mut response_stream = match app
             .chat(
                 agent_id.clone(),
                 ChatRequest::new(Event::new(task.clone()), conversation.id),
             )
-            .await?;
+            .await
+        {
+            Ok(response_stream) => response_stream,
+            Err(error) => {
+                task_session.mark_failed(error.to_string());
+                self.services
+                    .upsert_subagent_task_session(task_session)
+                    .await?;
+                return Err(error);
+            }
+        };
 
         // Collect responses from the agent
         let mut output = String::new();
-        let mut executed_tools = 0;
         while let Some(message) = response_stream.next().await {
-            let message = message?;
+            let message = match message {
+                Ok(message) => message,
+                Err(error) => {
+                    task_session.mark_failed(error.to_string());
+                    self.services
+                        .upsert_subagent_task_session(task_session)
+                        .await?;
+                    return Err(error);
+                }
+            };
             if matches!(&message, ChatResponse::ToolCallEnd(_)) {
-                executed_tools += 1;
+                task_session.heartbeat();
+                self.services
+                    .upsert_subagent_task_session(task_session.clone())
+                    .await?;
             }
             match message {
                 ChatResponse::TaskMessage { ref content } => match content {
@@ -108,6 +166,10 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> AgentEx
                 ChatResponse::ToolCallEnd(_) => ctx.send(message).await?,
                 ChatResponse::RetryAttempt { .. } => ctx.send(message).await?,
                 ChatResponse::Interrupt { reason } => {
+                    task_session.mark_interrupted(reason.to_string());
+                    self.services
+                        .upsert_subagent_task_session(task_session.clone())
+                        .await?;
                     return Err(Error::AgentToolInterrupted(reason))
                         .context(format!(
                             "Tool call to '{}' failed.\n\
@@ -119,15 +181,31 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> AgentEx
                 }
             }
         }
-        if !output.is_empty() || executed_tools > 0 {
-            // Create tool output
-            Ok(ToolOutput::ai(
+        if !output.trim().is_empty() {
+            task_session.mark_completed(output.clone());
+            self.services
+                .upsert_subagent_task_session(task_session.clone())
+                .await?;
+            let tool_output = ToolOutput::ai_task(
                 conversation.id,
+                task_session.task_id,
                 Element::new("task_completed")
+                    .attr("task_id", task_session.task_id.into_string())
+                    .attr("conversation_id", conversation.id.into_string())
+                    .attr("session_id", conversation.id.into_string())
                     .attr("task", &task)
                     .append(Element::new("output").text(output)),
-            ))
+            );
+            task_session.mark_delivered();
+            self.services
+                .upsert_subagent_task_session(task_session)
+                .await?;
+            Ok(tool_output)
         } else {
+            task_session.mark_failed("Empty tool response");
+            self.services
+                .upsert_subagent_task_session(task_session)
+                .await?;
             Err(Error::EmptyToolResponse.into())
         }
     }

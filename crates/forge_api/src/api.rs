@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use anyhow::Result;
 use forge_app::dto::ToolsOverview;
 use forge_app::{User, UserUsage};
-use forge_domain::{AgentId, Effort, ModelId, ProviderModels};
+use forge_domain::{
+    AgentId, Effort, ModelId, ProviderModels, SubagentTaskId, SubagentTaskSession,
+    SubagentTaskSessionFilter,
+};
 use forge_stream::MpscStream;
 use futures::stream::BoxStream;
 use url::Url;
@@ -72,6 +75,30 @@ pub trait API: Sync + Send {
 
     /// Lists sub-conversations (subagent chats) for a parent conversation
     async fn get_sub_conversations(&self, parent_id: &ConversationId) -> Result<Vec<Conversation>>;
+
+    /// Lists durable subagent task sessions.
+    ///
+    /// # Arguments
+    /// * `filter` - Selects active-only or all task sessions.
+    ///
+    /// # Errors
+    /// Returns an error if listing task sessions fails.
+    async fn list_subagent_task_sessions(
+        &self,
+        filter: SubagentTaskSessionFilter,
+    ) -> Result<Vec<SubagentTaskSession>>;
+
+    /// Returns a durable subagent task session by task ID.
+    ///
+    /// # Arguments
+    /// * `task_id` - The durable task ID to retrieve.
+    ///
+    /// # Errors
+    /// Returns an error if the lookup fails.
+    async fn subagent_task_session(
+        &self,
+        task_id: &SubagentTaskId,
+    ) -> Result<Option<SubagentTaskSession>>;
 
     /// Finds the last active conversation for the current workspace
     async fn last_conversation(&self) -> Result<Option<Conversation>>;

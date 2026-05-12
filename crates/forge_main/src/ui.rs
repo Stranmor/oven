@@ -32,7 +32,7 @@ use url::Url;
 
 use crate::cli::{
     Cli, CommitCommandGroup, ConversationCommand, ListCommand, McpCommand, SelectCommand,
-    TopLevelCommand,
+    TaskCommand, TopLevelCommand,
 };
 use crate::conversation_selector::ConversationSelector;
 use crate::display_constants::{CommandType, headers, markers, status};
@@ -652,7 +652,12 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                 return Ok(());
             }
             TopLevelCommand::Conversation(conversation_group) => {
-                self.handle_conversation_command(conversation_group).await?;
+                self.handle_conversation_command(conversation_group.clone())
+                    .await?;
+                return Ok(());
+            }
+            TopLevelCommand::Task(task_group) => {
+                self.handle_task_command(task_group.command.clone()).await?;
                 return Ok(());
             }
             TopLevelCommand::Suggest { prompt } => {
@@ -851,6 +856,18 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                     }
                 }
                 return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_task_command(&mut self, command: TaskCommand) -> anyhow::Result<()> {
+        match command {
+            TaskCommand::List { all, porcelain } => {
+                self.on_show_task_sessions(all, porcelain).await?;
+            }
+            TaskCommand::Show { id, porcelain } => {
+                self.on_show_task_session(&id, porcelain).await?;
             }
         }
         Ok(())
@@ -2074,6 +2091,89 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
 
             // Show conversation info
             self.on_info(false, Some(conversation_id)).await?;
+        }
+        Ok(())
+    }
+
+    async fn on_show_task_sessions(&mut self, all: bool, porcelain: bool) -> anyhow::Result<()> {
+        let filter = if all {
+            forge_domain::SubagentTaskSessionFilter::All
+        } else {
+            forge_domain::SubagentTaskSessionFilter::Active
+        };
+        let sessions = self.api.list_subagent_task_sessions(filter).await?;
+        let mut info = Info::new();
+        for session in sessions {
+            let updated = humanize_time(session.updated_at);
+            info = info
+                .add_title(session.task_id)
+                .add_key_value("Status", session.status.to_string())
+                .add_key_value("Agent", session.agent_id.to_string())
+                .add_key_value("Conversation", session.conversation_id.to_string())
+                .add_key_value(
+                    "Parent",
+                    session
+                        .parent_conversation_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| markers::EMPTY.to_string()),
+                )
+                .add_key_value("Updated", updated)
+                .add_key_value("Task", session.task);
+        }
+        if porcelain {
+            self.writeln(Porcelain::from(&info).uppercase_headers())?;
+        } else {
+            self.writeln(info)?;
+        }
+        Ok(())
+    }
+
+    async fn on_show_task_session(
+        &mut self,
+        id: &forge_domain::SubagentTaskId,
+        porcelain: bool,
+    ) -> anyhow::Result<()> {
+        let session = self
+            .api
+            .subagent_task_session(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Task session '{id}' not found"))?;
+        let mut info = Info::new()
+            .add_title(session.task_id)
+            .add_key_value("Status", session.status.to_string())
+            .add_key_value("Agent", session.agent_id.to_string())
+            .add_key_value("Conversation", session.conversation_id.to_string())
+            .add_key_value(
+                "Parent",
+                session
+                    .parent_conversation_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| markers::EMPTY.to_string()),
+            )
+            .add_key_value(
+                "Root",
+                session
+                    .root_conversation_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| markers::EMPTY.to_string()),
+            )
+            .add_key_value("Created", session.created_at.to_rfc3339())
+            .add_key_value("Updated", session.updated_at.to_rfc3339())
+            .add_key_value("Heartbeat", session.heartbeat_at.to_rfc3339())
+            .add_key_value("Task", session.task);
+        if let Some(result) = session.final_result {
+            info = info.add_key_value("Final Result", result);
+        }
+        if let Some(error) = session.final_error {
+            info = info.add_key_value("Final Error", error);
+        }
+        if let Some(delivered_at) = session.delivered_at {
+            info = info.add_key_value("Delivered", delivered_at.to_rfc3339());
+        }
+        if porcelain {
+            self.writeln(Porcelain::from(&info).uppercase_headers())?;
+        } else {
+            self.writeln(info)?;
         }
         Ok(())
     }

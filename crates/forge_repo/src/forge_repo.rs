@@ -16,7 +16,8 @@ use forge_domain::{
     FuzzySearchRepository, McpServerConfig, MigrationResult, Model, ModelId, ProcessId,
     ProcessReadCursor, ProcessReadOutput, ProcessStartOutput, ProcessStatus, Provider, ProviderId,
     ProviderRepository, ResultStream, SearchMatch, Skill, SkillRepository, Snapshot,
-    SnapshotRepository, TextPatchBlock, TextPatchRepository,
+    SnapshotRepository, SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter,
+    TextPatchBlock, TextPatchRepository,
 };
 use forge_eventsource::EventSource;
 // Re-export CacacheStorage from forge_infra
@@ -140,6 +141,42 @@ impl<F: Send + Sync> ConversationRepository for ForgeRepo<F> {
     ) -> anyhow::Result<Vec<Conversation>> {
         self.conversation_repository
             .get_sub_conversations(parent_id)
+            .await
+    }
+
+    async fn upsert_subagent_task_session(
+        &self,
+        session: SubagentTaskSession,
+    ) -> anyhow::Result<()> {
+        self.conversation_repository
+            .upsert_subagent_task_session(session)
+            .await
+    }
+
+    async fn get_subagent_task_session(
+        &self,
+        task_id: &SubagentTaskId,
+    ) -> anyhow::Result<Option<SubagentTaskSession>> {
+        self.conversation_repository
+            .get_subagent_task_session(task_id)
+            .await
+    }
+
+    async fn get_subagent_task_session_by_conversation(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> anyhow::Result<Option<SubagentTaskSession>> {
+        self.conversation_repository
+            .get_subagent_task_session_by_conversation(conversation_id)
+            .await
+    }
+
+    async fn list_subagent_task_sessions(
+        &self,
+        filter: SubagentTaskSessionFilter,
+    ) -> anyhow::Result<Vec<SubagentTaskSession>> {
+        self.conversation_repository
+            .list_subagent_task_sessions(filter)
             .await
     }
 

@@ -430,7 +430,7 @@ fn create_conversation_context_section(conversation: &Conversation) -> Element {
                                             Some(Element::new("img").attr("src", image.url()))
                                         }
                                         crate::ToolValue::Empty => None,
-                                        crate::ToolValue::AI { value, conversation_id } => {
+                                        crate::ToolValue::AI { value, conversation_id, .. } => {
                                             // Use anchor link to navigate within the same HTML
                                             let anchor_id = format!("conversation-{}", conversation_id);
                                             Some(

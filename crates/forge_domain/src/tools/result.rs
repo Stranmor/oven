@@ -2,7 +2,7 @@ use derive_setters::Setters;
 use forge_template::Element;
 use serde::{Deserialize, Serialize};
 
-use crate::{ConversationId, Image, ToolCallFull, ToolCallId, ToolName};
+use crate::{ConversationId, Image, SubagentTaskId, ToolCallFull, ToolCallId, ToolName};
 
 const REFLECTION_PROMPT: &str =
     include_str!("../../../../templates/forge-partial-tool-error-reflection.md");
@@ -97,7 +97,32 @@ impl ToolOutput {
     pub fn ai(id: ConversationId, output: impl ToString) -> Self {
         ToolOutput {
             is_error: Default::default(),
-            values: vec![ToolValue::AI { value: output.to_string(), conversation_id: id }],
+            values: vec![ToolValue::AI {
+                value: output.to_string(),
+                conversation_id: id,
+                task_id: None,
+            }],
+        }
+    }
+
+    /// Creates an AI tool output with delegated conversation and task IDs.
+    ///
+    /// # Arguments
+    /// * `conversation_id` - The delegated conversation/session ID.
+    /// * `task_id` - The durable lifecycle ledger task ID.
+    /// * `output` - The output payload returned to the caller.
+    pub fn ai_task(
+        conversation_id: ConversationId,
+        task_id: SubagentTaskId,
+        output: impl ToString,
+    ) -> Self {
+        ToolOutput {
+            is_error: Default::default(),
+            values: vec![ToolValue::AI {
+                value: output.to_string(),
+                conversation_id,
+                task_id: Some(task_id),
+            }],
         }
     }
 
@@ -139,6 +164,8 @@ pub enum ToolValue {
     AI {
         value: String,
         conversation_id: ConversationId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<SubagentTaskId>,
     },
     Image(Image),
     #[default]

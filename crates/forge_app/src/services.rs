@@ -8,8 +8,9 @@ use forge_domain::{
     ChatCompletionMessage, CommandOutput, Context, Conversation, ConversationId, File, FileInfo,
     FileStatus, Image, McpConfig, McpServers, Model, ModelId, Node, ProcessId, ProcessReadCursor,
     ProcessReadOutput, ProcessStartOutput, ProcessStatus, Provider, ProviderId, ResultStream,
-    Scope, SearchParams, SteerMessage, SyncProgress, SyntaxError, Template, ToolCallFull,
-    ToolOutput, WorkspaceAuth, WorkspaceId, WorkspaceInfo,
+    Scope, SearchParams, SteerMessage, SubagentTaskId, SubagentTaskSession,
+    SubagentTaskSessionFilter, SyncProgress, SyntaxError, Template, ToolCallFull, ToolOutput,
+    WorkspaceAuth, WorkspaceId, WorkspaceInfo,
 };
 use forge_eventsource::EventSource;
 use reqwest::Response;
@@ -257,12 +258,33 @@ pub trait McpService: Send + Sync {
 
 #[async_trait::async_trait]
 pub trait ConversationService: Send + Sync {
+    /// Finds a conversation by ID.
+    ///
+    /// # Arguments
+    /// * `id` - The conversation ID to retrieve.
+    ///
+    /// # Errors
+    /// Returns an error if the lookup fails.
     async fn find_conversation(&self, id: &ConversationId) -> anyhow::Result<Option<Conversation>>;
 
+    /// Creates or updates a conversation.
+    ///
+    /// # Arguments
+    /// * `conversation` - The conversation to persist.
+    ///
+    /// # Errors
+    /// Returns an error if persistence fails.
     async fn upsert_conversation(&self, conversation: Conversation) -> anyhow::Result<()>;
 
     /// Marks an existing conversation as delegated agent work and links it to
     /// the current parent conversation when available.
+    ///
+    /// # Arguments
+    /// * `id` - The delegated conversation ID.
+    /// * `parent_id` - The parent conversation that owns this delegated session.
+    ///
+    /// # Errors
+    /// Returns an error if the conversation is missing or ownership is invalid.
     async fn ensure_delegated_conversation(
         &self,
         id: &ConversationId,
@@ -271,24 +293,97 @@ pub trait ConversationService: Send + Sync {
 
     /// This is useful when you want to perform several operations on a
     /// conversation atomically.
+    ///
+    /// # Arguments
+    /// * `id` - The conversation ID to modify.
+    /// * `f` - The mutation closure executed before persistence.
+    ///
+    /// # Errors
+    /// Returns an error if the conversation is missing or persistence fails.
     async fn modify_conversation<F, T>(&self, id: &ConversationId, f: F) -> anyhow::Result<T>
     where
         F: FnOnce(&mut Conversation) -> T + Send,
         T: Send;
 
-    /// Find conversations
+    /// Find conversations.
+    ///
+    /// # Errors
+    /// Returns an error if listing conversations fails.
     async fn get_conversations(&self) -> anyhow::Result<Vec<Conversation>>;
 
-    /// Find sub-conversations (subagent chats) for a parent conversation
+    /// Find sub-conversations (subagent chats) for a parent conversation.
+    ///
+    /// # Arguments
+    /// * `parent_id` - The parent conversation ID.
+    ///
+    /// # Errors
+    /// Returns an error if listing sub-conversations fails.
     async fn get_sub_conversations(
         &self,
         parent_id: &ConversationId,
     ) -> anyhow::Result<Vec<Conversation>>;
 
-    /// Find the last active conversation
+    /// Creates or updates a durable subagent lifecycle ledger record.
+    ///
+    /// # Arguments
+    /// * `session` - The subagent task-session lifecycle record to persist.
+    ///
+    /// # Errors
+    /// Returns an error if persistence fails.
+    async fn upsert_subagent_task_session(
+        &self,
+        session: SubagentTaskSession,
+    ) -> anyhow::Result<()>;
+
+    /// Finds a durable subagent lifecycle ledger record by task ID.
+    ///
+    /// # Arguments
+    /// * `task_id` - The durable task ID to retrieve.
+    ///
+    /// # Errors
+    /// Returns an error if lookup fails.
+    async fn get_subagent_task_session(
+        &self,
+        task_id: &SubagentTaskId,
+    ) -> anyhow::Result<Option<SubagentTaskSession>>;
+
+    /// Finds a durable subagent lifecycle ledger record by conversation ID.
+    ///
+    /// # Arguments
+    /// * `conversation_id` - The delegated conversation/session ID to retrieve.
+    ///
+    /// # Errors
+    /// Returns an error if lookup fails.
+    async fn get_subagent_task_session_by_conversation(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> anyhow::Result<Option<SubagentTaskSession>>;
+
+    /// Lists durable subagent lifecycle ledger records.
+    ///
+    /// # Arguments
+    /// * `filter` - Selects active-only or all task sessions.
+    ///
+    /// # Errors
+    /// Returns an error if listing task sessions fails.
+    async fn list_subagent_task_sessions(
+        &self,
+        filter: SubagentTaskSessionFilter,
+    ) -> anyhow::Result<Vec<SubagentTaskSession>>;
+
+    /// Find the last active conversation.
+    ///
+    /// # Errors
+    /// Returns an error if lookup fails.
     async fn last_conversation(&self) -> anyhow::Result<Option<Conversation>>;
 
-    /// Permanently deletes a conversation
+    /// Permanently deletes a conversation.
+    ///
+    /// # Arguments
+    /// * `conversation_id` - The conversation ID to delete.
+    ///
+    /// # Errors
+    /// Returns an error if deletion fails.
     async fn delete_conversation(&self, conversation_id: &ConversationId) -> anyhow::Result<()>;
 }
 
@@ -756,6 +851,42 @@ impl<I: Services> ConversationService for I {
     ) -> anyhow::Result<Vec<Conversation>> {
         self.conversation_service()
             .get_sub_conversations(parent_id)
+            .await
+    }
+
+    async fn upsert_subagent_task_session(
+        &self,
+        session: SubagentTaskSession,
+    ) -> anyhow::Result<()> {
+        self.conversation_service()
+            .upsert_subagent_task_session(session)
+            .await
+    }
+
+    async fn get_subagent_task_session(
+        &self,
+        task_id: &SubagentTaskId,
+    ) -> anyhow::Result<Option<SubagentTaskSession>> {
+        self.conversation_service()
+            .get_subagent_task_session(task_id)
+            .await
+    }
+
+    async fn get_subagent_task_session_by_conversation(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> anyhow::Result<Option<SubagentTaskSession>> {
+        self.conversation_service()
+            .get_subagent_task_session_by_conversation(conversation_id)
+            .await
+    }
+
+    async fn list_subagent_task_sessions(
+        &self,
+        filter: SubagentTaskSessionFilter,
+    ) -> anyhow::Result<Vec<SubagentTaskSession>> {
+        self.conversation_service()
+            .list_subagent_task_sessions(filter)
             .await
     }
 
@@ -1340,6 +1471,34 @@ mod tests {
                 .filter(|conversation| conversation.parent_id == Some(*parent_id))
                 .cloned()
                 .collect())
+        }
+
+        async fn upsert_subagent_task_session(
+            &self,
+            _session: SubagentTaskSession,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn get_subagent_task_session(
+            &self,
+            _task_id: &SubagentTaskId,
+        ) -> anyhow::Result<Option<SubagentTaskSession>> {
+            Ok(None)
+        }
+
+        async fn get_subagent_task_session_by_conversation(
+            &self,
+            _conversation_id: &ConversationId,
+        ) -> anyhow::Result<Option<SubagentTaskSession>> {
+            Ok(None)
+        }
+
+        async fn list_subagent_task_sessions(
+            &self,
+            _filter: SubagentTaskSessionFilter,
+        ) -> anyhow::Result<Vec<SubagentTaskSession>> {
+            Ok(Vec::new())
         }
 
         async fn last_conversation(&self) -> anyhow::Result<Option<Conversation>> {
