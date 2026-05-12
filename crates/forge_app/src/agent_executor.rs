@@ -58,10 +58,21 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> AgentEx
         .await?;
 
         let parent_id = ctx.conversation_id;
-        let conversation = if let Some(conversation_id) = conversation_id {
-            self.services
+        let (conversation, existing_task_session) = if let Some(conversation_id) = conversation_id {
+            let existing_task_session = self
+                .services
+                .get_subagent_task_session_by_conversation(&conversation_id)
+                .await?;
+            guard_delegated_resume_ownership(
+                &conversation_id,
+                parent_id,
+                existing_task_session.as_ref(),
+            )?;
+            let conversation = self
+                .services
                 .ensure_delegated_conversation(&conversation_id, parent_id)
-                .await?
+                .await?;
+            (conversation, existing_task_session)
         } else {
             let mut conversation = Conversation::generate()
                 .title(task.clone())
@@ -72,28 +83,14 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> AgentEx
                 .conversation_service()
                 .upsert_conversation(conversation.clone())
                 .await?;
-            conversation
+            (conversation, None)
         };
         self.services.clear_steer(&conversation.id).await?;
         let root_id = self
             .services
             .resolve_root_conversation_id(parent_id)
             .await?;
-        let mut task_session = if let Some(existing) = self
-            .services
-            .get_subagent_task_session_by_conversation(&conversation.id)
-            .await?
-        {
-            if existing.parent_conversation_id.is_some()
-                && existing.parent_conversation_id != parent_id
-            {
-                anyhow::bail!(
-                    "Subagent session {} belongs to parent {:?}; refusing silent reparent to {:?}",
-                    conversation.id,
-                    existing.parent_conversation_id,
-                    parent_id
-                );
-            }
+        let mut task_session = if let Some(existing) = existing_task_session {
             if existing.status.is_terminal() {
                 SubagentTaskSession::new(
                     agent_id.clone(),
@@ -237,5 +234,64 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> AgentEx
     pub async fn contains_tool(&self, tool_name: &ToolName) -> anyhow::Result<bool> {
         let agent_tools = self.agent_definitions().await?;
         Ok(agent_tools.iter().any(|tool| tool.name == *tool_name))
+    }
+}
+
+fn guard_delegated_resume_ownership(
+    conversation_id: &ConversationId,
+    parent_id: Option<ConversationId>,
+    existing: Option<&SubagentTaskSession>,
+) -> anyhow::Result<()> {
+    let Some(existing) = existing else {
+        return Ok(());
+    };
+    if existing.parent_conversation_id.is_some() && existing.parent_conversation_id != parent_id {
+        anyhow::bail!(
+            "Subagent session {} belongs to parent {:?}; refusing silent reparent to {:?}",
+            conversation_id,
+            existing.parent_conversation_id,
+            parent_id
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use forge_domain::{Initiator, SubagentTaskStatus};
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[test]
+    fn test_guard_delegated_resume_ownership_rejects_ledger_owned_parentless_conversation() {
+        let conversation_id = ConversationId::generate();
+        let original_parent_id = ConversationId::generate();
+        let resume_parent_id = ConversationId::generate();
+        let conversation = Conversation::new(conversation_id).initiator(Initiator::Agent);
+        let existing = SubagentTaskSession::new(
+            AgentId::new("forge"),
+            conversation_id,
+            Some(original_parent_id),
+            Some(original_parent_id),
+            "resume guarded task",
+        );
+
+        let actual = guard_delegated_resume_ownership(
+            &conversation.id,
+            Some(resume_parent_id),
+            Some(&existing),
+        );
+        let expected = (Some(original_parent_id), None, SubagentTaskStatus::Created);
+
+        assert!(actual.is_err());
+        assert_eq!(
+            (
+                existing.parent_conversation_id,
+                conversation.parent_id,
+                existing.status,
+            ),
+            expected
+        );
     }
 }

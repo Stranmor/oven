@@ -47,6 +47,22 @@ pub trait SnapshotRepository: Send + Sync {
 /// creating, retrieving, and listing conversations.
 #[async_trait::async_trait]
 pub trait ConversationRepository: Send + Sync {
+    /// Atomically marks an existing conversation as delegated agent work after
+    /// validating persisted conversation and subagent ledger ownership.
+    ///
+    /// # Arguments
+    /// * `conversation_id` - The delegated conversation ID.
+    /// * `parent_id` - The parent conversation that should own the delegated conversation.
+    ///
+    /// # Errors
+    /// Returns an error if the conversation is missing, belongs to a different
+    /// parent/workspace, is owned by a different ledger parent, or persistence fails.
+    async fn promote_delegated_conversation(
+        &self,
+        conversation_id: &ConversationId,
+        parent_id: Option<ConversationId>,
+    ) -> Result<Conversation>;
+
     /// Creates or updates a conversation
     ///
     /// # Arguments

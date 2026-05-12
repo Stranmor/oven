@@ -59,6 +59,89 @@ impl ConversationRepositoryImpl {
 
 #[async_trait::async_trait]
 impl ConversationRepository for ConversationRepositoryImpl {
+    async fn promote_delegated_conversation(
+        &self,
+        conversation_id: &ConversationId,
+        parent_id: Option<ConversationId>,
+    ) -> anyhow::Result<Conversation> {
+        let conversation_id = *conversation_id;
+        self.run_with_connection(move |connection, wid| {
+            connection.immediate_transaction::<_, anyhow::Error, _>(|connection| {
+                let workspace_id = workspace_db_id(wid);
+                let mut conversation = conversations::table
+                    .filter(conversations::workspace_id.eq(&workspace_id))
+                    .filter(conversations::conversation_id.eq(conversation_id.into_string()))
+                    .first::<ConversationRecord>(connection)
+                    .optional()?
+                    .map(Conversation::try_from)
+                    .transpose()?
+                    .ok_or_else(|| forge_domain::Error::ConversationNotFound(conversation_id))?;
+                if conversation.parent_id.is_some() && conversation.parent_id != parent_id {
+                    anyhow::bail!(
+                        "Conversation {conversation_id} is already owned by parent {:?}; refusing silent reparent to {:?}",
+                        conversation.parent_id,
+                        parent_id
+                    );
+                }
+                let existing: Option<SubagentTaskSession> = subagent_task_sessions::table
+                    .filter(subagent_task_sessions::workspace_id.eq(workspace_id))
+                    .filter(subagent_task_sessions::conversation_id.eq(conversation_id.into_string()))
+                    .order(subagent_task_sessions::updated_at.desc())
+                    .first::<SubagentTaskSessionRecord>(connection)
+                    .optional()?
+                    .map(SubagentTaskSession::try_from)
+                    .transpose()?
+                    .map(classify_subagent_task_session);
+                if let Some(existing) = existing {
+                    if existing.parent_conversation_id.is_some()
+                        && existing.parent_conversation_id != parent_id
+                    {
+                        anyhow::bail!(
+                            "Subagent session {conversation_id} belongs to parent {:?}; refusing silent reparent to {:?}",
+                            existing.parent_conversation_id,
+                            parent_id
+                        );
+                    }
+                }
+                conversation.ensure_delegated(parent_id);
+                let record = ConversationRecord::new(conversation.clone(), workspace_id);
+                let changed_rows = diesel::sql_query(
+                    "INSERT INTO conversations (
+                    conversation_id, title, workspace_id, context, created_at,
+                    updated_at, metrics, parent_id, initiator
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(conversation_id) DO UPDATE SET
+                    title = excluded.title,
+                    context = excluded.context,
+                    updated_at = excluded.updated_at,
+                    metrics = excluded.metrics,
+                    parent_id = excluded.parent_id,
+                    initiator = excluded.initiator
+                WHERE conversations.workspace_id = excluded.workspace_id",
+                )
+                .bind::<diesel::sql_types::Text, _>(&record.conversation_id)
+                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.title)
+                .bind::<diesel::sql_types::BigInt, _>(record.workspace_id)
+                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.context)
+                .bind::<diesel::sql_types::Timestamp, _>(record.created_at)
+                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamp>, _>(record.updated_at)
+                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.metrics)
+                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.parent_id)
+                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.initiator)
+                .execute(connection)?;
+
+                if changed_rows == 0 {
+                    anyhow::bail!(
+                        "Conversation {} belongs to a different workspace",
+                        record.conversation_id
+                    );
+                }
+                Ok(conversation)
+            })
+        })
+        .await
+    }
+
     async fn upsert_conversation(&self, conversation: Conversation) -> anyhow::Result<()> {
         self.run_with_connection(move |connection, wid| {
             let workspace_id = workspace_db_id(wid);

@@ -59,23 +59,9 @@ impl<S: ConversationRepository> ConversationService for ForgeConversationService
         id: &ConversationId,
         parent_id: Option<ConversationId>,
     ) -> Result<Conversation> {
-        let mut conversation = self
-            .conversation_repository
-            .get_conversation(id)
-            .await?
-            .ok_or_else(|| forge_app::domain::Error::ConversationNotFound(*id))?;
-        if conversation.parent_id.is_some() && conversation.parent_id != parent_id {
-            anyhow::bail!(
-                "Conversation {id} is already owned by parent {:?}; refusing silent reparent to {:?}",
-                conversation.parent_id,
-                parent_id
-            );
-        }
-        conversation.ensure_delegated(parent_id);
         self.conversation_repository
-            .upsert_conversation(conversation.clone())
-            .await?;
-        Ok(conversation)
+            .promote_delegated_conversation(id, parent_id)
+            .await
     }
 
     async fn resolve_root_conversation_id(
@@ -172,10 +158,47 @@ mod tests {
     #[derive(Default)]
     struct FixtureRepository {
         conversations: Mutex<HashMap<ConversationId, Conversation>>,
+        subagent_task_sessions: Mutex<HashMap<ConversationId, SubagentTaskSession>>,
+        ledger_insert_after_lookup: Mutex<Option<SubagentTaskSession>>,
     }
 
     #[async_trait::async_trait]
     impl ConversationRepository for FixtureRepository {
+        async fn promote_delegated_conversation(
+            &self,
+            conversation_id: &ConversationId,
+            parent_id: Option<ConversationId>,
+        ) -> anyhow::Result<Conversation> {
+            let mut conversations = self.conversations.lock().unwrap();
+            let mut subagent_task_sessions = self.subagent_task_sessions.lock().unwrap();
+            if let Some(session) = self.ledger_insert_after_lookup.lock().unwrap().take() {
+                subagent_task_sessions.insert(session.conversation_id, session);
+            }
+            let conversation = conversations
+                .get_mut(conversation_id)
+                .ok_or_else(|| forge_app::domain::Error::ConversationNotFound(*conversation_id))?;
+            if conversation.parent_id.is_some() && conversation.parent_id != parent_id {
+                anyhow::bail!(
+                    "Conversation {conversation_id} is already owned by parent {:?}; refusing silent reparent to {:?}",
+                    conversation.parent_id,
+                    parent_id
+                );
+            }
+            if let Some(existing) = subagent_task_sessions.get(conversation_id) {
+                if existing.parent_conversation_id.is_some()
+                    && existing.parent_conversation_id != parent_id
+                {
+                    anyhow::bail!(
+                        "Subagent session {conversation_id} belongs to parent {:?}; refusing silent reparent to {:?}",
+                        existing.parent_conversation_id,
+                        parent_id
+                    );
+                }
+            }
+            conversation.ensure_delegated(parent_id);
+            Ok(conversation.clone())
+        }
+
         async fn upsert_conversation(&self, conversation: Conversation) -> anyhow::Result<()> {
             self.conversations
                 .lock()
@@ -222,8 +245,12 @@ mod tests {
 
         async fn upsert_subagent_task_session(
             &self,
-            _session: SubagentTaskSession,
+            session: SubagentTaskSession,
         ) -> anyhow::Result<()> {
+            self.subagent_task_sessions
+                .lock()
+                .unwrap()
+                .insert(session.conversation_id, session);
             Ok(())
         }
 
@@ -236,9 +263,21 @@ mod tests {
 
         async fn get_subagent_task_session_by_conversation(
             &self,
-            _conversation_id: &ConversationId,
+            conversation_id: &ConversationId,
         ) -> anyhow::Result<Option<SubagentTaskSession>> {
-            Ok(None)
+            let actual = self
+                .subagent_task_sessions
+                .lock()
+                .unwrap()
+                .get(conversation_id)
+                .cloned();
+            if let Some(session) = self.ledger_insert_after_lookup.lock().unwrap().take() {
+                self.subagent_task_sessions
+                    .lock()
+                    .unwrap()
+                    .insert(session.conversation_id, session);
+            }
+            Ok(actual)
         }
 
         async fn list_subagent_task_sessions(
@@ -362,6 +401,78 @@ mod tests {
             .await?
             .expect("conversation should remain persisted");
         assert_eq!(persisted.parent_id, Some(expected));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ensure_delegated_conversation_rejects_ledger_owned_parentless_reparent()
+    -> anyhow::Result<()> {
+        let repository = Arc::new(FixtureRepository::default());
+        let service = ForgeConversationService::new(repository.clone());
+        let original_parent_id = ConversationId::generate();
+        let unrelated_parent_id = ConversationId::generate();
+        let conversation = Conversation::new(ConversationId::generate())
+            .initiator(Initiator::Agent)
+            .context(Some(
+                Context::default().messages(vec![ContextMessage::user("Agent chat", None).into()]),
+            ));
+        let session = SubagentTaskSession::new(
+            forge_domain::AgentId::new("forge"),
+            conversation.id,
+            Some(original_parent_id),
+            Some(original_parent_id),
+            "resume guarded task",
+        );
+
+        repository.upsert_conversation(conversation.clone()).await?;
+        repository.upsert_subagent_task_session(session).await?;
+        let actual = service
+            .ensure_delegated_conversation(&conversation.id, Some(unrelated_parent_id))
+            .await;
+        let expected = None;
+
+        assert!(actual.is_err());
+        let persisted = repository
+            .get_conversation(&conversation.id)
+            .await?
+            .expect("conversation should remain persisted");
+        assert_eq!(persisted.parent_id, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ensure_delegated_conversation_rejects_ledger_inserted_between_guard_and_persist()
+    -> anyhow::Result<()> {
+        let repository = Arc::new(FixtureRepository::default());
+        let service = ForgeConversationService::new(repository.clone());
+        let original_parent_id = ConversationId::generate();
+        let unrelated_parent_id = ConversationId::generate();
+        let conversation = Conversation::new(ConversationId::generate())
+            .initiator(Initiator::Agent)
+            .context(Some(
+                Context::default().messages(vec![ContextMessage::user("Agent chat", None).into()]),
+            ));
+        let session = SubagentTaskSession::new(
+            forge_domain::AgentId::new("forge"),
+            conversation.id,
+            Some(original_parent_id),
+            Some(original_parent_id),
+            "racing ledger owner",
+        );
+
+        repository.upsert_conversation(conversation.clone()).await?;
+        *repository.ledger_insert_after_lookup.lock().unwrap() = Some(session);
+        let actual = service
+            .ensure_delegated_conversation(&conversation.id, Some(unrelated_parent_id))
+            .await;
+        let expected = None;
+
+        assert!(actual.is_err());
+        let persisted = repository
+            .get_conversation(&conversation.id)
+            .await?
+            .expect("conversation should remain persisted");
+        assert_eq!(persisted.parent_id, expected);
         Ok(())
     }
 

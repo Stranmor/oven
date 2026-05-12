@@ -116,6 +116,16 @@ impl<F: Send + Sync> SnapshotRepository for ForgeRepo<F> {
 
 #[async_trait::async_trait]
 impl<F: Send + Sync> ConversationRepository for ForgeRepo<F> {
+    async fn promote_delegated_conversation(
+        &self,
+        conversation_id: &ConversationId,
+        parent_id: Option<ConversationId>,
+    ) -> anyhow::Result<Conversation> {
+        self.conversation_repository
+            .promote_delegated_conversation(conversation_id, parent_id)
+            .await
+    }
+
     async fn upsert_conversation(&self, conversation: Conversation) -> anyhow::Result<()> {
         self.conversation_repository
             .upsert_conversation(conversation)
