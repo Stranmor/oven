@@ -172,6 +172,7 @@ impl ContextMessage {
             model,
             droppable: false,
             phase: None,
+            cacheable: None,
         }
         .into()
     }
@@ -187,6 +188,7 @@ impl ContextMessage {
             reasoning_details: None,
             droppable: false,
             phase: None,
+            cacheable: None,
         }
         .into()
     }
@@ -208,6 +210,7 @@ impl ContextMessage {
             model: None,
             droppable: false,
             phase: None,
+            cacheable: None,
         }
         .into()
     }
@@ -229,6 +232,15 @@ impl ContextMessage {
             ContextMessage::Text(message) => message.droppable,
             ContextMessage::Tool(_) => false,
             ContextMessage::Image(_) => false,
+        }
+    }
+
+    /// Returns whether this context message is eligible for provider prompt-cache markers.
+    pub fn is_cache_eligible(&self) -> bool {
+        match self {
+            ContextMessage::Text(message) => message.is_cache_eligible(),
+            ContextMessage::Tool(_) => true,
+            ContextMessage::Image(_) => true,
         }
     }
 
@@ -319,6 +331,9 @@ pub struct TextMessage {
     /// requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<MessagePhase>,
+    /// Explicit prompt-cache eligibility. Missing metadata preserves legacy cache eligibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cacheable: Option<bool>,
 }
 
 impl TextMessage {
@@ -334,11 +349,23 @@ impl TextMessage {
             reasoning_details: None,
             droppable: false,
             phase: None,
+            cacheable: None,
         }
     }
 
     pub fn has_role(&self, role: Role) -> bool {
         self.role == role
+    }
+
+    /// Returns whether this message is eligible for provider prompt-cache markers.
+    pub fn is_cache_eligible(&self) -> bool {
+        self.cacheable.unwrap_or(true)
+    }
+
+    /// Marks this message as ineligible for provider prompt-cache markers.
+    pub fn cache_ineligible(mut self) -> Self {
+        self.cacheable = Some(false);
+        self
     }
 
     pub fn assistant(
@@ -356,6 +383,7 @@ impl TextMessage {
             model,
             droppable: false,
             phase: None,
+            cacheable: None,
         }
     }
 }
@@ -488,7 +516,9 @@ impl Context {
                         .attr("total_lines", info.total_lines)
                         .cdata(content);
 
-                    let mut message = TextMessage::new(Role::User, elm.to_string()).droppable(true);
+                    let mut message = TextMessage::new(Role::User, elm.to_string())
+                        .droppable(true)
+                        .cacheable(false);
 
                     if let Some(model) = model_id.clone() {
                         message = message.model(model);
@@ -504,7 +534,9 @@ impl Context {
                             Element::new(tag_name).text(entry.path)
                         }));
 
-                    let mut message = TextMessage::new(Role::User, elm.to_string()).droppable(true);
+                    let mut message = TextMessage::new(Role::User, elm.to_string())
+                        .droppable(true)
+                        .cacheable(false);
 
                     if let Some(model) = model_id.clone() {
                         message = message.model(model);

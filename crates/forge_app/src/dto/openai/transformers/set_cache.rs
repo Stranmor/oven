@@ -17,30 +17,32 @@ impl Transformer for SetCache {
     /// 3. Remove cache control from second-to-last message (index
     ///    messages.len() - 2)
     fn transform(&mut self, mut request: Self::Value) -> Self::Value {
-        if let Some(messages) = request.messages.as_mut() {
-            let len = messages.len();
+        let len = request.message_count();
+        let first_cache_eligible = (0..len).find(|index| request.is_message_cache_eligible(*index));
+        let last_cache_eligible = (0..len)
+            .rev()
+            .find(|index| request.is_message_cache_eligible(*index));
 
+        if let Some(messages) = request.messages.as_mut() {
             if len == 0 {
                 return request;
             }
 
-            // Remove cache control from second-to-last message (when there are 3+ messages)
-            if len >= 3
-                && let Some(message) = messages.get_mut(len - 2)
-                && let Some(ref content) = message.content
-            {
-                message.content = Some(content.clone().cached(false));
+            for message in messages.iter_mut() {
+                if let Some(ref content) = message.content {
+                    message.content = Some(content.clone().cached(false));
+                }
             }
 
-            // Add cache control to first message
-            if let Some(message) = messages.first_mut()
+            if let Some(index) = first_cache_eligible
+                && let Some(message) = messages.get_mut(index)
                 && let Some(ref content) = message.content
             {
                 message.content = Some(content.clone().cached(true));
             }
 
-            // Add cache control to last message (if different from first)
-            if let Some(message) = messages.last_mut()
+            if let Some(index) = last_cache_eligible
+                && let Some(message) = messages.get_mut(index)
                 && let Some(ref content) = message.content
             {
                 message.content = Some(content.clone().cached(true));
@@ -72,6 +74,12 @@ mod tests {
                         TextMessage::new(Role::User, c.to_string()).model(ModelId::new("gpt-4")),
                     ),
                     'a' => ContextMessage::Text(TextMessage::new(Role::Assistant, c.to_string())),
+                    'd' => ContextMessage::Text(
+                        TextMessage::new(Role::User, c.to_string())
+                            .model(ModelId::new("gpt-4"))
+                            .droppable(true)
+                            .cacheable(false),
+                    ),
                     _ => {
                         panic!("Invalid character in test message");
                     }
@@ -161,6 +169,51 @@ mod tests {
     fn test_longer_conversation() {
         let actual = create_test_context("suuauuaaau");
         let expected = "[suuauuaaa[u";
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_project_model_context_is_sent_but_cache_ineligible() {
+        let fixture = Context::default()
+            .add_message(ContextMessage::Text(
+                TextMessage::new(Role::User, "real user").model(ModelId::new("gpt-4")),
+            ))
+            .add_message(ContextMessage::Text(
+                TextMessage::new(
+                    Role::User,
+                    "<project_model_context>dynamic</project_model_context>",
+                )
+                .model(ModelId::new("gpt-4"))
+                .droppable(true)
+                .cacheable(false),
+            ));
+        let mut transformer = SetCache;
+
+        let actual = transformer.transform(Request::from(fixture));
+        let messages = actual.messages.unwrap();
+
+        let expected = (true, false, true);
+        assert_eq!(
+            (
+                matches!(messages[1].content.as_ref().unwrap(), crate::dto::openai::MessageContent::Text(text) if text.contains("project_model_context")),
+                messages[1].content.as_ref().unwrap().is_cached(),
+                messages[0].content.as_ref().unwrap().is_cached(),
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_changed_files_notification_is_cache_ineligible() {
+        let actual = create_test_context("ud");
+        let expected = "[ud";
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_real_user_message_remains_rolling_marker_before_dynamic_messages() {
+        let actual = create_test_context("sud");
+        let expected = "[s[ud";
         assert_eq!(actual, expected);
     }
 

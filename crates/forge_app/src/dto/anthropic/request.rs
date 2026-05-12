@@ -41,6 +41,8 @@ pub struct Request {
     pub frequency_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presence_penalty: Option<f32>,
+    #[serde(skip)]
+    pub message_cache_eligibility: Vec<bool>,
 }
 
 #[derive(Serialize, Default)]
@@ -129,6 +131,13 @@ impl TryFrom<forge_domain::Context> for Request {
                 }
                 _ => None,
             })
+            .collect::<Vec<_>>();
+
+        let message_cache_eligibility = request
+            .messages
+            .iter()
+            .filter(|message| !message.has_role(forge_domain::Role::System))
+            .map(|message| message.is_cache_eligible())
             .collect::<Vec<_>>();
 
         // Gate on the domain rule so inherited configs with `enabled: None` but
@@ -249,6 +258,7 @@ impl TryFrom<forge_domain::Context> for Request {
             }),
             frequency_penalty: request.frequency_penalty.map(|f| f as f32),
             presence_penalty: request.presence_penalty.map(|f| f as f32),
+            message_cache_eligibility,
             ..Default::default()
         })
     }
@@ -263,6 +273,14 @@ impl Request {
     /// Get a mutable reference to the messages
     pub fn get_messages_mut(&mut self) -> &mut Vec<Message> {
         &mut self.messages
+    }
+
+    /// Returns whether the provider message at `index` may receive a prompt-cache marker.
+    pub fn is_message_cache_eligible(&self, index: usize) -> bool {
+        self.message_cache_eligibility
+            .get(index)
+            .copied()
+            .unwrap_or(true)
     }
 }
 

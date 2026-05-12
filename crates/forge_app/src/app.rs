@@ -91,7 +91,8 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
         let mut context = conversation.context.take().unwrap_or_default();
         let message = TextMessage::new(Role::User, content)
             .model(self.agent.model.clone())
-            .droppable(true);
+            .droppable(true)
+            .cacheable(false);
         context = context.add_message(ContextMessage::Text(message));
         conversation.context(context)
     }
@@ -750,14 +751,17 @@ mod tests {
 
         orch.run().await?;
         let captured_context = setup.captured_context.lock().await.clone().unwrap();
-        let actual = captured_context
+        let project_context_message = captured_context
             .messages
             .iter()
-            .filter_map(|message| message.content())
-            .find(|content| content.contains("<project_model_context"))
-            .unwrap()
-            .to_string();
-        let expected = (true, true, true, true, 1usize, false);
+            .find(|message| {
+                message
+                    .content()
+                    .is_some_and(|content| content.contains("<project_model_context"))
+            })
+            .unwrap();
+        let actual = project_context_message.content().unwrap().to_string();
+        let expected = (true, true, true, true, false, 1usize, false);
 
         assert_eq!(
             (
@@ -765,6 +769,7 @@ mod tests {
                 actual.contains("src/lib.rs"),
                 actual.contains("start_line=\"3\""),
                 actual.contains("score=\"0.875000\""),
+                project_context_message.is_cache_eligible(),
                 setup.workspace_queries.load(Ordering::SeqCst),
                 captured_context
                     .tools

@@ -1687,6 +1687,7 @@ mod tests {
                     reasoning_details: None,
                     droppable: false,
                     phase: None,
+                    cacheable: Some(false),
                 }),
                 usage: Some(Usage {
                     prompt_tokens: forge_domain::TokenCount::Actual(100),
@@ -1750,6 +1751,14 @@ mod tests {
                 assert_eq!(tool_result.output.values.len(), 2);
             }
             _ => panic!("Expected tool result message"),
+        }
+
+        match &actual.messages[3].message {
+            ContextMessage::Text(message) => {
+                assert_eq!(message.cacheable, Some(false));
+                assert_eq!(message.is_cache_eligible(), false);
+            }
+            _ => panic!("Expected assistant text message"),
         }
 
         // Verify usage is preserved

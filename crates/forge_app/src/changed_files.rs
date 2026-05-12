@@ -72,6 +72,7 @@ impl<S: FsReadService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Ch
 
         let message = TextMessage::new(Role::User, notification)
             .droppable(true)
+            .cacheable(false)
             .model(self.agent.model.clone());
 
         conversation = conversation.context(context.add_message(ContextMessage::from(message)));
@@ -224,9 +225,10 @@ mod tests {
 
         let messages = &actual.context.unwrap().messages;
         assert_eq!(messages.len(), 1);
-        let message = messages[0].content().unwrap().to_string();
-        assert!(message.contains("/test/file.txt"));
-        assert!(message.contains("modified externally"));
+        let message = &messages[0];
+        assert!(message.content().unwrap().contains("/test/file.txt"));
+        assert!(message.content().unwrap().contains("modified externally"));
+        assert_eq!(message.is_cache_eligible(), false);
     }
 
     #[tokio::test]

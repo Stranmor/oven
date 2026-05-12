@@ -285,6 +285,8 @@ pub struct Request {
     pub max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
+    #[serde(skip)]
+    pub message_cache_eligibility: Vec<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -328,6 +330,14 @@ impl Request {
             .max()
             .unwrap_or(0)
     }
+
+    /// Returns whether the provider message at `index` may receive a prompt-cache marker.
+    pub fn is_message_cache_eligible(&self, index: usize) -> bool {
+        self.message_cache_eligibility
+            .get(index)
+            .copied()
+            .unwrap_or(true)
+    }
 }
 
 /// ref: https://openrouter.ai/docs/transforms
@@ -364,6 +374,12 @@ impl From<ToolDefinition> for Tool {
 
 impl From<Context> for Request {
     fn from(context: Context) -> Self {
+        let message_cache_eligibility = context
+            .messages
+            .iter()
+            .map(|message| message.is_cache_eligible())
+            .collect::<Vec<_>>();
+
         Request {
             messages: {
                 let messages = context
@@ -429,6 +445,7 @@ impl From<Context> for Request {
             reasoning_effort: Default::default(),
             max_completion_tokens: Default::default(),
             thinking: Default::default(),
+            message_cache_eligibility,
         }
     }
 }

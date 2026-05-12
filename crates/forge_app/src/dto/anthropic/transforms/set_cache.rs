@@ -40,18 +40,25 @@ impl Transformer for SetCache {
             }
         }
 
+        let first_cache_eligible = (0..len).find(|index| request.is_message_cache_eligible(*index));
+        let last_cache_eligible = (0..len)
+            .rev()
+            .find(|index| request.is_message_cache_eligible(*index));
+
         for message in request.get_messages_mut().iter_mut() {
             *message = std::mem::take(message).cached(false);
         }
 
         if !has_system_prompt
-            && len > 0
-            && let Some(first_message) = request.get_messages_mut().first_mut()
+            && let Some(index) = first_cache_eligible
+            && let Some(first_message) = request.get_messages_mut().get_mut(index)
         {
             *first_message = std::mem::take(first_message).cached(true);
         }
 
-        if let Some(message) = request.get_messages_mut().last_mut() {
+        if let Some(index) = last_cache_eligible
+            && let Some(message) = request.get_messages_mut().get_mut(index)
+        {
             *message = std::mem::take(message).cached(true);
         }
 
@@ -96,6 +103,15 @@ mod tests {
                 ),
                 'a' => messages.push(
                     ContextMessage::Text(TextMessage::new(Role::Assistant, c.to_string())).into(),
+                ),
+                'd' => messages.push(
+                    ContextMessage::Text(
+                        TextMessage::new(Role::User, c.to_string())
+                            .model(ModelId::new("claude-3-5-sonnet-20241022"))
+                            .droppable(true)
+                            .cacheable(false),
+                    )
+                    .into(),
                 ),
                 _ => panic!("Invalid character in conversation message: {}", c),
             }
@@ -266,6 +282,75 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
         assert!(request.get_messages()[0].is_cached());
+    }
+
+    #[test]
+    fn test_project_model_context_is_sent_but_cache_ineligible() {
+        let fixture = Context::default()
+            .add_message(ContextMessage::Text(
+                TextMessage::new(Role::User, "real user")
+                    .model(ModelId::new("claude-3-5-sonnet-20241022")),
+            ))
+            .add_message(ContextMessage::Text(
+                TextMessage::new(
+                    Role::User,
+                    "<project_model_context>dynamic</project_model_context>",
+                )
+                .model(ModelId::new("claude-3-5-sonnet-20241022"))
+                .droppable(true)
+                .cacheable(false),
+            ));
+        let mut transformer = SetCache;
+
+        let actual = transformer.transform(Request::try_from(fixture).unwrap());
+
+        let expected = (true, false, true);
+        assert_eq!(
+            (
+                actual.get_messages()[1]
+                    .content
+                    .iter()
+                    .any(|content| matches!(content, crate::dto::anthropic::Content::Text { text, .. } if text.contains("project_model_context"))),
+                actual.get_messages()[1].is_cached(),
+                actual.get_messages()[0].is_cached(),
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_changed_files_notification_is_cache_ineligible() {
+        let fixture = Context::default()
+            .add_message(ContextMessage::Text(
+                TextMessage::new(Role::User, "real user")
+                    .model(ModelId::new("claude-3-5-sonnet-20241022")),
+            ))
+            .add_message(ContextMessage::Text(
+                TextMessage::new(Role::User, "modified externally")
+                    .model(ModelId::new("claude-3-5-sonnet-20241022"))
+                    .droppable(true)
+                    .cacheable(false),
+            ));
+        let mut transformer = SetCache;
+
+        let actual = transformer.transform(Request::try_from(fixture).unwrap());
+
+        let expected = vec![true, false];
+        assert_eq!(
+            actual
+                .get_messages()
+                .iter()
+                .map(|message| message.is_cached())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_real_user_message_remains_rolling_marker_before_dynamic_messages() {
+        let actual = create_test_context_with_system("s", "ud");
+        let expected = "[s[ud";
+        assert_eq!(actual, expected);
     }
 
     #[test]
