@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -102,6 +103,22 @@ pub enum InterruptionReason {
     MaxRequestPerTurnLimitReached {
         limit: u64,
     },
+}
+
+impl fmt::Display for InterruptionReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MaxToolFailurePerTurnLimitReached { limit, .. } => {
+                write!(
+                    formatter,
+                    "max tool failure per turn limit reached: {limit}"
+                )
+            }
+            Self::MaxRequestPerTurnLimitReached { limit } => {
+                write!(formatter, "max request per turn limit reached: {limit}")
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
