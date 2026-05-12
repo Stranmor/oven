@@ -1,3 +1,4 @@
 DROP INDEX IF EXISTS idx_subagent_task_sessions_workspace_parent_updated;
+DROP INDEX IF EXISTS idx_subagent_task_sessions_workspace_conversation_updated;
 DROP INDEX IF EXISTS idx_subagent_task_sessions_workspace_status_updated;
 DROP TABLE IF EXISTS subagent_task_sessions;

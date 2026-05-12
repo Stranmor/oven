@@ -258,6 +258,7 @@ impl ConversationRepository for ConversationRepositoryImpl {
             let record: Option<SubagentTaskSessionRecord> = subagent_task_sessions::table
                 .filter(subagent_task_sessions::workspace_id.eq(workspace_id))
                 .filter(subagent_task_sessions::conversation_id.eq(conversation_id.into_string()))
+                .order(subagent_task_sessions::updated_at.desc())
                 .first(connection)
                 .optional()?;
             record
@@ -1991,24 +1992,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_subagent_task_session_by_conversation() -> anyhow::Result<()> {
+    async fn test_get_subagent_task_session_by_conversation_returns_latest_attempt()
+    -> anyhow::Result<()> {
         let repo = repository()?;
-        let fixture = SubagentTaskSession::new(
+        let conversation_id = ConversationId::generate();
+        let mut previous = SubagentTaskSession::new(
             forge_domain::AgentId::new("forge"),
-            ConversationId::generate(),
+            conversation_id,
             Some(ConversationId::generate()),
             Some(ConversationId::generate()),
-            "resume task",
+            "previous task",
+        );
+        previous.mark_completed("previous result");
+        previous.mark_delivered();
+        previous.updated_at = Utc::now() - Duration::minutes(1);
+        let mut latest = SubagentTaskSession::new(
+            forge_domain::AgentId::new("forge"),
+            conversation_id,
+            previous.parent_conversation_id,
+            previous.root_conversation_id,
+            "latest task",
+        );
+        latest.mark_running();
+
+        repo.upsert_subagent_task_session(previous.clone()).await?;
+        repo.upsert_subagent_task_session(latest.clone()).await?;
+        let actual_latest = repo
+            .get_subagent_task_session_by_conversation(&conversation_id)
+            .await?
+            .expect("latest attempt should be found by conversation");
+        let actual_previous = repo
+            .get_subagent_task_session(&previous.task_id)
+            .await?
+            .expect("previous terminal attempt should remain durable");
+        let expected = (
+            latest.task_id,
+            Some("previous result".to_string()),
+            previous.delivered_at.is_some(),
         );
 
-        repo.upsert_subagent_task_session(fixture.clone()).await?;
-        let actual = repo
-            .get_subagent_task_session_by_conversation(&fixture.conversation_id)
-            .await?
-            .expect("task session should be found by conversation");
-        let expected = fixture.task_id;
-
-        assert_eq!(actual.task_id, expected);
+        assert_eq!(
+            (
+                actual_latest.task_id,
+                actual_previous.final_result,
+                actual_previous.delivered_at.is_some(),
+            ),
+            expected
+        );
         Ok(())
     }
 }

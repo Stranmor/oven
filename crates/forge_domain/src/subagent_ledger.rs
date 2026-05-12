@@ -159,9 +159,6 @@ impl SubagentTaskSession {
         self.status = SubagentTaskStatus::Running;
         self.updated_at = now;
         self.heartbeat_at = now;
-        self.final_result = None;
-        self.final_error = None;
-        self.delivered_at = None;
     }
 
     /// Refreshes the heartbeat timestamp for an active task session.
@@ -292,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_running_clears_previous_terminal_payload() {
+    fn test_mark_running_preserves_previous_terminal_payload_for_recovery() {
         let mut fixture = SubagentTaskSession::new(
             AgentId::new("forge"),
             ConversationId::generate(),
@@ -305,11 +302,17 @@ mod tests {
 
         fixture.mark_running();
         let actual = (
+            fixture.status,
             fixture.final_result,
             fixture.final_error,
-            fixture.delivered_at,
+            fixture.delivered_at.is_some(),
         );
-        let expected = (None, None, None);
+        let expected = (
+            SubagentTaskStatus::Running,
+            Some("done".to_string()),
+            None,
+            true,
+        );
 
         assert_eq!(actual, expected);
     }

@@ -94,7 +94,17 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> AgentEx
                     parent_id
                 );
             }
-            existing.task(task.clone()).agent_id(agent_id.clone())
+            if existing.status.is_terminal() {
+                SubagentTaskSession::new(
+                    agent_id.clone(),
+                    conversation.id,
+                    parent_id,
+                    root_id,
+                    task.clone(),
+                )
+            } else {
+                existing.task(task.clone()).agent_id(agent_id.clone())
+            }
         } else {
             SubagentTaskSession::new(
                 agent_id.clone(),
