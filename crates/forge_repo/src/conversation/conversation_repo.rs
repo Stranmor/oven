@@ -105,10 +105,46 @@ fn ensure_conversation_ledger_parent_is_compatible(
     Ok(())
 }
 
+fn ensure_task_session_identity_matches_by_task_id(
+    connection: &mut SqliteConnection,
+    record: &SubagentTaskSessionRecord,
+) -> anyhow::Result<()> {
+    let existing: Option<SubagentTaskSessionRecord> = subagent_task_sessions::table
+        .filter(subagent_task_sessions::task_id.eq(&record.task_id))
+        .first(connection)
+        .optional()?;
+
+    if let Some(existing) = existing {
+        if existing.workspace_id != record.workspace_id {
+            anyhow::bail!(
+                "Subagent task session {} belongs to a different workspace",
+                record.task_id
+            );
+        }
+        if existing.conversation_id != record.conversation_id
+            || existing.parent_conversation_id != record.parent_conversation_id
+            || existing.root_conversation_id != record.root_conversation_id
+        {
+            anyhow::bail!(
+                "Subagent task session {} is already bound to conversation {}, parent {:?}, and root {:?}; refusing reassignment to conversation {}, parent {:?}, and root {:?}",
+                record.task_id,
+                existing.conversation_id,
+                existing.parent_conversation_id,
+                existing.root_conversation_id,
+                record.conversation_id,
+                record.parent_conversation_id,
+                record.root_conversation_id
+            );
+        }
+    }
+    Ok(())
+}
+
 fn insert_subagent_task_session_record(
     connection: &mut SqliteConnection,
     record: &SubagentTaskSessionRecord,
 ) -> anyhow::Result<()> {
+    ensure_task_session_identity_matches_by_task_id(connection, record)?;
     let changed_rows = diesel::sql_query(
         "INSERT INTO subagent_task_sessions (
                     task_id, agent_id, conversation_id, parent_conversation_id,
@@ -117,9 +153,6 @@ fn insert_subagent_task_session_record(
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(task_id) DO UPDATE SET
                     agent_id = excluded.agent_id,
-                    conversation_id = excluded.conversation_id,
-                    parent_conversation_id = excluded.parent_conversation_id,
-                    root_conversation_id = excluded.root_conversation_id,
                     status = excluded.status,
                     task = excluded.task,
                     updated_at = excluded.updated_at,
@@ -127,7 +160,10 @@ fn insert_subagent_task_session_record(
                     final_result = excluded.final_result,
                     final_error = excluded.final_error,
                     delivered_at = excluded.delivered_at
-                WHERE subagent_task_sessions.workspace_id = excluded.workspace_id",
+                WHERE subagent_task_sessions.workspace_id = excluded.workspace_id
+                    AND subagent_task_sessions.conversation_id = excluded.conversation_id
+                    AND subagent_task_sessions.parent_conversation_id IS excluded.parent_conversation_id
+                    AND subagent_task_sessions.root_conversation_id IS excluded.root_conversation_id",
     )
     .bind::<diesel::sql_types::Text, _>(&record.task_id)
     .bind::<diesel::sql_types::Text, _>(&record.agent_id)
@@ -2090,6 +2126,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_subagent_task_session_lifecycle_updates_same_task_identity() -> anyhow::Result<()>
+    {
+        let repo = repository()?;
+        let mut fixture = SubagentTaskSession::new(
+            forge_domain::AgentId::new("forge"),
+            ConversationId::generate(),
+            Some(ConversationId::generate()),
+            Some(ConversationId::generate()),
+            "inspect repository",
+        );
+        fixture.mark_running();
+        repo.upsert_subagent_task_session(fixture.clone()).await?;
+        fixture.mark_completed("done");
+        repo.upsert_subagent_task_session(fixture.clone()).await?;
+        fixture.mark_delivered();
+
+        repo.upsert_subagent_task_session(fixture.clone()).await?;
+        let actual = repo
+            .get_subagent_task_session(&fixture.task_id)
+            .await?
+            .expect("task session should be updated");
+        let expected = fixture;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_subagent_task_session_lifecycle_updates_parentless_task_identity()
+    -> anyhow::Result<()> {
+        let repo = repository()?;
+        let mut fixture = SubagentTaskSession::new(
+            forge_domain::AgentId::new("forge"),
+            ConversationId::generate(),
+            None,
+            None,
+            "parentless task",
+        );
+        fixture.mark_running();
+        repo.upsert_subagent_task_session(fixture.clone()).await?;
+        fixture.mark_completed("done");
+
+        repo.upsert_subagent_task_session(fixture.clone()).await?;
+        let actual = repo
+            .get_subagent_task_session(&fixture.task_id)
+            .await?
+            .expect("parentless task session should be updated");
+        let expected = fixture;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_list_subagent_task_sessions_active_and_all() -> anyhow::Result<()> {
         let repo = repository()?;
         let mut active = SubagentTaskSession::new(
@@ -2204,6 +2294,39 @@ mod tests {
         let actual = repo.upsert_subagent_task_session(conflicting_owner).await;
 
         assert!(actual.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_upsert_subagent_task_session_rejects_task_id_conversation_reassignment()
+    -> anyhow::Result<()> {
+        let repo = repository()?;
+        let original = SubagentTaskSession::new(
+            forge_domain::AgentId::new("forge"),
+            ConversationId::generate(),
+            Some(ConversationId::generate()),
+            Some(ConversationId::generate()),
+            "original task",
+        );
+        let mut reassigned = SubagentTaskSession::new(
+            forge_domain::AgentId::new("forge"),
+            ConversationId::generate(),
+            Some(ConversationId::generate()),
+            Some(ConversationId::generate()),
+            "reassigned task",
+        );
+        reassigned.task_id = original.task_id;
+
+        repo.upsert_subagent_task_session(original.clone()).await?;
+        let actual = repo.upsert_subagent_task_session(reassigned).await;
+        let persisted = repo
+            .get_subagent_task_session(&original.task_id)
+            .await?
+            .expect("original task session should remain persisted");
+        let expected = original.conversation_id;
+
+        assert!(actual.is_err());
+        assert_eq!(persisted.conversation_id, expected);
         Ok(())
     }
 
