@@ -145,6 +145,30 @@ mod tests {
             Ok(conversation.clone())
         }
 
+        async fn resolve_root_conversation_id(
+            &self,
+            parent_id: Option<ConversationId>,
+        ) -> anyhow::Result<Option<ConversationId>> {
+            let Some(mut current_id) = parent_id else {
+                return Ok(None);
+            };
+            let mut root_id = current_id;
+            let mut seen = std::collections::HashSet::new();
+            while seen.insert(current_id) {
+                let conversations = self.conversations.lock().await;
+                let Some(parent) = conversations.get(&current_id) else {
+                    break;
+                };
+                let Some(next_parent_id) = parent.parent_id else {
+                    break;
+                };
+                drop(conversations);
+                root_id = next_parent_id;
+                current_id = next_parent_id;
+            }
+            Ok(Some(root_id))
+        }
+
         async fn modify_conversation<F, T>(&self, id: &ConversationId, f: F) -> anyhow::Result<T>
         where
             F: FnOnce(&mut Conversation) -> T + Send,

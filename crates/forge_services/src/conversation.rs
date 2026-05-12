@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -75,6 +76,32 @@ impl<S: ConversationRepository> ConversationService for ForgeConversationService
             .upsert_conversation(conversation.clone())
             .await?;
         Ok(conversation)
+    }
+
+    async fn resolve_root_conversation_id(
+        &self,
+        parent_id: Option<ConversationId>,
+    ) -> Result<Option<ConversationId>> {
+        let Some(mut current_id) = parent_id else {
+            return Ok(None);
+        };
+        let mut root_id = current_id;
+        let mut seen = HashSet::new();
+        while seen.insert(current_id) {
+            let Some(parent) = self
+                .conversation_repository
+                .get_conversation(&current_id)
+                .await?
+            else {
+                break;
+            };
+            let Some(next_parent_id) = parent.parent_id else {
+                break;
+            };
+            root_id = next_parent_id;
+            current_id = next_parent_id;
+        }
+        Ok(Some(root_id))
     }
 
     async fn get_conversations(&self) -> Result<Vec<Conversation>> {
@@ -335,6 +362,38 @@ mod tests {
             .await?
             .expect("conversation should remain persisted");
         assert_eq!(persisted.parent_id, Some(expected));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_resolve_root_conversation_id_walks_nested_parent_chain() -> anyhow::Result<()> {
+        let repository = Arc::new(FixtureRepository::default());
+        let service = ForgeConversationService::new(repository.clone());
+        let root = Conversation::new(ConversationId::generate()).context(Some(
+            Context::default().messages(vec![ContextMessage::user("Root chat", None).into()]),
+        ));
+        let child = Conversation::new(ConversationId::generate())
+            .initiator(Initiator::Agent)
+            .parent_id(root.id)
+            .context(Some(
+                Context::default().messages(vec![ContextMessage::user("Child chat", None).into()]),
+            ));
+        let grandchild = Conversation::new(ConversationId::generate())
+            .initiator(Initiator::Agent)
+            .parent_id(child.id)
+            .context(Some(Context::default().messages(vec![
+                ContextMessage::user("Grandchild chat", None).into(),
+            ])));
+
+        repository.upsert_conversation(root.clone()).await?;
+        repository.upsert_conversation(child.clone()).await?;
+        repository.upsert_conversation(grandchild.clone()).await?;
+        let actual = service
+            .resolve_root_conversation_id(Some(grandchild.id))
+            .await?;
+        let expected = Some(root.id);
+
+        assert_eq!(actual, expected);
         Ok(())
     }
 }

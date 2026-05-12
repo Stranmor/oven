@@ -291,6 +291,18 @@ pub trait ConversationService: Send + Sync {
         parent_id: Option<ConversationId>,
     ) -> anyhow::Result<Conversation>;
 
+    /// Resolves the root conversation ID for a delegated parent chain.
+    ///
+    /// # Arguments
+    /// * `parent_id` - The immediate parent conversation, when the task is delegated.
+    ///
+    /// # Errors
+    /// Returns an error if reading the persisted parent chain fails.
+    async fn resolve_root_conversation_id(
+        &self,
+        parent_id: Option<ConversationId>,
+    ) -> anyhow::Result<Option<ConversationId>>;
+
     /// This is useful when you want to perform several operations on a
     /// conversation atomically.
     ///
@@ -831,6 +843,15 @@ impl<I: Services> ConversationService for I {
             .await?;
         self.steer_service().clear_steer(id).await?;
         Ok(conversation)
+    }
+
+    async fn resolve_root_conversation_id(
+        &self,
+        parent_id: Option<ConversationId>,
+    ) -> anyhow::Result<Option<ConversationId>> {
+        self.conversation_service()
+            .resolve_root_conversation_id(parent_id)
+            .await
     }
 
     async fn modify_conversation<F, T>(&self, id: &ConversationId, f: F) -> anyhow::Result<T>
@@ -1441,6 +1462,30 @@ mod tests {
                 .ok_or_else(|| forge_domain::Error::ConversationNotFound(*id))?;
             conversation.ensure_delegated(parent_id);
             Ok(conversation.clone())
+        }
+
+        async fn resolve_root_conversation_id(
+            &self,
+            parent_id: Option<ConversationId>,
+        ) -> anyhow::Result<Option<ConversationId>> {
+            let Some(mut current_id) = parent_id else {
+                return Ok(None);
+            };
+            let mut root_id = current_id;
+            let mut seen = std::collections::HashSet::new();
+            while seen.insert(current_id) {
+                let conversations = self.conversations.lock().await;
+                let Some(parent) = conversations.get(&current_id) else {
+                    break;
+                };
+                let Some(next_parent_id) = parent.parent_id else {
+                    break;
+                };
+                drop(conversations);
+                root_id = next_parent_id;
+                current_id = next_parent_id;
+            }
+            Ok(Some(root_id))
         }
 
         async fn modify_conversation<F, T>(&self, id: &ConversationId, f: F) -> anyhow::Result<T>

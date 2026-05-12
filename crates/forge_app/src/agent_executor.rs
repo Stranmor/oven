@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use convert_case::{Case, Casing};
@@ -12,6 +13,8 @@ use tokio::sync::RwLock;
 
 use crate::error::Error;
 use crate::{AgentRegistry, ConversationService, EnvironmentInfra, Services, SteerService};
+const SUBAGENT_TASK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
 #[derive(Clone)]
 pub struct AgentExecutor<S> {
     services: Arc<S>,
@@ -72,15 +75,10 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> AgentEx
             conversation
         };
         self.services.clear_steer(&conversation.id).await?;
-        let root_id = match parent_id {
-            Some(parent_id) => self
-                .services
-                .find_conversation(&parent_id)
-                .await?
-                .and_then(|parent| parent.parent_id)
-                .or(Some(parent_id)),
-            None => None,
-        };
+        let root_id = self
+            .services
+            .resolve_root_conversation_id(parent_id)
+            .await?;
         let mut task_session = if let Some(existing) = self
             .services
             .get_subagent_task_session_by_conversation(&conversation.id)
@@ -129,9 +127,25 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> AgentEx
             }
         };
 
-        // Collect responses from the agent
+        // Collect responses from the agent while persisting periodic heartbeats so
+        // long-running subagents do not look like zombie sessions between events.
         let mut output = String::new();
-        while let Some(message) = response_stream.next().await {
+        let mut heartbeat_interval = tokio::time::interval(SUBAGENT_TASK_HEARTBEAT_INTERVAL);
+        heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let message = tokio::select! {
+                _ = heartbeat_interval.tick() => {
+                    task_session.heartbeat();
+                    self.services
+                        .upsert_subagent_task_session(task_session.clone())
+                        .await?;
+                    continue;
+                }
+                message = response_stream.next() => message,
+            };
+            let Some(message) = message else {
+                break;
+            };
             let message = match message {
                 Ok(message) => message,
                 Err(error) => {

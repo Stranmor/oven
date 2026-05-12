@@ -257,6 +257,24 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_with_heartbeat_keeps_fresh_running_task_active() {
+        let mut fixture = SubagentTaskSession::new(
+            AgentId::new("forge"),
+            ConversationId::generate(),
+            Some(ConversationId::generate()),
+            Some(ConversationId::generate()),
+            "run task",
+        );
+        fixture.status = SubagentTaskStatus::Running;
+        fixture.heartbeat_at = Utc::now() - Duration::minutes(1);
+
+        let actual = fixture.classify_with_heartbeat(Utc::now(), Duration::minutes(5));
+        let expected = SubagentTaskStatus::Running;
+
+        assert_eq!(actual.status, expected);
+    }
+
+    #[test]
     fn test_mark_completed_does_not_mark_parent_delivery() {
         let mut fixture = SubagentTaskSession::new(
             AgentId::new("forge"),
