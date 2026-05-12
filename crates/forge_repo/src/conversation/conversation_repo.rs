@@ -5,7 +5,7 @@ use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 use forge_domain::{
     Conversation, ConversationId, ConversationRepository, SubagentTaskId, SubagentTaskSession,
-    SubagentTaskSessionFilter, WorkspaceHash,
+    SubagentTaskSessionFilter, SubagentTaskStatus, WorkspaceHash,
 };
 
 use crate::conversation::conversation_record::ConversationRecord;
@@ -136,6 +136,44 @@ fn ensure_task_session_identity_matches_by_task_id(
                 record.root_conversation_id
             );
         }
+    }
+    Ok(())
+}
+
+fn ensure_no_other_active_conversation_session(
+    connection: &mut SqliteConnection,
+    record: &SubagentTaskSessionRecord,
+) -> anyhow::Result<()> {
+    let status = record.status.parse::<SubagentTaskStatus>()?;
+    if !status.is_active() {
+        return Ok(());
+    }
+
+    let existing: Option<SubagentTaskSessionRecord> = subagent_task_sessions::table
+        .filter(subagent_task_sessions::workspace_id.eq(record.workspace_id))
+        .filter(subagent_task_sessions::conversation_id.eq(&record.conversation_id))
+        .filter(subagent_task_sessions::task_id.ne(&record.task_id))
+        .filter(
+            subagent_task_sessions::status
+                .eq("created")
+                .or(subagent_task_sessions::status.eq("running"))
+                .or(subagent_task_sessions::status.eq("zombie")),
+        )
+        .order((
+            subagent_task_sessions::updated_at.desc(),
+            subagent_task_sessions::created_at.desc(),
+            subagent_task_sessions::task_id.desc(),
+        ))
+        .first(connection)
+        .optional()?;
+
+    if let Some(existing) = existing {
+        anyhow::bail!(
+            "Subagent session {} already has active task session {}; refusing duplicate active attempt {}",
+            record.conversation_id,
+            existing.task_id,
+            record.task_id
+        );
     }
     Ok(())
 }
@@ -435,6 +473,7 @@ impl ConversationRepository for ConversationRepositoryImpl {
                     requested_parent_id,
                     requested_root_id,
                 )?;
+                ensure_no_other_active_conversation_session(connection, &record)?;
                 insert_subagent_task_session_record(connection, &record)
             })
         })
@@ -468,9 +507,15 @@ impl ConversationRepository for ConversationRepositoryImpl {
         let conversation_id = *conversation_id;
         self.run_with_connection(move |connection, wid| {
             let workspace_id = workspace_db_id(wid);
-            let record: Option<SubagentTaskSessionRecord> = subagent_task_sessions::table
+            let active_record: Option<SubagentTaskSessionRecord> = subagent_task_sessions::table
                 .filter(subagent_task_sessions::workspace_id.eq(workspace_id))
                 .filter(subagent_task_sessions::conversation_id.eq(conversation_id.into_string()))
+                .filter(
+                    subagent_task_sessions::status
+                        .eq("created")
+                        .or(subagent_task_sessions::status.eq("running"))
+                        .or(subagent_task_sessions::status.eq("zombie")),
+                )
                 .order((
                     subagent_task_sessions::updated_at.desc(),
                     subagent_task_sessions::created_at.desc(),
@@ -478,6 +523,21 @@ impl ConversationRepository for ConversationRepositoryImpl {
                 ))
                 .first(connection)
                 .optional()?;
+            let record: Option<SubagentTaskSessionRecord> = match active_record {
+                Some(record) => Some(record),
+                None => subagent_task_sessions::table
+                    .filter(subagent_task_sessions::workspace_id.eq(workspace_id))
+                    .filter(
+                        subagent_task_sessions::conversation_id.eq(conversation_id.into_string()),
+                    )
+                    .order((
+                        subagent_task_sessions::updated_at.desc(),
+                        subagent_task_sessions::created_at.desc(),
+                        subagent_task_sessions::task_id.desc(),
+                    ))
+                    .first(connection)
+                    .optional()?,
+            };
             record
                 .map(SubagentTaskSession::try_from)
                 .transpose()
@@ -2421,6 +2481,118 @@ mod tests {
         let expected = latest.task_id;
 
         assert_eq!(actual.task_id, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_subagent_task_session_by_conversation_prefers_older_active_attempt_over_newer_terminal()
+    -> anyhow::Result<()> {
+        let repo = repository()?;
+        let conversation_id = ConversationId::generate();
+        let parent_id = ConversationId::generate();
+        let root_id = ConversationId::generate();
+        let mut active = SubagentTaskSession::new(
+            forge_domain::AgentId::new("forge"),
+            conversation_id,
+            Some(parent_id),
+            Some(root_id),
+            "older active task",
+        );
+        active.mark_running();
+        active.updated_at = Utc::now() - Duration::minutes(10);
+        active.heartbeat_at = active.updated_at;
+        let mut terminal = SubagentTaskSession::new(
+            forge_domain::AgentId::new("forge"),
+            conversation_id,
+            Some(parent_id),
+            Some(root_id),
+            "newer terminal task",
+        );
+        terminal.mark_completed("done");
+
+        repo.upsert_subagent_task_session(active.clone()).await?;
+        repo.upsert_subagent_task_session(terminal.clone()).await?;
+        let actual = repo
+            .get_subagent_task_session_by_conversation(&conversation_id)
+            .await?
+            .expect("active attempt should block resume even when not latest");
+        let expected = (active.task_id, forge_domain::SubagentTaskStatus::Zombie);
+
+        assert_eq!((actual.task_id, actual.status), expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_upsert_subagent_task_session_rejects_second_active_attempt_for_conversation()
+    -> anyhow::Result<()> {
+        let repo = repository()?;
+        let conversation_id = ConversationId::generate();
+        let parent_id = ConversationId::generate();
+        let root_id = ConversationId::generate();
+        let mut original = SubagentTaskSession::new(
+            forge_domain::AgentId::new("forge"),
+            conversation_id,
+            Some(parent_id),
+            Some(root_id),
+            "original active task",
+        );
+        original.mark_running();
+        let mut duplicate = SubagentTaskSession::new(
+            forge_domain::AgentId::new("forge"),
+            conversation_id,
+            Some(parent_id),
+            Some(root_id),
+            "duplicate active task",
+        );
+        duplicate.mark_running();
+
+        repo.upsert_subagent_task_session(original.clone()).await?;
+        let actual = repo.upsert_subagent_task_session(duplicate).await;
+        let persisted = repo
+            .get_subagent_task_session(&original.task_id)
+            .await?
+            .expect("original active task should remain persisted");
+        let expected = original.task_id;
+
+        assert!(actual.is_err());
+        assert_eq!(persisted.task_id, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_upsert_subagent_task_session_allows_new_active_attempt_after_terminal_history()
+    -> anyhow::Result<()> {
+        let repo = repository()?;
+        let conversation_id = ConversationId::generate();
+        let parent_id = ConversationId::generate();
+        let root_id = ConversationId::generate();
+        let mut terminal = SubagentTaskSession::new(
+            forge_domain::AgentId::new("forge"),
+            conversation_id,
+            Some(parent_id),
+            Some(root_id),
+            "terminal task",
+        );
+        terminal.mark_completed("done");
+        let mut next = SubagentTaskSession::new(
+            forge_domain::AgentId::new("forge"),
+            conversation_id,
+            Some(parent_id),
+            Some(root_id),
+            "next active task",
+        );
+        next.mark_running();
+
+        repo.upsert_subagent_task_session(terminal).await?;
+        let actual = repo.upsert_subagent_task_session(next.clone()).await;
+        let persisted = repo
+            .get_subagent_task_session_by_conversation(&conversation_id)
+            .await?
+            .expect("new active task should be persisted after terminal history");
+        let expected = next.task_id;
+
+        assert!(actual.is_ok());
+        assert_eq!(persisted.task_id, expected);
         Ok(())
     }
 
