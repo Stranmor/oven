@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use chrono::{Duration, Utc};
 use diesel::prelude::*;
+use diesel::sqlite::SqliteConnection;
 use forge_domain::{
     Conversation, ConversationId, ConversationRepository, SubagentTaskId, SubagentTaskSession,
     SubagentTaskSessionFilter, WorkspaceHash,
@@ -16,6 +17,140 @@ const SUBAGENT_TASK_HEARTBEAT_TIMEOUT: Duration = Duration::minutes(5);
 
 fn classify_subagent_task_session(session: SubagentTaskSession) -> SubagentTaskSession {
     session.classify_with_heartbeat(Utc::now(), SUBAGENT_TASK_HEARTBEAT_TIMEOUT)
+}
+
+fn ensure_ledger_owner_matches_exact(
+    conversation_id: ConversationId,
+    requested_parent_id: Option<ConversationId>,
+    requested_root_id: Option<ConversationId>,
+    existing: SubagentTaskSession,
+) -> anyhow::Result<()> {
+    if existing.parent_conversation_id != requested_parent_id
+        || existing.root_conversation_id != requested_root_id
+    {
+        anyhow::bail!(
+            "Subagent session {conversation_id} belongs to parent {:?} and root {:?}; refusing silent reparent to parent {:?} and root {:?}",
+            existing.parent_conversation_id,
+            existing.root_conversation_id,
+            requested_parent_id,
+            requested_root_id
+        );
+    }
+    Ok(())
+}
+
+fn ensure_conversation_ledger_owner_matches_exact(
+    connection: &mut SqliteConnection,
+    workspace_id: i64,
+    conversation_id: ConversationId,
+    requested_parent_id: Option<ConversationId>,
+    requested_root_id: Option<ConversationId>,
+) -> anyhow::Result<()> {
+    let records: Vec<SubagentTaskSessionRecord> = subagent_task_sessions::table
+        .filter(subagent_task_sessions::workspace_id.eq(workspace_id))
+        .filter(subagent_task_sessions::conversation_id.eq(conversation_id.into_string()))
+        .load(connection)?;
+
+    for record in records {
+        let existing = SubagentTaskSession::try_from(record)?;
+        ensure_ledger_owner_matches_exact(
+            conversation_id,
+            requested_parent_id,
+            requested_root_id,
+            existing,
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_conversation_ledger_parent_is_compatible(
+    connection: &mut SqliteConnection,
+    workspace_id: i64,
+    conversation_id: ConversationId,
+    requested_parent_id: Option<ConversationId>,
+) -> anyhow::Result<()> {
+    let records: Vec<SubagentTaskSessionRecord> = subagent_task_sessions::table
+        .filter(subagent_task_sessions::workspace_id.eq(workspace_id))
+        .filter(subagent_task_sessions::conversation_id.eq(conversation_id.into_string()))
+        .load(connection)?;
+    let mut owner: Option<(Option<ConversationId>, Option<ConversationId>)> = None;
+
+    for record in records {
+        let existing = SubagentTaskSession::try_from(record)?;
+        let existing_owner = (
+            existing.parent_conversation_id,
+            existing.root_conversation_id,
+        );
+        if existing_owner.0 != requested_parent_id {
+            anyhow::bail!(
+                "Subagent session {conversation_id} belongs to parent {:?} and root {:?}; refusing silent reparent to parent {:?}",
+                existing_owner.0,
+                existing_owner.1,
+                requested_parent_id
+            );
+        }
+        if let Some(owner) = owner {
+            if owner != existing_owner {
+                anyhow::bail!(
+                    "Subagent session {conversation_id} has inconsistent historical owners {:?} and {:?}; refusing promotion to parent {:?}",
+                    owner,
+                    existing_owner,
+                    requested_parent_id
+                );
+            }
+        } else {
+            owner = Some(existing_owner);
+        }
+    }
+    Ok(())
+}
+
+fn insert_subagent_task_session_record(
+    connection: &mut SqliteConnection,
+    record: &SubagentTaskSessionRecord,
+) -> anyhow::Result<()> {
+    let changed_rows = diesel::sql_query(
+        "INSERT INTO subagent_task_sessions (
+                    task_id, agent_id, conversation_id, parent_conversation_id,
+                    root_conversation_id, workspace_id, status, task, created_at,
+                    updated_at, heartbeat_at, final_result, final_error, delivered_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    agent_id = excluded.agent_id,
+                    conversation_id = excluded.conversation_id,
+                    parent_conversation_id = excluded.parent_conversation_id,
+                    root_conversation_id = excluded.root_conversation_id,
+                    status = excluded.status,
+                    task = excluded.task,
+                    updated_at = excluded.updated_at,
+                    heartbeat_at = excluded.heartbeat_at,
+                    final_result = excluded.final_result,
+                    final_error = excluded.final_error,
+                    delivered_at = excluded.delivered_at
+                WHERE subagent_task_sessions.workspace_id = excluded.workspace_id",
+    )
+    .bind::<diesel::sql_types::Text, _>(&record.task_id)
+    .bind::<diesel::sql_types::Text, _>(&record.agent_id)
+    .bind::<diesel::sql_types::Text, _>(&record.conversation_id)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.parent_conversation_id)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.root_conversation_id)
+    .bind::<diesel::sql_types::BigInt, _>(record.workspace_id)
+    .bind::<diesel::sql_types::Text, _>(&record.status)
+    .bind::<diesel::sql_types::Text, _>(&record.task)
+    .bind::<diesel::sql_types::Timestamp, _>(record.created_at)
+    .bind::<diesel::sql_types::Timestamp, _>(record.updated_at)
+    .bind::<diesel::sql_types::Timestamp, _>(record.heartbeat_at)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.final_result)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.final_error)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamp>, _>(record.delivered_at)
+    .execute(connection)?;
+    if changed_rows == 0 {
+        anyhow::bail!(
+            "Subagent task session {} belongs to a different workspace",
+            record.task_id
+        );
+    }
+    Ok(())
 }
 
 pub struct ConversationRepositoryImpl {
@@ -83,26 +218,12 @@ impl ConversationRepository for ConversationRepositoryImpl {
                         parent_id
                     );
                 }
-                let existing: Option<SubagentTaskSession> = subagent_task_sessions::table
-                    .filter(subagent_task_sessions::workspace_id.eq(workspace_id))
-                    .filter(subagent_task_sessions::conversation_id.eq(conversation_id.into_string()))
-                    .order(subagent_task_sessions::updated_at.desc())
-                    .first::<SubagentTaskSessionRecord>(connection)
-                    .optional()?
-                    .map(SubagentTaskSession::try_from)
-                    .transpose()?
-                    .map(classify_subagent_task_session);
-                if let Some(existing) = existing {
-                    if existing.parent_conversation_id.is_some()
-                        && existing.parent_conversation_id != parent_id
-                    {
-                        anyhow::bail!(
-                            "Subagent session {conversation_id} belongs to parent {:?}; refusing silent reparent to {:?}",
-                            existing.parent_conversation_id,
-                            parent_id
-                        );
-                    }
-                }
+                ensure_conversation_ledger_parent_is_compatible(
+                    connection,
+                    workspace_id,
+                    conversation_id,
+                    parent_id,
+                )?;
                 conversation.ensure_delegated(parent_id);
                 let record = ConversationRecord::new(conversation.clone(), workspace_id);
                 let changed_rows = diesel::sql_query(
@@ -257,56 +378,29 @@ impl ConversationRepository for ConversationRepositoryImpl {
         session: SubagentTaskSession,
     ) -> anyhow::Result<()> {
         self.run_with_connection(move |connection, wid| {
-            let workspace_id = workspace_db_id(wid);
-            let record = SubagentTaskSessionRecord::new(session, workspace_id);
-            let changed_rows = diesel::sql_query(
-                "INSERT INTO subagent_task_sessions (
-                    task_id, agent_id, conversation_id, parent_conversation_id,
-                    root_conversation_id, workspace_id, status, task, created_at,
-                    updated_at, heartbeat_at, final_result, final_error, delivered_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(task_id) DO UPDATE SET
-                    agent_id = excluded.agent_id,
-                    conversation_id = excluded.conversation_id,
-                    parent_conversation_id = excluded.parent_conversation_id,
-                    root_conversation_id = excluded.root_conversation_id,
-                    status = excluded.status,
-                    task = excluded.task,
-                    updated_at = excluded.updated_at,
-                    heartbeat_at = excluded.heartbeat_at,
-                    final_result = excluded.final_result,
-                    final_error = excluded.final_error,
-                    delivered_at = excluded.delivered_at
-                WHERE subagent_task_sessions.workspace_id = excluded.workspace_id",
-            )
-            .bind::<diesel::sql_types::Text, _>(&record.task_id)
-            .bind::<diesel::sql_types::Text, _>(&record.agent_id)
-            .bind::<diesel::sql_types::Text, _>(&record.conversation_id)
-            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
-                &record.parent_conversation_id,
-            )
-            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
-                &record.root_conversation_id,
-            )
-            .bind::<diesel::sql_types::BigInt, _>(record.workspace_id)
-            .bind::<diesel::sql_types::Text, _>(&record.status)
-            .bind::<diesel::sql_types::Text, _>(&record.task)
-            .bind::<diesel::sql_types::Timestamp, _>(record.created_at)
-            .bind::<diesel::sql_types::Timestamp, _>(record.updated_at)
-            .bind::<diesel::sql_types::Timestamp, _>(record.heartbeat_at)
-            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.final_result)
-            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.final_error)
-            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamp>, _>(
-                record.delivered_at,
-            )
-            .execute(connection)?;
-            if changed_rows == 0 {
-                anyhow::bail!(
-                    "Subagent task session {} belongs to a different workspace",
-                    record.task_id
-                );
-            }
-            Ok(())
+            connection.immediate_transaction::<_, anyhow::Error, _>(|connection| {
+                let workspace_id = workspace_db_id(wid);
+                let record = SubagentTaskSessionRecord::new(session, workspace_id);
+                let conversation_id = ConversationId::parse(&record.conversation_id)?;
+                let requested_parent_id = record
+                    .parent_conversation_id
+                    .as_deref()
+                    .map(ConversationId::parse)
+                    .transpose()?;
+                let requested_root_id = record
+                    .root_conversation_id
+                    .as_deref()
+                    .map(ConversationId::parse)
+                    .transpose()?;
+                ensure_conversation_ledger_owner_matches_exact(
+                    connection,
+                    workspace_id,
+                    conversation_id,
+                    requested_parent_id,
+                    requested_root_id,
+                )?;
+                insert_subagent_task_session_record(connection, &record)
+            })
         })
         .await
     }
@@ -491,6 +585,18 @@ mod tests {
         .await?;
 
         Ok(id)
+    }
+
+    async fn insert_legacy_subagent_task_session(
+        repo: &ConversationRepositoryImpl,
+        session: SubagentTaskSession,
+    ) -> anyhow::Result<()> {
+        repo.run_with_connection(move |connection, wid| {
+            let workspace_id = workspace_db_id(wid);
+            let record = SubagentTaskSessionRecord::new(session, workspace_id);
+            insert_subagent_task_session_record(connection, &record)
+        })
+        .await
     }
 
     #[tokio::test]
@@ -2071,6 +2177,76 @@ mod tests {
         let actual = foreign_repo.upsert_subagent_task_session(fixture).await;
 
         assert!(actual.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_upsert_subagent_task_session_rejects_conflicting_ledger_owner()
+    -> anyhow::Result<()> {
+        let repo = repository()?;
+        let conversation_id = ConversationId::generate();
+        let original_owner = SubagentTaskSession::new(
+            forge_domain::AgentId::new("forge"),
+            conversation_id,
+            Some(ConversationId::generate()),
+            Some(ConversationId::generate()),
+            "original owner",
+        );
+        let conflicting_owner = SubagentTaskSession::new(
+            forge_domain::AgentId::new("forge"),
+            conversation_id,
+            Some(ConversationId::generate()),
+            original_owner.root_conversation_id,
+            "conflicting owner",
+        );
+
+        repo.upsert_subagent_task_session(original_owner).await?;
+        let actual = repo.upsert_subagent_task_session(conflicting_owner).await;
+
+        assert!(actual.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_promote_delegated_conversation_rejects_any_historical_conflicting_ledger_owner()
+    -> anyhow::Result<()> {
+        let repo = repository()?;
+        let conversation_id = ConversationId::generate();
+        let original_parent_id = ConversationId::generate();
+        let resume_parent_id = ConversationId::generate();
+        let conversation = forge_domain::Conversation::new(conversation_id);
+        let mut original_owner = SubagentTaskSession::new(
+            forge_domain::AgentId::new("forge"),
+            conversation_id,
+            Some(original_parent_id),
+            Some(original_parent_id),
+            "original owner",
+        );
+        original_owner.mark_completed("done");
+        original_owner.updated_at = Utc::now() - Duration::minutes(10);
+        let mut latest_attempt = SubagentTaskSession::new(
+            forge_domain::AgentId::new("forge"),
+            conversation_id,
+            Some(resume_parent_id),
+            Some(resume_parent_id),
+            "conflicting latest owner",
+        );
+        latest_attempt.mark_running();
+
+        repo.upsert_conversation(conversation).await?;
+        repo.upsert_subagent_task_session(original_owner).await?;
+        insert_legacy_subagent_task_session(&repo, latest_attempt).await?;
+        let actual = repo
+            .promote_delegated_conversation(&conversation_id, Some(resume_parent_id))
+            .await;
+        let expected = None;
+
+        assert!(actual.is_err());
+        let persisted = repo
+            .get_conversation(&conversation_id)
+            .await?
+            .expect("conversation should remain persisted");
+        assert_eq!(persisted.parent_id, expected);
         Ok(())
     }
 
