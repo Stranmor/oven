@@ -1,6 +1,7 @@
 pub mod banner;
 mod cli;
 mod completer;
+mod completion_notification;
 mod conversation_selector;
 mod display_constants;
 mod editor;

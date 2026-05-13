@@ -1,5 +1,6 @@
 mod auto_dump;
 mod compact;
+mod completion_notification;
 mod config;
 mod decimal;
 mod error;
@@ -14,6 +15,7 @@ mod writer;
 
 pub use auto_dump::*;
 pub use compact::*;
+pub use completion_notification::*;
 pub use config::*;
 pub use decimal::*;
 pub use error::Error;

@@ -42,6 +42,17 @@
         }
       ]
     },
+    "completion_notification": {
+      "description": "Sound notification emitted by the local UI when the main session\ncompletes; disabled when absent.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CompletionNotification"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "currency_conversion_rate": {
       "description": "Conversion rate applied to costs before display in the shell rprompt.\nThe raw USD cost is multiplied by this value, allowing costs to be shown\nin a local currency. Defaults to `1.0` (no conversion).",
       "$ref": "#/$defs/double",
@@ -231,6 +242,11 @@
       ],
       "format": "uint",
       "minimum": 0
+    },
+    "merge_system_messages": {
+      "description": "Whether OpenAI-compatible providers should merge all system messages into\none leading system message before sending the request.",
+      "type": "boolean",
+      "default": false
     },
     "model_cache_ttl_secs": {
       "description": "Time-to-live in seconds for the cached model API list.",
@@ -493,6 +509,16 @@
         }
       }
     },
+    "CompletionNotification": {
+      "description": "Session completion sound notification backend.",
+      "oneOf": [
+        {
+          "description": "Emits a terminal bell character when the main session completes.",
+          "type": "string",
+          "const": "bell"
+        }
+      ]
+    },
     "Effort": {
       "description": "Effort level for model reasoning.",
       "oneOf": [
@@ -657,67 +683,6 @@
         }
       ]
     },
-    "Model": {
-      "type": "object",
-      "properties": {
-        "context_length": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "id": {
-          "type": "string"
-        },
-        "input_modalities": {
-          "description": "Input modalities supported by the model (defaults to text-only)",
-          "type": "array",
-          "default": [
-            "text"
-          ],
-          "items": {
-            "$ref": "#/$defs/InputModality"
-          }
-        },
-        "name": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "supports_parallel_tool_calls": {
-          "description": "Whether the model supports parallel tool calls",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "supports_reasoning": {
-          "description": "Whether the model supports reasoning",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "tools_supported": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "id"
-      ]
-    },
     "ModelConfig": {
       "description": "Pairs a provider and model together for a specific operation.",
       "type": "object",
@@ -747,7 +712,7 @@
           "description": "A static list of models defined directly in the configuration.",
           "type": "array",
           "items": {
-            "$ref": "#/$defs/Model"
+            "$ref": "#/$defs/ProviderModelConfig"
           }
         }
       ]
@@ -840,6 +805,73 @@
       "required": [
         "id",
         "url"
+      ]
+    },
+    "ProviderModelConfig": {
+      "description": "Provider-local model configuration for inline provider entries.\n\nThe owning provider supplies the final `provider_id` during repository\nconversion, so inline model declarations cannot encode a stale or mismatched\nprovider association.",
+      "type": "object",
+      "properties": {
+        "context_length": {
+          "description": "Optional maximum context length in tokens.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "description": {
+          "description": "Optional human-readable model description.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "Provider-local model identifier.",
+          "type": "string"
+        },
+        "input_modalities": {
+          "description": "Input modalities supported by the model.",
+          "type": "array",
+          "default": [
+            "text"
+          ],
+          "items": {
+            "$ref": "#/$defs/InputModality"
+          }
+        },
+        "name": {
+          "description": "Optional display name for the model.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "supports_parallel_tool_calls": {
+          "description": "Optional parallel tool-calling support flag.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "supports_reasoning": {
+          "description": "Optional reasoning support flag.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "tools_supported": {
+          "description": "Optional tool-calling support flag.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id"
       ]
     },
     "ProviderResponseType": {

@@ -34,6 +34,7 @@ use crate::cli::{
     Cli, CommitCommandGroup, ConversationCommand, ListCommand, McpCommand, SelectCommand,
     TaskCommand, TopLevelCommand,
 };
+use crate::completion_notification::play_completion_notification;
 use crate::conversation_selector::ConversationSelector;
 use crate::display_constants::{CommandType, headers, markers, status};
 use crate::editor::ReadLineError;
@@ -4272,6 +4273,10 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             }
             ChatResponse::TaskComplete => {
                 writer.finish()?;
+                play_completion_notification(
+                    self.config.completion_notification.as_ref(),
+                    &mut std::io::stdout(),
+                )?;
                 if let Some(conversation_id) = self.state.conversation_id {
                     let mut title_str = "Finished".to_string();
                     if let Ok(Some(conversation)) = self.api.conversation(&conversation_id).await
