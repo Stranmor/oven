@@ -12,10 +12,14 @@ const LOCAL_FORGE_SOURCE: &str = "/home/stranmor/Documents/project/_mycelium/ove
 const FORGE_REAL_TARGET: &str = "/home/stranmor/.local/lib/forge/forge-real";
 const FORGE_WRAPPER_ENTRYPOINT: &str = "/home/stranmor/.local/bin/forge";
 const UPDATE_REPOSITORY: &str = "Stranmor/oven";
+const UPSTREAM_SYNC_SUCCESS_FILE: &str =
+    "/home/stranmor/.local/state/forge-upstream-sync/last-success.json";
+const UPDATE_CARGO_TOOLCHAIN: &str = "1.94";
 
 fn local_fork_update_command() -> String {
     format!(
-        "set -eu; repo={repo:?}; target={target:?}; wrapper={wrapper:?}; \
+        "set -eu; repo={repo:?}; target={target:?}; wrapper={wrapper:?}; metadata={metadata:?}; toolchain={toolchain:?}; \
+         is_valid_commit_date() {{ test -n \"$1\" && date --date=\"$1\" --iso-8601=seconds >/dev/null 2>&1; }}; \
          test -d \"$repo/.git\"; \
          origin_url=\"$(git -C \"$repo\" remote get-url origin)\"; \
          test \"$origin_url\" = \"git@github.com:Stranmor/oven.git\" -o \
@@ -27,7 +31,27 @@ fn local_fork_update_command() -> String {
          test -z \"$(git -C \"$repo\" status --porcelain)\"; \
          test -L \"$wrapper\"; \
          test \"$(readlink -f \"$wrapper\")\" != \"$target\"; \
-         cargo build --release --manifest-path \"$repo/Cargo.toml\" -p forge_main; \
+         upstream_commit_date=\"\"; upstream_sha=\"\"; \
+         if test -f \"$metadata\"; then \
+             upstream_commit_date=\"$(jq -r '.upstream_commit_date // empty' \"$metadata\")\"; \
+             upstream_sha=\"$(jq -r '.upstream_sha // empty' \"$metadata\")\"; \
+         fi; \
+         if ! is_valid_commit_date \"$upstream_commit_date\"; then \
+             upstream_commit_date=\"\"; \
+         fi; \
+         if test -z \"$upstream_commit_date\" -a -n \"$upstream_sha\"; then \
+             upstream_commit_date=\"$(git -C \"$repo\" log -1 --format=%cI \"$upstream_sha\" 2>/dev/null || true)\"; \
+         fi; \
+         if ! is_valid_commit_date \"$upstream_commit_date\"; then \
+             upstream_commit_date=\"\"; \
+         fi; \
+         if test -z \"$upstream_commit_date\"; then \
+             upstream_commit_date=\"$(git -C \"$repo\" log -1 --format=%cI HEAD)\"; \
+         fi; \
+         if ! is_valid_commit_date \"$upstream_commit_date\"; then \
+             upstream_commit_date=\"\"; \
+         fi; \
+         CARGO_PROFILE_RELEASE_PANIC=unwind APP_LAST_UPDATED=\"$upstream_commit_date\" cargo +\"$toolchain\" build --release --manifest-path \"$repo/Cargo.toml\" -p forge_main; \
          mkdir -p \"$(dirname \"$target\")\"; \
          tmp=\"$(mktemp \"$(dirname \"$target\")/.forge-real.XXXXXX\")\"; \
          cp \"$repo/target/release/forge\" \"$tmp\"; \
@@ -36,6 +60,8 @@ fn local_fork_update_command() -> String {
         repo = LOCAL_FORGE_SOURCE,
         target = FORGE_REAL_TARGET,
         wrapper = FORGE_WRAPPER_ENTRYPOINT,
+        metadata = UPSTREAM_SYNC_SUCCESS_FILE,
+        toolchain = UPDATE_CARGO_TOOLCHAIN,
     )
 }
 
@@ -157,7 +183,7 @@ mod tests {
 
         let actual = fixture.contains("Stranmor/oven.git")
             && fixture.contains(LOCAL_FORGE_SOURCE)
-            && fixture.contains("cargo build --release")
+            && fixture.contains("cargo +\"$toolchain\" build --release")
             && fixture.contains("-p forge_main");
 
         let expected = true;
@@ -259,6 +285,42 @@ mod tests {
             && fixture.contains("rev-parse HEAD")
             && fixture.contains("rev-parse refs/remotes/origin/main")
             && fixture.contains("status --porcelain");
+
+        let expected = true;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_local_fork_update_command_passes_upstream_commit_date_to_build() {
+        let fixture = local_fork_update_command();
+
+        let actual = fixture.contains(UPSTREAM_SYNC_SUCCESS_FILE)
+            && fixture.contains(".upstream_commit_date // empty")
+            && fixture.contains(".upstream_sha // empty")
+            && fixture.contains("log -1 --format=%cI \"$upstream_sha\"")
+            && fixture
+                .contains("APP_LAST_UPDATED=\"$upstream_commit_date\" cargo +\"$toolchain\" build");
+
+        let expected = true;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_local_fork_update_command_uses_task_local_release_panic_override() {
+        let fixture = local_fork_update_command();
+
+        let actual = fixture.contains("CARGO_PROFILE_RELEASE_PANIC=unwind");
+
+        let expected = true;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_local_fork_update_command_uses_repository_rust_toolchain() {
+        let fixture = local_fork_update_command();
+
+        let actual = fixture.contains(UPDATE_CARGO_TOOLCHAIN)
+            && fixture.contains("cargo +\"$toolchain\" build");
 
         let expected = true;
         assert_eq!(actual, expected);
