@@ -5,6 +5,7 @@ use async_openai::types::responses as oai;
 use forge_app::domain::{Context as ChatContext, ContextMessage, MessagePhase, Role, ToolChoice};
 use forge_app::utils::enforce_strict_schema;
 use forge_domain::{Effort, ReasoningConfig, ReasoningFull};
+use serde_json::{Value, json};
 
 use crate::provider::FromDomain;
 
@@ -188,6 +189,197 @@ fn codex_tool_parameters(schema: &schemars::Schema) -> anyhow::Result<(serde_jso
     enforce_strict_schema(&mut params, is_strict);
 
     Ok((params, is_strict))
+}
+
+/// Builds per-Responses-input-item cache eligibility metadata from the domain
+/// context.
+///
+/// # Arguments
+/// - `context` - Domain chat context before conversion into Responses API input
+///   items.
+///
+/// The first system message becomes top-level `instructions` and therefore has
+/// no corresponding `input` item. Metadata for subsequent messages is expanded
+/// to match the actual Responses `input` array shape.
+pub fn responses_input_cache_eligibility(context: &ChatContext) -> Vec<bool> {
+    let mut instructions_seen = false;
+    let mut eligibility = Vec::new();
+
+    for entry in &context.messages {
+        let is_cache_eligible = entry.is_cache_eligible();
+        match &entry.message {
+            ContextMessage::Text(message) => match message.role {
+                Role::System => {
+                    if instructions_seen {
+                        eligibility.push(is_cache_eligible);
+                    } else {
+                        instructions_seen = true;
+                    }
+                }
+                Role::User => eligibility.push(is_cache_eligible),
+                Role::Assistant => {
+                    if !message.content.trim().is_empty() {
+                        eligibility.push(is_cache_eligible);
+                    }
+
+                    if let Some(reasoning_details) = &message.reasoning_details {
+                        eligibility.extend(std::iter::repeat_n(
+                            false,
+                            map_reasoning_details_to_input_items(reasoning_details.clone()).len(),
+                        ));
+                    }
+
+                    if let Some(tool_calls) = &message.tool_calls {
+                        eligibility.extend(std::iter::repeat_n(false, tool_calls.len()));
+                    }
+                }
+            },
+            ContextMessage::Tool(_) => eligibility.push(is_cache_eligible),
+            ContextMessage::Image(_) => eligibility.push(is_cache_eligible),
+        }
+    }
+
+    eligibility
+}
+
+/// Adds OpenAI-compatible ephemeral cache markers to serialized Responses API
+/// message content.
+///
+/// The upstream `async-openai` Responses types do not yet expose
+/// `cache_control` fields for response input parts. This helper keeps the
+/// provider request strongly typed until the final serialization boundary, then
+/// augments the JSON shape that is sent upstream.
+///
+/// # Arguments
+/// - `request` - Typed Responses API request to serialize.
+/// - `message_cache_eligibility` - Per-input-item cache eligibility metadata
+///   preserved from the domain context.
+/// - `enable_cache_control` - Whether this route accepts OpenAI-compatible
+///   cache markers.
+///
+/// # Errors
+/// Returns an error if the typed Responses API request cannot be serialized.
+pub fn serialize_create_response_with_cache_control(
+    request: &oai::CreateResponse,
+    message_cache_eligibility: &[bool],
+    enable_cache_control: bool,
+) -> anyhow::Result<Vec<u8>> {
+    let mut value = serde_json::to_value(request)
+        .with_context(|| "Failed to serialize OpenAI Responses request")?;
+
+    if enable_cache_control {
+        mark_responses_cache_control(&mut value, message_cache_eligibility);
+    }
+
+    serde_json::to_vec(&value).with_context(|| "Failed to serialize OpenAI Responses request")
+}
+
+fn mark_responses_cache_control(value: &mut Value, message_cache_eligibility: &[bool]) {
+    let Some(input) = value.get_mut("input") else {
+        return;
+    };
+
+    let Value::Array(items) = input else {
+        return;
+    };
+
+    let first_cache_eligible = (0..items.len()).find(|index| {
+        is_responses_input_item_cache_eligible(items.get(*index), message_cache_eligibility, *index)
+    });
+    let last_cache_eligible = (0..items.len()).rev().find(|index| {
+        is_responses_input_item_cache_eligible(items.get(*index), message_cache_eligibility, *index)
+    });
+
+    items
+        .iter_mut()
+        .for_each(|item| set_responses_item_cache_control(item, false));
+
+    if let Some(index) = first_cache_eligible
+        && let Some(item) = items.get_mut(index)
+    {
+        set_responses_item_cache_control(item, true);
+    }
+
+    if let Some(index) = last_cache_eligible
+        && let Some(item) = items.get_mut(index)
+    {
+        set_responses_item_cache_control(item, true);
+    }
+}
+
+fn is_responses_input_item_cache_eligible(
+    item: Option<&Value>,
+    message_cache_eligibility: &[bool],
+    index: usize,
+) -> bool {
+    message_cache_eligibility
+        .get(index)
+        .copied()
+        .unwrap_or(true)
+        && item.is_some_and(is_responses_cacheable_input_item)
+}
+
+fn is_responses_cacheable_input_item(item: &Value) -> bool {
+    item.as_object()
+        .and_then(|object| object.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|type_name| type_name == "message")
+}
+
+fn set_responses_item_cache_control(item: &mut Value, enable_cache: bool) {
+    let Some(object) = item.as_object_mut() else {
+        return;
+    };
+
+    if object.get("type").and_then(Value::as_str) != Some("message") {
+        return;
+    }
+
+    let Some(content) = object.get_mut("content") else {
+        return;
+    };
+
+    match content {
+        Value::String(text) => {
+            if enable_cache {
+                let text = text.clone();
+                *content = Value::Array(vec![json!({
+                    "type": "input_text",
+                    "text": text,
+                    "cache_control": {"type": "ephemeral"},
+                })]);
+            }
+        }
+        Value::Array(parts) => {
+            parts
+                .iter_mut()
+                .for_each(remove_responses_part_cache_control);
+
+            if enable_cache
+                && let Some(part) = parts
+                    .iter_mut()
+                    .rev()
+                    .find(|part| is_responses_cacheable_content_part(part))
+                && let Some(object) = part.as_object_mut()
+            {
+                object.insert("cache_control".to_string(), json!({"type": "ephemeral"}));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn remove_responses_part_cache_control(part: &mut Value) {
+    if let Some(object) = part.as_object_mut() {
+        object.remove("cache_control");
+    }
+}
+
+fn is_responses_cacheable_content_part(part: &Value) -> bool {
+    part.as_object()
+        .and_then(|object| object.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|type_name| type_name == "input_text" || type_name == "input_image")
 }
 
 /// Converts Forge's domain-level Context into an async-openai Responses API
@@ -407,8 +599,69 @@ mod tests {
 
     use crate::provider::FromDomain;
     use crate::provider::openai_responses::request::{
-        codex_tool_parameters, has_open_additional_properties,
+        codex_tool_parameters, has_open_additional_properties, responses_input_cache_eligibility,
+        serialize_create_response_with_cache_control,
     };
+
+    fn dynamic_user_message(content: &str) -> ContextMessage {
+        use forge_domain::{Role, TextMessage};
+
+        ContextMessage::Text(TextMessage::new(Role::User, content).cacheable(false))
+    }
+
+    #[test]
+    fn test_responses_cache_control_serialization_marks_static_and_rolling_messages()
+    -> anyhow::Result<()> {
+        let context = ChatContext::default()
+            .add_message(ContextMessage::system("stable system"))
+            .add_message(ContextMessage::user("real user turn", None))
+            .add_message(dynamic_user_message(
+                "<project_model_context>dynamic</project_model_context>",
+            ));
+        let eligibility = responses_input_cache_eligibility(&context);
+        let mut request = oai::CreateResponse::from_domain(context)?;
+        request.model = Some("gpt-5.5".to_string());
+
+        let actual = serde_json::from_slice::<serde_json::Value>(
+            &serialize_create_response_with_cache_control(&request, &eligibility, true)?,
+        )?;
+
+        let expected = json!({"type": "ephemeral"});
+        assert_eq!(actual["input"][0]["content"][0]["cache_control"], expected);
+        assert_eq!(
+            actual["input"][1]["content"].as_str(),
+            Some("<project_model_context>dynamic</project_model_context>")
+        );
+        assert_eq!(actual["input"][1]["content"]["cache_control"], json!(null));
+        assert_eq!(actual["instructions"].as_str(), Some("stable system"));
+        assert_eq!(actual["model"].as_str(), Some("gpt-5.5"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_responses_cache_control_serialization_leaves_payload_unmarked_when_disabled()
+    -> anyhow::Result<()> {
+        let context = ChatContext::default()
+            .add_message(ContextMessage::system("stable system"))
+            .add_message(ContextMessage::user("real user turn", None));
+        let eligibility = responses_input_cache_eligibility(&context);
+        let mut request = oai::CreateResponse::from_domain(context)?;
+        request.model = Some("gpt-5.5".to_string());
+
+        let actual = serde_json::from_slice::<serde_json::Value>(
+            &serialize_create_response_with_cache_control(&request, &eligibility, false)?,
+        )?;
+
+        assert_eq!(
+            actual["input"][0]["content"].as_str(),
+            Some("real user turn")
+        );
+        assert_eq!(actual["input"][0]["content"]["cache_control"], json!(null));
+        assert_eq!(actual["instructions"].as_str(), Some("stable system"));
+
+        Ok(())
+    }
 
     #[test]
     fn test_reasoning_config_conversion_with_effort() -> anyhow::Result<()> {

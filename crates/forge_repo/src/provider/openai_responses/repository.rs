@@ -16,6 +16,9 @@ use tracing::info;
 use url::Url;
 
 use crate::provider::FromDomain;
+use crate::provider::openai_responses::request::{
+    responses_input_cache_eligibility, serialize_create_response_with_cache_control,
+};
 use crate::provider::retry::into_retry;
 use crate::provider::utils::{create_headers, format_http_context, read_http_error_reason};
 
@@ -156,9 +159,12 @@ impl<T: HttpInfra> OpenAIResponsesProvider<T> {
         context: ChatContext,
     ) -> ResultStream<ChatCompletionMessage, anyhow::Error> {
         let conversation_id = context.conversation_id.as_ref().map(ToString::to_string);
+        let message_cache_eligibility = responses_input_cache_eligibility(&context);
         let headers = create_headers(self.get_headers_for_conversation(conversation_id.as_deref()));
         let mut request = oai::CreateResponse::from_domain(context)?;
         request.model = Some(model.as_str().to_string());
+        let enable_cache_control =
+            supports_openai_compatible_cache_control(&self.provider, &request);
 
         // Apply Codex-specific request adjustments via the transformer pipeline.
         if self.provider.id == forge_domain::ProviderId::CODEX {
@@ -175,8 +181,11 @@ impl<T: HttpInfra> OpenAIResponsesProvider<T> {
             "Connecting Upstream (Responses API)"
         );
 
-        let json_bytes = serde_json::to_vec(&request)
-            .with_context(|| "Failed to serialize OpenAI Responses request")?;
+        let json_bytes = serialize_create_response_with_cache_control(
+            &request,
+            &message_cache_eligibility,
+            enable_cache_control,
+        )?;
 
         // The Codex backend at chatgpt.com does not return
         // `Content-Type: text/event-stream`, which causes the
@@ -382,6 +391,19 @@ fn request_message_count(request: &oai::CreateResponse) -> usize {
         oai::InputParam::Text(_) => 1,
         oai::InputParam::Items(items) => items.len(),
     }
+}
+
+fn supports_openai_compatible_cache_control(
+    provider: &Provider<Url>,
+    request: &oai::CreateResponse,
+) -> bool {
+    (provider.id == forge_domain::ProviderId::FORGE
+        || provider.id == forge_domain::ProviderId::OPENAI_COMPATIBLE
+        || provider.id == forge_domain::ProviderId::OPENAI_RESPONSES_COMPATIBLE)
+        && request
+            .model
+            .as_deref()
+            .is_some_and(|model| model.contains("gpt-5.5"))
 }
 
 /// Repository for OpenAI Codex models using the Responses API
@@ -730,6 +752,81 @@ mod tests {
         let request =
             oai::CreateResponse { input: oai::InputParam::Items(vec![]), ..Default::default() };
         assert_eq!(request_message_count(&request), 0);
+    }
+
+    #[test]
+    fn test_supports_cache_control_for_openai_responses_compatible_gpt55() {
+        let provider = Provider {
+            id: ProviderId::OPENAI_RESPONSES_COMPATIBLE,
+            provider_type: forge_domain::ProviderType::Llm,
+            response: Some(ProviderResponse::OpenAIResponses),
+            url: Url::parse("https://provider.example/v1/responses").unwrap(),
+            credential: make_credential(ProviderId::OPENAI_RESPONSES_COMPATIBLE, "test-key"),
+            custom_headers: None,
+            auth_methods: vec![forge_domain::AuthMethod::ApiKey],
+            url_params: vec![],
+            models: None,
+        };
+        let request =
+            oai::CreateResponse { model: Some("gpt-5.5".to_string()), ..Default::default() };
+
+        let actual = supports_openai_compatible_cache_control(&provider, &request);
+
+        let expected = true;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_supports_cache_control_excludes_codex_gpt55() {
+        let provider = Provider {
+            id: ProviderId::CODEX,
+            provider_type: forge_domain::ProviderType::Llm,
+            response: Some(ProviderResponse::OpenAI),
+            url: Url::parse("https://chatgpt.com/backend-api/codex/responses").unwrap(),
+            credential: make_credential(ProviderId::CODEX, "test-token"),
+            custom_headers: None,
+            auth_methods: vec![forge_domain::AuthMethod::ApiKey],
+            url_params: vec![],
+            models: None,
+        };
+        let request =
+            oai::CreateResponse { model: Some("gpt-5.5".to_string()), ..Default::default() };
+
+        let actual = supports_openai_compatible_cache_control(&provider, &request);
+
+        let expected = false;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_codex_transform_serialization_keeps_required_fields_without_cache_control()
+    -> anyhow::Result<()> {
+        use forge_domain::Transformer;
+
+        let context = ChatContext::default().add_message(ContextMessage::user("Hello", None));
+        let eligibility = responses_input_cache_eligibility(&context);
+        let mut request = oai::CreateResponse::from_domain(context)?;
+        request.model = Some("gpt-5.5".to_string());
+
+        let request = super::super::codex_transformer::CodexTransformer.transform(request);
+        let actual = serde_json::from_slice::<serde_json::Value>(
+            &serialize_create_response_with_cache_control(&request, &eligibility, false)?,
+        )?;
+
+        assert_eq!(actual["store"].as_bool(), Some(false));
+        assert_eq!(actual["model"].as_str(), Some("gpt-5.5"));
+        assert_eq!(actual["stream"].as_bool(), Some(true));
+        assert_eq!(
+            actual["include"],
+            serde_json::json!(["reasoning.encrypted_content"])
+        );
+        assert_eq!(actual["input"][0]["content"].as_str(), Some("Hello"));
+        assert_eq!(
+            actual["input"][0]["content"]["cache_control"],
+            serde_json::json!(null)
+        );
+
+        Ok(())
     }
 
     #[test]
