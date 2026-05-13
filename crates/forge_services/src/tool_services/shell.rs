@@ -203,7 +203,7 @@ mod tests {
                         output: CommandOutput {
                             stdout: "early stdout".to_string(),
                             stderr: format!(
-                                "early stderr\nCommand exceeded the 2 second synchronous shell window and is running as managed background process {process_id}. Use process_status and process_read with this process_id to observe it.",
+                                "early stderr\nCommand exceeded the 15 second synchronous shell window and is running as managed background process {process_id}. Use process_status and process_read with this process_id to observe it.",
                                 process_id = self.process_id
                             ),
                             command,

@@ -45,6 +45,7 @@ impl Transformer for TransformToolCalls {
                             droppable: text_msg.droppable,
                             phase: text_msg.phase,
                             cacheable: text_msg.cacheable,
+                            kind: text_msg.kind.clone(),
                         })
                         .into(),
                     );

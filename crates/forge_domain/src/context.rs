@@ -173,6 +173,7 @@ impl ContextMessage {
             droppable: false,
             phase: None,
             cacheable: None,
+            kind: None,
         }
         .into()
     }
@@ -189,6 +190,7 @@ impl ContextMessage {
             droppable: false,
             phase: None,
             cacheable: None,
+            kind: None,
         }
         .into()
     }
@@ -211,6 +213,7 @@ impl ContextMessage {
             droppable: false,
             phase: None,
             cacheable: None,
+            kind: None,
         }
         .into()
     }
@@ -305,6 +308,14 @@ fn reasoning_content_char_count(text_message: &TextMessage) -> usize {
         })
 }
 
+/// Semantic category for internal text messages that need typed handling.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextMessageKind {
+    /// Live request-scoped runtime context message.
+    RuntimeContext,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, Setters)]
 #[setters(strip_option, into)]
 #[serde(rename_all = "snake_case")]
@@ -331,9 +342,13 @@ pub struct TextMessage {
     /// requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<MessagePhase>,
-    /// Explicit prompt-cache eligibility. Missing metadata preserves legacy cache eligibility.
+    /// Overrides provider prompt-cache eligibility for volatile context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cacheable: Option<bool>,
+    /// Semantic kind for agent-internal context messages that must be distinguished
+    /// from real user text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<TextMessageKind>,
 }
 
 impl TextMessage {
@@ -350,7 +365,19 @@ impl TextMessage {
             droppable: false,
             phase: None,
             cacheable: None,
+            kind: None,
         }
+    }
+
+    /// Returns whether this message is the live runtime context payload.
+    pub fn is_runtime_context(&self) -> bool {
+        self.kind == Some(TextMessageKind::RuntimeContext)
+    }
+
+    /// Marks this message as the live runtime context payload.
+    pub fn runtime_context(mut self) -> Self {
+        self.kind = Some(TextMessageKind::RuntimeContext);
+        self
     }
 
     pub fn has_role(&self, role: Role) -> bool {
@@ -384,6 +411,7 @@ impl TextMessage {
             droppable: false,
             phase: None,
             cacheable: None,
+            kind: None,
         }
     }
 }

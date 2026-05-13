@@ -319,6 +319,8 @@ pub(super) struct TextMessageRecord {
     droppable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cacheable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kind: Option<forge_domain::TextMessageKind>,
 }
 
 /// Helper function for serde to skip serializing false boolean values
@@ -344,6 +346,7 @@ impl From<&forge_domain::TextMessage> for TextMessageRecord {
                 .map(|details| details.iter().map(ReasoningFullRecord::from).collect()),
             droppable: msg.droppable,
             cacheable: msg.cacheable,
+            kind: msg.kind.clone(),
         }
     }
 }
@@ -367,6 +370,7 @@ impl TryFrom<TextMessageRecord> for forge_domain::TextMessage {
             droppable: record.droppable,
             phase: None,
             cacheable: record.cacheable,
+            kind: record.kind,
         })
     }
 }

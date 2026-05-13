@@ -74,6 +74,7 @@ mod tests {
                 droppable: false,
                 phase: None,
                 cacheable: None,
+                kind: None,
             }));
 
         // Apply the transformer
@@ -152,6 +153,7 @@ mod tests {
                 droppable: false,
                 phase: None,
                 cacheable: None,
+                kind: None,
             }));
 
         let mut transformer = NormalizeToolCallArguments::new();

@@ -43,6 +43,7 @@ impl<S: AttachmentService + EnvironmentInfra<Config = forge_config::ForgeConfig>
             .unwrap_or(false);
 
         let (conversation, content) = self.add_rendered_message(conversation).await?;
+        let conversation = self.add_runtime_context(conversation);
         let conversation = if is_resume {
             self.add_todos_on_resume(conversation)?
         } else {
@@ -56,6 +57,27 @@ impl<S: AttachmentService + EnvironmentInfra<Config = forge_config::ForgeConfig>
         };
 
         Ok(conversation)
+    }
+
+    fn runtime_context(&self) -> LiveRuntimeContext {
+        LiveRuntimeContext::from_local(self.current_time)
+    }
+
+    /// Adds request-scoped runtime context as a small cache-ineligible message.
+    fn add_runtime_context(&self, mut conversation: Conversation) -> Conversation {
+        let mut context = conversation.context.take().unwrap_or_default();
+        context.messages.retain(|message| {
+            !matches!(
+                &message.message,
+                ContextMessage::Text(text) if text.is_runtime_context()
+            )
+        });
+        let message = TextMessage::new(Role::User, self.runtime_context().render_prompt_xml())
+            .model(self.agent.model.clone())
+            .runtime_context()
+            .cacheable(false);
+        context = context.add_message(ContextMessage::Text(message));
+        conversation.context(context)
     }
 
     /// Adds existing todos as a user message when resuming a conversation
@@ -81,6 +103,7 @@ impl<S: AttachmentService + EnvironmentInfra<Config = forge_config::ForgeConfig>
                 droppable: true, // Droppable so it can be removed during context compression
                 phase: None,
                 cacheable: Some(false),
+                kind: None,
             };
             context = context.add_message(ContextMessage::Text(todo_message));
         }
@@ -128,6 +151,7 @@ impl<S: AttachmentService + EnvironmentInfra<Config = forge_config::ForgeConfig>
                 droppable: true, // Piped input is droppable
                 phase: None,
                 cacheable: Some(false),
+                kind: None,
             };
             context = context.add_message(ContextMessage::Text(piped_message));
         }
@@ -154,8 +178,11 @@ impl<S: AttachmentService + EnvironmentInfra<Config = forge_config::ForgeConfig>
                 .as_ref()
                 .and_then(|v| v.as_user_prompt().map(|u| u.as_str().to_string()))
                 .unwrap_or_default();
-            let mut event_context = EventContext::new(EventContextValue::new(user_input))
-                .current_date(self.current_time.format("%Y-%m-%d").to_string());
+            let runtime_context = self.runtime_context();
+            let mut event_context = EventContext::from_runtime_context(
+                EventContextValue::new(user_input),
+                runtime_context,
+            );
 
             // Check if context already contains user messages to determine if it's feedback
             let has_user_messages = context.messages.iter().any(|msg| msg.has_role(Role::User));
@@ -214,6 +241,7 @@ impl<S: AttachmentService + EnvironmentInfra<Config = forge_config::ForgeConfig>
                 droppable: false,
                 phase: None,
                 cacheable: None,
+                kind: None,
             };
             context = context.add_message(ContextMessage::Text(message));
         }
@@ -316,7 +344,10 @@ mod tests {
     }
 
     fn fixture_generator(agent: Agent, event: Event) -> UserPromptGenerator<MockService> {
-        UserPromptGenerator::new(Arc::new(MockService), agent, event, chrono::Local::now())
+        let current_time = chrono::DateTime::parse_from_rfc3339("2026-05-13T12:34:56+03:00")
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        UserPromptGenerator::new(Arc::new(MockService), agent, event, current_time)
     }
 
     #[tokio::test]
@@ -331,8 +362,8 @@ mod tests {
         let messages = actual.context.unwrap().messages;
         assert_eq!(
             messages.len(),
-            2,
-            "Should have context message and main message"
+            3,
+            "Should have task, runtime context, and context message"
         );
 
         // First message should be the context (droppable)
@@ -343,12 +374,12 @@ mod tests {
             "Context message should be droppable"
         );
 
-        // Second message should not be droppable
+        // Third message should be the additional context and should be droppable
         let context_message = messages.last().unwrap();
         assert_eq!(context_message.content().unwrap(), "Second Message");
         assert!(
             context_message.is_droppable(),
-            "Main message should not be droppable"
+            "Additional context message should be droppable"
         );
         assert_eq!(context_message.is_cache_eligible(), false);
     }
@@ -363,11 +394,12 @@ mod tests {
         let actual = generator.add_user_prompt(conversation).await.unwrap();
 
         let messages = actual.context.unwrap().messages;
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 3);
 
-        // Verify order: main message first, then additional context
+        // Verify order: main message first, runtime context second, then additional context
         assert_eq!(messages[0].content().unwrap(), "First Message");
-        assert_eq!(messages[1].content().unwrap(), "Second Message");
+        assert!(messages[1].content().unwrap().contains("<runtime_context"));
+        assert_eq!(messages[2].content().unwrap(), "Second Message");
     }
 
     #[tokio::test]
@@ -380,8 +412,13 @@ mod tests {
         let actual = generator.add_user_prompt(conversation).await.unwrap();
 
         let messages = actual.context.unwrap().messages;
-        assert_eq!(messages.len(), 1, "Should only have the main message");
+        assert_eq!(
+            messages.len(),
+            2,
+            "Should have main and runtime context messages"
+        );
         assert_eq!(messages[0].content().unwrap(), "Simple task");
+        assert!(messages[1].content().unwrap().contains("<runtime_context"));
     }
 
     #[tokio::test]
@@ -396,9 +433,11 @@ mod tests {
         let messages = actual.context.unwrap().messages;
         assert_eq!(
             messages.len(),
-            0,
-            "Should not add any message for empty event"
+            1,
+            "Should add runtime context even when there is no user event message"
         );
+        assert!(messages[0].content().unwrap().contains("<runtime_context"));
+        assert_eq!(messages[0].is_cache_eligible(), false);
     }
 
     #[tokio::test]
@@ -423,6 +462,112 @@ mod tests {
         } else {
             panic!("Expected TextMessage");
         }
+    }
+
+    #[tokio::test]
+    async fn test_runtime_context_added_as_cache_ineligible_message() {
+        let agent = fixture_agent_without_user_prompt();
+        let event = Event::new("Simple task");
+        let conversation = fixture_conversation();
+        let generator = fixture_generator(agent.clone(), event);
+
+        let expected_runtime_context = generator.runtime_context();
+        let actual = generator.add_user_prompt(conversation).await.unwrap();
+
+        let messages = actual.context.unwrap().messages;
+        let runtime_message = &messages[1];
+        let runtime_content = runtime_message.content().unwrap();
+        assert!(
+            runtime_content.contains("<runtime_context freshness=\"live\" cache=\"uncached\">")
+        );
+        assert!(runtime_content.contains(&format!(
+            "<current_date>{}</current_date>",
+            expected_runtime_context.current_date()
+        )));
+        assert!(runtime_content.contains(&format!(
+            "<current_datetime>{}</current_datetime>",
+            expected_runtime_context.current_datetime()
+        )));
+        assert!(runtime_content.contains(&format!(
+            "<timezone_offset>{}</timezone_offset>",
+            expected_runtime_context.timezone_offset()
+        )));
+        assert!(runtime_content.contains(&format!(
+            "<unix_timestamp>{}</unix_timestamp>",
+            expected_runtime_context.unix_timestamp()
+        )));
+        assert!(matches!(
+            &runtime_message.message,
+            ContextMessage::Text(text) if text.is_runtime_context()
+        ));
+        assert_eq!(runtime_message.is_cache_eligible(), false);
+        assert_eq!(runtime_message.is_droppable(), false);
+    }
+
+    #[tokio::test]
+    async fn test_runtime_context_replaces_previous_request_context() {
+        let agent = fixture_agent_without_user_prompt();
+        let first_event = Event::new("First task");
+        let first_conversation = fixture_conversation();
+        let first_generator = fixture_generator(agent.clone(), first_event);
+        let first_actual = first_generator
+            .add_user_prompt(first_conversation)
+            .await
+            .unwrap();
+        let second_event = Event::new("Second task");
+        let second_generator = fixture_generator(agent.clone(), second_event);
+
+        let actual = second_generator
+            .add_user_prompt(first_actual)
+            .await
+            .unwrap();
+
+        let runtime_messages = actual
+            .context
+            .unwrap()
+            .messages
+            .into_iter()
+            .filter(|message| {
+                matches!(&message.message, ContextMessage::Text(text) if text.is_runtime_context())
+            })
+            .count();
+        let expected = 1;
+        assert_eq!(runtime_messages, expected);
+    }
+
+    #[tokio::test]
+    async fn test_runtime_context_replaces_legacy_persisted_context_without_kind() {
+        let agent = fixture_agent_without_user_prompt();
+        let event = Event::new("Second task");
+        let conversation = fixture_conversation().context(
+            Context::default()
+                .add_message(ContextMessage::user("First task", None))
+                .add_message(ContextMessage::Text(
+                    TextMessage::new(
+                        Role::User,
+                        "<runtime_context freshness=\"live\" cache=\"uncached\">\n<current_date>2026-05-12</current_date>\n</runtime_context>",
+                    )
+                    .model(ModelId::new("test-model"))
+                    .cacheable(false),
+                )),
+        );
+        let generator = fixture_generator(agent.clone(), event);
+
+        let actual = generator.add_user_prompt(conversation).await.unwrap();
+
+        let runtime_messages = actual
+            .context
+            .unwrap()
+            .messages
+            .into_iter()
+            .filter(|message| {
+                message
+                    .content()
+                    .is_some_and(|content| content.contains("<runtime_context"))
+            })
+            .count();
+        let expected = 1;
+        assert_eq!(runtime_messages, expected);
     }
 
     #[tokio::test]
@@ -591,9 +736,9 @@ mod tests {
         // Execute
         let actual = generator.add_user_prompt(conversation).await.unwrap();
 
-        // Assert - Should have system, previous user, new user message, and todo list
+        // Assert - Should have system, previous user, new user message, runtime context, and todo list
         let messages = actual.context.unwrap().messages;
-        assert_eq!(messages.len(), 4, "Should have 4 messages");
+        assert_eq!(messages.len(), 5, "Should have 5 messages");
 
         // First is system message
         assert_eq!(messages[0].content().unwrap(), "System message");
@@ -604,8 +749,12 @@ mod tests {
         // Third is the new user message
         assert_eq!(messages[2].content().unwrap(), "Continue working");
 
-        // Fourth should be the todo list (droppable)
-        let todo_message = &messages[3];
+        // Fourth is runtime context
+        assert!(messages[3].content().unwrap().contains("<runtime_context"));
+        assert_eq!(messages[3].is_cache_eligible(), false);
+
+        // Fifth should be the todo list (droppable)
+        let todo_message = &messages[4];
         assert!(
             todo_message.is_droppable(),
             "Todo message should be droppable"
@@ -680,9 +829,14 @@ mod tests {
         // Execute
         let actual = generator.add_user_prompt(conversation).await.unwrap();
 
-        // Assert - Should only have the user message, no todos
+        // Assert - Should have user message and runtime context, no todos
         let messages = actual.context.unwrap().messages;
-        assert_eq!(messages.len(), 1, "Should only have user message");
+        assert_eq!(
+            messages.len(),
+            2,
+            "Should have user message and runtime context"
+        );
         assert_eq!(messages[0].content().unwrap(), "First task");
+        assert!(messages[1].content().unwrap().contains("<runtime_context"));
     }
 }

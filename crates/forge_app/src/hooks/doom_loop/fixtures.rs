@@ -17,6 +17,7 @@ pub(super) fn assistant_message_with_tool_calls(tool_calls: Vec<ToolCallFull>) -
         droppable: false,
         phase: None,
         cacheable: None,
+        kind: None,
     }
 }
 
@@ -36,6 +37,7 @@ pub(super) fn text_message(role: Role, content: &str) -> TextMessage {
         droppable: false,
         phase: None,
         cacheable: None,
+        kind: None,
     }
 }
 

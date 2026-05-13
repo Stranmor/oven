@@ -12,6 +12,6 @@ expression: to_value(actual)
 >
 <stderr
   total_lines="1"
-><![CDATA[Command exceeded the 2 second synchronous shell window]]>
+><![CDATA[Command exceeded the 15 second synchronous shell window]]>
 </stderr>
 </shell_output>

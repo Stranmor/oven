@@ -347,7 +347,6 @@ fn extract_tool_info(call: &ToolCallFull, current_todos: &[Todo]) -> Option<Summ
             }
             ToolCatalog::Remove(input) => Some(SummaryTool::FileRemove { path: input.path }),
             ToolCatalog::Shell(input) => Some(SummaryTool::Shell { command: input.command }),
-            ToolCatalog::ProcessStart(input) => Some(SummaryTool::Shell { command: input.command }),
             ToolCatalog::ProcessStatus(_) => {
                 Some(SummaryTool::Mcp { name: "process_status".to_string() })
             }

@@ -2551,7 +2551,7 @@ mod tests {
                 output: forge_domain::CommandOutput {
                     command: "sleep 60".to_string(),
                     stdout: String::new(),
-                    stderr: "Command exceeded the 2 second synchronous shell window".to_string(),
+                    stderr: "Command exceeded the 15 second synchronous shell window".to_string(),
                     exit_code: None,
                 },
                 shell: "/bin/bash".to_string(),

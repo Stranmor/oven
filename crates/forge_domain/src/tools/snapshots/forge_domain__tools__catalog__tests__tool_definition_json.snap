@@ -305,7 +305,7 @@ expression: tools
       "nullable": true
     },
     "handoff_timeout_seconds": {
-      "description": "Optional synchronous wait window before handoff to managed background execution.\nDefaults to 2 seconds when omitted. The command is not killed when this\ntimeout elapses; the already-started process is registered for\nprocess_status/process_read observation.",
+      "description": "Optional synchronous wait window before handoff to managed background execution.\nDefaults to 15 seconds when omitted. The command is not killed when this\ntimeout elapses; the already-started process is registered for\nprocess_status/process_read observation.",
       "type": "integer",
       "format": "uint64",
       "minimum": 1,
@@ -321,42 +321,11 @@ expression: tools
   ]
 }
 {
-  "title": "ProcessStart",
-  "type": "object",
-  "properties": {
-    "command": {
-      "description": "The shell command to start as a managed background process.",
-      "type": "string"
-    },
-    "cwd": {
-      "description": "The working directory where the process should start.",
-      "type": "string",
-      "nullable": true
-    },
-    "description": {
-      "description": "Clear, concise description of what this background process does.",
-      "type": "string",
-      "nullable": true
-    },
-    "env": {
-      "description": "Environment variable names to pass to the process.",
-      "type": "array",
-      "items": {
-        "type": "string"
-      },
-      "nullable": true
-    }
-  },
-  "required": [
-    "command"
-  ]
-}
-{
   "title": "ProcessStatusInput",
   "type": "object",
   "properties": {
     "process_id": {
-      "description": "Handle returned by process_start or shell timeout handoff.",
+      "description": "Handle returned by a shell timeout handoff.",
       "type": "string"
     },
     "wait_seconds": {
@@ -384,7 +353,7 @@ expression: tools
       "minimum": 0
     },
     "process_id": {
-      "description": "Handle returned by process_start or shell timeout handoff.",
+      "description": "Handle returned by a shell timeout handoff.",
       "type": "string"
     },
     "wait_seconds": {
@@ -409,7 +378,7 @@ expression: tools
   "type": "object",
   "properties": {
     "process_id": {
-      "description": "Handle returned by process_start or shell timeout handoff.",
+      "description": "Handle returned by a shell timeout handoff.",
       "type": "string"
     }
   },
@@ -566,7 +535,7 @@ expression: tools
       "type": "string"
     },
     "session_id": {
-      "description": "Optional session ID to continue an existing agent session. If not\nprovided, a new stateless session will be created. Use this to\nmaintain context across multiple task invocations with the same\nagent.",
+      "description": "Optional compatibility session ID to continue an existing agent\nconversation. Pass the `conversation_id` returned from a previous task\nresult. Ownership is guarded by the durable lifecycle ledger so\nunrelated parent sessions cannot silently reparent this conversation.",
       "type": "string",
       "nullable": true
     },

@@ -293,19 +293,6 @@ impl<
                     .await?;
                 output.into()
             }
-            ToolCatalog::ProcessStart(input) => {
-                let execution_cwd = self.resolve_execution_cwd(input.cwd.as_ref());
-                let output = self
-                    .services
-                    .process_start(
-                        input.command.clone(),
-                        execution_cwd,
-                        input.env.clone(),
-                        input.description.clone(),
-                    )
-                    .await?;
-                ToolOperation::ProcessStart { output }
-            }
             ToolCatalog::ProcessStatus(input) => {
                 let output = self
                     .services
@@ -444,7 +431,7 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_domain::{PermissionOperation, ProcessStart, Shell};
+    use forge_domain::{PermissionOperation, Shell};
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
     fn create_directory_symlink(physical: &PathBuf, alias: &PathBuf) -> anyhow::Result<()> {
@@ -491,29 +478,6 @@ mod tests {
         let expected = match tool.to_policy_operation(workspace).unwrap() {
             PermissionOperation::Execute { cwd, .. } => cwd,
             _ => unreachable!("shell policy operation must be execute"),
-        };
-        assert_eq!(actual, physical);
-        assert_eq!(actual, expected);
-        Ok(())
-    }
-
-    #[test]
-    fn test_process_start_execution_cwd_matches_policy_physical_symlink_resolution()
-    -> anyhow::Result<()> {
-        let Some((_fixture, workspace, physical)) = symlink_fixture()? else {
-            return Ok(());
-        };
-        let cwd = PathBuf::from("alias");
-        let tool = ToolCatalog::ProcessStart(ProcessStart {
-            command: "pwd".to_string(),
-            cwd: Some(cwd.clone()),
-            ..Default::default()
-        });
-
-        let actual = resolve_tool_execution_cwd(Some(&cwd), workspace.as_path());
-        let expected = match tool.to_policy_operation(workspace).unwrap() {
-            PermissionOperation::Execute { cwd, .. } => cwd,
-            _ => unreachable!("process_start policy operation must be execute"),
         };
         assert_eq!(actual, physical);
         assert_eq!(actual, expected);

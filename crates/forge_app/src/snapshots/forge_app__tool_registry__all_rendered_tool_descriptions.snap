@@ -153,7 +153,7 @@ Reverts the most recent file operation (create/modify/delete) on a specific file
 
 Executes shell commands. The `cwd` parameter sets the working directory for command execution. If not specified, defaults to `/home/user/project`.
 
-Short commands remain synchronous and return stdout, stderr, and exit code directly. Commands that exceed the synchronous startup window are automatically handed off to the managed background process subsystem; the shell result then has no exit code, includes the process handle in the output attributes, and should be followed with `process_status` and `process_read` using the returned `process_id`. The `handoff_timeout_seconds` parameter controls this per command: omit it for the default 2 second window, or set a positive integer (for example `15`) when the command needs a longer synchronous wait before background handoff. Handoff does not kill or restart the command; the already-started process continues exactly once under managed process tracking.
+Short commands remain synchronous and return stdout, stderr, and exit code directly. Commands that exceed the synchronous startup window are automatically handed off to the managed background process subsystem; the shell result then has no exit code, includes the process handle in the output attributes, and should be followed with `process_status` and `process_read` using the returned `process_id`. The `handoff_timeout_seconds` parameter controls this per command: omit it for the default 15 second window, or set a positive integer (for example `30`) when the command needs a longer synchronous wait before background handoff. Handoff does not kill or restart the command; the already-started process continues exactly once under managed process tracking.
 
 CRITICAL: Do NOT use `cd` commands in the command string. This is FORBIDDEN. Always use the `cwd` parameter to set the working directory instead. Any use of `cd` in the command is redundant, incorrect, and violates the tool contract.
 
@@ -204,45 +204,39 @@ Returns complete output including stdout, stderr, and exit code for synchronous 
 
 ---
 
-### process_start
-
-Starts a shell command as a managed background process and returns immediately with a `process_id` handle.
-
-Use this for long-running servers, watchers, REPL-adjacent daemons, and commands expected to run longer than an interactive foreground turn. Do not use it for short commands; use `shell` instead.
-
-The process captures stdout/stderr asynchronously. Use `process_status` to inspect lifecycle state, `process_read` to read captured output with a cursor, `process_list` to see active handles, and `process_kill` to stop a process.
-
-The `cwd` parameter sets the working directory. Do not put `cd` in the command string.
-
----
-
 ### process_status
 
-Returns structured lifecycle status for a managed background process. The `process_id` handle may come from `process_start` or from a shell timeout handoff when a shell command exceeds the synchronous execution window.
+Returns structured lifecycle status for a managed background process. The `process_id` handle comes from a shell timeout handoff when a shell command exceeds the synchronous execution window.
 
-The result includes the typed `process_id`, command, working directory, and status: running, exited with exit code, or killed.
+The result includes the typed `process_id`, command, working directory, and status: running, exited with exit code, or killed. Recent completed process ids can still be queried after they disappear from `process_list`.
+
+Use `wait_seconds` when a process is expected to finish soon. The bounded wait returns early when the process leaves `running`, and otherwise returns the current status after the requested delay. Prefer this over repeated immediate status polling.
 
 ---
 
 ### process_read
 
-Reads captured stdout/stderr from a managed background process. The `process_id` handle may come from `process_start` or from a shell timeout handoff when a shell command exceeds the synchronous execution window.
+Reads captured stdout/stderr from a managed background process. The `process_id` handle comes from a shell timeout handoff when a shell command exceeds the synchronous execution window.
 
-Pass the `cursor` returned by the previous `process_read` call to receive only new output. Omit it or pass `0` to read from the beginning. The result returns `next_cursor` for idempotent continuation.
+Pass the `cursor` returned by the previous `process_read` call to receive only new output. Omit it or pass `0` to read from the beginning. The result returns `next_cursor` for idempotent continuation. Recent completed process ids can still return captured output after they disappear from `process_list`.
+
+Use `wait_seconds` when the same cursor previously returned no entries and more output is expected. The bounded wait returns early as soon as new output is captured or the process exits, and otherwise returns after the requested delay without advancing `next_cursor`. Prefer this over repeated immediate polling of the same cursor.
 
 ---
 
 ### process_list
 
-Lists all managed background process handles known to the current Forge runtime.
+Lists currently running managed background process handles known to the current Forge runtime.
 
-Use this before starting duplicate servers or to discover handles for status, log reading, and cleanup.
+Completed or killed managed processes are intentionally omitted from this inventory. Recent completed process ids may still be queried directly with `process_status` and `process_read` for status and captured-output readback.
+
+Use this to discover active handles for status, log reading, and cleanup before starting duplicate servers or watchers.
 
 ---
 
 ### process_kill
 
-Stops a managed background process. The `process_id` handle may come from `process_start` or from a shell timeout handoff when a shell command exceeds the synchronous execution window.
+Stops a managed background process. The `process_id` handle comes from a shell timeout handoff when a shell command exceeds the synchronous execution window.
 
 Use this to clean up servers, watchers, or long-running commands after verification. The result reports the final process status.
 
@@ -514,8 +508,8 @@ Usage notes:
 - Always include a short description (3-5 words) summarizing what the agent will do
 - Launch multiple agents concurrently whenever possible, to maximize performance; to do that, use a single message with multiple tool uses
 - When the agent is done, it will return a single message back to you. The result returned by the agent is not visible to the user. To show the user the result, you should send a text message back to the user with a concise summary of the result.
-- Agents can be resumed using the `session_id` parameter by passing the agent ID from a previous invocation. When resumed, the agent continues with its full previous context preserved. When NOT resuming, each invocation starts fresh. Provide a clear task description, but **NEVER copy-paste large conversation histories or file contents into the task description**. If the subagent needs large context (>500 words), write it to a temporary markdown file using the `write` tool and pass the file path in the task description instead.
-- When the agent is done, it will return a single message back to you along with its agent ID. You can use this ID to resume the agent later if needed for follow-up work.
+- Agents can be resumed using the `session_id` parameter by passing the `conversation_id` returned from a previous invocation. The tool result also includes a durable `task_id` for lifecycle recovery and an explicit `conversation_id`/`session_id` for compatibility resume. Resuming is allowed only for the same delegated conversation ownership lineage; unrelated parent conversations are rejected instead of silently reparented. Use `forge task list` to inspect active task sessions, `forge task list --all` to include terminal history, and `forge task show <task_id>` to recover final result/error/status metadata. When NOT resuming, each invocation starts a fresh delegated conversation and durable task record. Provide a clear task description, but **NEVER copy-paste large conversation histories or file contents into the task description**. If the subagent needs large context (>500 words), write it to a temporary markdown file using the `write` tool and pass the file path in the task description instead.
+- When the agent is done, it will return a single message back to you along with both `task_id` and `conversation_id`. Use `conversation_id` as the compatibility `session_id` for follow-up resume; use `task_id` for durable lifecycle inspection, recovery, active/all listing, and final result/error audit.
 - Provide clear, detailed prompts so the agent can work autonomously and return exactly the information you need.
 - Agents with "access to current context" can see the full conversation history before the tool call. When using these agents, you can write concise prompts that reference earlier context (e.g., "investigate the error discussed above") instead of repeating information. The agent will receive all prior messages and understand the context.
 - The agent's outputs should generally be trusted

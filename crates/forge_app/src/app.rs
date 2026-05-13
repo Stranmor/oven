@@ -106,7 +106,14 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
             .messages
             .iter()
             .rev()
-            .find(|message| message.has_role(Role::User) && !message.is_droppable())
+            .find(|message| {
+                message.has_role(Role::User)
+                    && !message.is_droppable()
+                    && !matches!(
+                        &message.message,
+                        ContextMessage::Text(text) if text.is_runtime_context()
+                    )
+            })
             .and_then(|message| message.content())
             .map(str::trim)
             .filter(|content| !content.is_empty())
@@ -746,6 +753,62 @@ mod tests {
             r#"{"version":1,"root":"fixture","files":[],"file_nodes":[],"symbols":[],"edges":[],"shards":[],"manifest_hash":"fixture"}"#,
         )?;
         Ok((fixture, root))
+    }
+
+    #[tokio::test]
+    async fn project_model_query_ignores_live_runtime_context_message() -> Result<()> {
+        let (_fixture, _root) = fixture_workspace()?;
+        let model_id = ModelId::new("test-model");
+        let conversation = Conversation::generate().context(
+            Context::default()
+                .add_message(ContextMessage::user(
+                    "find automatic injection needle",
+                    Some(model_id.clone()),
+                ))
+                .add_message(ContextMessage::Text(
+                    TextMessage::new(
+                        Role::User,
+                        "<runtime_context freshness=\"live\" cache=\"uncached\">time</runtime_context>",
+                    )
+                    .model(model_id.clone())
+                    .runtime_context()
+                    .cacheable(false),
+                )),
+        );
+
+        let actual = ProjectContextInjection::<ProjectContextHarness>::query_from_conversation(
+            &conversation,
+        )
+        .unwrap();
+        let expected = "find automatic injection needle";
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_model_query_preserves_real_user_message_containing_runtime_context_text()
+    -> Result<()> {
+        let (_fixture, _root) = fixture_workspace()?;
+        let model_id = ModelId::new("test-model");
+        let conversation = Conversation::generate().context(
+            Context::default()
+                .add_message(ContextMessage::user(
+                    "previous automatic injection needle",
+                    Some(model_id.clone()),
+                ))
+                .add_message(ContextMessage::user(
+                    "explain the literal <runtime_context tag in prompts",
+                    Some(model_id.clone()),
+                )),
+        );
+
+        let actual = ProjectContextInjection::<ProjectContextHarness>::query_from_conversation(
+            &conversation,
+        )
+        .unwrap();
+        let expected = "explain the literal <runtime_context tag in prompts";
+        assert_eq!(actual, expected);
+        Ok(())
     }
 
     #[tokio::test]

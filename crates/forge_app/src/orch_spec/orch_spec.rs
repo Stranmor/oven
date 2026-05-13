@@ -30,7 +30,10 @@ async fn test_simple_conversation_no_errors() {
 
     let message_count = messages
         .iter()
-        .filter(|message| message.has_role(Role::User))
+        .filter(|message| match &message.message {
+            ContextMessage::Text(text) => text.has_role(Role::User) && !text.is_runtime_context(),
+            _ => message.has_role(Role::User),
+        })
         .count();
     assert_eq!(message_count, 1, "Should have only one user message");
 
@@ -648,6 +651,7 @@ async fn test_doom_loop_reminder_is_not_duplicated_without_new_tool_evidence() {
             droppable: false,
             phase: None,
             cacheable: None,
+            kind: None,
         })
         .into()
     }

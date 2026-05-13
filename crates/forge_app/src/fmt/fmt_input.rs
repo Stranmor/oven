@@ -135,11 +135,6 @@ impl FormatContent for ToolCatalog {
                     .sub_title(&input.command)
                     .into(),
             ),
-            ToolCatalog::ProcessStart(input) => Some(
-                TitleFormat::debug(format!("Start Process [{}]", env.shell))
-                    .sub_title(&input.command)
-                    .into(),
-            ),
             ToolCatalog::ProcessStatus(input) => Some(
                 TitleFormat::debug("Process Status")
                     .sub_title(format_process_status_subtitle(input))

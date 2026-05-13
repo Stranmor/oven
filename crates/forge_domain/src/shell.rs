@@ -86,7 +86,7 @@ pub struct ShellHandoffTimeoutSeconds(u64);
 
 impl ShellHandoffTimeoutSeconds {
     /// Default synchronous shell handoff timeout in seconds.
-    pub const DEFAULT_SECONDS: u64 = 2;
+    pub const DEFAULT_SECONDS: u64 = 15;
 
     /// Creates a timeout from externally provided seconds.
     ///
@@ -289,6 +289,16 @@ mod tests {
     use schemars::schema_for;
 
     use super::*;
+
+    #[test]
+    fn test_shell_handoff_timeout_defaults_to_fifteen_seconds() {
+        let fixture = ShellHandoffTimeoutSeconds::default();
+
+        let actual = fixture.seconds();
+        let expected = 15;
+
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn test_shell_handoff_timeout_rejects_zero_at_json_boundary() {

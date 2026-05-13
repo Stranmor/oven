@@ -205,6 +205,43 @@ mod tests {
     }
 
     #[test]
+    fn test_runtime_context_is_sent_but_cache_ineligible() {
+        let fixture = Context::default()
+            .add_message(ContextMessage::Text(
+                TextMessage::new(Role::User, "real user").model(ModelId::new("gpt-4")),
+            ))
+            .add_message(ContextMessage::Text(
+                TextMessage::new(
+                    Role::User,
+                    "<runtime_context freshness=\"live\" cache=\"uncached\">dynamic</runtime_context>",
+                )
+                .model(ModelId::new("gpt-4"))
+                .cacheable(false),
+            ));
+        let mut transformer = SetCache;
+
+        let actual = transformer.transform(Request::from(fixture));
+        let messages = actual.messages.unwrap();
+
+        let expected = (true, false, true);
+        assert_eq!(
+            (
+                matches!(messages[1].content.as_ref().unwrap(), crate::dto::openai::MessageContent::Text(text) if text.contains("runtime_context")),
+                messages[1].content.as_ref().unwrap().is_cached(),
+                messages[0].content.as_ref().unwrap().is_cached(),
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_real_user_message_remains_rolling_marker_before_runtime_context() {
+        let actual = create_test_context("sud");
+        let expected = "[s[ud";
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn test_changed_files_notification_is_cache_ineligible() {
         let actual = create_test_context("ud");
         let expected = "[ud";

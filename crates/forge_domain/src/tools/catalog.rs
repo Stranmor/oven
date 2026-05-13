@@ -56,7 +56,6 @@ pub enum ToolCatalog {
     MultiPatch(FSMultiPatch),
     Undo(FSUndo),
     Shell(Shell),
-    ProcessStart(ProcessStart),
     ProcessStatus(ProcessStatusInput),
     ProcessRead(ProcessRead),
     ProcessList(ProcessList),
@@ -621,7 +620,7 @@ pub struct Shell {
     pub keep_ansi: bool,
 
     /// Optional synchronous wait window before handoff to managed background execution.
-    /// Defaults to 2 seconds when omitted. The command is not killed when this
+    /// Defaults to 15 seconds when omitted. The command is not killed when this
     /// timeout elapses; the already-started process is registered for
     /// process_status/process_read observation.
     #[serde(default)]
@@ -647,31 +646,9 @@ pub struct Shell {
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema, ToolDescription, PartialEq)]
-#[tool_description_file = "crates/forge_domain/src/tools/descriptions/process_start.md"]
-pub struct ProcessStart {
-    /// The shell command to start as a managed background process.
-    pub command: String,
-
-    /// The working directory where the process should start.
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<PathBuf>,
-
-    /// Environment variable names to pass to the process.
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub env: Option<Vec<String>>,
-
-    /// Clear, concise description of what this background process does.
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-}
-
-#[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema, ToolDescription, PartialEq)]
 #[tool_description_file = "crates/forge_domain/src/tools/descriptions/process_status.md"]
 pub struct ProcessStatusInput {
-    /// Handle returned by process_start or shell timeout handoff.
+    /// Handle returned by a shell timeout handoff.
     pub process_id: String,
 
     /// Optional bounded wait before returning status. Use this instead of immediate repeated polling.
@@ -684,7 +661,7 @@ pub struct ProcessStatusInput {
 #[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema, ToolDescription, PartialEq)]
 #[tool_description_file = "crates/forge_domain/src/tools/descriptions/process_read.md"]
 pub struct ProcessRead {
-    /// Handle returned by process_start or shell timeout handoff.
+    /// Handle returned by a shell timeout handoff.
     pub process_id: String,
 
     /// Cursor returned by the previous process_read call. Defaults to 0.
@@ -705,7 +682,7 @@ pub struct ProcessList {}
 #[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema, ToolDescription, PartialEq)]
 #[tool_description_file = "crates/forge_domain/src/tools/descriptions/process_kill.md"]
 pub struct ProcessKill {
-    /// Handle returned by process_start or shell timeout handoff.
+    /// Handle returned by a shell timeout handoff.
     pub process_id: String,
 }
 
@@ -899,7 +876,6 @@ impl ToolDescription for ToolCatalog {
             ToolCatalog::Patch(v) => v.description(),
             ToolCatalog::MultiPatch(v) => v.description(),
             ToolCatalog::Shell(v) => v.description(),
-            ToolCatalog::ProcessStart(v) => v.description(),
             ToolCatalog::ProcessStatus(v) => v.description(),
             ToolCatalog::ProcessRead(v) => v.description(),
             ToolCatalog::ProcessList(v) => v.description(),
@@ -973,7 +949,6 @@ impl ToolCatalog {
             ToolCatalog::Patch(_) => r#gen.into_root_schema_for::<FSPatch>(),
             ToolCatalog::MultiPatch(_) => r#gen.into_root_schema_for::<FSMultiPatch>(),
             ToolCatalog::Shell(_) => r#gen.into_root_schema_for::<Shell>(),
-            ToolCatalog::ProcessStart(_) => r#gen.into_root_schema_for::<ProcessStart>(),
             ToolCatalog::ProcessStatus(_) => r#gen.into_root_schema_for::<ProcessStatusInput>(),
             ToolCatalog::ProcessRead(_) => r#gen.into_root_schema_for::<ProcessRead>(),
             ToolCatalog::ProcessList(_) => r#gen.into_root_schema_for::<ProcessList>(),
@@ -1104,13 +1079,6 @@ impl ToolCatalog {
                 ),
             }),
             ToolCatalog::Shell(input) => {
-                let execution_cwd = resolve_execution_cwd(input.cwd.as_ref(), &cwd);
-                Some(crate::policies::PermissionOperation::Execute {
-                    command: input.command.clone(),
-                    cwd: execution_cwd,
-                })
-            }
-            ToolCatalog::ProcessStart(input) => {
                 let execution_cwd = resolve_execution_cwd(input.cwd.as_ref(), &cwd);
                 Some(crate::policies::PermissionOperation::Execute {
                     command: input.command.clone(),
@@ -1374,7 +1342,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use strum::IntoEnumIterator;
 
-    use super::{ProcessRead, ProcessStart, ProcessStatusInput, Shell, ShellHandoffTimeoutSeconds};
+    use super::{ProcessRead, ProcessStatusInput, Shell, ShellHandoffTimeoutSeconds};
     use crate::{ToolCatalog, ToolKind, ToolName};
 
     #[test]
@@ -1488,6 +1456,16 @@ mod tests {
             assert_eq!(actual_direct.pointer("/maximum").unwrap(), 30);
             assert_eq!(actual_cached, actual_direct);
         }
+    }
+
+    #[test]
+    fn test_process_start_is_not_model_visible_tool() {
+        let fixture = ToolName::new("process_start");
+
+        let actual = ToolCatalog::contains(&fixture);
+        let expected = false;
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -1688,46 +1666,6 @@ mod tests {
             ToolCatalog::contains(&ToolName::new("Write")),
             "Should contain capitalized 'Write'"
         );
-    }
-
-    #[test]
-    fn test_process_start_policy_uses_requested_cwd_for_execute_permission() {
-        use crate::policies::PermissionOperation;
-
-        let fixture = ToolCatalog::ProcessStart(ProcessStart {
-            command: "printf restricted".to_string(),
-            cwd: Some(PathBuf::from("allowed")),
-            ..Default::default()
-        });
-
-        let actual = fixture
-            .to_policy_operation(PathBuf::from("/workspace"))
-            .unwrap();
-        let expected = PermissionOperation::Execute {
-            command: "printf restricted".to_string(),
-            cwd: PathBuf::from("/workspace/allowed"),
-        };
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn test_process_start_policy_normalizes_requested_cwd_before_permission_match() {
-        use crate::policies::PermissionOperation;
-
-        let fixture = ToolCatalog::ProcessStart(ProcessStart {
-            command: "printf traversal".to_string(),
-            cwd: Some(PathBuf::from("allowed/../forbidden")),
-            ..Default::default()
-        });
-
-        let actual = fixture
-            .to_policy_operation(PathBuf::from("/workspace"))
-            .unwrap();
-        let expected = PermissionOperation::Execute {
-            command: "printf traversal".to_string(),
-            cwd: PathBuf::from("/workspace/forbidden"),
-        };
-        assert_eq!(actual, expected);
     }
 
     #[test]

@@ -321,6 +321,46 @@ mod tests {
     }
 
     #[test]
+    fn test_runtime_context_is_sent_but_cache_ineligible() {
+        let fixture = Context::default()
+            .add_message(ContextMessage::Text(
+                TextMessage::new(Role::User, "real user")
+                    .model(ModelId::new("claude-3-5-sonnet-20241022")),
+            ))
+            .add_message(ContextMessage::Text(
+                TextMessage::new(
+                    Role::User,
+                    "<runtime_context freshness=\"live\" cache=\"uncached\">dynamic</runtime_context>",
+                )
+                .model(ModelId::new("claude-3-5-sonnet-20241022"))
+                .cacheable(false),
+            ));
+        let mut transformer = SetCache;
+
+        let actual = transformer.transform(Request::try_from(fixture).unwrap());
+
+        let expected = (true, false, true);
+        assert_eq!(
+            (
+                actual.get_messages()[1]
+                    .content
+                    .iter()
+                    .any(|content| matches!(content, crate::dto::anthropic::Content::Text { text, .. } if text.contains("runtime_context"))),
+                actual.get_messages()[1].is_cached(),
+                actual.get_messages()[0].is_cached(),
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_real_user_message_remains_rolling_marker_before_runtime_context() {
+        let actual = create_test_context_with_system("s", "ud");
+        let expected = "[s[ud";
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn test_changed_files_notification_is_cache_ineligible() {
         let fixture = Context::default()
             .add_message(ContextMessage::Text(

@@ -20,6 +20,7 @@ use tokio::sync::{Mutex, Notify};
 use crate::console::StdConsoleWriter;
 
 const MAX_BACKGROUND_LOG_ENTRIES: usize = 8192;
+const MAX_COMPLETED_PROCESS_ARCHIVE: usize = 128;
 const PROCESS_OBSERVATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Service for executing shell commands
@@ -30,6 +31,53 @@ pub struct ForgeCommandExecutorService<O = Stdout, E = Stderr> {
     // Mutex to ensure that only one command is executed at a time
     ready: Arc<Mutex<()>>,
     processes: Arc<Mutex<HashMap<ProcessId, ManagedProcess>>>,
+    completed_processes: Arc<Mutex<CompletedProcessArchive>>,
+}
+
+struct CompletedProcessArchive {
+    entries: HashMap<ProcessId, CompletedProcess>,
+    order: VecDeque<ProcessId>,
+}
+
+struct CompletedProcess {
+    command: String,
+    cwd: String,
+    status: ProcessStatusKind,
+    logs: Arc<Mutex<VecDeque<ProcessLogEntry>>>,
+    dropped_before_cursor: Arc<AtomicU64>,
+}
+
+impl CompletedProcess {
+    fn status(&self, process_id: ProcessId) -> ProcessStatus {
+        ProcessStatus {
+            process_id,
+            status: self.status.clone(),
+            command: self.command.clone(),
+            cwd: self.cwd.clone(),
+        }
+    }
+}
+
+impl CompletedProcessArchive {
+    fn new() -> Self {
+        Self { entries: HashMap::new(), order: VecDeque::new() }
+    }
+
+    fn insert(&mut self, process_id: ProcessId, process: CompletedProcess) {
+        if !self.entries.contains_key(&process_id) {
+            self.order.push_back(process_id.clone());
+        }
+        self.entries.insert(process_id.clone(), process);
+        while self.order.len() > MAX_COMPLETED_PROCESS_ARCHIVE {
+            if let Some(expired) = self.order.pop_front() {
+                self.entries.remove(&expired);
+            }
+        }
+    }
+
+    fn get(&self, process_id: &ProcessId) -> Option<&CompletedProcess> {
+        self.entries.get(process_id)
+    }
 }
 
 struct ManagedProcess {
@@ -227,6 +275,7 @@ impl<O, E> Clone for ForgeCommandExecutorService<O, E> {
             output_printer: self.output_printer.clone(),
             ready: self.ready.clone(),
             processes: self.processes.clone(),
+            completed_processes: self.completed_processes.clone(),
         }
     }
 }
@@ -242,6 +291,7 @@ where
             output_printer,
             ready: Arc::new(Mutex::new(())),
             processes: Arc::new(Mutex::new(HashMap::new())),
+            completed_processes: Arc::new(Mutex::new(CompletedProcessArchive::new())),
         }
     }
 
@@ -437,6 +487,76 @@ where
         self.processes.lock().await.insert(process_id, managed);
         Ok(())
     }
+
+    async fn archive_completed_process(&self, process_id: ProcessId, process: ManagedProcess) {
+        let completed = CompletedProcess {
+            command: process.command,
+            cwd: process.cwd,
+            status: process.status,
+            logs: process.logs,
+            dropped_before_cursor: process.dropped_before_cursor,
+        };
+        self.completed_processes
+            .lock()
+            .await
+            .insert(process_id, completed);
+    }
+
+    async fn archived_status(&self, process_id: &ProcessId) -> Option<ProcessStatus> {
+        self.completed_processes
+            .lock()
+            .await
+            .get(process_id)
+            .map(|process| process.status(process_id.clone()))
+    }
+
+    async fn archived_read_output(
+        &self,
+        process_id: &ProcessId,
+        cursor: ProcessReadCursor,
+    ) -> Option<(ProcessReadOutput, ProcessStatusKind)> {
+        let (logs, dropped_before_cursor, status) = {
+            let archive = self.completed_processes.lock().await;
+            let process = archive.get(process_id)?;
+            let dropped_before_cursor = match process.dropped_before_cursor.load(Ordering::Relaxed)
+            {
+                0 => None,
+                cursor => Some(ProcessReadCursor::new(cursor)),
+            };
+            (
+                Arc::clone(&process.logs),
+                dropped_before_cursor,
+                process.status.clone(),
+            )
+        };
+        let logs = logs.lock().await;
+        Some((
+            process_read_output_from_logs(process_id.clone(), cursor, &logs, dropped_before_cursor),
+            status,
+        ))
+    }
+
+    async fn finalize_and_archive_process(
+        &self,
+        process_id: ProcessId,
+        stdout_task: Option<tokio::task::JoinHandle<()>>,
+        stderr_task: Option<tokio::task::JoinHandle<()>>,
+    ) -> anyhow::Result<()> {
+        finalize_output_tasks(stdout_task, stderr_task).await?;
+        let process = {
+            let mut processes = self.processes.lock().await;
+            if let Some(process) = processes.get_mut(&process_id) {
+                process.output_finalized = true;
+                process.output_finalized_notify.notify_waiters();
+            }
+            processes.remove(&process_id)
+        };
+        if let Some(process) = process {
+            self.archive_completed_process(process_id, process).await;
+        }
+        Ok(())
+    }
+
     async fn execute_command_internal(
         &self,
         command: String,
@@ -503,17 +623,21 @@ where
     }
 
     async fn process_status_once(&self, process_id: ProcessId) -> anyhow::Result<ProcessStatus> {
-        let (status, stdout_task, stderr_task, output_finalized_notify) = loop {
+        let (status, stdout_task, stderr_task) = loop {
             let mut processes = self.processes.lock().await;
-            let process = processes
-                .get_mut(&process_id)
-                .ok_or_else(|| anyhow::anyhow!("Unknown process id: {process_id}"))?;
+            let Some(process) = processes.get_mut(&process_id) else {
+                drop(processes);
+                return self
+                    .archived_status(&process_id)
+                    .await
+                    .ok_or_else(|| anyhow::anyhow!("Unknown process id: {process_id}"));
+            };
             process.refresh_status_without_output_join().await?;
             if matches!(process.status, ProcessStatusKind::Running) {
-                break (process.status(process_id), None, None, None);
+                return Ok(process.status(process_id));
             }
             if process.output_finalized {
-                break (process.status(process_id), None, None, None);
+                break (process.status(process_id), None, None);
             }
             if process.output_finalizing {
                 let notify = Arc::clone(&process.output_finalized_notify);
@@ -524,23 +648,10 @@ where
             }
             process.output_finalizing = true;
             let tasks = process.take_output_tasks();
-            break (
-                process.status(process_id),
-                tasks.0,
-                tasks.1,
-                Some(Arc::clone(&process.output_finalized_notify)),
-            );
+            break (process.status(process_id), tasks.0, tasks.1);
         };
-        finalize_output_tasks(stdout_task, stderr_task).await?;
-        if let Some(output_finalized_notify) = output_finalized_notify {
-            let mut processes = self.processes.lock().await;
-            let process = processes
-                .get_mut(&status.process_id)
-                .ok_or_else(|| anyhow::anyhow!("Unknown process id: {}", status.process_id))?;
-            process.output_finalized = true;
-            process.output_finalized_notify.notify_waiters();
-            drop(output_finalized_notify);
-        }
+        self.finalize_and_archive_process(status.process_id.clone(), stdout_task, stderr_task)
+            .await?;
         Ok(status)
     }
 
@@ -558,9 +669,14 @@ where
             output_finalized_notify,
         ) = loop {
             let mut processes = self.processes.lock().await;
-            let process = processes
-                .get_mut(&process_id)
-                .ok_or_else(|| anyhow::anyhow!("Unknown process id: {process_id}"))?;
+            let Some(process) = processes.get_mut(&process_id) else {
+                drop(processes);
+                if let Some((output, status)) = self.archived_read_output(&process_id, cursor).await
+                {
+                    return Ok((output, status));
+                }
+                anyhow::bail!("Unknown process id: {process_id}");
+            };
             process.refresh_status_without_output_join().await?;
             let dropped_before_cursor = match process.dropped_before_cursor.load(Ordering::Relaxed)
             {
@@ -595,15 +711,11 @@ where
                 Some(Arc::clone(&process.output_finalized_notify)),
             );
         };
-        finalize_output_tasks(stdout_task, stderr_task).await?;
-        if let Some(output_finalized_notify) = output_finalized_notify {
-            let mut processes = self.processes.lock().await;
-            let process = processes
-                .get_mut(&process_id)
-                .ok_or_else(|| anyhow::anyhow!("Unknown process id: {process_id}"))?;
-            process.output_finalized = true;
-            process.output_finalized_notify.notify_waiters();
-            drop(output_finalized_notify);
+        if output_finalized_notify.is_some() {
+            self.finalize_and_archive_process(process_id.clone(), stdout_task, stderr_task)
+                .await?;
+        } else {
+            finalize_output_tasks(stdout_task, stderr_task).await?;
         }
         let logs = logs.lock().await;
         Ok((
@@ -912,25 +1024,43 @@ where
     }
 
     async fn list_processes(&self) -> anyhow::Result<Vec<ProcessStatus>> {
-        let mut processes = self.processes.lock().await;
-        let mut statuses = Vec::with_capacity(processes.len());
-        for (process_id, process) in processes.iter_mut() {
-            process.refresh_status_without_output_join().await?;
-            statuses.push(process.status(process_id.clone()));
+        let mut terminal_processes = Vec::new();
+        let statuses = {
+            let mut processes = self.processes.lock().await;
+            let mut statuses = Vec::with_capacity(processes.len());
+            for (process_id, process) in processes.iter_mut() {
+                process.refresh_status_without_output_join().await?;
+                if matches!(process.status, ProcessStatusKind::Running) {
+                    statuses.push(process.status(process_id.clone()));
+                } else if !process.output_finalizing {
+                    process.output_finalizing = true;
+                    let (stdout_task, stderr_task) = process.take_output_tasks();
+                    terminal_processes.push((process_id.clone(), stdout_task, stderr_task));
+                }
+            }
+            statuses
+        };
+        for (process_id, stdout_task, stderr_task) in terminal_processes {
+            self.finalize_and_archive_process(process_id, stdout_task, stderr_task)
+                .await?;
         }
         Ok(statuses)
     }
 
     async fn kill_process(&self, process_id: ProcessId) -> anyhow::Result<ProcessStatus> {
-        let (status, stdout_task, stderr_task, output_finalized_notify) = loop {
+        let (status, stdout_task, stderr_task) = loop {
             let mut processes = self.processes.lock().await;
-            let process = processes
-                .get_mut(&process_id)
-                .ok_or_else(|| anyhow::anyhow!("Unknown process id: {process_id}"))?;
+            let Some(process) = processes.get_mut(&process_id) else {
+                drop(processes);
+                return self
+                    .archived_status(&process_id)
+                    .await
+                    .ok_or_else(|| anyhow::anyhow!("Unknown process id: {process_id}"));
+            };
             process.refresh_status_without_output_join().await?;
             if process.output_finalized {
                 let status = process.status(process_id.clone());
-                break (status, None, None, None);
+                break (status, None, None);
             }
             if process.output_finalizing {
                 let notify = Arc::clone(&process.output_finalized_notify);
@@ -948,28 +1078,12 @@ where
                 }
             }
             let status = process.status(process_id.clone());
-            if process.output_finalized {
-                break (status, None, None, None);
-            }
             process.output_finalizing = true;
             let (stdout_task, stderr_task) = process.take_output_tasks();
-            break (
-                status,
-                stdout_task,
-                stderr_task,
-                Some(Arc::clone(&process.output_finalized_notify)),
-            );
+            break (status, stdout_task, stderr_task);
         };
-        finalize_output_tasks(stdout_task, stderr_task).await?;
-        if let Some(output_finalized_notify) = output_finalized_notify {
-            let mut processes = self.processes.lock().await;
-            let process = processes
-                .get_mut(&process_id)
-                .ok_or_else(|| anyhow::anyhow!("Unknown process id: {process_id}"))?;
-            process.output_finalized = true;
-            process.output_finalized_notify.notify_waiters();
-            drop(output_finalized_notify);
-        }
+        self.finalize_and_archive_process(status.process_id.clone(), stdout_task, stderr_task)
+            .await?;
         Ok(status)
     }
 }
@@ -1483,7 +1597,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_list_refreshes_exited_status_without_status_probe() {
+    async fn test_process_list_omits_exited_process_and_archives_status() {
         let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
         let started = fixture
             .start_process("exit 7".to_string(), PathBuf::new().join("."), None)
@@ -1491,15 +1605,47 @@ mod tests {
             .unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let actual = fixture.list_processes().await.unwrap();
+        let list = fixture.list_processes().await.unwrap();
+        let actual = fixture
+            .process_status(started.process_id, None)
+            .await
+            .unwrap();
         let expected = ProcessStatusKind::Exited { exit_code: Some(7) };
 
-        assert_eq!(actual.first().unwrap().process_id, started.process_id);
-        assert_eq!(actual.first().unwrap().status, expected);
+        assert_eq!(list, Vec::new());
+        assert_eq!(actual.status, expected);
     }
 
     #[tokio::test]
-    async fn test_process_kill_refreshes_naturally_exited_status_before_killing() {
+    async fn test_process_read_returns_archived_output_after_process_leaves_list() {
+        let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
+        let started = fixture
+            .start_process(
+                "printf archived".to_string(),
+                PathBuf::new().join("."),
+                None,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let list = fixture.list_processes().await.unwrap();
+        let actual = fixture
+            .read_process(started.process_id, ProcessReadCursor::new(0), None)
+            .await
+            .unwrap();
+
+        assert_eq!(list, Vec::new());
+        assert!(
+            actual
+                .entries
+                .iter()
+                .any(|entry| entry.content.contains("archived"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_kill_archives_process_after_cleanup() {
         let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
         let started = fixture
             .start_process("exit 9".to_string(), PathBuf::new().join("."), None)
@@ -1589,7 +1735,7 @@ mod tests {
     async fn test_process_kill_waits_for_in_progress_output_finalization() {
         let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
         let started = fixture
-            .start_process("sleep 5".to_string(), PathBuf::new().join("."), None)
+            .start_process("exit 0".to_string(), PathBuf::new().join("."), None)
             .await
             .unwrap();
         {
@@ -1760,7 +1906,7 @@ mod tests {
                 temp_dir.path().to_path_buf(),
                 true,
                 None,
-                Default::default(),
+                ShellHandoffTimeoutSeconds::new(1).unwrap(),
             )
             .await
             .unwrap();
@@ -1781,7 +1927,7 @@ mod tests {
             actual
                 .output
                 .stderr
-                .contains("exceeded the 2 second synchronous shell window")
+                .contains("exceeded the 1 second synchronous shell window")
         );
         assert!(
             read_output
@@ -1838,6 +1984,54 @@ mod tests {
                 .any(|entry| entry.content.contains("custom-early"))
         );
         assert_eq!(side_effects, "custom-run");
+    }
+
+    #[tokio::test]
+    async fn test_execute_command_completes_before_timeout_without_managed_entry() {
+        let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
+
+        let actual = fixture
+            .execute_command(
+                "printf immediate".to_string(),
+                PathBuf::new().join("."),
+                true,
+                None,
+                ShellHandoffTimeoutSeconds::new(1).unwrap(),
+            )
+            .await
+            .unwrap();
+        let processes = fixture.list_processes().await.unwrap();
+        let expected = ("immediate".to_string(), None, Vec::new());
+
+        assert_eq!((actual.output.stdout, actual.process, processes), expected);
+    }
+
+    #[tokio::test]
+    async fn test_execute_command_default_handoff_timeout_is_fifteen_seconds() {
+        let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
+
+        let actual = fixture
+            .execute_command(
+                "printf default-timeout; sleep 1".to_string(),
+                PathBuf::new().join("."),
+                true,
+                None,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let processes = fixture.list_processes().await.unwrap();
+        let expected = ("default-timeout".to_string(), Some(0), None, Vec::new());
+
+        assert_eq!(
+            (
+                actual.output.stdout,
+                actual.output.exit_code,
+                actual.process,
+                processes,
+            ),
+            expected
+        );
     }
 
     #[tokio::test]

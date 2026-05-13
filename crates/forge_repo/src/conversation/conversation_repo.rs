@@ -1688,6 +1688,7 @@ mod tests {
                     droppable: false,
                     phase: None,
                     cacheable: Some(false),
+                    kind: None,
                 }),
                 usage: Some(Usage {
                     prompt_tokens: forge_domain::TokenCount::Actual(100),
