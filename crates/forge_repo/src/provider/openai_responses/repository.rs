@@ -6,7 +6,7 @@ use forge_app::domain::{
     ChatCompletionMessage, Context as ChatContext, Model, ModelId, ResultStream,
 };
 use forge_app::{EnvironmentInfra, HttpInfra};
-use forge_domain::{BoxStream, ChatRepository, Provider};
+use forge_domain::{BoxStream, ChatRepository, Provider, ProviderId, ProviderResponse};
 use forge_eventsource_stream::Eventsource;
 use forge_infra::sanitize_headers;
 use futures::StreamExt;
@@ -164,7 +164,7 @@ impl<T: HttpInfra> OpenAIResponsesProvider<T> {
         let mut request = oai::CreateResponse::from_domain(context)?;
         request.model = Some(model.as_str().to_string());
         let enable_cache_control =
-            supports_openai_compatible_cache_control(&self.provider, &request);
+            classify_openai_responses_cache_control(&self.provider, &request).allows_markers();
 
         // Apply Codex-specific request adjustments via the transformer pipeline.
         if self.provider.id == forge_domain::ProviderId::CODEX {
@@ -393,17 +393,52 @@ fn request_message_count(request: &oai::CreateResponse) -> usize {
     }
 }
 
-fn supports_openai_compatible_cache_control(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenAIResponsesCacheControlCapability {
+    Supported,
+    CodexExcluded,
+    UnsupportedProvider,
+    UnsupportedModel,
+}
+
+impl OpenAIResponsesCacheControlCapability {
+    fn allows_markers(self) -> bool {
+        matches!(self, Self::Supported)
+    }
+}
+
+fn classify_openai_responses_cache_control(
     provider: &Provider<Url>,
     request: &oai::CreateResponse,
-) -> bool {
-    (provider.id == forge_domain::ProviderId::FORGE
-        || provider.id == forge_domain::ProviderId::OPENAI_COMPATIBLE
-        || provider.id == forge_domain::ProviderId::OPENAI_RESPONSES_COMPATIBLE)
-        && request
-            .model
-            .as_deref()
-            .is_some_and(|model| model.contains("gpt-5.5"))
+) -> OpenAIResponsesCacheControlCapability {
+    if provider.id == ProviderId::CODEX {
+        return OpenAIResponsesCacheControlCapability::CodexExcluded;
+    }
+
+    if !request
+        .model
+        .as_deref()
+        .is_some_and(|model| model.contains("gpt-5.5"))
+    {
+        return OpenAIResponsesCacheControlCapability::UnsupportedModel;
+    }
+
+    if provider_accepts_openai_responses_cache_control(provider) {
+        OpenAIResponsesCacheControlCapability::Supported
+    } else {
+        OpenAIResponsesCacheControlCapability::UnsupportedProvider
+    }
+}
+
+fn provider_accepts_openai_responses_cache_control(provider: &Provider<Url>) -> bool {
+    provider.id == ProviderId::FORGE
+        || provider.id == ProviderId::OPENAI
+        || provider.id == ProviderId::GITHUB_COPILOT
+        || provider.id == ProviderId::OPENAI_COMPATIBLE
+        || provider.id == ProviderId::OPENAI_RESPONSES_COMPATIBLE
+        || provider.id == ProviderId::OPENCODE_ZEN
+        || provider.id == ProviderId::OPENCODE_GO
+        || provider.response == Some(ProviderResponse::OpenAIResponses)
 }
 
 /// Repository for OpenAI Codex models using the Responses API
@@ -492,7 +527,7 @@ mod tests {
 
     use forge_app::domain::{
         Content, Context as ChatContext, ContextMessage, FinishReason, ModelId, Provider,
-        ProviderId, ProviderResponse,
+        ProviderId, ProviderResponse, ToolCallId,
     };
     use pretty_assertions::assert_eq;
     use tokio_stream::StreamExt;
@@ -770,7 +805,7 @@ mod tests {
         let request =
             oai::CreateResponse { model: Some("gpt-5.5".to_string()), ..Default::default() };
 
-        let actual = supports_openai_compatible_cache_control(&provider, &request);
+        let actual = classify_openai_responses_cache_control(&provider, &request).allows_markers();
 
         let expected = true;
         assert_eq!(actual, expected);
@@ -792,7 +827,7 @@ mod tests {
         let request =
             oai::CreateResponse { model: Some("gpt-5.5".to_string()), ..Default::default() };
 
-        let actual = supports_openai_compatible_cache_control(&provider, &request);
+        let actual = classify_openai_responses_cache_control(&provider, &request).allows_markers();
 
         let expected = false;
         assert_eq!(actual, expected);
@@ -1757,5 +1792,386 @@ mod tests {
         );
         assert!(err_str.contains("/v1/responses"), "missing url: {err_str}");
         Ok(())
+    }
+
+    fn openai_responses_provider(
+        provider_id: ProviderId,
+        response: ProviderResponse,
+        url: &str,
+    ) -> Provider<Url> {
+        Provider {
+            id: provider_id.clone(),
+            provider_type: forge_domain::ProviderType::Llm,
+            response: Some(response),
+            url: Url::parse(url).unwrap(),
+            credential: make_credential(provider_id, "test-key"),
+            custom_headers: None,
+            auth_methods: vec![forge_domain::AuthMethod::ApiKey],
+            url_params: vec![],
+            models: None,
+        }
+    }
+
+    #[test]
+    fn test_cache_control_gating_covers_all_gpt55_responses_routes() {
+        let fixture = [
+            (ProviderId::FORGE, ProviderResponse::OpenAIResponses),
+            (ProviderId::OPENAI, ProviderResponse::OpenAI),
+            (ProviderId::GITHUB_COPILOT, ProviderResponse::OpenAI),
+            (ProviderId::OPENAI_COMPATIBLE, ProviderResponse::OpenAI),
+            (
+                ProviderId::OPENAI_RESPONSES_COMPATIBLE,
+                ProviderResponse::OpenAIResponses,
+            ),
+            (ProviderId::OPENCODE_ZEN, ProviderResponse::OpenAIResponses),
+            (ProviderId::OPENCODE_GO, ProviderResponse::OpenAIResponses),
+        ];
+        let request =
+            oai::CreateResponse { model: Some("gpt-5.5".to_string()), ..Default::default() };
+
+        let actual = fixture
+            .into_iter()
+            .map(|(provider_id, response)| {
+                let provider = openai_responses_provider(
+                    provider_id,
+                    response,
+                    "https://provider.example/v1/responses",
+                );
+                classify_openai_responses_cache_control(&provider, &request)
+            })
+            .collect::<Vec<_>>();
+
+        let expected = vec![
+            OpenAIResponsesCacheControlCapability::Supported,
+            OpenAIResponsesCacheControlCapability::Supported,
+            OpenAIResponsesCacheControlCapability::Supported,
+            OpenAIResponsesCacheControlCapability::Supported,
+            OpenAIResponsesCacheControlCapability::Supported,
+            OpenAIResponsesCacheControlCapability::Supported,
+            OpenAIResponsesCacheControlCapability::Supported,
+        ];
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_cache_control_gating_supports_explicit_openai_responses_adapter() {
+        let provider = openai_responses_provider(
+            ProviderId::from("custom_responses".to_string()),
+            ProviderResponse::OpenAIResponses,
+            "https://provider.example/v1/responses",
+        );
+        let request =
+            oai::CreateResponse { model: Some("gpt-5.5".to_string()), ..Default::default() };
+
+        let actual = classify_openai_responses_cache_control(&provider, &request);
+
+        let expected = OpenAIResponsesCacheControlCapability::Supported;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_cache_control_gating_classifies_unsupported_model() {
+        let provider = openai_responses_provider(
+            ProviderId::OPENAI,
+            ProviderResponse::OpenAI,
+            "https://api.openai.com/v1/responses",
+        );
+        let request =
+            oai::CreateResponse { model: Some("gpt-5.1".to_string()), ..Default::default() };
+
+        let actual = classify_openai_responses_cache_control(&provider, &request);
+
+        let expected = OpenAIResponsesCacheControlCapability::UnsupportedModel;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_cache_control_gating_classifies_codex_exclusion() {
+        let provider = openai_responses_provider(
+            ProviderId::CODEX,
+            ProviderResponse::OpenAI,
+            "https://chatgpt.com/backend-api/codex/responses",
+        );
+        let request =
+            oai::CreateResponse { model: Some("gpt-5.5".to_string()), ..Default::default() };
+
+        let actual = classify_openai_responses_cache_control(&provider, &request);
+
+        let expected = OpenAIResponsesCacheControlCapability::CodexExcluded;
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_openai_responses_repository_sends_cache_control_for_tool_heavy_body()
+    -> anyhow::Result<()> {
+        let mut fixture = MockServer::new().await;
+        let expected = serde_json::json!({
+            "model": "gpt-5.5",
+            "instructions": "Stable instructions stay top-level.",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "First cacheable user message.",
+                        "cache_control": {"type": "ephemeral"}
+                    }]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "shell"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1"
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "Second cacheable user message.",
+                        "cache_control": {"type": "ephemeral"}
+                    }]
+                }
+            ],
+            "tools": [{
+                "type": "function",
+                "name": "shell"
+            }]
+        });
+        let events = responses_stream_events("body matched");
+        let mock = fixture
+            .mock_responses_stream_matching_body(
+                events,
+                200,
+                mockito::Matcher::PartialJson(expected),
+            )
+            .await;
+        let provider = openai_responses(
+            "test-api-key",
+            &format!("{}/v1/chat/completions", fixture.url()),
+        );
+        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let provider_impl = OpenAIResponsesProvider::new(provider, infra);
+        let context = tool_heavy_context();
+
+        let mut actual = provider_impl
+            .chat(&ModelId::from("gpt-5.5"), context)
+            .await?;
+
+        let expected = Some(Content::part("body matched"));
+        let actual = actual
+            .next()
+            .await
+            .transpose()?
+            .map(|message| message.content);
+        mock.assert_async().await;
+        assert_eq!(actual, Some(expected));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_openai_responses_repository_keeps_instructions_top_level_without_marker()
+    -> anyhow::Result<()> {
+        let mut fixture = MockServer::new().await;
+        let expected = serde_json::json!({
+            "model": "gpt-5.5",
+            "instructions": "Stable instructions stay top-level.",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "First cacheable user message.",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }]
+        });
+        let mock = fixture
+            .mock_responses_stream_matching_body(
+                responses_stream_events("instructions covered by input marker"),
+                200,
+                mockito::Matcher::PartialJson(expected),
+            )
+            .await;
+        let provider = openai_responses(
+            "test-api-key",
+            &format!("{}/v1/chat/completions", fixture.url()),
+        );
+        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let provider_impl = OpenAIResponsesProvider::new(provider, infra);
+        let context = ChatContext::default()
+            .add_message(ContextMessage::system(
+                "Stable instructions stay top-level.",
+            ))
+            .add_message(ContextMessage::user("First cacheable user message.", None));
+
+        let mut actual = provider_impl
+            .chat(&ModelId::from("gpt-5.5"), context)
+            .await?;
+
+        assert_eq!(
+            actual
+                .next()
+                .await
+                .transpose()?
+                .map(|message| message.content),
+            Some(Some(Content::part("instructions covered by input marker")))
+        );
+        mock.assert_async().await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_openai_responses_repository_sends_no_cache_control_without_eligible_input_messages()
+    -> anyhow::Result<()> {
+        let mut fixture = MockServer::new().await;
+        let expected = serde_json::json!({
+            "model": "gpt-5.5",
+            "instructions": "Only instructions are present.",
+            "input": []
+        });
+        let mock = fixture
+            .mock_responses_stream_matching_body(
+                responses_stream_events("no marker"),
+                200,
+                mockito::Matcher::PartialJson(expected),
+            )
+            .await;
+        let provider = openai_responses(
+            "test-api-key",
+            &format!("{}/v1/chat/completions", fixture.url()),
+        );
+        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let provider_impl = OpenAIResponsesProvider::new(provider, infra);
+        let context = ChatContext::default()
+            .add_message(ContextMessage::system("Only instructions are present."));
+
+        let actual = responses_input_cache_eligibility(&context);
+        let expected = Vec::<bool>::new();
+        assert_eq!(actual, expected);
+
+        let mut actual = provider_impl
+            .chat(&ModelId::from("gpt-5.5"), context)
+            .await?;
+
+        assert_eq!(
+            actual
+                .next()
+                .await
+                .transpose()?
+                .map(|message| message.content),
+            Some(Some(Content::part("no marker")))
+        );
+        mock.assert_async().await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_codex_repository_body_excludes_cache_control() -> anyhow::Result<()> {
+        let mut fixture = MockServer::new().await;
+        let codex_url = format!("{}/backend-api/codex/responses", fixture.url());
+        let expected = serde_json::json!({
+            "model": "gpt-5.5",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": "First cacheable user message."
+            }]
+        });
+        let events = responses_stream_events("codex body matched");
+        let mock = fixture
+            .mock_codex_responses_stream_matching_body(
+                "/backend-api/codex/responses",
+                events,
+                200,
+                mockito::Matcher::PartialJson(expected),
+            )
+            .await;
+        let provider =
+            openai_responses_provider(ProviderId::CODEX, ProviderResponse::OpenAI, &codex_url);
+        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let provider_impl = OpenAIResponsesProvider::new(provider, infra);
+        let context = ChatContext::default()
+            .add_message(ContextMessage::user("First cacheable user message.", None));
+
+        let mut actual = provider_impl
+            .chat(&ModelId::from("gpt-5.5"), context)
+            .await?;
+
+        assert_eq!(
+            actual
+                .next()
+                .await
+                .transpose()?
+                .map(|message| message.content),
+            Some(Some(Content::part("codex body matched")))
+        );
+        mock.assert_async().await;
+
+        Ok(())
+    }
+
+    fn responses_stream_events(delta: &str) -> Vec<String> {
+        vec![
+            "event: response.output_text.delta".to_string(),
+            format!(
+                "data: {}",
+                serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "sequence_number": 1,
+                    "item_id": "item_1",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": delta
+                })
+            ),
+            "event: response.completed".to_string(),
+            format!(
+                "data: {}",
+                serde_json::json!({
+                    "type": "response.completed",
+                    "sequence_number": 2,
+                    "response": openai_response_fixture()
+                })
+            ),
+            "event: done".to_string(),
+            "data: [DONE]".to_string(),
+        ]
+    }
+
+    fn tool_heavy_context() -> ChatContext {
+        let tool_definition =
+            forge_app::domain::ToolDefinition::new("shell").description("Run a shell command");
+        let tool_call = forge_app::domain::ToolCallFull::new("shell")
+            .call_id(ToolCallId::new("call_1"))
+            .arguments(forge_app::domain::ToolCallArguments::from_json(
+                r#"{"cmd":"echo hi"}"#,
+            ));
+        let tool_result = forge_app::domain::ToolResult::new("shell")
+            .call_id(Some(ToolCallId::new("call_1")))
+            .success("ok");
+
+        ChatContext::default()
+            .add_message(ContextMessage::system(
+                "Stable instructions stay top-level.",
+            ))
+            .add_message(ContextMessage::user("First cacheable user message.", None))
+            .add_message(ContextMessage::assistant(
+                "",
+                None,
+                None,
+                Some(vec![tool_call]),
+            ))
+            .add_message(ContextMessage::tool_result(tool_result))
+            .add_message(ContextMessage::user("Second cacheable user message.", None))
+            .add_tool(tool_definition)
+            .tool_choice(forge_domain::ToolChoice::Auto)
     }
 }

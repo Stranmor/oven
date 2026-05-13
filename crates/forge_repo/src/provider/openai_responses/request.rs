@@ -274,7 +274,47 @@ pub fn serialize_create_response_with_cache_control(
     serde_json::to_vec(&value).with_context(|| "Failed to serialize OpenAI Responses request")
 }
 
+/// Describes whether the serialized Responses API input contains message items
+/// that can legally receive OpenAI-compatible cache markers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponsesCacheControlMarkerPlan {
+    /// Cache markers should be applied to the first and last eligible input messages.
+    Mark {
+        first_index: usize,
+        last_index: usize,
+    },
+    /// The request has an `input` array, but no cacheable message item exists.
+    NoEligibleInputMessageItems,
+    /// The serialized request has no array-shaped `input` payload.
+    NoInputItems,
+}
+
+fn responses_cache_control_marker_plan(
+    value: &Value,
+    message_cache_eligibility: &[bool],
+) -> ResponsesCacheControlMarkerPlan {
+    let Some(Value::Array(items)) = value.get("input") else {
+        return ResponsesCacheControlMarkerPlan::NoInputItems;
+    };
+
+    let first_index = (0..items.len()).find(|index| {
+        is_responses_input_item_cache_eligible(items.get(*index), message_cache_eligibility, *index)
+    });
+    let last_index = (0..items.len()).rev().find(|index| {
+        is_responses_input_item_cache_eligible(items.get(*index), message_cache_eligibility, *index)
+    });
+
+    match (first_index, last_index) {
+        (Some(first_index), Some(last_index)) => {
+            ResponsesCacheControlMarkerPlan::Mark { first_index, last_index }
+        }
+        _ => ResponsesCacheControlMarkerPlan::NoEligibleInputMessageItems,
+    }
+}
+
 fn mark_responses_cache_control(value: &mut Value, message_cache_eligibility: &[bool]) {
+    let plan = responses_cache_control_marker_plan(value, message_cache_eligibility);
+
     let Some(input) = value.get_mut("input") else {
         return;
     };
@@ -283,26 +323,19 @@ fn mark_responses_cache_control(value: &mut Value, message_cache_eligibility: &[
         return;
     };
 
-    let first_cache_eligible = (0..items.len()).find(|index| {
-        is_responses_input_item_cache_eligible(items.get(*index), message_cache_eligibility, *index)
-    });
-    let last_cache_eligible = (0..items.len()).rev().find(|index| {
-        is_responses_input_item_cache_eligible(items.get(*index), message_cache_eligibility, *index)
-    });
-
     items
         .iter_mut()
         .for_each(|item| set_responses_item_cache_control(item, false));
 
-    if let Some(index) = first_cache_eligible
-        && let Some(item) = items.get_mut(index)
-    {
+    let ResponsesCacheControlMarkerPlan::Mark { first_index, last_index } = plan else {
+        return;
+    };
+
+    if let Some(item) = items.get_mut(first_index) {
         set_responses_item_cache_control(item, true);
     }
 
-    if let Some(index) = last_cache_eligible
-        && let Some(item) = items.get_mut(index)
-    {
+    if let Some(item) = items.get_mut(last_index) {
         set_responses_item_cache_control(item, true);
     }
 }
@@ -599,7 +632,8 @@ mod tests {
 
     use crate::provider::FromDomain;
     use crate::provider::openai_responses::request::{
-        codex_tool_parameters, has_open_additional_properties, responses_input_cache_eligibility,
+        ResponsesCacheControlMarkerPlan, codex_tool_parameters, has_open_additional_properties,
+        responses_cache_control_marker_plan, responses_input_cache_eligibility,
         serialize_create_response_with_cache_control,
     };
 
@@ -637,6 +671,32 @@ mod tests {
         assert_eq!(actual["model"].as_str(), Some("gpt-5.5"));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_responses_cache_control_marker_plan_classifies_no_eligible_input_messages()
+    -> anyhow::Result<()> {
+        let context = ChatContext::default().add_message(ContextMessage::system("stable system"));
+        let eligibility = responses_input_cache_eligibility(&context);
+        let request = oai::CreateResponse::from_domain(context)?;
+        let value = serde_json::to_value(&request)?;
+
+        let actual = responses_cache_control_marker_plan(&value, &eligibility);
+
+        let expected = ResponsesCacheControlMarkerPlan::NoEligibleInputMessageItems;
+        assert_eq!(actual, expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_responses_cache_control_marker_plan_classifies_missing_input() {
+        let fixture = json!({"model": "gpt-5.5"});
+
+        let actual = responses_cache_control_marker_plan(&fixture, &[]);
+
+        let expected = ResponsesCacheControlMarkerPlan::NoInputItems;
+        assert_eq!(actual, expected);
     }
 
     #[test]

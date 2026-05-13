@@ -1,4 +1,4 @@
-use mockito::{Mock, Server, ServerGuard};
+use mockito::{Matcher, Mock, Server, ServerGuard};
 
 pub struct MockServer {
     server: ServerGuard,
@@ -62,6 +62,24 @@ impl MockServer {
             .await
     }
 
+    pub async fn mock_responses_stream_matching_body(
+        &mut self,
+        events: Vec<String>,
+        status: usize,
+        body_matcher: Matcher,
+    ) -> Mock {
+        let sse_body = events.join("\n\n");
+        self.server
+            .mock("POST", "/v1/responses")
+            .match_body(body_matcher)
+            .with_status(status)
+            .with_header("content-type", "text/event-stream")
+            .with_header("cache-control", "no-cache")
+            .with_body(sse_body)
+            .create_async()
+            .await
+    }
+
     /// Mock SSE responses without `Content-Type: text/event-stream`.
     /// Simulates the Codex backend behavior where SSE data is returned
     /// as `application/octet-stream` instead of `text/event-stream`.
@@ -74,6 +92,25 @@ impl MockServer {
         let sse_body = events.join("\n\n");
         self.server
             .mock("POST", path)
+            .with_status(status)
+            .with_header("content-type", "application/octet-stream")
+            .with_header("cache-control", "no-cache")
+            .with_body(sse_body)
+            .create_async()
+            .await
+    }
+
+    pub async fn mock_codex_responses_stream_matching_body(
+        &mut self,
+        path: &str,
+        events: Vec<String>,
+        status: usize,
+        body_matcher: Matcher,
+    ) -> Mock {
+        let sse_body = events.join("\n\n");
+        self.server
+            .mock("POST", path)
+            .match_body(body_matcher)
             .with_status(status)
             .with_header("content-type", "application/octet-stream")
             .with_header("cache-control", "no-cache")
