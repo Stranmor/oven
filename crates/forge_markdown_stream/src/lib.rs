@@ -104,12 +104,18 @@ impl<W: Write> StreamdownRenderer<W> {
 
     fn render_line(&mut self, line: &str) -> io::Result<()> {
         let continuation_line = self.line_after_first_indent(line);
-        if !self.parser.state().is_in_code()
-            && self
+        if !self.parser.state().is_in_code() {
+            if self
+                .renderer
+                .is_list_embedded_fence_candidate(&continuation_line)
+            {
+                self.renderer.preserve_list_for_next_code_block();
+            } else if self
                 .renderer
                 .try_render_list_continuation(&continuation_line)?
-        {
-            return Ok(());
+            {
+                return Ok(());
+            }
         }
 
         for repaired in repair_line(line, self.parser.state()) {
@@ -217,6 +223,27 @@ mod tests {
             "3. Third\n",
             "   Description\n",
             "4. Fourth\n",
+            "   Description"
+        );
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_streaming_renderer_preserves_fenced_code_block_inside_ordered_item() {
+        let fixture = concat!(
+            "1. **First**\n",
+            "   ```rust\n",
+            "   fn main() {}\n",
+            "   ```\n",
+            "2. **Second**\n",
+            "   Description\n",
+        );
+        let actual = fixture_rendered_output(fixture, 200);
+        let expected = concat!(
+            "1. First\n",
+            "   fn main() {}\n",
+            "2. Second\n",
             "   Description"
         );
 

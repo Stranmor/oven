@@ -30,6 +30,7 @@ pub struct Renderer<W: Write> {
     blockquote_depth: usize,
     // List state
     list_state: ListState,
+    preserve_list_through_code_block: bool,
     // Column tracking
     column: usize,
 }
@@ -51,6 +52,7 @@ impl<W: Write> Renderer<W> {
             in_blockquote: false,
             blockquote_depth: 0,
             list_state: ListState::default(),
+            preserve_list_through_code_block: false,
             column: 0,
         }
     }
@@ -110,11 +112,22 @@ impl<W: Write> Renderer<W> {
         Ok(())
     }
 
+    /// Returns whether the line is an indented fenced-code marker belonging to
+    /// the active list item rather than ordinary continuation text.
+    pub fn is_list_embedded_fence_candidate(&self, line: &str) -> bool {
+        self.list_state.continuation_content(line).is_some() && is_fenced_code_marker_line(line)
+    }
+
+    /// Keep list numbering alive while an embedded fenced code block is parsed.
+    pub fn preserve_list_for_next_code_block(&mut self) {
+        self.preserve_list_through_code_block = true;
+    }
+
     /// Render a source line as a continuation of the active list item when it
     /// is indented under the previous item rather than being a new markdown
     /// block.
     pub fn try_render_list_continuation(&mut self, line: &str) -> io::Result<bool> {
-        if is_list_marker_line(line) {
+        if is_list_marker_line(line) || is_fenced_code_marker_line(line) {
             return Ok(false);
         }
         let Some(content) = self.list_state.continuation_content(line) else {
@@ -144,10 +157,20 @@ impl<W: Write> Renderer<W> {
         )
     }
 
+    fn should_preserve_list_for_event(&self, event: &ParseEvent) -> bool {
+        self.preserve_list_through_code_block
+            && matches!(
+                event,
+                ParseEvent::CodeBlockStart { .. }
+                    | ParseEvent::CodeBlockLine(_)
+                    | ParseEvent::CodeBlockEnd
+            )
+    }
+
     /// Render a single parse event.
     pub fn render_event(&mut self, event: &ParseEvent) -> io::Result<()> {
         // Reset pending list if this event breaks the list context
-        if Self::should_reset_list(event) {
+        if Self::should_reset_list(event) && !self.should_preserve_list_for_event(event) {
             self.list_state.reset();
         }
 
@@ -236,6 +259,10 @@ impl<W: Write> Renderer<W> {
             ParseEvent::CodeBlockEnd => {
                 self.current_language = None;
                 self.code_buffer.clear();
+                if self.preserve_list_through_code_block {
+                    self.list_state.mark_pending_reset();
+                }
+                self.preserve_list_through_code_block = false;
             }
 
             ParseEvent::ListItem { indent, bullet, content } => {
@@ -344,6 +371,11 @@ fn is_list_marker_line(line: &str) -> bool {
         .or_else(|| trimmed.strip_prefix("+ "))
         .is_some()
         || is_ordered_marker_line(trimmed)
+}
+
+fn is_fenced_code_marker_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
 }
 
 fn is_ordered_marker_line(line: &str) -> bool {
