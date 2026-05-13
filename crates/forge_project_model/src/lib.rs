@@ -6,6 +6,7 @@ mod freshness;
 mod indexer;
 mod ingestion;
 mod lexical;
+mod render;
 mod retrieval;
 mod types;
 mod util;
@@ -23,6 +24,10 @@ pub use freshness::compare_freshness;
 pub use indexer::ProjectIndexer;
 pub use ingestion::{ingest_external_facts, ingest_typed_external_facts};
 pub use lexical::{LexicalIndex, documents_from_manifest};
+pub use render::{
+    DEFAULT_RENDERED_SOURCE_LIMIT, ProjectModelContextRenderBudget, ProjectModelContextSource,
+    render_project_model_context,
+};
 pub use retrieval::{retrieve, retrieve_with_boundaries};
 pub use types::{
     ContextPack, ContextPackEvidence, ContextPackEvidenceSource, ContextPackSelection,

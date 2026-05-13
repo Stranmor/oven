@@ -4,8 +4,10 @@ use anyhow::Result;
 use chrono::Local;
 use forge_config::ForgeConfig;
 use forge_domain::*;
+use forge_project_model::{
+    ProjectModelContextRenderBudget, ProjectModelContextSource, render_project_model_context,
+};
 use forge_stream::MpscStream;
-use forge_template::Element;
 
 use crate::apply_tunable_parameters::ApplyTunableParameters;
 use crate::changed_files::ChangedFiles;
@@ -74,8 +76,8 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
         let Some(query) = Self::query_from_conversation(&conversation) else {
             return conversation;
         };
-        let params =
-            SearchParams::new(&query, "automatic project-model context injection").limit(5usize);
+        let params = SearchParams::new(&query, "automatic project-model context injection")
+            .limit(ProjectModelContextRenderBudget::default().max_sources);
         let nodes = match self.services.query_workspace(cwd.clone(), params).await {
             Ok(nodes) => nodes,
             Err(error) => {
@@ -113,92 +115,70 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
 
     fn render_context(workspace_root: &std::path::Path, nodes: Vec<Node>) -> String {
         let manifest_path = workspace_root.join(".forge_project_model/project_manifest.json");
-        Element::new("project_model_context")
-            .attr("workspace_root", xml_attr(workspace_root.display()))
-            .attr("manifest_path", xml_attr(manifest_path.display()))
-            .attr("freshness", "local_manifest_available")
-            .attr("provenance", "WorkspaceService::query_workspace")
-            .append(nodes.into_iter().filter_map(Self::render_node))
-            .render()
+        let sources = nodes
+            .into_iter()
+            .map(Self::source_from_node)
+            .collect::<Vec<_>>();
+        render_project_model_context(
+            &workspace_root.display().to_string(),
+            &manifest_path.display().to_string(),
+            "local_manifest_available",
+            "WorkspaceService::query_workspace",
+            &sources,
+            &ProjectModelContextRenderBudget::default(),
+        )
     }
 
-    fn render_node(node: Node) -> Option<Element> {
+    fn source_from_node(node: Node) -> ProjectModelContextSource {
+        let node_id = node.node_id.as_str().to_string();
+        let score = node.relevance;
         match node.node {
-            NodeData::FileChunk(chunk) => Some(
-                Element::new("source")
-                    .attr("path", xml_attr(chunk.file_path))
-                    .attr("start_line", chunk.start_line)
-                    .attr("end_line", chunk.end_line)
-                    .attr(
-                        "score",
-                        node.relevance
-                            .map(|score| format!("{score:.6}"))
-                            .unwrap_or_else(|| "unknown".to_string()),
-                    )
-                    .attr("freshness", "manifest_snapshot")
-                    .attr("provenance", "local_project_model_manifest")
-                    .attr("node_id", xml_attr(node.node_id.as_str()))
-                    .append(Element::new("symbol_or_content").cdata(xml_cdata(chunk.content))),
-            ),
-            NodeData::File(file) => Some(
-                Element::new("source")
-                    .attr("path", xml_attr(file.file_path))
-                    .attr("start_line", 1)
-                    .attr("end_line", "unknown")
-                    .attr("score", "unknown")
-                    .attr("freshness", "manifest_snapshot")
-                    .attr("provenance", "local_project_model_manifest")
-                    .attr("node_id", xml_attr(node.node_id.as_str()))
-                    .append(Element::new("symbol_or_content").cdata(xml_cdata(file.content))),
-            ),
-            NodeData::FileRef(file_ref) => Some(
-                Element::new("source")
-                    .attr("path", xml_attr(file_ref.file_path))
-                    .attr("start_line", "unknown")
-                    .attr("end_line", "unknown")
-                    .attr("score", "unknown")
-                    .attr("freshness", "manifest_snapshot")
-                    .attr("provenance", "local_project_model_manifest")
-                    .attr("content_hash", xml_attr(file_ref.file_hash))
-                    .attr("node_id", xml_attr(node.node_id.as_str())),
-            ),
-            NodeData::Note(note) => Some(
-                Element::new("source")
-                    .attr("path", "note")
-                    .attr("start_line", "unknown")
-                    .attr("end_line", "unknown")
-                    .attr("score", "unknown")
-                    .attr("freshness", "manifest_snapshot")
-                    .attr("provenance", "local_project_model_manifest")
-                    .attr("node_id", xml_attr(node.node_id.as_str()))
-                    .append(Element::new("symbol_or_content").cdata(xml_cdata(note.content))),
-            ),
-            NodeData::Task(task) => Some(
-                Element::new("source")
-                    .attr("path", "task")
-                    .attr("start_line", "unknown")
-                    .attr("end_line", "unknown")
-                    .attr("score", "unknown")
-                    .attr("freshness", "manifest_snapshot")
-                    .attr("provenance", "local_project_model_manifest")
-                    .attr("node_id", xml_attr(node.node_id.as_str()))
-                    .append(Element::new("symbol_or_content").cdata(xml_cdata(task.task))),
-            ),
+            NodeData::FileChunk(chunk) => ProjectModelContextSource::new(
+                chunk.file_path,
+                "manifest_snapshot",
+                "local_project_model_manifest",
+                node_id,
+            )
+            .line_range(chunk.start_line, chunk.end_line)
+            .score(score)
+            .content(chunk.content),
+            NodeData::File(file) => ProjectModelContextSource::new(
+                file.file_path,
+                "manifest_snapshot",
+                "local_project_model_manifest",
+                node_id,
+            )
+            .score(score)
+            .content_hash(file.hash)
+            .content(file.content)
+            .metadata_only("whole_file_metadata_only"),
+            NodeData::FileRef(file_ref) => ProjectModelContextSource::new(
+                file_ref.file_path,
+                "manifest_snapshot",
+                "local_project_model_manifest",
+                node_id,
+            )
+            .score(score)
+            .content_hash(file_ref.file_hash)
+            .metadata_only("file_reference_metadata_only"),
+            NodeData::Note(note) => ProjectModelContextSource::new(
+                "note",
+                "manifest_snapshot",
+                "local_project_model_manifest",
+                node_id,
+            )
+            .score(score)
+            .content(note.content),
+            NodeData::Task(task) => ProjectModelContextSource::new(
+                "task",
+                "manifest_snapshot",
+                "local_project_model_manifest",
+                node_id,
+            )
+            .score(score)
+            .content(task.task),
         }
     }
-}
-
-fn xml_attr(value: impl ToString) -> String {
-    value
-        .to_string()
-        .replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-fn xml_cdata(value: impl ToString) -> String {
-    value.to_string().replace("]]>", "]]]]><![CDATA[>")
 }
 
 /// ForgeApp handles the core chat functionality by orchestrating various
@@ -625,17 +605,56 @@ mod tests {
         ) -> Result<Vec<Node>> {
             self.workspace_queries.fetch_add(1, Ordering::SeqCst);
             assert!(params.query.contains("automatic injection needle"));
-            Ok(vec![Node {
-                node_id: NodeId::new("symbol:src/lib.rs:automatic_injection_needle"),
-                node: NodeData::FileChunk(FileChunk {
-                    file_path: "src/lib.rs".to_string(),
-                    content: "pub fn automatic_injection_needle() -> usize { 42 }".to_string(),
-                    start_line: 3,
-                    end_line: 3,
-                }),
-                relevance: Some(0.875),
-                distance: None,
-            }])
+            assert_eq!(params.limit, Some(3));
+            let long_content = (0..40)
+                .map(|index| format!("pub fn long_{index}() -> usize {{ {index} }}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(vec![
+                Node {
+                    node_id: NodeId::new("symbol:src/lib.rs:automatic_injection_needle"),
+                    node: NodeData::FileChunk(FileChunk {
+                        file_path: "src/lib.rs".to_string(),
+                        content: "pub fn automatic_injection_needle() -> usize { 42 }".to_string(),
+                        start_line: 3,
+                        end_line: 3,
+                    }),
+                    relevance: Some(0.875),
+                    distance: None,
+                },
+                Node {
+                    node_id: NodeId::new("symbol:src/long.rs:long_block"),
+                    node: NodeData::FileChunk(FileChunk {
+                        file_path: "src/long.rs".to_string(),
+                        content: long_content,
+                        start_line: 10,
+                        end_line: 80,
+                    }),
+                    relevance: Some(0.75),
+                    distance: None,
+                },
+                Node {
+                    node_id: NodeId::new("file:src/full.rs"),
+                    node: NodeData::File(forge_domain::FileNode {
+                        file_path: "src/full.rs".to_string(),
+                        content: "pub fn full_file_should_not_render() {}".repeat(100),
+                        hash: "full-file-hash".to_string(),
+                    }),
+                    relevance: Some(0.5),
+                    distance: None,
+                },
+                Node {
+                    node_id: NodeId::new("symbol:src/extra.rs:extra"),
+                    node: NodeData::FileChunk(FileChunk {
+                        file_path: "src/extra.rs".to_string(),
+                        content: "pub fn extra_should_not_render() {}".to_string(),
+                        start_line: 1,
+                        end_line: 1,
+                    }),
+                    relevance: Some(0.25),
+                    distance: None,
+                },
+            ])
         }
 
         async fn list_workspaces(&self) -> Result<Vec<WorkspaceInfo>> {
@@ -761,22 +780,32 @@ mod tests {
             })
             .unwrap();
         let actual = project_context_message.content().unwrap().to_string();
-        let expected = (true, true, true, true, false, 1usize, false);
-
-        assert_eq!(
-            (
-                actual.contains("manifest_path"),
-                actual.contains("src/lib.rs"),
-                actual.contains("start_line=\"3\""),
-                actual.contains("score=\"0.875000\""),
-                project_context_message.is_cache_eligible(),
-                setup.workspace_queries.load(Ordering::SeqCst),
-                captured_context
-                    .tools
-                    .iter()
-                    .any(|tool| tool.name.as_str().eq_ignore_ascii_case("sem_search")),
-            ),
-            expected
+        let actual_flags = vec![
+            actual.contains("manifest_path"),
+            actual.contains("src/lib.rs"),
+            actual.contains("start_line=\"3\""),
+            actual.contains("score=\"0.875000\""),
+            actual.contains("content_digest=\""),
+            actual.contains("truncated_reason=\"content_line_budget_exceeded\"")
+                || actual.contains("truncated_reason=\"content_char_budget_exceeded\""),
+            actual.contains("omitted_reason=\"whole_file_metadata_only\""),
+            actual.contains("full_file_should_not_render"),
+            actual.contains("extra_should_not_render"),
+            project_context_message.is_cache_eligible(),
+            captured_context
+                .tools
+                .iter()
+                .any(|tool| tool.name.as_str().eq_ignore_ascii_case("sem_search")),
+        ];
+        let expected_flags = vec![
+            true, true, true, true, true, true, true, false, false, false, false,
+        ];
+        assert_eq!(actual_flags, expected_flags);
+        assert_eq!(actual.matches("<source").count(), 3usize);
+        assert_eq!(setup.workspace_queries.load(Ordering::SeqCst), 1usize);
+        assert!(
+            actual.chars().count() <= ProjectModelContextRenderBudget::default().max_rendered_chars,
+            "project-model context should stay inside the typed render budget"
         );
         Ok(())
     }
