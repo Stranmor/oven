@@ -1,5 +1,5 @@
 auto_open_dump = false
-completion_notification = "bell"
+completion_notification = "desktop"
 max_conversations = 100
 max_commit_count = 20
 max_extensions = 15

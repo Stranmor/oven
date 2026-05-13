@@ -43,7 +43,7 @@
       ]
     },
     "completion_notification": {
-      "description": "Sound notification emitted by the local UI when the main session\ncompletes; disabled when absent.",
+      "description": "Completion notification emitted by the local UI when the main session\ncompletes; disabled when absent.",
       "anyOf": [
         {
           "$ref": "#/$defs/CompletionNotification"
@@ -510,12 +510,17 @@
       }
     },
     "CompletionNotification": {
-      "description": "Session completion sound notification backend.",
+      "description": "Session completion notification backend.",
       "oneOf": [
         {
           "description": "Emits a terminal bell character when the main session completes.",
           "type": "string",
           "const": "bell"
+        },
+        {
+          "description": "Emits an operating-system desktop notification when the main session completes.",
+          "type": "string",
+          "const": "desktop"
         }
       ]
     },

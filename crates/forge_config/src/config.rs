@@ -251,7 +251,7 @@ pub struct ForgeConfig {
     /// completion; disabled when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_dump: Option<AutoDumpFormat>,
-    /// Sound notification emitted by the local UI when the main session
+    /// Completion notification emitted by the local UI when the main session
     /// completes; disabled when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_notification: Option<CompletionNotification>,
@@ -479,6 +479,26 @@ completion_notification = "bell"
         let actual = ConfigReader::default().read_toml(fixture).build().unwrap();
 
         let expected = Some(CompletionNotification::Bell);
+        assert_eq!(actual.completion_notification, expected);
+    }
+
+    #[test]
+    fn test_completion_notification_desktop_deserialize_round_trip() {
+        let fixture = r#"
+completion_notification = "desktop"
+"#;
+
+        let actual = ConfigReader::default().read_toml(fixture).build().unwrap();
+
+        let expected = Some(CompletionNotification::Desktop);
+        assert_eq!(actual.completion_notification, expected);
+    }
+
+    #[test]
+    fn test_default_completion_notification_is_desktop() {
+        let actual = ConfigReader::default().read_defaults().build().unwrap();
+
+        let expected = Some(CompletionNotification::Desktop);
         assert_eq!(actual.completion_notification, expected);
     }
 
