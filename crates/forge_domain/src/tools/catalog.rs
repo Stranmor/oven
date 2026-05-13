@@ -1469,6 +1469,16 @@ mod tests {
     }
 
     #[test]
+    fn test_process_start_is_absent_from_model_visible_definitions() {
+        let fixture = "process_start";
+
+        let actual = ToolCatalog::iter().any(|tool| tool.definition().name.as_str() == fixture);
+        let expected = false;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn test_tool_definition_json() {
         let tools = ToolCatalog::iter()
             .map(|tool| {

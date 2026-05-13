@@ -657,7 +657,7 @@ pub trait ShellService: Send + Sync {
         anyhow::bail!("Managed background processes are not supported by this shell service")
     }
 
-    /// Lists all managed background process statuses.
+    /// Lists currently running managed background process statuses.
     async fn process_list(&self) -> anyhow::Result<Vec<ProcessStatus>> {
         anyhow::bail!("Managed background processes are not supported by this shell service")
     }
