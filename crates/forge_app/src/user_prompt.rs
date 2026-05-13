@@ -66,18 +66,30 @@ impl<S: AttachmentService + EnvironmentInfra<Config = forge_config::ForgeConfig>
     /// Adds request-scoped runtime context as a small cache-ineligible message.
     fn add_runtime_context(&self, mut conversation: Conversation) -> Conversation {
         let mut context = conversation.context.take().unwrap_or_default();
-        context.messages.retain(|message| {
-            !matches!(
-                &message.message,
-                ContextMessage::Text(text) if text.is_runtime_context()
-            )
-        });
+        context
+            .messages
+            .retain(|message| !Self::is_stale_runtime_context_message(message));
         let message = TextMessage::new(Role::User, self.runtime_context().render_prompt_xml())
             .model(self.agent.model.clone())
             .runtime_context()
             .cacheable(false);
         context = context.add_message(ContextMessage::Text(message));
         conversation.context(context)
+    }
+
+    fn is_stale_runtime_context_message(message: &MessageEntry) -> bool {
+        match &message.message {
+            ContextMessage::Text(text) if text.is_runtime_context() => true,
+            ContextMessage::Text(text) => {
+                text.role == Role::User
+                    && text.cacheable == Some(false)
+                    && text.raw_content.is_none()
+                    && text.content.trim_start().starts_with(
+                        "<runtime_context freshness=\"live\" cache=\"uncached\">",
+                    )
+            }
+            _ => false,
+        }
     }
 
     /// Adds existing todos as a user message when resuming a conversation
