@@ -18,8 +18,8 @@ use crate::temperature::Temperature;
 use crate::top_k::TopK;
 use crate::top_p::TopP;
 use crate::{
-    Attachment, AttachmentContent, ConversationId, EventValue, Image, MessagePhase, ModelId,
-    ReasoningFull, ToolChoice, ToolDefinition, ToolOutput, ToolValue, Usage,
+    Attachment, AttachmentContent, ConversationId, EventValue, Image, Initiator, MessagePhase,
+    ModelId, ReasoningFull, ToolChoice, ToolDefinition, ToolOutput, ToolValue, Usage,
 };
 
 /// Response format for structured output
@@ -430,6 +430,9 @@ impl std::ops::DerefMut for MessageEntry {
 pub struct Context {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<ConversationId>,
+    /// Indicates whether the current conversation turn is user- or agent-initiated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiator: Option<Initiator>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<MessageEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -329,6 +329,7 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
                 DropReasoningOnlyMessages
                     .when(|_| model_id.as_str().to_lowercase().contains("claude")),
             );
+        let context = context.initiator(self.conversation.initiator);
         let context = transformers.transform(context);
         let response = self
             .services

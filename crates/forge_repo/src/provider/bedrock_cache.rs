@@ -93,6 +93,7 @@ mod tests {
     fn test_single_user_message() {
         let context = Context {
             conversation_id: None,
+            initiator: None,
             messages: vec![ContextMessage::Text(TextMessage::new(Role::User, "Hello")).into()],
             tools: vec![],
             tool_choice: None,
@@ -119,6 +120,7 @@ mod tests {
     fn test_with_system_message() {
         let context = Context {
             conversation_id: None,
+            initiator: None,
             messages: vec![
                 ContextMessage::Text(TextMessage::new(Role::System, "System prompt")).into(),
                 ContextMessage::Text(TextMessage::new(Role::User, "Hello")).into(),
@@ -148,6 +150,7 @@ mod tests {
     fn test_multiple_messages() {
         let context = Context {
             conversation_id: None,
+            initiator: None,
             messages: vec![
                 ContextMessage::Text(TextMessage::new(Role::System, "System prompt")).into(),
                 ContextMessage::Text(TextMessage::new(Role::User, "Hello")).into(),

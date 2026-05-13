@@ -119,6 +119,7 @@ mod tests {
 
         let context = Context {
             conversation_id: None,
+            initiator: None,
             messages,
             tools: vec![],
             tool_choice: None,
@@ -246,6 +247,7 @@ mod tests {
     fn test_multiple_system_messages_all_cached() {
         let fixture = Context {
             conversation_id: None,
+            initiator: None,
             messages: vec![
                 ContextMessage::Text(TextMessage::new(Role::System, "first")).into(),
                 ContextMessage::Text(TextMessage::new(Role::System, "second")).into(),

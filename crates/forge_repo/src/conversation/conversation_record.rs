@@ -823,6 +823,7 @@ impl TryFrom<ContextRecord> for Context {
 
         Ok(Context {
             conversation_id,
+            initiator: None,
             messages: messages?,
             tools: tools?,
             tool_choice: record.tool_choice.map(Into::into),

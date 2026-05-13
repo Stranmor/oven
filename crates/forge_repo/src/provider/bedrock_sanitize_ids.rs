@@ -98,6 +98,7 @@ mod tests {
         // This is the exact error case from the issue: "functions.shell:0"
         let context = Context {
             conversation_id: None,
+            initiator: None,
             messages: vec![
                 ContextMessage::Text(
                     TextMessage::new(Role::Assistant, "test")
@@ -147,6 +148,7 @@ mod tests {
     fn test_sanitizes_tool_result_id_with_invalid_chars() {
         let context = Context {
             conversation_id: None,
+            initiator: None,
             messages: vec![
                 ContextMessage::tool_result(
                     ToolResult::new(ToolName::new("test_tool"))
@@ -194,6 +196,7 @@ mod tests {
         let valid_id = "call_abc-123_XYZ";
         let context = Context {
             conversation_id: None,
+            initiator: None,
             messages: vec![
                 ContextMessage::Text(
                     TextMessage::new(Role::Assistant, "test")
@@ -243,6 +246,7 @@ mod tests {
     fn test_no_panic_on_empty_messages() {
         let context = Context {
             conversation_id: None,
+            initiator: None,
             messages: vec![],
             tools: vec![],
             tool_choice: None,

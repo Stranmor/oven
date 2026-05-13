@@ -80,6 +80,7 @@ mod tests {
 
         let context = Context {
             conversation_id: None,
+            initiator: None,
             messages,
             tools: vec![],
             tool_choice: None,

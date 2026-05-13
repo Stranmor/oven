@@ -444,7 +444,10 @@ impl From<Context> for Request {
                                               * on model capabilities */
             stream_options: Some(StreamOptions { include_usage: Some(true) }),
             session_id: context.conversation_id.map(|id| id.to_string()),
-            initiator: Default::default(),
+            initiator: context.initiator.map(|initiator| match initiator {
+                forge_domain::Initiator::User => "user".to_string(),
+                forge_domain::Initiator::Agent => "agent".to_string(),
+            }),
             reasoning: context.reasoning,
             reasoning_effort: Default::default(),
             max_completion_tokens: Default::default(),
@@ -1030,6 +1033,22 @@ mod tests {
         let actual = Request::from(fixture);
 
         assert_eq!(actual.stream, Some(true));
+    }
+
+    #[test]
+    fn test_context_conversion_maps_agent_initiator() {
+        let fixture = forge_domain::Context::default().initiator(forge_domain::Initiator::Agent);
+        let actual = Request::from(fixture);
+
+        assert_eq!(actual.initiator, Some("agent".to_string()));
+    }
+
+    #[test]
+    fn test_context_conversion_maps_user_initiator() {
+        let fixture = forge_domain::Context::default().initiator(forge_domain::Initiator::User);
+        let actual = Request::from(fixture);
+
+        assert_eq!(actual.initiator, Some("user".to_string()));
     }
 
     #[test]

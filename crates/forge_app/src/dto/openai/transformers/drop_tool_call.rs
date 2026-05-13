@@ -55,6 +55,7 @@ mod tests {
 
         let context = Context {
             conversation_id: None,
+            initiator: None,
             messages: vec![
                 ContextMessage::Text(
                     TextMessage::new(Role::Assistant, "Using tool").tool_calls(vec![tool_call]),
