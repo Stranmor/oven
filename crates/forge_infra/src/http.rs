@@ -11,7 +11,7 @@ use forge_eventsource::{EventSource, RequestBuilderExt};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use reqwest::redirect::Policy;
 use reqwest::{Certificate, Client, Response, StatusCode, Url};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 const VERSION: &str = match option_env!("APP_VERSION") {
@@ -246,6 +246,7 @@ pub fn sanitize_debug_body(body: &Bytes) -> Bytes {
         return Bytes::from_static(REDACTED_NON_JSON_BODY);
     };
 
+    attach_cache_control_probe(&mut value);
     redact_json_value(&mut value);
 
     match serde_json::to_vec(&value) {
@@ -254,6 +255,84 @@ pub fn sanitize_debug_body(body: &Bytes) -> Bytes {
             warn!(%error, "Failed to serialize sanitized debug request body");
             Bytes::from_static(REDACTED_NON_JSON_BODY)
         }
+    }
+}
+
+fn attach_cache_control_probe(value: &mut Value) {
+    let Some(map) = value.as_object_mut() else {
+        return;
+    };
+
+    if !map.contains_key("messages") && !map.contains_key("tools") {
+        return;
+    }
+
+    let messages = map
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let tools = map
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+
+    let message_summaries = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            let content = message.get("content");
+            let cache_control_count = count_cache_control_markers(message);
+            let content_part_count = content.map(content_part_count).unwrap_or(0);
+            if cache_control_count == 0 {
+                return None;
+            }
+
+            Some(json!({
+                "index": index,
+                "role": message.get("role").and_then(Value::as_str).unwrap_or("unknown"),
+                "cache_control_count": cache_control_count,
+                "content_part_count": content_part_count,
+            }))
+        })
+        .collect::<Vec<_>>();
+
+    let total_message_cache_control_markers = messages
+        .iter()
+        .map(count_cache_control_markers)
+        .sum::<usize>();
+    let total_tool_cache_control_markers =
+        tools.iter().map(count_cache_control_markers).sum::<usize>();
+
+    map.insert(
+        "cache_control_probe".to_string(),
+        json!({
+            "message_count": messages.len(),
+            "message_cache_control_markers": total_message_cache_control_markers,
+            "marked_messages": message_summaries,
+            "tool_count": tools.len(),
+            "tool_cache_control_markers": total_tool_cache_control_markers,
+        }),
+    );
+}
+
+fn content_part_count(value: &Value) -> usize {
+    if value.is_string() {
+        1
+    } else {
+        value.as_array().map(Vec::len).unwrap_or(0)
+    }
+}
+
+fn count_cache_control_markers(value: &Value) -> usize {
+    match value {
+        Value::Object(map) => {
+            let current = usize::from(map.contains_key("cache_control"));
+            current.saturating_add(map.values().map(count_cache_control_markers).sum::<usize>())
+        }
+        Value::Array(items) => items.iter().map(count_cache_control_markers).sum(),
+        _ => 0,
     }
 }
 
@@ -630,6 +709,111 @@ mod tests {
         assert_eq!(parsed["proxy_url"], REDACTED_VALUE);
         assert_eq!(parsed["metadata"]["authorization"], REDACTED_VALUE);
         assert_eq!(parsed["metadata"]["request_id"], "safe-request-id");
+    }
+
+    #[test]
+    fn test_sanitize_debug_body_adds_redacted_cache_control_probe() {
+        let body = Bytes::from(
+            r#"{
+                "model": "gpt-5.5",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "stable secret system",
+                                "cache_control": {"type": "ephemeral"}
+                            }
+                        ]
+                    },
+                    {
+                        "role": "user",
+                        "content": "raw secret user"
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "part one"},
+                            {
+                                "type": "text",
+                                "text": "part two",
+                                "cache_control": {"type": "ephemeral"}
+                            }
+                        ]
+                    }
+                ],
+                "tools": [
+                    {"type": "function", "function": {"name": "shell"}}
+                ]
+            }"#,
+        );
+
+        let sanitized = sanitize_debug_body(&body);
+        let actual: Value = serde_json::from_slice(&sanitized).unwrap();
+        let expected = json!({
+            "message_count": 3,
+            "message_cache_control_markers": 2,
+            "marked_messages": [
+                {
+                    "index": 0,
+                    "role": "system",
+                    "cache_control_count": 1,
+                    "content_part_count": 1,
+                },
+                {
+                    "index": 2,
+                    "role": "user",
+                    "cache_control_count": 1,
+                    "content_part_count": 2,
+                }
+            ],
+            "tool_count": 1,
+            "tool_cache_control_markers": 0,
+        });
+
+        assert_eq!(actual["cache_control_probe"], expected);
+        assert_eq!(actual["messages"], REDACTED_PAYLOAD);
+        assert_eq!(actual["tools"], REDACTED_PAYLOAD);
+        assert!(
+            !String::from_utf8(sanitized.to_vec())
+                .unwrap()
+                .contains("stable secret system")
+        );
+    }
+
+    #[test]
+    fn test_sanitize_debug_body_reports_tool_cache_control_markers_without_tool_payload() {
+        let body = Bytes::from(
+            r#"{
+                "messages": [],
+                "tools": [
+                    {
+                        "type": "function",
+                        "cache_control": {"type": "ephemeral"},
+                        "function": {"name": "secret_tool", "description": "secret tool text"}
+                    }
+                ]
+            }"#,
+        );
+
+        let sanitized = sanitize_debug_body(&body);
+        let actual: Value = serde_json::from_slice(&sanitized).unwrap();
+        let expected = json!({
+            "message_count": 0,
+            "message_cache_control_markers": 0,
+            "marked_messages": [],
+            "tool_count": 1,
+            "tool_cache_control_markers": 1,
+        });
+
+        assert_eq!(actual["cache_control_probe"], expected);
+        assert_eq!(actual["tools"], REDACTED_PAYLOAD);
+        assert!(
+            !String::from_utf8(sanitized.to_vec())
+                .unwrap()
+                .contains("secret_tool")
+        );
     }
 
     #[test]

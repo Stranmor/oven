@@ -172,7 +172,7 @@ fn supports_openai_compatible_cache_control(provider: &Provider<Url>, request: &
         return when_model("gemini|anthropic|minimax")(request);
     }
 
-    if provider.id == ProviderId::FORGE {
+    if provider.id == ProviderId::FORGE || provider.id == ProviderId::OPENAI_COMPATIBLE {
         return when_model("gemini|anthropic|minimax|gpt-5\\.5")(request);
     }
 
@@ -184,6 +184,7 @@ mod tests {
     use std::collections::HashMap;
 
     use forge_domain::{Context, ContextMessage, ModelId, Role, TextMessage};
+    use pretty_assertions::assert_eq;
     use url::Url;
 
     use super::*;
@@ -213,6 +214,20 @@ mod tests {
             models: Some(ModelSource::Url(
                 Url::parse("https://antinomy.ai/api/v1/models").unwrap(),
             )),
+        }
+    }
+
+    fn openai_compatible(key: &str) -> Provider<Url> {
+        Provider {
+            id: ProviderId::OPENAI_COMPATIBLE,
+            provider_type: Default::default(),
+            response: Some(ProviderResponse::OpenAI),
+            url: Url::parse("https://antigravity.quantumind.ru/v1/chat/completions").unwrap(),
+            auth_methods: vec![forge_domain::AuthMethod::ApiKey],
+            url_params: vec![],
+            credential: make_credential(ProviderId::OPENAI_COMPATIBLE, key),
+            custom_headers: None,
+            models: Some(ModelSource::Hardcoded(vec![])),
         }
     }
 
@@ -449,6 +464,38 @@ mod tests {
         let actual = cached_message_flags(&provider, "gpt-5.5", fixture);
 
         let expected = vec![true, false];
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_openai_compatible_gpt55_applies_cache_control_to_static_and_rolling_messages() {
+        let provider = openai_compatible("openai-compatible");
+        let fixture = Context::default()
+            .add_message(text_message(Role::System, "stable system"))
+            .add_message(text_message(Role::User, "real user turn"))
+            .add_message(dynamic_user_message(
+                "<project_model_context>dynamic</project_model_context>",
+            ));
+
+        let actual = cached_message_flags(&provider, "gpt-5.5", fixture);
+
+        let expected = vec![true, true, false];
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_openai_compatible_gpt55_skips_cache_ineligible_dynamic_messages() {
+        let provider = openai_compatible("openai-compatible");
+        let fixture = Context::default()
+            .add_message(text_message(Role::User, "real user turn"))
+            .add_message(dynamic_user_message(
+                "<project_model_context>dynamic</project_model_context>",
+            ))
+            .add_message(dynamic_user_message("Changed files:\n- crates/example.rs"));
+
+        let actual = cached_message_flags(&provider, "gpt-5.5", fixture);
+
+        let expected = vec![true, false, false];
         assert_eq!(actual, expected);
     }
 
