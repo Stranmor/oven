@@ -82,12 +82,7 @@ impl<W: Write> StreamdownRenderer<W> {
 
         while let Some(pos) = self.line_buffer.find('\n') {
             let line = self.line_buffer.get(..pos).unwrap_or("").to_string();
-
-            for repaired in repair_line(&line, self.parser.state()) {
-                for event in self.parser.parse_line(&repaired) {
-                    self.renderer.render_event(&event)?;
-                }
-            }
+            self.render_line(&line)?;
 
             self.line_buffer = self.line_buffer.get(pos + 1..).unwrap_or("").to_string();
         }
@@ -98,16 +93,50 @@ impl<W: Write> StreamdownRenderer<W> {
     /// Returns the underlying writer.
     pub fn finish(mut self) -> io::Result<()> {
         if !self.line_buffer.is_empty() {
-            for repaired in repair_line(&self.line_buffer, self.parser.state()) {
-                for event in self.parser.parse_line(&repaired) {
-                    self.renderer.render_event(&event)?;
-                }
-            }
+            let line = std::mem::take(&mut self.line_buffer);
+            self.render_line(&line)?;
         }
         for event in self.parser.finalize() {
             self.renderer.render_event(&event)?;
         }
         Ok(())
+    }
+
+    fn render_line(&mut self, line: &str) -> io::Result<()> {
+        let continuation_line = self.line_after_first_indent(line);
+        if !self.parser.state().is_in_code()
+            && self
+                .renderer
+                .try_render_list_continuation(&continuation_line)?
+        {
+            return Ok(());
+        }
+
+        for repaired in repair_line(line, self.parser.state()) {
+            for event in self.parser.parse_line(&repaired) {
+                self.renderer.render_event(&event)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn line_after_first_indent(&self, line: &str) -> String {
+        let Some(first_indent) = self.parser.state().first_indent else {
+            return line.to_string();
+        };
+        if first_indent == 0 {
+            return line.to_string();
+        }
+
+        let current_indent = line
+            .chars()
+            .take_while(|character| character.is_whitespace())
+            .count();
+        if current_indent >= first_indent {
+            line.chars().skip(first_indent).collect()
+        } else {
+            line.to_string()
+        }
     }
 }
 
@@ -143,6 +172,55 @@ mod tests {
             .unwrap()
             .trim_matches('\n')
             .to_string()
+    }
+
+    #[test]
+    fn test_streaming_renderer_keeps_ordered_numbers_for_multiline_items() {
+        let fixture = concat!(
+            "1. **First**\n",
+            "   Description\n",
+            "2. **Second**\n",
+            "   Description\n",
+            "3. **Third**\n",
+            "   Description\n",
+            "4. **Fourth**\n",
+            "   Description\n",
+        );
+        let actual = fixture_rendered_output(fixture, 200);
+        let expected = concat!(
+            "1. First\n",
+            "   Description\n",
+            "2. Second\n",
+            "   Description\n",
+            "3. Third\n",
+            "   Description\n",
+            "4. Fourth\n",
+            "   Description"
+        );
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_streaming_renderer_keeps_ordered_numbers_for_chunked_multiline_items() {
+        let fixture = [
+            "1. **First**\n   Description\n2. **Second**",
+            "\n   Description\n3. **Third**\n",
+            "   Description\n4. **Fourth**\n   Description\n",
+        ];
+        let actual = fixture_rendered_output_from_chunks(&fixture, 200);
+        let expected = concat!(
+            "1. First\n",
+            "   Description\n",
+            "2. Second\n",
+            "   Description\n",
+            "3. Third\n",
+            "   Description\n",
+            "4. Fourth\n",
+            "   Description"
+        );
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

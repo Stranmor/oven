@@ -48,6 +48,15 @@ pub struct ListState {
     numbers: Vec<usize>,
     /// Whether we're in a "pending" state (saw ListEnd but might continue)
     pending_reset: bool,
+    /// Last list item continuation alignment, when a following source line is
+    /// indented under that item rather than being a new block.
+    continuation: Option<ListContinuation>,
+}
+
+#[derive(Clone, Copy)]
+struct ListContinuation {
+    source_indent: usize,
+    render_indent: usize,
 }
 
 impl ListState {
@@ -63,6 +72,7 @@ impl ListState {
     pub fn pop(&mut self) {
         self.stack.pop();
         self.numbers.pop();
+        self.continuation = None;
     }
 
     pub fn next_number(&mut self) -> usize {
@@ -95,12 +105,38 @@ impl ListState {
         self.stack.clear();
         self.numbers.clear();
         self.pending_reset = false;
+        self.continuation = None;
     }
 
     /// Mark list as pending reset (saw ListEnd, but might continue with more
     /// items)
     pub fn mark_pending_reset(&mut self) {
         self.pending_reset = true;
+    }
+
+    pub fn continuation_content<'a>(&self, line: &'a str) -> Option<&'a str> {
+        let continuation = self.continuation?;
+        let leading_spaces = line
+            .chars()
+            .take_while(|character| *character == ' ')
+            .count();
+        if leading_spaces < continuation.source_indent || line.trim().is_empty() {
+            return None;
+        }
+
+        line.char_indices()
+            .nth(continuation.source_indent)
+            .map(|(index, _)| line.get(index..).unwrap_or_default())
+            .or(Some(""))
+    }
+
+    fn record_continuation(&mut self, source_indent: usize, render_indent: usize) {
+        self.continuation = Some(ListContinuation { source_indent, render_indent });
+    }
+
+    fn continuation_render_indent(&self) -> Option<usize> {
+        self.continuation
+            .map(|continuation| continuation.render_indent)
     }
 
     /// Resume list if it was pending reset (new list item arrived)
@@ -168,6 +204,8 @@ pub fn render_list_item<S: InlineStyler + ListStyler>(
     let marker_width = visible_length(&marker);
     let checkbox_width = if checkbox_prefix.is_empty() { 0 } else { 2 }; // checkbox + space
     let content_indent = indent_spaces + marker_width + 1 + checkbox_width;
+    let source_content_indent = indent + marker_width + 1;
+    list_state.record_continuation(source_content_indent, content_indent);
 
     // Color the marker based on bullet type
     let colored_marker = match bullet {
@@ -214,6 +252,35 @@ pub fn render_list_item<S: InlineStyler + ListStyler>(
 
     if wrapped.is_empty() {
         vec![first_prefix]
+    } else {
+        wrapped
+    }
+}
+
+/// Render a continuation line for the most recent list item.
+pub fn render_list_continuation<S: InlineStyler + ListStyler>(
+    content: &str,
+    width: usize,
+    margin: &str,
+    styler: &S,
+    list_state: &ListState,
+) -> Vec<String> {
+    let Some(render_indent) = list_state.continuation_render_indent() else {
+        return Vec::new();
+    };
+    let prefix = format!("{}{}", margin, " ".repeat(render_indent));
+    let content_width = width.saturating_sub(visible_length(&prefix)).max(5);
+    let rendered_content = render_inline_content(content.trim(), styler);
+    let wrapped = wrap_text_preserving_spaces(
+        &rendered_content,
+        content_width,
+        content_width,
+        &prefix,
+        &prefix,
+    );
+
+    if wrapped.is_empty() {
+        vec![prefix]
     } else {
         wrapped
     }
@@ -498,6 +565,40 @@ mod tests {
             "    /very/long\n",
             "    /path)\n",
             "    설명"
+        );
+
+        pretty_assertions::assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_continuation_rendering_preserves_ordered_counter() {
+        let mut fixture = ListState::default();
+        let first = render_list_item(
+            0,
+            &ListBullet::Ordered(1),
+            "First",
+            80,
+            "  ",
+            &TagStyler,
+            &mut fixture,
+        );
+        let continuation = fixture.continuation_content("   Description").unwrap();
+        let rendered_continuation =
+            render_list_continuation(continuation, 80, "  ", &TagStyler, &fixture);
+        let second = render_list_item(
+            0,
+            &ListBullet::Ordered(1),
+            "Second",
+            80,
+            "  ",
+            &TagStyler,
+            &mut fixture,
+        );
+        let actual = [first, rendered_continuation, second].concat().join("\n");
+        let expected = concat!(
+            "  <num>1.</num> First\n",
+            "     Description\n",
+            "  <num>2.</num> Second"
         );
 
         pretty_assertions::assert_eq!(actual, expected);

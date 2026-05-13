@@ -8,7 +8,7 @@ use streamdown_parser::ParseEvent;
 use crate::code::CodeHighlighter;
 use crate::heading::render_heading;
 use crate::inline::{render_inline_content, render_inline_elements};
-use crate::list::{ListState, render_list_item};
+use crate::list::{ListState, render_list_continuation, render_list_item};
 use crate::style::InlineStyler;
 use crate::table::render_table;
 use crate::theme::Theme;
@@ -108,6 +108,28 @@ impl<W: Write> Renderer<W> {
             self.writeln(&line)?;
         }
         Ok(())
+    }
+
+    /// Render a source line as a continuation of the active list item when it
+    /// is indented under the previous item rather than being a new markdown
+    /// block.
+    pub fn try_render_list_continuation(&mut self, line: &str) -> io::Result<bool> {
+        if is_list_marker_line(line) {
+            return Ok(false);
+        }
+        let Some(content) = self.list_state.continuation_content(line) else {
+            return Ok(false);
+        };
+
+        let margin = self.left_margin();
+        let width = self.current_width();
+        let lines =
+            render_list_continuation(content, width, &margin, &self.theme, &self.list_state);
+        for line in lines {
+            self.writeln(&line)?;
+        }
+        self.writer.flush()?;
+        Ok(true)
     }
 
     /// Check if this event should reset a pending list.
@@ -312,4 +334,25 @@ impl<W: Write> Renderer<W> {
 
         self.writer.flush()
     }
+}
+
+fn is_list_marker_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+        .is_some()
+        || is_ordered_marker_line(trimmed)
+}
+
+fn is_ordered_marker_line(line: &str) -> bool {
+    let Some((marker, _)) = line.split_once(' ') else {
+        return false;
+    };
+    let Some(number) = marker.strip_suffix('.') else {
+        return false;
+    };
+
+    !number.is_empty() && number.chars().all(|character| character.is_ascii_digit())
 }
