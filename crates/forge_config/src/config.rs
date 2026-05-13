@@ -261,8 +261,10 @@ pub struct ForgeConfig {
     /// Time-to-live in seconds for the cached model API list.
     #[serde(default)]
     pub model_cache_ttl_secs: u64,
-    /// Whether OpenAI-compatible providers should merge all system messages into
-    /// one leading system message before sending the request.
+    /// When `true`, all system messages in the conversation are merged into a
+    /// single leading system message before the request is sent. Enable this
+    /// for providers that reject requests containing system messages after
+    /// user or assistant turns (e.g. vLLM, NVIDIA NIM).
     #[serde(default)]
     pub merge_system_messages: bool,
     /// Default model and provider configuration used when not overridden by

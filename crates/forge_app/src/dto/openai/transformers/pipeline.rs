@@ -32,6 +32,10 @@ pub struct ProviderPipeline<'a> {
 
 impl<'a> ProviderPipeline<'a> {
     /// Creates a new provider pipeline for the given provider.
+    ///
+    /// Set `merge_system_messages` to `true` to force all system messages into
+    /// a single leading message (controlled by
+    /// `ForgeConfig::merge_system_messages`).
     pub fn new(provider: &'a Provider<Url>, merge_system_messages: bool) -> Self {
         Self { provider, merge_system_messages }
     }
@@ -189,6 +193,7 @@ fn supports_openai_compatible_cache_control(provider: &Provider<Url>, request: &
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::str::FromStr;
 
     use forge_domain::{Context, ContextMessage, ModelId, Role, TextMessage};
     use pretty_assertions::assert_eq;
@@ -283,6 +288,21 @@ mod tests {
             models: Some(ModelSource::Url(
                 Url::parse("https://api.openai.com/v1/models").unwrap(),
             )),
+        }
+    }
+
+    fn vllm(key: &str) -> Provider<Url> {
+        let id = ProviderId::from_str("vllm").unwrap();
+        Provider {
+            id: id.clone(),
+            provider_type: Default::default(),
+            response: Some(ProviderResponse::OpenAI),
+            url: Url::parse("http://localhost:8000/v1/chat/completions").unwrap(),
+            auth_methods: vec![forge_domain::AuthMethod::ApiKey],
+            url_params: vec![],
+            credential: make_credential(id, key),
+            custom_headers: None,
+            models: Some(ModelSource::Hardcoded(vec![])),
         }
     }
 
@@ -530,6 +550,97 @@ mod tests {
 
         let expected = vec![false, false];
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_vllm_provider_merges_system_messages() {
+        use crate::dto::openai::{Message, MessageContent, Role};
+
+        let provider = vllm("vllm-key");
+        let fixture = Request::default().messages(vec![
+            Message {
+                role: Role::User,
+                content: Some(MessageContent::Text("hello".to_string())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_details: None,
+                reasoning_text: None,
+                reasoning_opaque: None,
+                reasoning_content: None,
+                extra_content: None,
+            },
+            Message {
+                role: Role::System,
+                content: Some(MessageContent::Text("be concise".to_string())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_details: None,
+                reasoning_text: None,
+                reasoning_opaque: None,
+                reasoning_content: None,
+                extra_content: None,
+            },
+        ]);
+
+        let mut pipeline = ProviderPipeline::new(&provider, false);
+        let actual = pipeline.transform(fixture);
+
+        let messages = actual.messages.unwrap();
+        let expected_first_role = Role::System;
+        assert_eq!(messages[0].role, expected_first_role);
+
+        let system_messages = messages
+            .iter()
+            .filter(|message| message.role == Role::System)
+            .count();
+        assert_eq!(system_messages, 1);
+    }
+
+    #[test]
+    fn test_merge_system_messages_flag_merges_for_any_provider() {
+        use crate::dto::openai::{Message, MessageContent, Role};
+
+        // Use a plain OpenAI provider — it would NOT merge system messages by default.
+        // The global `merge_system_messages = true` flag must trigger the merge.
+        let provider = openai("openai-key");
+        let fixture = Request::default().messages(vec![
+            Message {
+                role: Role::User,
+                content: Some(MessageContent::Text("hello".to_string())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_details: None,
+                reasoning_text: None,
+                reasoning_opaque: None,
+                reasoning_content: None,
+                extra_content: None,
+            },
+            Message {
+                role: Role::System,
+                content: Some(MessageContent::Text("be concise".to_string())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_details: None,
+                reasoning_text: None,
+                reasoning_opaque: None,
+                reasoning_content: None,
+                extra_content: None,
+            },
+        ]);
+
+        let mut pipeline = ProviderPipeline::new(&provider, true);
+        let actual = pipeline.transform(fixture);
+
+        let messages = actual.messages.unwrap();
+        assert_eq!(messages[0].role, Role::System);
+        assert_eq!(
+            messages.iter().filter(|m| m.role == Role::System).count(),
+            1
+        );
     }
 
     #[test]
