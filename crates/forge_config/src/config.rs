@@ -256,6 +256,10 @@ pub struct ForgeConfig {
     /// Time-to-live in seconds for the cached model API list.
     #[serde(default)]
     pub model_cache_ttl_secs: u64,
+    /// Whether OpenAI-compatible providers should merge all system messages into
+    /// one leading system message before sending the request.
+    #[serde(default)]
+    pub merge_system_messages: bool,
     /// Default model and provider configuration used when not overridden by
     /// individual agents.    
     #[serde(default, skip_serializing_if = "Option::is_none")]

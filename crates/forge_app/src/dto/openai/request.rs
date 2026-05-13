@@ -275,6 +275,9 @@ pub struct Request {
     pub parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Indicates whether the request is user- or agent-initiated.
+    #[serde(skip_serializing)]
+    pub initiator: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<StreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -441,6 +444,7 @@ impl From<Context> for Request {
                                               * on model capabilities */
             stream_options: Some(StreamOptions { include_usage: Some(true) }),
             session_id: context.conversation_id.map(|id| id.to_string()),
+            initiator: Default::default(),
             reasoning: context.reasoning,
             reasoning_effort: Default::default(),
             max_completion_tokens: Default::default(),

@@ -128,9 +128,9 @@ impl<H: HttpInfra> OpenAIProvider<H> {
 
         // Add GitHub Copilot optimization headers only for github_copilot provider
         if self.provider.id == ProviderId::GITHUB_COPILOT {
-            // Determine initiator from messages
-            let initiator = {
-                // Fall back to detecting from last message role
+            // Prefer the request-level initiator when it is available, then fall back
+            // to detecting the last message role for older call paths.
+            let initiator = request.initiator.as_deref().unwrap_or_else(|| {
                 let is_agent_initiated = request.messages.as_ref().is_some_and(|messages| {
                     messages.last().is_some_and(|msg| {
                         // If last message role is not User, it's agent-initiated
@@ -138,7 +138,7 @@ impl<H: HttpInfra> OpenAIProvider<H> {
                     })
                 });
                 if is_agent_initiated { "agent" } else { "user" }
-            };
+            });
 
             headers.push(("x-initiator".to_string(), initiator.to_string()));
             headers.push((
@@ -193,10 +193,11 @@ impl<H: HttpInfra> OpenAIProvider<H> {
         &self,
         model: &ModelId,
         context: ChatContext,
+        merge_system_messages: bool,
     ) -> ResultStream<ChatCompletionMessage, anyhow::Error> {
         let mut request = Request::from(context).model(model.clone());
         request.validate_and_canonicalize_images()?;
-        let mut pipeline = ProviderPipeline::new(&self.provider);
+        let mut pipeline = ProviderPipeline::new(&self.provider, merge_system_messages);
         request = pipeline.transform(request);
         request.validate_and_canonicalize_images()?;
 
@@ -342,8 +343,9 @@ impl<T: HttpInfra> OpenAIProvider<T> {
         &self,
         model: &ModelId,
         context: ChatContext,
+        merge_system_messages: bool,
     ) -> ResultStream<ChatCompletionMessage, anyhow::Error> {
-        self.inner_chat(model, context).await
+        self.inner_chat(model, context, merge_system_messages).await
     }
 
     pub async fn models(&self) -> Result<Vec<forge_app::domain::Model>> {
@@ -380,11 +382,13 @@ impl<F: HttpInfra + EnvironmentInfra<Config = forge_config::ForgeConfig> + 'stat
         context: ChatContext,
         provider: Provider<Url>,
     ) -> ResultStream<ChatCompletionMessage, anyhow::Error> {
-        let retry_config = self.infra.get_config()?.retry.unwrap_or_default();
+        let config = self.infra.get_config()?;
+        let retry_config = config.retry.unwrap_or_default();
+        let merge_system_messages = config.merge_system_messages;
         let provider_id = provider.id.clone();
         let provider_client = OpenAIProvider::new(provider, self.infra.clone());
         let stream = provider_client
-            .chat(model_id, context)
+            .chat(model_id, context, merge_system_messages)
             .await
             .map_err(|e| into_retry(e, &retry_config))?;
 
@@ -1024,6 +1028,40 @@ mod tests {
             headers
                 .iter()
                 .any(|(k, v)| k == "Openai-Intent" && v == "conversation-edits")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_headers_with_request_github_copilot_explicit_initiator_overrides_messages()
+    -> anyhow::Result<()> {
+        let provider = github_copilot("test-key");
+        let http_client = Arc::new(MockHttpClient::new());
+        let openai_provider = OpenAIProvider::new(provider, http_client);
+
+        let request = Request {
+            initiator: Some("agent".to_string()),
+            messages: Some(vec![Message {
+                role: Role::User,
+                content: Some(MessageContent::Text("Hello".to_string())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_details: None,
+                reasoning_text: None,
+                reasoning_opaque: None,
+                reasoning_content: None,
+                extra_content: None,
+            }]),
+            ..Default::default()
+        };
+
+        let headers = openai_provider.get_headers_with_request(&request);
+
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "x-initiator" && v == "agent")
         );
         Ok(())
     }

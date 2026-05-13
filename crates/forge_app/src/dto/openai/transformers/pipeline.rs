@@ -25,12 +25,15 @@ use super::zai_reasoning::SetZaiThinking;
 use crate::dto::openai::{Request, ToolChoice};
 
 /// Pipeline for transforming requests based on the provider type
-pub struct ProviderPipeline<'a>(&'a Provider<Url>);
+pub struct ProviderPipeline<'a> {
+    provider: &'a Provider<Url>,
+    merge_system_messages: bool,
+}
 
 impl<'a> ProviderPipeline<'a> {
-    /// Creates a new provider pipeline for the given provider
-    pub fn new(provider: &'a Provider<Url>) -> Self {
-        Self(provider)
+    /// Creates a new provider pipeline for the given provider.
+    pub fn new(provider: &'a Provider<Url>, merge_system_messages: bool) -> Self {
+        Self { provider, merge_system_messages }
     }
 }
 
@@ -40,7 +43,8 @@ impl Transformer for ProviderPipeline<'_> {
     fn transform(&mut self, request: Self::Value) -> Self::Value {
         // Only Anthropic and Gemini requires cache configuration to be set.
         // ref: https://openrouter.ai/docs/features/prompt-caching
-        let provider = self.0;
+        let provider = self.provider;
+        let merge_system_messages = self.merge_system_messages;
 
         // Z.ai transformer must run before MakeOpenAiCompat which removes reasoning
         // field
@@ -85,8 +89,11 @@ impl Transformer for ProviderPipeline<'_> {
 
         let xai_compat = MakeXaiCompat.when(move |_| provider.id == ProviderId::XAI);
 
-        let ensure_system_first =
-            MergeSystemMessages.when(move |_| provider.id == ProviderId::NVIDIA);
+        let ensure_system_first = MergeSystemMessages.when(move |_| {
+            provider.id == ProviderId::NVIDIA
+                || provider.id.as_ref() == "vllm"
+                || merge_system_messages
+        });
 
         let trim_tool_call_ids = TrimToolCallIds.when(move |_| provider.id == ProviderId::OPENAI);
 
@@ -403,7 +410,7 @@ mod tests {
 
     fn cached_message_flags(provider: &Provider<Url>, model: &str, context: Context) -> Vec<bool> {
         let fixture = Request::from(context).model(ModelId::new(model));
-        let mut pipeline = ProviderPipeline::new(provider);
+        let mut pipeline = ProviderPipeline::new(provider, false);
         let actual = pipeline.transform(fixture);
 
         actual
@@ -545,7 +552,7 @@ mod tests {
             exclude: None,
         });
 
-        let mut pipeline = ProviderPipeline::new(&provider);
+        let mut pipeline = ProviderPipeline::new(&provider, false);
         let actual = pipeline.transform(fixture);
 
         assert!(actual.thinking.is_some());
@@ -566,7 +573,7 @@ mod tests {
             exclude: None,
         });
 
-        let mut pipeline = ProviderPipeline::new(&provider);
+        let mut pipeline = ProviderPipeline::new(&provider, false);
         let actual = pipeline.transform(fixture);
 
         assert!(actual.thinking.is_some());
@@ -587,7 +594,7 @@ mod tests {
             exclude: None,
         });
 
-        let mut pipeline = ProviderPipeline::new(&provider);
+        let mut pipeline = ProviderPipeline::new(&provider, false);
         let actual = pipeline.transform(fixture);
 
         assert_eq!(actual.thinking, None);
@@ -613,7 +620,7 @@ mod tests {
             extra_content: None,
         }]);
 
-        let mut pipeline = ProviderPipeline::new(&provider);
+        let mut pipeline = ProviderPipeline::new(&provider, false);
         let actual = pipeline.transform(fixture);
 
         let expected_id = "call_123456789012345678_79a9957747d56681";
@@ -644,7 +651,7 @@ mod tests {
             extra_content: None,
         }]);
 
-        let mut pipeline = ProviderPipeline::new(&provider);
+        let mut pipeline = ProviderPipeline::new(&provider, false);
         let actual = pipeline.transform(fixture);
 
         // Anthropic provider should not trim tool call IDs
@@ -674,7 +681,7 @@ mod tests {
                 }),
             }]);
 
-        let mut pipeline = ProviderPipeline::new(&provider);
+        let mut pipeline = ProviderPipeline::new(&provider, false);
         let actual = pipeline.transform(fixture);
 
         // Thought signature should be preserved for gemini-3 models
@@ -715,7 +722,7 @@ mod tests {
                 }),
             }]);
 
-        let mut pipeline = ProviderPipeline::new(&provider);
+        let mut pipeline = ProviderPipeline::new(&provider, false);
         let actual = pipeline.transform(fixture);
 
         // Thought signature should be stripped for non-gemini-3 models
@@ -757,7 +764,7 @@ mod tests {
                 },
             ]);
 
-        let mut pipeline = ProviderPipeline::new(&provider);
+        let mut pipeline = ProviderPipeline::new(&provider, false);
         let actual = pipeline.transform(fixture);
 
         // Cache should be applied: first and last messages cached
@@ -816,7 +823,7 @@ mod tests {
                 },
             ]);
 
-        let mut pipeline = ProviderPipeline::new(&provider);
+        let mut pipeline = ProviderPipeline::new(&provider, false);
         let actual = pipeline.transform(fixture);
 
         // Cache should NOT be applied for non-minimax/gemini/anthropic models
@@ -863,7 +870,7 @@ mod tests {
                 }),
             }]);
 
-        let mut pipeline = ProviderPipeline::new(&provider);
+        let mut pipeline = ProviderPipeline::new(&provider, false);
         let actual = pipeline.transform(fixture);
 
         // Thought signature should be stripped for gemini-2 models (not gemini-3)
@@ -893,7 +900,7 @@ mod tests {
             },
         }]);
 
-        let mut pipeline = ProviderPipeline::new(&provider);
+        let mut pipeline = ProviderPipeline::new(&provider, false);
         let actual = pipeline.transform(fixture);
 
         let expected = serde_json::json!({
@@ -960,7 +967,7 @@ mod tests {
                 ),
             });
 
-        let mut pipeline = ProviderPipeline::new(&provider);
+        let mut pipeline = ProviderPipeline::new(&provider, false);
         let actual = pipeline.transform(fixture);
 
         let expected_tool_schema = serde_json::json!({
@@ -1034,7 +1041,7 @@ mod tests {
             extra_content: None,
         }]);
 
-        let mut pipeline = ProviderPipeline::new(&provider);
+        let mut pipeline = ProviderPipeline::new(&provider, false);
         let actual = pipeline.transform(fixture);
 
         let message = actual.messages.unwrap().into_iter().next().unwrap();
@@ -1066,7 +1073,7 @@ mod tests {
             extra_content: None,
         }]);
 
-        let mut pipeline = ProviderPipeline::new(&provider);
+        let mut pipeline = ProviderPipeline::new(&provider, false);
         let actual = pipeline.transform(fixture);
 
         let message = actual.messages.unwrap().into_iter().next().unwrap();
@@ -1090,7 +1097,7 @@ mod tests {
             extra_content: None,
         }]);
 
-        let mut pipeline = ProviderPipeline::new(&provider);
+        let mut pipeline = ProviderPipeline::new(&provider, false);
         let actual = pipeline.transform(fixture);
 
         let message = actual.messages.unwrap().into_iter().next().unwrap();
@@ -1107,7 +1114,7 @@ mod tests {
             exclude: None,
         });
 
-        let mut pipeline = ProviderPipeline::new(&provider);
+        let mut pipeline = ProviderPipeline::new(&provider, false);
         let actual = pipeline.transform(fixture);
 
         assert_eq!(actual.reasoning_effort, Some("high".to_string()));
@@ -1124,7 +1131,7 @@ mod tests {
             exclude: None,
         });
 
-        let mut pipeline = ProviderPipeline::new(&provider);
+        let mut pipeline = ProviderPipeline::new(&provider, false);
         let actual = pipeline.transform(fixture);
 
         assert_eq!(actual.reasoning_effort, Some("none".to_string()));
@@ -1157,7 +1164,7 @@ mod tests {
                 extra_content: None,
             }]);
 
-        let mut pipeline = ProviderPipeline::new(&provider);
+        let mut pipeline = ProviderPipeline::new(&provider, false);
         let actual = pipeline.transform(fixture);
 
         let message = actual.messages.unwrap().into_iter().next().unwrap();
@@ -1183,7 +1190,7 @@ mod tests {
                 extra_content: None,
             }]);
 
-        let mut pipeline = ProviderPipeline::new(&provider);
+        let mut pipeline = ProviderPipeline::new(&provider, false);
         let actual = pipeline.transform(fixture);
 
         let message = actual.messages.unwrap().into_iter().next().unwrap();
@@ -1202,7 +1209,7 @@ mod tests {
                 exclude: None,
             });
 
-        let mut pipeline = ProviderPipeline::new(&provider);
+        let mut pipeline = ProviderPipeline::new(&provider, false);
         let actual = pipeline.transform(fixture);
 
         assert_eq!(actual.reasoning_effort, Some("high".to_string()));
@@ -1235,7 +1242,7 @@ mod tests {
                 extra_content: None,
             }]);
 
-        let mut pipeline = ProviderPipeline::new(&provider);
+        let mut pipeline = ProviderPipeline::new(&provider, false);
         let actual = pipeline.transform(fixture);
 
         let message = actual.messages.unwrap().into_iter().next().unwrap();
@@ -1243,6 +1250,67 @@ mod tests {
         // DeepSeek transforms; reasoning_details should remain as-is.
         assert_eq!(message.reasoning_content, None);
         assert!(message.reasoning_details.is_some());
+    }
+
+    #[test]
+    fn test_merge_system_messages_config_merges_for_non_nvidia_provider() {
+        let provider = openai("openai");
+        let fixture = Request::default().messages(vec![
+            crate::dto::openai::Message {
+                role: crate::dto::openai::Role::User,
+                content: Some(crate::dto::openai::MessageContent::Text(
+                    "hello".to_string(),
+                )),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_details: None,
+                reasoning_text: None,
+                reasoning_opaque: None,
+                reasoning_content: None,
+                extra_content: None,
+            },
+            crate::dto::openai::Message {
+                role: crate::dto::openai::Role::System,
+                content: Some(crate::dto::openai::MessageContent::Text(
+                    "first".to_string(),
+                )),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_details: None,
+                reasoning_text: None,
+                reasoning_opaque: None,
+                reasoning_content: None,
+                extra_content: None,
+            },
+            crate::dto::openai::Message {
+                role: crate::dto::openai::Role::System,
+                content: Some(crate::dto::openai::MessageContent::Text(
+                    "second".to_string(),
+                )),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_details: None,
+                reasoning_text: None,
+                reasoning_opaque: None,
+                reasoning_content: None,
+                extra_content: None,
+            },
+        ]);
+
+        let mut pipeline = ProviderPipeline::new(&provider, true);
+        let actual = pipeline.transform(fixture);
+
+        let messages = actual.messages.unwrap();
+        assert_eq!(messages[0].role, crate::dto::openai::Role::System);
+        assert_eq!(
+            messages[0].content,
+            Some(crate::dto::openai::MessageContent::Text(
+                "first\n\nsecond".to_string()
+            ))
+        );
     }
 
     #[test]
@@ -1267,7 +1335,7 @@ mod tests {
             },
         }]);
 
-        let mut pipeline = ProviderPipeline::new(&provider);
+        let mut pipeline = ProviderPipeline::new(&provider, false);
         let actual = pipeline.transform(fixture);
 
         let expected = serde_json::json!({
