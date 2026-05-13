@@ -169,37 +169,19 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> AgentEx
                     .upsert_subagent_task_session(task_session.clone())
                     .await?;
             }
-            match message {
-                ChatResponse::TaskMessage { ref content } => match content {
-                    ChatResponseContent::ToolInput(_) => ctx.send(message).await?,
-                    ChatResponseContent::ToolOutput(_) => {}
-                    ChatResponseContent::Markdown { text, partial } => {
-                        if *partial {
-                            output.push_str(text);
-                        } else {
-                            output = text.to_string();
-                        }
-                    }
-                },
-                ChatResponse::TaskReasoning { .. } => {}
-                ChatResponse::TaskComplete => {}
-                ChatResponse::ToolCallStart { .. } => ctx.send(message).await?,
-                ChatResponse::ToolCallEnd(_) => ctx.send(message).await?,
-                ChatResponse::RetryAttempt { .. } => ctx.send(message).await?,
-                ChatResponse::Interrupt { reason } => {
-                    task_session.mark_interrupted(reason.to_string());
-                    self.services
-                        .upsert_subagent_task_session(task_session.clone())
-                        .await?;
-                    return Err(Error::AgentToolInterrupted(reason))
-                        .context(format!(
-                            "Tool call to '{}' failed.\n\
-                             Note: This is an AGENTIC tool (powered by an LLM), not a traditional function.\n\
-                             The failure occurred because the underlying LLM did not behave as expected.\n\
-                             This is typically caused by model limitations, prompt issues, or reaching safety limits.",
-                            agent_id.as_str()
-                        ));
-                }
+            if let Some(reason) = forward_subagent_message(message, ctx, &mut output).await? {
+                task_session.mark_interrupted(reason.to_string());
+                self.services
+                    .upsert_subagent_task_session(task_session.clone())
+                    .await?;
+                return Err(Error::AgentToolInterrupted(reason))
+                    .context(format!(
+                        "Tool call to '{}' failed.\n\
+                         Note: This is an AGENTIC tool (powered by an LLM), not a traditional function.\n\
+                         The failure occurred because the underlying LLM did not behave as expected.\n\
+                         This is typically caused by model limitations, prompt issues, or reaching safety limits.",
+                        agent_id.as_str()
+                    ));
             }
         }
         if !output.trim().is_empty() {
@@ -237,6 +219,34 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> AgentEx
     }
 }
 
+async fn forward_subagent_message(
+    message: ChatResponse,
+    ctx: &ToolCallContext,
+    output: &mut String,
+) -> anyhow::Result<Option<forge_domain::InterruptionReason>> {
+    match message {
+        ChatResponse::TaskMessage { ref content } => match content {
+            ChatResponseContent::ToolInput(_) | ChatResponseContent::ToolOutput(_) => {
+                ctx.send(message).await?;
+            }
+            ChatResponseContent::Markdown { text, partial } => {
+                if *partial {
+                    output.push_str(text);
+                } else {
+                    *output = text.to_string();
+                }
+            }
+        },
+        ChatResponse::TaskReasoning { .. } => {}
+        ChatResponse::TaskComplete => {}
+        ChatResponse::ToolCallStart { .. } => ctx.send(message).await?,
+        ChatResponse::ToolCallEnd(_) => ctx.send(message).await?,
+        ChatResponse::RetryAttempt { .. } => ctx.send(message).await?,
+        ChatResponse::Interrupt { reason } => return Ok(Some(reason)),
+    }
+    Ok(None)
+}
+
 fn guard_delegated_resume_ownership(
     conversation_id: &ConversationId,
     parent_id: Option<ConversationId>,
@@ -265,10 +275,34 @@ fn guard_delegated_resume_ownership(
 
 #[cfg(test)]
 mod tests {
-    use forge_domain::{Initiator, SubagentTaskStatus};
+    use forge_domain::{Initiator, Metrics, SubagentTaskStatus};
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[tokio::test]
+    async fn test_forward_subagent_message_sends_tool_output_to_parent_context() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<anyhow::Result<ChatResponse>>(1);
+        let setup = ToolCallContext::new(Metrics::default()).sender(Some(sender));
+        let mut output = String::new();
+        let fixture = ChatResponse::TaskMessage {
+            content: ChatResponseContent::ToolOutput("diff --git a/file b/file".to_string()),
+        };
+
+        let actual = forward_subagent_message(fixture, &setup, &mut output)
+            .await
+            .unwrap();
+        let expected = (None, String::new());
+        let actual_message = receiver.recv().await.unwrap().unwrap();
+
+        assert_eq!((actual, output), expected);
+        assert!(matches!(
+            actual_message,
+            ChatResponse::TaskMessage {
+                content: ChatResponseContent::ToolOutput(text)
+            } if text == "diff --git a/file b/file"
+        ));
+    }
 
     #[test]
     fn test_guard_delegated_resume_ownership_rejects_created_session_duplicate_work() {
