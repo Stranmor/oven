@@ -140,6 +140,20 @@ Detection: About to point a local Forge auto-updater at upstream/main, install a
 
 Mnemonic: The fork is the update source; upstream is input, not the installed truth. The active PATH command is the proof, not the payload file; local build quirks stay local unless deliberately promoted.
 
+## Rust TUI Architecture Direction
+
+Forge's interactive terminal UI direction is a Rust-native TUI built on `ratatui` with `crossterm` as the terminal rendering substrate. This is an additive presentation architecture decision, not authorization for a hard rewrite of the existing classic UI path. The active upstream-compatible install and update model remains unchanged: local active Forge comes from `Stranmor/oven` `origin/main`; `tailcallhq/forgecode` `main` is upstream input that must be merged or ported into the fork before local installation, never consumed directly as the installed source of truth.
+
+The TUI must preserve a typed UI boundary. Domain/API/app surfaces emit `ChatResponse` values or equivalent typed domain events, those events are transformed into a shared UI render model such as `forge_ui_model`, and renderers consume that model. The classic stdout/transcript renderer and the `ratatui` renderer are sibling presentation adapters; neither should parse domain objects ad hoc or own business semantics. Markdown, tool-call output, streaming chunks, transcript records, status indicators, and structured assistant/user messages should be represented once in the typed render model and rendered by each adapter, not duplicated as parallel parser/rendering logic.
+
+`ratatui` and `crossterm` belong only in presentation crates/modules. They must stay out of domain, API, agent/application orchestration, provider, tool-call, project-model, and infrastructure crates except for narrow feature-gated adapter wiring whose dependency direction remains presentation-only. `crates/forge_main/src/ui.rs` and other hot upstream files should receive only thin seams, delegation points, or compatibility-preserving adapters. Local rich TUI behavior must live behind additive crates/modules and feature/config gates so upstream sync remains reviewable and low-conflict.
+
+Classic stdout and transcript mode remain first-class fallbacks for shell workflows, CI logs, non-interactive terminals, redirected output, remote automation, and any environment where the TUI is unavailable or disabled. The TUI must not make transcript fidelity, stream consumption, tool output visibility, or shell-safe behavior second-class. Renderer selection should be explicit and safe, with equivalent semantic coverage across renderers.
+
+Drift protection is required for this architecture. Tests or fixtures must protect: upstream-sync compatibility of thin seams in hot files; renderer behavior for the shared UI model; markdown/tool-output semantics across classic and TUI renderers; feature/config-gated availability; and fallback behavior for stdout/transcript workflows. Detection: About to add TUI behavior by rewriting `crates/forge_main/src/ui.rs`, importing `ratatui`/`crossterm` into domain/API/app crates, duplicating markdown/tool-output parsing in each renderer, consuming upstream directly instead of the fork, or weakening classic stdout/transcript behavior → STOP → route the change through the typed UI model boundary, keep dependencies presentation-only, gate rich TUI features additively, and add drift tests.
+
+Mnemonic: TUI is a renderer, not the product core. Events become a typed UI model; stdout and `ratatui` render the same semantics; the fork stays the installed truth.
+
 ## Service Implementation Guidelines
 
 Services should follow clean architecture principles and maintain clear separation of concerns:
