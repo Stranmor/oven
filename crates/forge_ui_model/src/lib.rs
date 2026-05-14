@@ -4,6 +4,8 @@
 //! presentation renderers. It intentionally owns no terminal backend and has no
 //! `ratatui` dependency.
 
+use std::time::Duration;
+
 use forge_domain::{Category, ChatResponse, ChatResponseContent, InterruptionReason, ToolResult};
 
 /// A complete append-only render document for one UI surface refresh.
@@ -51,7 +53,7 @@ pub enum UiBlock {
     /// Tool lifecycle status emitted from typed tool events.
     ToolStatus(UiToolStatus),
     /// Retry status emitted from typed retry events.
-    Retry { cause: String, duration_ms: u128 },
+    Retry { cause: String, delay: UiRetryDelay },
     /// Task completion marker.
     Completion,
     /// Interrupt marker with structured reason text.
@@ -69,8 +71,8 @@ impl UiBlock {
             | UiBlock::Interrupt(text) => text.clone(),
             UiBlock::ToolInput(title) => title.display_text(),
             UiBlock::ToolStatus(status) => status.display_text(),
-            UiBlock::Retry { cause, duration_ms } => {
-                format!("retry in {duration_ms}ms: {cause}")
+            UiBlock::Retry { cause, delay } => {
+                format!("retry in {}: {cause}", delay.display_text())
             }
             UiBlock::Completion => "complete".to_string(),
         }
@@ -96,6 +98,35 @@ impl UiTitle {
             Some(subtitle) if !subtitle.is_empty() => format!("{} — {subtitle}", self.title),
             _ => self.title.clone(),
         }
+    }
+}
+
+/// Presentation-safe retry delay that preserves duration semantics across UI boundaries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UiRetryDelay(Duration);
+
+impl UiRetryDelay {
+    /// Creates a retry delay from a typed duration.
+    ///
+    /// # Arguments
+    /// * `duration` - Domain retry delay duration to preserve for presentation.
+    pub fn from_duration(duration: Duration) -> Self {
+        Self(duration)
+    }
+
+    /// Returns the retry delay as a typed duration.
+    pub fn as_duration(&self) -> Duration {
+        self.0
+    }
+
+    /// Returns the retry delay in milliseconds for presentation formatting.
+    pub fn as_millis(&self) -> u128 {
+        self.0.as_millis()
+    }
+
+    /// Formats the retry delay as deterministic presentation text.
+    pub fn display_text(&self) -> String {
+        format!("{}ms", self.as_millis())
     }
 }
 
@@ -190,7 +221,7 @@ impl From<&ChatResponse> for UiBlock {
             ChatResponse::ToolCallEnd(result) => UiBlock::ToolStatus(tool_result_status(result)),
             ChatResponse::RetryAttempt { cause, duration } => UiBlock::Retry {
                 cause: cause.as_str().to_string(),
-                duration_ms: duration.as_millis(),
+                delay: UiRetryDelay::from_duration(*duration),
             },
             ChatResponse::Interrupt { reason } => UiBlock::Interrupt(interruption_text(reason)),
         }
@@ -284,7 +315,21 @@ mod tests {
 
         let actual = UiBlock::from(&fixture);
 
-        let expected = UiBlock::Retry { cause: "network".to_string(), duration_ms: 250 };
+        let expected = UiBlock::Retry {
+            cause: "network".to_string(),
+            delay: UiRetryDelay::from_duration(Duration::from_millis(250)),
+        };
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_retry_delay_preserves_typed_duration_and_formats_text() {
+        let fixture = Duration::from_millis(1_250);
+
+        let actual = UiRetryDelay::from_duration(fixture);
+
+        assert_eq!(actual.as_duration(), fixture);
+        assert_eq!(actual.as_millis(), 1_250);
+        assert_eq!(actual.display_text(), "1250ms");
     }
 }

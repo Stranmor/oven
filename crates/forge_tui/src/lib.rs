@@ -6,12 +6,12 @@
 use std::convert::Infallible;
 
 use forge_ui_model::{UiBlock, UiModel, UiToolPhase};
+use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use ratatui::Terminal;
 
 /// Renders a typed UI model into a deterministic `ratatui` test backend string.
 ///
@@ -92,9 +92,11 @@ fn render_block(block: &UiBlock) -> Line<'static> {
             };
             tagged_line("tool", &status.display_text(), color)
         }
-        UiBlock::Retry { cause, duration_ms } => {
-            tagged_line("retry", &format!("{duration_ms}ms {cause}"), Color::Magenta)
-        }
+        UiBlock::Retry { cause, delay } => tagged_line(
+            "retry",
+            &format!("{} {cause}", delay.display_text()),
+            Color::Magenta,
+        ),
         UiBlock::Completion => tagged_line("done", "complete", Color::Green),
         UiBlock::Interrupt(reason) => tagged_line("interrupt", reason, Color::Red),
     }
@@ -112,7 +114,9 @@ fn tagged_line(tag: &'static str, text: &str, color: Color) -> Line<'static> {
 
 #[cfg(test)]
 mod tests {
-    use forge_ui_model::{UiBlock, UiModel, UiToolPhase, UiToolStatus};
+    use std::time::Duration;
+
+    use forge_ui_model::{UiBlock, UiModel, UiRetryDelay, UiToolPhase, UiToolStatus};
     use pretty_assertions::assert_eq;
 
     use super::*;
@@ -138,6 +142,26 @@ mod tests {
             "\"│[markdown] Hello markdown                     │\"\n",
             "\"│[tool] shell finished: exit 0                 │\"\n",
             "\"│                                              │\"\n",
+            "\"└──────────────────────────────────────────────┘\"\n",
+        );
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_ratatui_dashboard_renders_retry_delay_through_ui_retry_delay() {
+        let fixture = UiModel::new(vec![UiBlock::Retry {
+            cause: "network".to_string(),
+            delay: UiRetryDelay::from_duration(Duration::from_millis(250)),
+        }]);
+
+        let actual = render_dashboard_to_string(&fixture, 48, 6);
+
+        let expected = concat!(
+            "\"┌status────────────────────────────────────────┐\"\n",
+            "\"│Forge typed TUI preview                       │\"\n",
+            "\"└──────────────────────────────────────────────┘\"\n",
+            "\"┌events────────────────────────────────────────┐\"\n",
+            "\"│[retry] 250ms network                         │\"\n",
             "\"└──────────────────────────────────────────────┘\"\n",
         );
         assert_eq!(actual, expected);
