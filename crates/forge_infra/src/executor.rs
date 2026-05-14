@@ -96,14 +96,23 @@ struct ManagedProcess {
 }
 
 #[derive(Clone, Copy)]
-struct ProcessGroupId(u32);
+struct ProcessGroupId {
+    #[cfg(unix)]
+    id: u32,
+}
 
 impl ProcessGroupId {
+    #[cfg(unix)]
     fn from_child(child: &Child) -> anyhow::Result<Self> {
         child
             .id()
-            .map(Self)
+            .map(|id| Self { id })
             .ok_or_else(|| anyhow::anyhow!("Managed process has no live pid"))
+    }
+
+    #[cfg(not(unix))]
+    fn from_child(_child: &Child) -> anyhow::Result<Self> {
+        Ok(Self {})
     }
 }
 
@@ -878,7 +887,7 @@ async fn kill_child_process_group(
     child: &mut Child,
     process_group_id: ProcessGroupId,
 ) -> anyhow::Result<()> {
-    let process_group_id = i32::try_from(process_group_id.0)?;
+    let process_group_id = i32::try_from(process_group_id.id)?;
     let kill_target = process_group_id
         .checked_neg()
         .ok_or_else(|| anyhow::anyhow!("Invalid managed process group id: {process_group_id}"))?;
