@@ -142,7 +142,7 @@ impl std::fmt::Debug for Cause {
 
 impl From<&anyhow::Error> for Cause {
     fn from(value: &anyhow::Error) -> Self {
-        Self(format!("{value:?}"))
+        Self(value.to_string())
     }
 }
 
@@ -251,5 +251,15 @@ mod tests {
         assert_eq!(title.sub_title, Some("Subtitle".to_string()));
         assert_eq!(title.category, Category::Action);
         assert_eq!(title.timestamp, timestamp);
+    }
+
+    #[test]
+    fn test_cause_from_anyhow_error_uses_stable_display_message() {
+        let setup = anyhow::anyhow!("inner provider failure").context("retryable provider error");
+
+        let actual = Cause::from(&setup).into_string();
+        let expected = "retryable provider error".to_string();
+
+        assert_eq!(actual, expected);
     }
 }
