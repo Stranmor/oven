@@ -4051,7 +4051,12 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                         }
                         AppCommand::Exit => return Ok(()),
                         command => {
-                            let should_exit = self.on_command(command).await?;
+                            let should_exit = run_tui_command_with_suspended_stdout(
+                                self,
+                                &mut session,
+                                command,
+                            )
+                            .await?;
                             if should_exit {
                                 return Ok(());
                             }
@@ -5515,32 +5520,44 @@ fn queue_tui_response_and_notify(
         return Ok(());
     }
 
-    struct NotifyGuard<'a>(&'a tokio::sync::Notify);
-    impl Drop for NotifyGuard<'_> {
-        fn drop(&mut self) {
-            self.0.notify_one();
-        }
-    }
-
-    let notify_guard = if let ChatResponse::ToolCallStart { notifier, .. } = message {
-        Some(NotifyGuard(notifier))
-    } else {
-        None
-    };
-
     session.queue_and_render(forge_ui_model::UiModel::from(message))?;
-    if let ChatResponse::ToolCallStart { tool_call, .. } = message
-        && tool_call.requires_stdout()
-    {
-        session.suspend_for_stdout()?;
+    if let ChatResponse::ToolCallStart { tool_call, notifier } = message {
+        if tool_call.requires_stdout() {
+            session.suspend_for_stdout()?;
+        }
+        notifier.notify_one();
     }
-    drop(notify_guard);
     Ok(())
+}
+
+async fn run_tui_command_with_suspended_stdout<
+    A: API + ConsoleWriter + 'static,
+    F: Fn(ForgeConfig) -> A + Send + Sync,
+>(
+    ui: &mut UI<A, F>,
+    session: &mut impl forge_tui::TuiRenderer,
+    command: AppCommand,
+) -> Result<bool> {
+    run_tui_suspended_stdout_boundary(session, ui.on_command(command)).await
+}
+
+async fn run_tui_suspended_stdout_boundary(
+    session: &mut impl forge_tui::TuiRenderer,
+    operation: impl std::future::Future<Output = Result<bool>>,
+) -> Result<bool> {
+    session.suspend_for_stdout()?;
+    let command_result = operation.await;
+    let resume_result = session.resume_after_stdout();
+    let redraw_result = session.queue_and_render(forge_ui_model::UiModel::default());
+    let should_exit = command_result?;
+    resume_result?;
+    redraw_result?;
+    Ok(should_exit)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::{self, Write};
+    use std::io;
     use std::sync::Arc;
 
     use forge_domain::{ToolCallFull, ToolResult};
@@ -5551,22 +5568,13 @@ mod tests {
 
     use super::*;
 
-    struct FailingWrite;
-
-    impl Write for FailingWrite {
-        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
-            Err(io::Error::other("write failed"))
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
     struct ObservingRenderer {
         notifier: Arc<Notify>,
+        saw_notify_before_resume: bool,
         saw_suspend_before_notify: bool,
         saw_resume_before_render: bool,
+        fail_render: bool,
+        fail_suspend: bool,
         render_count: usize,
         suspend_count: usize,
         resume_count: usize,
@@ -5576,12 +5584,23 @@ mod tests {
         fn new(notifier: Arc<Notify>) -> Self {
             Self {
                 notifier,
+                saw_notify_before_resume: false,
                 saw_suspend_before_notify: false,
                 saw_resume_before_render: false,
+                fail_render: false,
+                fail_suspend: false,
                 render_count: 0,
                 suspend_count: 0,
                 resume_count: 0,
             }
+        }
+
+        fn failing_render(notifier: Arc<Notify>) -> Self {
+            Self { fail_render: true, ..Self::new(notifier) }
+        }
+
+        fn failing_suspend(notifier: Arc<Notify>) -> Self {
+            Self { fail_suspend: true, ..Self::new(notifier) }
         }
     }
 
@@ -5592,6 +5611,9 @@ mod tests {
                 .checked_add(1)
                 .expect("fixture render count should not overflow");
             self.saw_resume_before_render = self.resume_count > 0;
+            if self.fail_render {
+                return Err(io::Error::other("render failed"));
+            }
             Ok(())
         }
 
@@ -5601,6 +5623,9 @@ mod tests {
                 .checked_add(1)
                 .expect("fixture suspend count should not overflow");
             self.saw_suspend_before_notify = self.notifier.notified().now_or_never().is_none();
+            if self.fail_suspend {
+                return Err(io::Error::other("suspend failed"));
+            }
             Ok(())
         }
 
@@ -5609,6 +5634,7 @@ mod tests {
                 .resume_count
                 .checked_add(1)
                 .expect("fixture resume count should not overflow");
+            self.saw_notify_before_resume = self.notifier.notified().now_or_never().is_some();
             Ok(())
         }
     }
@@ -5670,21 +5696,23 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    #[test]
-    fn test_tui_initialization_can_be_wrapped_by_stdout_suspension() {
-        let mut setup = ObservingRenderer::new(Arc::new(Notify::new()));
+    #[tokio::test]
+    async fn test_tui_command_boundary_suspends_resumes_and_redraws_without_notifier_release() {
+        let notifier = Arc::new(Notify::new());
+        let mut setup = ObservingRenderer::new(notifier.clone());
 
-        setup
-            .suspend_for_stdout()
-            .expect("fixture TUI renderer should suspend successfully");
-        setup
-            .resume_after_stdout()
-            .expect("fixture TUI renderer should resume successfully");
-        setup
-            .queue_and_render(UiModel::default())
-            .expect("fixture TUI renderer should render successfully");
-        let actual = (setup.suspend_count, setup.resume_count, setup.render_count);
-        let expected = (1, 1, 1);
+        let should_exit = run_tui_suspended_stdout_boundary(&mut setup, async { Ok(false) })
+            .await
+            .expect("fixture TUI command boundary should complete successfully");
+        let actual = (
+            should_exit,
+            setup.suspend_count,
+            setup.resume_count,
+            setup.render_count,
+            setup.saw_notify_before_resume,
+            notifier.notified().now_or_never().is_some(),
+        );
+        let expected = (false, 1, 1, 1, false, false);
         assert_eq!(actual, expected);
     }
 
@@ -5710,19 +5738,39 @@ mod tests {
     }
 
     #[test]
-    fn test_tui_tool_start_notifier_fires_even_when_render_fails() {
+    fn test_tui_tool_start_notifier_waits_when_render_fails() {
         let notifier = Arc::new(Notify::new());
         let fixture = ChatResponse::ToolCallStart {
             tool_call: ToolCallFull::new("shell"),
             notifier: notifier.clone(),
         };
-        let mut setup = forge_tui::TuiSession::new(FailingWrite, 64, 9);
+        let mut setup = ObservingRenderer::failing_render(notifier.clone());
 
         let actual = (
             queue_tui_response_and_notify(&mut setup, &fixture).is_err(),
+            setup.suspend_count,
             notifier.notified().now_or_never().is_some(),
         );
-        let expected = (true, true);
+        let expected = (true, 0, false);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_tui_tool_start_notifier_waits_when_suspend_fails() {
+        let notifier = Arc::new(Notify::new());
+        let fixture = ChatResponse::ToolCallStart {
+            tool_call: ToolCallFull::new("shell"),
+            notifier: notifier.clone(),
+        };
+        let mut setup = ObservingRenderer::failing_suspend(notifier.clone());
+
+        let actual = (
+            queue_tui_response_and_notify(&mut setup, &fixture).is_err(),
+            setup.render_count,
+            setup.suspend_count,
+            notifier.notified().now_or_never().is_some(),
+        );
+        let expected = (true, 1, 1, false);
         assert_eq!(actual, expected);
     }
 
