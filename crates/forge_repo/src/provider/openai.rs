@@ -3,9 +3,8 @@ use std::sync::{Arc, LazyLock};
 use anyhow::{Context as _, Result};
 use forge_app::domain::{
     ChatCompletionMessage, Context as ChatContext, Model, ModelId, ProviderId, ResultStream,
-    Transformer,
 };
-use forge_app::dto::openai::{ListModelResponse, ProviderPipeline, Request, Response};
+use forge_app::dto::openai::{ContentPart, ListModelResponse, MessageContent, Request, Response};
 use forge_app::{EnvironmentInfra, HttpInfra};
 use forge_domain::{ChatRepository, Provider};
 use forge_infra::sanitize_headers;
@@ -150,12 +149,10 @@ impl<H: HttpInfra> OpenAIProvider<H> {
             let has_vision_content = request.messages.as_ref().is_some_and(|messages| {
                 messages.iter().any(|msg| {
                     msg.content.as_ref().is_some_and(|content| match content {
-                        forge_app::dto::openai::MessageContent::Text(_) => false,
-                        forge_app::dto::openai::MessageContent::Parts(parts) => {
-                            parts.iter().any(|part| {
-                                matches!(part, forge_app::dto::openai::ContentPart::ImageUrl { .. })
-                            })
-                        }
+                        MessageContent::Text(_) => false,
+                        MessageContent::Parts(parts) => parts
+                            .iter()
+                            .any(|part| matches!(part, ContentPart::ImageUrl { .. })),
                     })
                 })
             });
@@ -195,11 +192,12 @@ impl<H: HttpInfra> OpenAIProvider<H> {
         context: ChatContext,
         merge_system_messages: bool,
     ) -> ResultStream<ChatCompletionMessage, anyhow::Error> {
-        let mut request = Request::from(context).model(model.clone());
-        request.validate_and_canonicalize_images()?;
-        let mut pipeline = ProviderPipeline::new(&self.provider, merge_system_messages);
-        request = pipeline.transform(request);
-        request.validate_and_canonicalize_images()?;
+        let request = Request::from_context_for_provider(
+            context,
+            model,
+            &self.provider,
+            merge_system_messages,
+        )?;
 
         let url = self.provider.url.clone();
         let headers = create_headers(self.get_headers_with_request(&request));

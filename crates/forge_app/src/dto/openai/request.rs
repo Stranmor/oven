@@ -5,14 +5,16 @@ use derive_setters::Setters;
 use forge_json_repair::coerce_to_schema;
 use serde::{Deserialize, Serialize};
 use strum::IntoEnumIterator;
+use url::Url;
 
 use super::response::{ExtraContent, FunctionCall, ToolCall};
 use super::tool_choice::ToolChoice;
 use crate::domain::{
-    Context, ContextMessage, ContextWindowBudget, ModelId, ToolCallFull, ToolCallId, ToolCatalog,
-    ToolDefinition, ToolName, ToolResult, ToolValue,
+    Context, ContextMessage, ContextWindowBudget, ModelId, Provider, ToolCallFull, ToolCallId,
+    ToolCatalog, ToolDefinition, ToolName, ToolResult, ToolValue, Transformer,
 };
 use crate::dto::openai::ReasoningDetail;
+use crate::dto::openai::transformers::ProviderPipeline;
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct ImageUrl {
@@ -322,6 +324,52 @@ pub struct StreamOptions {
 }
 
 impl Request {
+    /// Builds the exact OpenAI-compatible request shape used by provider dispatch.
+    ///
+    /// # Arguments
+    /// * `context` - Domain context to convert into an OpenAI-compatible request.
+    /// * `model` - Provider-local model identifier attached to the request.
+    /// * `provider` - Provider metadata driving compatibility transformations.
+    /// * `merge_system_messages` - Whether system messages should be merged before dispatch.
+    ///
+    /// # Errors
+    /// Returns an error when image payloads cannot be canonicalized for the provider request.
+    pub fn from_context_for_provider(
+        context: Context,
+        model: &ModelId,
+        provider: &Provider<Url>,
+        merge_system_messages: bool,
+    ) -> anyhow::Result<Self> {
+        let mut request = Request::from(context).model(model.clone());
+        request.validate_and_canonicalize_images()?;
+        let mut pipeline = ProviderPipeline::new(provider, merge_system_messages);
+        let mut request = pipeline.transform(request);
+        request.validate_and_canonicalize_images()?;
+        Ok(request)
+    }
+
+    /// Estimates input tokens from the final serialized OpenAI-compatible provider request.
+    ///
+    /// # Arguments
+    /// * `context` - Domain context to convert into the provider request.
+    /// * `model` - Provider-local model identifier attached to the request.
+    /// * `provider` - Provider metadata driving compatibility transformations.
+    /// * `merge_system_messages` - Whether system messages should be merged before dispatch.
+    ///
+    /// # Errors
+    /// Returns an error when request conversion or serialization fails.
+    pub fn estimate_provider_input_tokens(
+        context: Context,
+        model: &ModelId,
+        provider: &Provider<Url>,
+        merge_system_messages: bool,
+    ) -> anyhow::Result<usize> {
+        let request =
+            Self::from_context_for_provider(context, model, provider, merge_system_messages)?;
+        let serialized_request = serde_json::to_vec(&request)?;
+        Ok(request.estimated_input_tokens_from_serialized(&serialized_request))
+    }
+
     pub fn validate_and_canonicalize_images(&mut self) -> anyhow::Result<()> {
         for message in self.messages.iter_mut().flatten() {
             if let Some(MessageContent::Parts(parts)) = &mut message.content {

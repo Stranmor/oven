@@ -9,9 +9,11 @@ use forge_template::Element;
 use futures::future::join_all;
 use tokio::sync::Notify;
 use tracing::warn;
+use url::Url;
 
 use crate::agent::AgentService;
 use crate::compact::Compactor;
+use crate::dto::openai::Request;
 use crate::transformers::{DropReasoningOnlyMessages, ModelSpecificReasoning};
 use crate::{EnvironmentInfra, TemplateEngine};
 
@@ -194,11 +196,30 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
             .unwrap_or(ContextWindowBudget::DEFAULT_OUTPUT_TOKEN_RESERVATION)
     }
 
+    /// Returns a minimal provider value for provider-pipeline estimation.
+    fn estimation_provider(&self) -> anyhow::Result<Provider<Url>> {
+        Ok(Provider {
+            id: self.agent.provider.clone(),
+            provider_type: ProviderType::Llm,
+            response: Some(ProviderResponse::OpenAI),
+            url: Url::parse("https://context-window-estimator.invalid/v1/chat/completions")?,
+            models: None,
+            auth_methods: vec![],
+            url_params: vec![],
+            credential: None,
+            custom_headers: None,
+        })
+    }
+
     /// Returns the estimated token count for the outbound provider request.
-    fn estimated_request_tokens(context: &Context) -> usize {
-        serde_json::to_vec(context)
-            .map(|payload| payload.len())
-            .unwrap_or_else(|_| context.token_count_approx())
+    fn estimated_request_tokens(&self, context: &Context) -> anyhow::Result<usize> {
+        let provider = self.estimation_provider()?;
+        Request::estimate_provider_input_tokens(
+            context.clone(),
+            &self.agent.model,
+            &provider,
+            self.config.merge_system_messages,
+        )
     }
 
     /// Returns a conservative provider context-window safety margin.
@@ -255,14 +276,14 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
                 )
             })?;
 
-        let estimated_tokens = Self::estimated_request_tokens(&context);
+        let estimated_tokens = self.estimated_request_tokens(&context)?;
         if estimated_tokens <= input_budget {
             return Ok(context);
         }
 
         let compacted = Compactor::new(self.agent.compact.clone(), self.services.get_environment())
             .compact(context, true)?;
-        let compacted_estimated_tokens = Self::estimated_request_tokens(&compacted);
+        let compacted_estimated_tokens = self.estimated_request_tokens(&compacted)?;
         if compacted_estimated_tokens <= input_budget {
             return Ok(compacted);
         }
@@ -715,10 +736,10 @@ mod tests {
         }
     }
 
-    fn model_fixture(context_length: u64) -> Model {
+    fn model_fixture_for_provider(context_length: u64, provider_id: ProviderId) -> Model {
         Model {
             id: ModelId::new("context-guard-model"),
-            provider_id: ProviderId::OPENAI,
+            provider_id,
             name: None,
             description: None,
             context_length: Some(context_length),
@@ -729,13 +750,18 @@ mod tests {
         }
     }
 
-    fn orchestrator_fixture(
+    fn model_fixture(context_length: u64) -> Model {
+        model_fixture_for_provider(context_length, ProviderId::OPENAI)
+    }
+
+    fn orchestrator_fixture_for_provider(
         compact: Compact,
         context_length: u64,
+        provider_id: ProviderId,
     ) -> Orchestrator<FixtureServices> {
         let agent = Agent::new(
             AgentId::new("context_guard_agent"),
-            ProviderId::OPENAI,
+            provider_id.clone(),
             ModelId::new("context-guard-model"),
         )
         .compact(compact);
@@ -746,7 +772,17 @@ mod tests {
             agent,
             forge_config::ForgeConfig::default(),
         )
-        .models(vec![model_fixture(context_length)])
+        .models(vec![model_fixture_for_provider(
+            context_length,
+            provider_id,
+        )])
+    }
+
+    fn orchestrator_fixture(
+        compact: Compact,
+        context_length: u64,
+    ) -> Orchestrator<FixtureServices> {
+        orchestrator_fixture_for_provider(compact, context_length, ProviderId::OPENAI)
     }
 
     fn droppable_user_message(content: String) -> ContextMessage {
@@ -774,20 +810,18 @@ mod tests {
             .add_message(ContextMessage::user("fresh user request", None))
             .max_tokens(2_000_usize);
 
-        let original_estimated_tokens =
-            Orchestrator::<FixtureServices>::estimated_request_tokens(&context);
+        let original_estimated_tokens = fixture.estimated_request_tokens(&context).unwrap();
         let actual = fixture.preflight_context_window(context).unwrap();
         let input_budget =
             Orchestrator::<FixtureServices>::effective_input_budget(40_000, 2_000).unwrap();
         let expected = true;
 
         assert_eq!(
-            Orchestrator::<FixtureServices>::estimated_request_tokens(&actual)
-                < original_estimated_tokens,
+            fixture.estimated_request_tokens(&actual).unwrap() < original_estimated_tokens,
             expected
         );
         assert_eq!(
-            Orchestrator::<FixtureServices>::estimated_request_tokens(&actual) <= input_budget,
+            fixture.estimated_request_tokens(&actual).unwrap() <= input_budget,
             expected
         );
     }
@@ -884,22 +918,71 @@ mod tests {
 
     #[test]
     fn test_regression_230k_threshold_with_60k_output_exceeds_266k_window_budget() {
-        let fixture = Context::default()
+        let fixture = orchestrator_fixture(Compact::new().retention_window(1_usize), 266_300);
+        let fixture_context = Context::default()
             .add_message(ContextMessage::user(large_text(230_000), None))
             .max_tokens(60_000_usize);
         let input_budget =
             Orchestrator::<FixtureServices>::effective_input_budget(266_300, 60_000).unwrap();
 
-        let actual =
-            Orchestrator::<FixtureServices>::estimated_request_tokens(&fixture) > input_budget;
+        let actual = fixture.estimated_request_tokens(&fixture_context).unwrap() > input_budget;
         let expected = true;
 
         assert_eq!(actual, expected);
     }
 
     #[test]
-    fn test_request_estimate_includes_tool_definitions() {
-        let fixture = Context::default()
+    fn test_preflight_uses_provider_serialized_request_estimate_after_pipeline() {
+        let context = Context::default()
+            .add_message(ContextMessage::system("system prompt"))
+            .add_message(ContextMessage::user(large_text(8_000), None))
+            .add_tool(
+                ToolDefinition::new("schema_heavy_tool")
+                    .description(large_text(750))
+                    .input_schema(schemars::schema_for!(())),
+            )
+            .max_tokens(512_usize);
+        let estimation_fixture =
+            orchestrator_fixture(Compact::new().retention_window(1_usize), 128_000);
+        let domain_estimated_tokens = serde_json::to_vec(&context).unwrap().len();
+        let provider_estimated_tokens = estimation_fixture
+            .estimated_request_tokens(&context)
+            .unwrap();
+        let context_window = (8_000_usize..128_000)
+            .find(|context_window| {
+                Orchestrator::<FixtureServices>::effective_input_budget(*context_window, 512)
+                    .is_some_and(|budget| {
+                        domain_estimated_tokens <= budget && provider_estimated_tokens > budget
+                    })
+            })
+            .expect("fixture should expose provider serialization overhead gap");
+        let fixture = orchestrator_fixture(
+            Compact::new().retention_window(1_usize),
+            context_window as u64,
+        );
+
+        let actual = fixture
+            .preflight_context_window(context)
+            .unwrap_err()
+            .to_string();
+        let expected = true;
+
+        assert_eq!(
+            provider_estimated_tokens > domain_estimated_tokens,
+            expected
+        );
+        assert_eq!(actual.contains("estimated request is"), expected);
+    }
+
+    #[test]
+    fn test_preflight_provider_serialized_estimate_supports_custom_openai_compatible_provider() {
+        let provider_id = ProviderId::from("vllm".to_string());
+        let fixture = orchestrator_fixture_for_provider(
+            Compact::new().retention_window(1_usize),
+            128_000,
+            provider_id,
+        );
+        let context = Context::default()
             .add_message(ContextMessage::user("short", None))
             .add_tool(
                 ToolDefinition::new("large_tool")
@@ -907,8 +990,26 @@ mod tests {
                     .input_schema(schemars::schema_for!(())),
             );
 
-        let actual = Orchestrator::<FixtureServices>::estimated_request_tokens(&fixture)
-            > fixture.token_count_approx();
+        let actual = fixture.estimated_request_tokens(&context).unwrap()
+            > serde_json::to_vec(&context).unwrap().len();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_request_estimate_includes_tool_definitions() {
+        let fixture = orchestrator_fixture(Compact::new().retention_window(1_usize), 64_000);
+        let context = Context::default()
+            .add_message(ContextMessage::user("short", None))
+            .add_tool(
+                ToolDefinition::new("large_tool")
+                    .description(large_text(1_000))
+                    .input_schema(schemars::schema_for!(())),
+            );
+
+        let actual =
+            fixture.estimated_request_tokens(&context).unwrap() > context.token_count_approx();
         let expected = true;
 
         assert_eq!(actual, expected);
