@@ -315,8 +315,9 @@ mod tests {
                 .unwrap(),
         ];
         assert_eq!(actual.len(), 2);
-        assert_eq!(actual[0].content, expected[0].content);
-        assert_eq!(actual[1].content, expected[1].content);
+        let actual_contents: Vec<_> = actual.iter().map(|todo| &todo.content).collect();
+        let expected_contents: Vec<_> = expected.iter().map(|todo| &todo.content).collect();
+        assert_eq!(actual_contents, expected_contents);
     }
 
     #[test]
@@ -330,10 +331,13 @@ mod tests {
             .apply_todo_changes(vec![todo_item("Task A", TodoStatus::Completed)])
             .unwrap();
 
-        let actual = fixture.get_todos().to_vec();
-        assert_eq!(actual.len(), 1);
-        assert_eq!(actual[0].content, "Task A");
-        assert_eq!(actual[0].status, TodoStatus::Completed);
+        let actual = fixture
+            .get_todos()
+            .first()
+            .expect("expected task A")
+            .clone();
+        assert_eq!(actual.content, "Task A");
+        assert_eq!(actual.status, TodoStatus::Completed);
     }
 
     #[test]
@@ -350,9 +354,11 @@ mod tests {
             .apply_todo_changes(vec![todo_item("Task A", TodoStatus::Cancelled)])
             .unwrap();
 
-        let actual = fixture.get_todos().to_vec();
-        assert_eq!(actual.len(), 1);
-        assert_eq!(actual[0].content, "Task B");
+        let actual = fixture
+            .get_todos()
+            .first()
+            .expect("expected remaining task");
+        assert_eq!(actual.content, "Task B");
     }
 
     #[test]
@@ -396,7 +402,10 @@ mod tests {
         // Only active todos are returned
         let active = fixture.get_active_todos();
         assert_eq!(active.len(), 1);
-        assert_eq!(active[0].content, "Task B");
+        assert_eq!(
+            active.first().expect("expected active task").content,
+            "Task B"
+        );
 
         // But Task A is still in the full list
         let all = fixture.get_todos().to_vec();

@@ -425,7 +425,7 @@ mod tests {
     fn test_generated_plugin_wraps_zle_commands_with_osc133_markers() {
         use pretty_assertions::assert_eq;
 
-        let fixture = generate_zsh_plugin().unwrap();
+        let fixture = generate_zsh_plugin().expect("fixture zsh plugin should be generated");
         let actual = fixture.contains(
             "    _forge_osc133_emit \"B\"\n    _forge_osc133_emit \"C\"\n    case \"$user_action\" in",
         ) && fixture.contains(
@@ -441,7 +441,7 @@ mod tests {
     fn test_generated_plugin_registers_zvm_after_init_hook() {
         use pretty_assertions::assert_eq;
 
-        let fixture = generate_zsh_plugin().unwrap();
+        let fixture = generate_zsh_plugin().expect("fixture zsh plugin should be generated");
         let actual = fixture.contains("function _forge_apply_keybindings()")
             && fixture.contains("typeset -ga zvm_after_init_commands")
             && fixture.contains("zvm_after_init_commands+=('_forge_apply_keybindings')");
@@ -454,10 +454,12 @@ mod tests {
         use tempfile::TempDir;
 
         // Lock to prevent parallel test execution that modifies env vars
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .expect("environment lock should not be poisoned");
 
         // Create a temporary directory for the test
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("fixture temp directory should be created");
         let zshrc_path = temp_dir.path().join(".zshrc");
 
         // Set HOME to temp directory
@@ -511,10 +513,12 @@ mod tests {
         use tempfile::TempDir;
 
         // Lock to prevent parallel test execution that modifies env vars
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .expect("environment lock should not be poisoned");
 
         // Create a temporary directory for the test
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("fixture temp directory should be created");
         let zshrc_path = temp_dir.path().join(".zshrc");
 
         // Set HOME to temp directory
@@ -570,10 +574,12 @@ mod tests {
         use tempfile::TempDir;
 
         // Lock to prevent parallel test execution that modifies env vars
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .expect("environment lock should not be poisoned");
 
         // Create a temporary directory for the test
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("fixture temp directory should be created");
         let zshrc_path = temp_dir.path().join(".zshrc");
 
         // Set HOME to temp directory
@@ -635,10 +641,12 @@ mod tests {
         use tempfile::TempDir;
 
         // Lock to prevent parallel test execution that modifies env vars
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .expect("environment lock should not be poisoned");
 
         // Create a temporary directory for the test
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("fixture temp directory should be created");
         let zshrc_path = temp_dir.path().join(".zshrc");
 
         // Set HOME to temp directory
@@ -692,10 +700,12 @@ mod tests {
         use tempfile::TempDir;
 
         // Lock to prevent parallel test execution that modifies env vars
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .expect("environment lock should not be poisoned");
 
         // Create a temporary directory for the test
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("fixture temp directory should be created");
         let zshrc_path = temp_dir.path().join(".zshrc");
 
         // Set HOME to temp directory
@@ -714,7 +724,11 @@ mod tests {
 
         // First setup should not create a backup (no existing file)
         assert!(
-            result.as_ref().unwrap().backup_path.is_none(),
+            result
+                .as_ref()
+                .expect("initial zsh setup should succeed")
+                .backup_path
+                .is_none(),
             "Should not create backup on initial setup"
         );
 
@@ -733,13 +747,21 @@ mod tests {
         assert!(result.is_ok(), "Update setup should succeed: {:?}", result);
 
         // Second setup should create a backup (existing file)
-        let backup_path = result.as_ref().unwrap().backup_path.as_ref();
+        let backup_path = result
+            .as_ref()
+            .expect("update zsh setup should succeed")
+            .backup_path
+            .as_ref();
         assert!(backup_path.is_some(), "Should create backup on update");
-        let backup = backup_path.unwrap();
+        let backup = backup_path.expect("backup path should be present after update");
         assert!(backup.exists(), "Backup file should exist at {:?}", backup);
 
         // Verify backup filename contains timestamp
-        let backup_name = backup.file_name().unwrap().to_str().unwrap();
+        let backup_name = backup
+            .file_name()
+            .expect("backup path should have a file name")
+            .to_str()
+            .expect("backup file name should be valid UTF-8");
         assert!(
             backup_name.starts_with(".zshrc.bak."),
             "Backup filename should start with .zshrc.bak.: {}",

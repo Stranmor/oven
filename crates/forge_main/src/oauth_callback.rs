@@ -348,12 +348,15 @@ mod tests {
 
     fn sample_code_request(authorization_url: &str) -> CodeRequest {
         CodeRequest {
-            authorization_url: Url::parse(authorization_url).unwrap(),
+            authorization_url: Url::parse(authorization_url)
+                .expect("fixture authorization URL should be valid"),
             state: State::from("expected-state".to_string()),
             pkce_verifier: Some(PkceVerifier::from("verifier".to_string())),
             oauth_config: OAuthConfig {
-                auth_url: Url::parse("https://auth.openai.com/oauth/authorize").unwrap(),
-                token_url: Url::parse("https://auth.openai.com/oauth/token").unwrap(),
+                auth_url: Url::parse("https://auth.openai.com/oauth/authorize")
+                    .expect("fixture auth URL should be valid"),
+                token_url: Url::parse("https://auth.openai.com/oauth/token")
+                    .expect("fixture token URL should be valid"),
                 client_id: "client-id".to_string().into(),
                 scopes: vec!["openid".to_string()],
                 redirect_uri: Some("http://localhost:1455/auth/callback".to_string()),
@@ -366,20 +369,33 @@ mod tests {
     }
 
     fn sample_callback_server() -> (Arc<Server>, SocketAddr, Arc<AtomicBool>) {
-        let fixture = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = fixture.local_addr().unwrap();
-        let server = Arc::new(Server::from_listener(fixture, None).unwrap());
+        let fixture = TcpListener::bind("127.0.0.1:0")
+            .expect("fixture TCP listener should bind to localhost");
+        let addr = fixture
+            .local_addr()
+            .expect("fixture TCP listener local address should be available");
+        let server = Arc::new(
+            Server::from_listener(fixture, None)
+                .expect("fixture callback server should be created"),
+        );
         let shutdown = Arc::new(AtomicBool::new(false));
         (server, addr, shutdown)
     }
 
     fn send_http_request(addr: SocketAddr, request: &str) -> String {
-        let mut fixture = TcpStream::connect(addr).unwrap();
-        fixture.write_all(request.as_bytes()).unwrap();
-        fixture.shutdown(Shutdown::Write).unwrap();
+        let mut fixture =
+            TcpStream::connect(addr).expect("fixture TCP stream should connect to callback server");
+        fixture
+            .write_all(request.as_bytes())
+            .expect("fixture HTTP request should be written");
+        fixture
+            .shutdown(Shutdown::Write)
+            .expect("fixture TCP stream write side should shut down");
 
         let mut actual = String::new();
-        fixture.read_to_string(&mut actual).unwrap();
+        fixture
+            .read_to_string(&mut actual)
+            .expect("fixture HTTP response should be readable");
         actual
     }
 
@@ -389,7 +405,8 @@ mod tests {
             "https://auth.openai.com/oauth/authorize?client_id=test&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&state=expected-state",
         );
 
-        let actual = localhost_oauth_redirect_uri(&setup).unwrap();
+        let actual = localhost_oauth_redirect_uri(&setup)
+            .expect("fixture localhost redirect URI should be extracted");
 
         let expected = "http://localhost:1455/auth/callback";
         assert_eq!(actual.as_str(), expected);
@@ -400,7 +417,8 @@ mod tests {
         let mut setup = sample_code_request("https://auth.openai.com/oauth/authorize");
         setup.oauth_config.redirect_uri = Some("http://[::1]:1455/auth/callback".to_string());
 
-        let actual = localhost_oauth_redirect_uri(&setup).unwrap();
+        let actual = localhost_oauth_redirect_uri(&setup)
+            .expect("fixture localhost redirect URI should be extracted");
 
         let expected = "http://[::1]:1455/auth/callback";
         assert_eq!(actual.as_str(), expected);
@@ -425,9 +443,11 @@ mod tests {
             "expected-state".to_string(),
             shutdown,
         )
-        .unwrap();
+        .expect("fixture valid callback should complete successfully");
 
-        let response = fixture.join().unwrap();
+        let response = fixture
+            .join()
+            .expect("fixture callback request thread should join successfully");
         let expected = "auth-code".to_string();
         assert_eq!(actual, expected);
         assert!(response.contains("200 OK"));
@@ -457,9 +477,11 @@ mod tests {
             "expected-state".to_string(),
             shutdown,
         )
-        .unwrap();
+        .expect("fixture valid callback should complete successfully");
 
-        let responses = fixture.join().unwrap();
+        let responses = fixture
+            .join()
+            .expect("fixture callback request thread should join successfully");
         let expected = "auth-code".to_string();
         assert_eq!(actual, expected);
         assert!(responses.0.contains("400 Bad Request"));
@@ -490,9 +512,11 @@ mod tests {
             "expected-state".to_string(),
             shutdown,
         )
-        .unwrap();
+        .expect("fixture valid callback should complete successfully");
 
-        let responses = fixture.join().unwrap();
+        let responses = fixture
+            .join()
+            .expect("fixture callback request thread should join successfully");
         let expected = "auth-code".to_string();
         assert_eq!(actual, expected);
         assert!(responses.0.contains("405 Method Not Allowed"));
@@ -518,9 +542,11 @@ mod tests {
             "expected-state".to_string(),
             shutdown,
         )
-        .unwrap_err();
+        .expect_err("fixture terminal OAuth error should fail callback wait");
 
-        let response = fixture.join().unwrap();
+        let response = fixture
+            .join()
+            .expect("fixture callback request thread should join successfully");
         let expected = "Authorization failed (access_denied: user cancelled)";
         assert_eq!(actual.to_string(), expected);
         assert!(response.contains("400 Bad Request"));

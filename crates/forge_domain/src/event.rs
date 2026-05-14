@@ -3,7 +3,6 @@ use std::fmt::Write;
 
 use derive_more::{Deref, From};
 use derive_setters::Setters;
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -104,7 +103,8 @@ pub struct EventContext {
     terminal_context: Option<TerminalContext>,
 }
 
-/// Request-scoped live runtime time context rendered as an uncached prompt message.
+/// Request-scoped live runtime time context rendered as an uncached prompt
+/// message.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct LiveRuntimeContext {
     current_date: String,
@@ -173,7 +173,11 @@ impl LiveRuntimeContext {
     ///
     /// # Arguments
     /// * `current_time` - Timestamp captured once for the current chat request.
-    pub fn from_local(current_time: chrono::DateTime<chrono::Local>) -> Self {
+    pub fn from_local<Tz>(current_time: chrono::DateTime<Tz>) -> Self
+    where
+        Tz: chrono::TimeZone,
+        Tz::Offset: std::fmt::Display,
+    {
         Self {
             current_date: current_time.format("%Y-%m-%d").to_string(),
             current_datetime: current_time.to_rfc3339(),
@@ -322,9 +326,8 @@ mod tests {
 
     #[test]
     fn test_live_runtime_context_from_local_uses_request_timestamp() {
-        let current_time = chrono::DateTime::parse_from_rfc3339("2026-05-13T12:34:56+03:00")
-            .unwrap()
-            .with_timezone(&chrono::Local);
+        let current_time =
+            chrono::DateTime::parse_from_rfc3339("2026-05-13T12:34:56+03:00").unwrap();
         let actual = LiveRuntimeContext::from_local(current_time);
         let expected = (
             "2026-05-13",
@@ -345,9 +348,8 @@ mod tests {
 
     #[test]
     fn test_live_runtime_context_renders_prompt_xml() {
-        let current_time = chrono::DateTime::parse_from_rfc3339("2026-05-13T12:34:56+03:00")
-            .unwrap()
-            .with_timezone(&chrono::Local);
+        let current_time =
+            chrono::DateTime::parse_from_rfc3339("2026-05-13T12:34:56+03:00").unwrap();
         let actual = LiveRuntimeContext::from_local(current_time).render_prompt_xml();
         let expected = "<runtime_context freshness=\"live\" cache=\"uncached\">\n<current_date>2026-05-13</current_date>\n<current_datetime>2026-05-13T12:34:56+03:00</current_datetime>\n<timezone_offset>+03:00</timezone_offset>\n<unix_timestamp>1778664896</unix_timestamp>\n</runtime_context>";
         assert_eq!(actual, expected);

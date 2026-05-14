@@ -126,12 +126,33 @@ mod tests {
         styled.buffer.iter().map(|(style, _)| *style).collect()
     }
 
+    fn part<'a>(parts: &'a [(Style, &'a str)], index: usize) -> (Style, &'a str) {
+        parts
+            .get(index)
+            .copied()
+            .expect("expected styled part should be present")
+    }
+
+    fn style_at(styled: &StyledText, index: usize) -> Style {
+        *styles(styled)
+            .get(index)
+            .expect("expected styled segment should be present")
+    }
+
+    fn buffer_style_at(styled: &StyledText, index: usize) -> Style {
+        styled
+            .buffer
+            .get(index)
+            .map(|(style, _)| *style)
+            .expect("expected buffer segment should be present")
+    }
+
     #[test]
     fn test_slash_command_highlighted() {
         let fixture = ForgeHighlighter;
         let actual = fixture.highlight("/compact", 0);
         assert_eq!(render(&actual), "/compact");
-        assert_eq!(styles(&actual)[0], Style::new().bold().fg(Color::Yellow));
+        assert_eq!(style_at(&actual, 0), Style::new().bold().fg(Color::Yellow));
     }
 
     #[test]
@@ -139,7 +160,7 @@ mod tests {
         let fixture = ForgeHighlighter;
         let actual = fixture.highlight(":compact", 0);
         assert_eq!(render(&actual), ":compact");
-        assert_eq!(styles(&actual)[0], Style::new().bold().fg(Color::Yellow));
+        assert_eq!(style_at(&actual, 0), Style::new().bold().fg(Color::Yellow));
     }
 
     #[test]
@@ -151,8 +172,11 @@ mod tests {
             .iter()
             .map(|(s, t)| (*s, t.as_str()))
             .collect();
-        assert_eq!(parts[0], (Style::new().bold().fg(Color::Yellow), ":commit"));
-        assert_eq!(parts[1].1, " some message");
+        assert_eq!(
+            part(&parts, 0),
+            (Style::new().bold().fg(Color::Yellow), ":commit")
+        );
+        assert_eq!(part(&parts, 1).1, " some message");
     }
 
     #[test]
@@ -164,8 +188,11 @@ mod tests {
             .iter()
             .map(|(s, t)| (*s, t.as_str()))
             .collect();
-        assert_eq!(parts[0], (Style::new().bold().fg(Color::Yellow), "/commit"));
-        assert_eq!(parts[1].1, " some message");
+        assert_eq!(
+            part(&parts, 0),
+            (Style::new().bold().fg(Color::Yellow), "/commit")
+        );
+        assert_eq!(part(&parts, 1).1, " some message");
     }
 
     #[test]
@@ -173,7 +200,7 @@ mod tests {
         let fixture = ForgeHighlighter;
         let actual = fixture.highlight("!ls -la", 0);
         assert_eq!(render(&actual), "!ls -la");
-        assert_eq!(styles(&actual)[0], Style::new().fg(Color::Magenta));
+        assert_eq!(style_at(&actual, 0), Style::new().fg(Color::Magenta));
     }
 
     #[test]
@@ -185,12 +212,12 @@ mod tests {
             .iter()
             .map(|(s, t)| (*s, t.as_str()))
             .collect();
-        assert_eq!(parts[0], (Style::new(), "explain "));
+        assert_eq!(part(&parts, 0), (Style::new(), "explain "));
         assert_eq!(
-            parts[1],
+            part(&parts, 1),
             (Style::new().bold().fg(Color::Cyan), "@[src/main.rs]")
         );
-        assert_eq!(parts[2], (Style::new(), " please"));
+        assert_eq!(part(&parts, 2), (Style::new(), " please"));
     }
 
     #[test]
@@ -199,8 +226,14 @@ mod tests {
         let actual = fixture.highlight("@[a.rs] and @[b.rs]", 0);
         let texts: Vec<_> = actual.buffer.iter().map(|(_, t)| t.as_str()).collect();
         assert_eq!(texts, vec!["@[a.rs]", " and ", "@[b.rs]"]);
-        assert_eq!(actual.buffer[0].0, Style::new().bold().fg(Color::Cyan));
-        assert_eq!(actual.buffer[2].0, Style::new().bold().fg(Color::Cyan));
+        assert_eq!(
+            buffer_style_at(&actual, 0),
+            Style::new().bold().fg(Color::Cyan)
+        );
+        assert_eq!(
+            buffer_style_at(&actual, 2),
+            Style::new().bold().fg(Color::Cyan)
+        );
     }
 
     #[test]
@@ -208,7 +241,7 @@ mod tests {
         let fixture = ForgeHighlighter;
         let actual = fixture.highlight("hello world", 0);
         assert_eq!(render(&actual), "hello world");
-        assert_eq!(styles(&actual)[0], Style::new());
+        assert_eq!(style_at(&actual, 0), Style::new());
     }
 
     #[test]
@@ -226,7 +259,7 @@ mod tests {
         let fixture = ForgeHighlighter;
         let actual = fixture.highlight("@[src/main.rs:10:20]", 0);
         assert_eq!(render(&actual), "@[src/main.rs:10:20]");
-        assert_eq!(styles(&actual)[0], Style::new().bold().fg(Color::Cyan));
+        assert_eq!(style_at(&actual, 0), Style::new().bold().fg(Color::Cyan));
     }
 
     #[test]
@@ -240,7 +273,7 @@ mod tests {
             .map(|(s, t)| (*s, t.as_str()))
             .collect();
         assert_eq!(
-            parts[1],
+            part(&parts, 1),
             (Style::new().bold().fg(Color::Cyan), "@[src/lib.rs#my_fn]")
         );
     }
@@ -268,13 +301,16 @@ mod tests {
             .iter()
             .map(|(s, t)| (*s, t.as_str()))
             .collect();
-        assert_eq!(parts[0], (Style::new().bold().fg(Color::Yellow), "/review"));
-        assert_eq!(parts[1], (Style::new(), " "));
         assert_eq!(
-            parts[2],
+            part(&parts, 0),
+            (Style::new().bold().fg(Color::Yellow), "/review")
+        );
+        assert_eq!(part(&parts, 1), (Style::new(), " "));
+        assert_eq!(
+            part(&parts, 2),
             (Style::new().bold().fg(Color::Cyan), "@[src/main.rs]")
         );
-        assert_eq!(parts[3], (Style::new(), " please"));
+        assert_eq!(part(&parts, 3), (Style::new(), " please"));
     }
 
     #[test]
@@ -286,10 +322,13 @@ mod tests {
             .iter()
             .map(|(s, t)| (*s, t.as_str()))
             .collect();
-        assert_eq!(parts[0], (Style::new().bold().fg(Color::Yellow), ":review"));
-        assert_eq!(parts[1], (Style::new(), " "));
         assert_eq!(
-            parts[2],
+            part(&parts, 0),
+            (Style::new().bold().fg(Color::Yellow), ":review")
+        );
+        assert_eq!(part(&parts, 1), (Style::new(), " "));
+        assert_eq!(
+            part(&parts, 2),
             (Style::new().bold().fg(Color::Cyan), "@[src/lib.rs]")
         );
     }
@@ -300,6 +339,6 @@ mod tests {
         let fixture = ForgeHighlighter;
         let actual = fixture.highlight("email@example.com", 0);
         assert_eq!(render(&actual), "email@example.com");
-        assert_eq!(styles(&actual)[0], Style::new());
+        assert_eq!(style_at(&actual, 0), Style::new());
     }
 }

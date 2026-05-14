@@ -91,8 +91,18 @@ mod tests {
         let actual = fixture.eval(&operation);
 
         assert_eq!(actual.len(), 2);
-        assert_eq!(actual[0].as_ref().unwrap(), &Permission::Allow);
-        assert_eq!(actual[1], None); // Second rule doesn't match
+        assert_eq!(
+            actual
+                .first()
+                .expect("expected first policy evaluation")
+                .as_ref()
+                .expect("expected first policy to match"),
+            &Permission::Allow
+        );
+        assert_eq!(
+            actual.get(1).expect("expected second policy evaluation"),
+            &None
+        ); // Second rule doesn't match
     }
 
     #[cfg(test)]
@@ -109,17 +119,23 @@ mod tests {
             assert_eq!(policies.policies.len(), 3);
 
             // Test first policy - get first policy from the set
-            let first_policy = policies.policies.iter().next().unwrap();
-            if let Policy::Simple { permission, rule } = first_policy {
-                assert_eq!(permission, &Permission::Allow);
-                if let Rule::Read(rule) = rule {
-                    assert_eq!(rule.read, "**/*.rs");
-                } else {
-                    panic!("Expected Read rule");
-                }
-            } else {
-                panic!("Expected Simple policy");
+            let first_policy = policies
+                .policies
+                .iter()
+                .next()
+                .expect("expected first policy");
+            let (permission, rule) = match first_policy {
+                Policy::Simple { permission, rule } => Some((permission, rule)),
+                _ => None,
             }
+            .expect("expected simple policy");
+            assert_eq!(permission, &Permission::Allow);
+            let rule = match rule {
+                Rule::Read(rule) => Some(rule),
+                _ => None,
+            }
+            .expect("expected read rule");
+            assert_eq!(rule.read, "**/*.rs");
 
             // Test round-trip serialization
             let serialized = serde_yml::to_string(&policies).expect("Failed to serialize policies");

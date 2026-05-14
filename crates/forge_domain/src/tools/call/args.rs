@@ -244,8 +244,8 @@ mod tests {
             "Should be JSON object, got: {}",
             serialized
         );
-        assert_eq!(reparsed["param"], "value");
-        assert_eq!(reparsed["count"], 42);
+        assert_eq!(reparsed.get("param").expect("expected param"), "value");
+        assert_eq!(reparsed.get("count").expect("expected count"), 42);
     }
 
     #[test]
@@ -414,10 +414,10 @@ mod tests {
         // Should be converted to Parsed
         match normalized {
             ToolCallArguments::Parsed(value) => {
-                assert_eq!(value["file_path"], "/test");
-                assert_eq!(value["content"], "hello");
+                assert_eq!(value.get("file_path").expect("expected file_path"), "/test");
+                assert_eq!(value.get("content").expect("expected content"), "hello");
             }
-            ToolCallArguments::Unparsed(_) => panic!("Should be Parsed after normalization"),
+            ToolCallArguments::Unparsed(_) => unreachable!("normalization should parse valid JSON"),
         }
     }
 
@@ -428,8 +428,10 @@ mod tests {
         let normalized = fixture.normalize();
 
         match normalized {
-            ToolCallArguments::Parsed(value) => assert_eq!(value["key"], "value"),
-            ToolCallArguments::Unparsed(_) => panic!("Should remain Parsed"),
+            ToolCallArguments::Parsed(value) => {
+                assert_eq!(value.get("key").expect("expected key"), "value");
+            }
+            ToolCallArguments::Unparsed(_) => unreachable!("parsed value should remain parsed"),
         }
     }
 
@@ -450,7 +452,7 @@ mod tests {
                 );
             }
             ToolCallArguments::Unparsed(_) => {
-                panic!("Should be Parsed (with fallback) even for malformed JSON")
+                unreachable!("malformed JSON should normalize into fallback parsed object")
             }
         }
     }

@@ -1,8 +1,10 @@
 //! Shared deterministic helpers for project-model modules.
 
-use crate::types::{EdgeConfidence, GraphEdge, GraphEdgeKind, Language, Provenance, SourceFile};
-use sha2::{Digest, Sha256};
 use std::path::Path;
+
+use sha2::{Digest, Sha256};
+
+use crate::types::{EdgeConfidence, GraphEdge, GraphEdgeKind, Language, Provenance, SourceFile};
 
 /// Builds a redaction-safe SHA-256 fingerprint for arbitrary sensitive text.
 ///

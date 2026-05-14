@@ -464,7 +464,9 @@ mod tests {
     fn test_telegram_notification_request_uses_configured_chat_id_without_leaking_token_to_payload()
     {
         let fixture = TelegramCompletionNotification {
-            chat_id: Some(TelegramChatId::new("432567587").unwrap()),
+            chat_id: Some(
+                TelegramChatId::new("432567587").expect("fixture Telegram chat ID should be valid"),
+            ),
             ..Default::default()
         };
         let setup = CompletionNotificationContext::new("Finished: Task")
@@ -509,7 +511,9 @@ mod tests {
     #[test]
     fn test_telegram_notification_request_is_absent_without_token() {
         let fixture = TelegramCompletionNotification {
-            chat_id: Some(TelegramChatId::new("432567587").unwrap()),
+            chat_id: Some(
+                TelegramChatId::new("432567587").expect("fixture Telegram chat ID should be valid"),
+            ),
             ..Default::default()
         };
 

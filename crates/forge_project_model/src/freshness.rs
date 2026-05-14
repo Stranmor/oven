@@ -1,9 +1,11 @@
 //! Freshness comparison for deterministic project manifests.
 
-use crate::types::{FreshnessState, ProjectManifest};
 use std::collections::BTreeMap;
 
-/// Compares two manifests and returns deterministic freshness invalidation details.
+use crate::types::{FreshnessState, ProjectManifest};
+
+/// Compares two manifests and returns deterministic freshness invalidation
+/// details.
 ///
 /// # Arguments
 ///

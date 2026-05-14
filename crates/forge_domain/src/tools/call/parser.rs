@@ -283,12 +283,33 @@ mod tests {
         let expected = vec![tool.build_expected()];
         assert_eq!(action, expected);
 
-        if let Value::Object(map) = &action[0].arguments.parse().unwrap() {
-            assert!(matches!(map["int_value"], Value::Number(_)));
-            assert!(matches!(map["float_value"], Value::Number(_)));
-            assert!(matches!(map["large_int"], Value::Number(_)));
-            assert!(matches!(map["zero"], Value::Number(_)));
-            assert!(matches!(map["negative"], Value::Number(_)));
+        let parsed = action
+            .first()
+            .expect("expected parsed tool call")
+            .arguments
+            .parse()
+            .expect("expected numeric arguments to parse");
+        if let Value::Object(map) = &parsed {
+            assert!(matches!(
+                map.get("int_value").expect("expected int_value"),
+                Value::Number(_)
+            ));
+            assert!(matches!(
+                map.get("float_value").expect("expected float_value"),
+                Value::Number(_)
+            ));
+            assert!(matches!(
+                map.get("large_int").expect("expected large_int"),
+                Value::Number(_)
+            ));
+            assert!(matches!(
+                map.get("zero").expect("expected zero"),
+                Value::Number(_)
+            ));
+            assert!(matches!(
+                map.get("negative").expect("expected negative"),
+                Value::Number(_)
+            ));
         }
     }
 
@@ -304,11 +325,29 @@ mod tests {
         let expected = vec![tool.build_expected()];
         assert_eq!(action, expected);
 
-        if let Value::Object(map) = &action[0].arguments.parse().unwrap() {
-            assert_eq!(map["bool1"], Value::Bool(true));
-            assert_eq!(map["bool2"], Value::Bool(false));
-            assert_eq!(map["bool3"], Value::Bool(true));
-            assert_eq!(map["bool4"], Value::Bool(false));
+        let parsed = action
+            .first()
+            .expect("expected parsed tool call")
+            .arguments
+            .parse()
+            .expect("expected numeric arguments to parse");
+        if let Value::Object(map) = &parsed {
+            assert_eq!(
+                map.get("bool1").expect("expected bool1"),
+                &Value::Bool(true)
+            );
+            assert_eq!(
+                map.get("bool2").expect("expected bool2"),
+                &Value::Bool(false)
+            );
+            assert_eq!(
+                map.get("bool3").expect("expected bool3"),
+                &Value::Bool(true)
+            );
+            assert_eq!(
+                map.get("bool4").expect("expected bool4"),
+                &Value::Bool(false)
+            );
         }
     }
 
@@ -325,12 +364,33 @@ mod tests {
         let expected = vec![tool.build_expected()];
         assert_eq!(action, expected);
 
-        if let Value::Object(map) = &action[0].arguments.parse().unwrap() {
-            assert!(matches!(map["text"], Value::String(_)));
-            assert!(matches!(map["number"], Value::Number(_)));
-            assert!(matches!(map["float"], Value::Number(_)));
-            assert!(matches!(map["bool"], Value::Bool(_)));
-            assert!(matches!(map["complex"], Value::String(_)));
+        let parsed = action
+            .first()
+            .expect("expected parsed tool call")
+            .arguments
+            .parse()
+            .expect("expected numeric arguments to parse");
+        if let Value::Object(map) = &parsed {
+            assert!(matches!(
+                map.get("text").expect("expected text"),
+                Value::String(_)
+            ));
+            assert!(matches!(
+                map.get("number").expect("expected number"),
+                Value::Number(_)
+            ));
+            assert!(matches!(
+                map.get("float").expect("expected float"),
+                Value::Number(_)
+            ));
+            assert!(matches!(
+                map.get("bool").expect("expected bool"),
+                Value::Bool(_)
+            ));
+            assert!(matches!(
+                map.get("complex").expect("expected complex"),
+                Value::String(_)
+            ));
         }
     }
 

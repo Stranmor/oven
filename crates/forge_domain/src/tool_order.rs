@@ -271,11 +271,8 @@ mod tests {
 
         let names: Vec<String> = actual.tools.iter().map(|t| t.to_string()).collect();
         // Should maintain exact order as specified
-        assert_eq!(names[0], "write");
-        assert_eq!(names[1], "read");
-        assert_eq!(names[2], "sage");
-        assert_eq!(names[3], "patch");
-        assert_eq!(names[4], "sem_search");
+        let expected = vec!["write", "read", "sage", "patch", "sem_search"];
+        assert_eq!(names, expected);
     }
 
     #[test]
@@ -292,11 +289,8 @@ mod tests {
 
         let names: Vec<String> = actual.tools.iter().map(|t| t.to_string()).collect();
         // Should maintain exact order as specified, no special rules
-        assert_eq!(names[0], "read");
-        assert_eq!(names[1], "mcp_github");
-        assert_eq!(names[2], "write");
-        assert_eq!(names[3], "mcp_slack");
-        assert_eq!(names[4], "patch");
+        let expected = vec!["read", "mcp_github", "write", "mcp_slack", "patch"];
+        assert_eq!(names, expected);
     }
 
     #[test]
@@ -322,12 +316,8 @@ mod tests {
 
         let names: Vec<String> = actual.tools.iter().map(|t| t.to_string()).collect();
         // All tools and patterns preserved
-        assert_eq!(names.len(), 5);
-        assert_eq!(names[0], "read");
-        assert_eq!(names[1], "fs_*");
-        assert_eq!(names[2], "write");
-        assert_eq!(names[3], "mcp_*");
-        assert_eq!(names[4], "patch");
+        let expected = vec!["read", "fs_*", "write", "mcp_*", "patch"];
+        assert_eq!(names, expected);
     }
 
     #[test]

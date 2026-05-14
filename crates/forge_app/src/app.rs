@@ -1394,7 +1394,9 @@ mod tests {
             .await;
         let mut orch =
             Orchestrator::new(setup.clone(), conversation, agent, ForgeConfig::default())
-                .models(vec![Model::new(ProviderId::OPENAI, model_id)])
+                .models(vec![
+                    Model::new(ProviderId::OPENAI, model_id).context_length(200_000_u64),
+                ])
                 .tool_definitions(Vec::new());
 
         orch.run().await?;

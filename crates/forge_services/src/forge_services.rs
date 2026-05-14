@@ -11,8 +11,6 @@ use forge_domain::{
     WorkspaceIndexRepository,
 };
 
-use crate::ForgeProviderAuthService;
-use crate::ForgeSteerService;
 use crate::agent_registry::ForgeAgentRegistryService;
 use crate::app_config::ForgeAppConfigService;
 use crate::attachment::ForgeChatRequest;
@@ -30,6 +28,7 @@ use crate::tool_services::{
     ForgeFetch, ForgeFollowup, ForgeFsPatch, ForgeFsRead, ForgeFsRemove, ForgeFsSearch,
     ForgeFsUndo, ForgeFsWrite, ForgeImageRead, ForgePlanCreate, ForgeShell, ForgeSkillFetch,
 };
+use crate::{ForgeProviderAuthService, ForgeSteerService};
 
 type McpService<F> = ForgeMcpService<ForgeMcpManager<F>, F, <F as McpServerInfra>::Client>;
 type AuthService<F> = ForgeAuthService<F>;

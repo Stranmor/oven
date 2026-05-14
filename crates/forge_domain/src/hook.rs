@@ -426,6 +426,10 @@ mod tests {
         let _ = conversation;
     }
 
+    fn handled_at<T>(handled: &[T], index: usize) -> &T {
+        handled.get(index).expect("expected handled event at index")
+    }
+
     #[tokio::test]
     async fn test_hook_on_start() {
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -454,7 +458,7 @@ mod tests {
         let handled = events.lock().unwrap();
         assert_eq!(handled.len(), 1);
         assert_eq!(
-            handled[0],
+            *handled_at(&handled, 0),
             EventData::new(test_agent(), test_model_id(), StartPayload)
         );
     }
@@ -529,15 +533,15 @@ mod tests {
         let handled = events.lock().unwrap();
         assert_eq!(handled.len(), 3);
         assert_eq!(
-            handled[0],
+            *handled_at(&handled, 0),
             LifecycleEvent::Start(EventData::new(test_agent(), test_model_id(), StartPayload))
         );
         assert_eq!(
-            handled[1],
+            *handled_at(&handled, 1),
             LifecycleEvent::End(EventData::new(test_agent(), test_model_id(), EndPayload))
         );
         assert_eq!(
-            handled[2],
+            *handled_at(&handled, 2),
             LifecycleEvent::Request(EventData::new(
                 test_agent(),
                 test_model_id(),
@@ -795,9 +799,9 @@ mod tests {
 
         let handled = events.lock().unwrap();
         assert_eq!(handled.len(), 3);
-        assert!(handled[0].starts_with("h1:EventData"));
-        assert!(handled[1].starts_with("h2:EventData"));
-        assert!(handled[2].starts_with("h3:EventData"));
+        assert!(handled_at(&handled, 0).starts_with("h1:EventData"));
+        assert!(handled_at(&handled, 1).starts_with("h2:EventData"));
+        assert!(handled_at(&handled, 2).starts_with("h3:EventData"));
     }
 
     #[tokio::test]
@@ -994,9 +998,9 @@ mod tests {
 
         let handled = events.lock().unwrap();
         assert_eq!(handled.len(), 3);
-        assert!(handled[0].starts_with("h1:EventData"));
-        assert!(handled[1].starts_with("h2:EventData"));
-        assert!(handled[2].starts_with("h3:EventData"));
+        assert!(handled_at(&handled, 0).starts_with("h1:EventData"));
+        assert!(handled_at(&handled, 1).starts_with("h2:EventData"));
+        assert!(handled_at(&handled, 2).starts_with("h3:EventData"));
     }
 
     #[tokio::test]
@@ -1041,8 +1045,9 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(events.lock().unwrap().len(), 1);
-        assert!(events.lock().unwrap()[0].starts_with("Event: EventData"));
+        let handled = events.lock().unwrap();
+        assert_eq!(handled.len(), 1);
+        assert!(handled_at(&handled, 0).starts_with("Event: EventData"));
     }
 
     #[tokio::test]

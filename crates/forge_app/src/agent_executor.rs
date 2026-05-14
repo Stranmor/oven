@@ -40,7 +40,8 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> AgentEx
     /// Executes an agent tool call by creating a new chat request for the
     /// specified agent. If conversation_id is provided, the agent will reuse
     /// that conversation only when it is already owned by the same parent or is
-    /// parentless compatibility state. Otherwise, a new conversation is created.
+    /// parentless compatibility state. Otherwise, a new conversation is
+    /// created.
     pub async fn execute(
         &self,
         agent_id: AgentId,

@@ -98,7 +98,10 @@ mod tests {
         let (indent, lines) = code_wrap("let x = 1;", 80, true);
         assert_eq!(indent, 0);
         assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0], "let x = 1;");
+        assert_eq!(
+            lines.first().expect("expected first wrapped code line"),
+            "let x = 1;"
+        );
     }
 
     #[test]

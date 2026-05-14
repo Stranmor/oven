@@ -150,7 +150,8 @@ mod tests {
             ..Compact::new()
         };
 
-        let toml = toml_edit::ser::to_string_pretty(&fixture).unwrap();
+        let toml = toml_edit::ser::to_string_pretty(&fixture)
+            .expect("compact config fixture should serialize to TOML");
 
         assert!(
             toml.contains("eviction_window = 0.2\n"),
@@ -166,13 +167,14 @@ mod tests {
         };
         let config_fixture = ForgeConfig::default().compact(fixture.clone());
 
-        let toml = toml_edit::ser::to_string_pretty(&config_fixture).unwrap();
+        let toml = toml_edit::ser::to_string_pretty(&config_fixture)
+            .expect("compact config fixture should serialize to TOML");
 
         let actual = ConfigReader::default()
             .read_defaults()
             .read_toml(&toml)
             .build()
-            .unwrap();
+            .expect("compact config fixture should serialize to TOML");
         let actual = actual.compact.expect("compact config should deserialize");
 
         assert_eq!(actual.eviction_window, fixture.eviction_window);
@@ -181,12 +183,15 @@ mod tests {
     #[test]
     fn test_token_threshold_percentage_round_trip() {
         let fixture = Compact {
-            token_threshold_percentage: Some(Percentage::new(0.7).unwrap()),
+            token_threshold_percentage: Some(
+                Percentage::new(0.7).expect("compact config fixture should serialize to TOML"),
+            ),
             ..Compact::new()
         };
         let config_fixture = ForgeConfig::default().compact(fixture.clone());
 
-        let toml = toml_edit::ser::to_string_pretty(&config_fixture).unwrap();
+        let toml = toml_edit::ser::to_string_pretty(&config_fixture)
+            .expect("compact config fixture should serialize to TOML");
 
         assert!(
             toml.contains("token_threshold_percentage = 0.7\n"),
@@ -197,7 +202,7 @@ mod tests {
             .read_defaults()
             .read_toml(&toml)
             .build()
-            .unwrap();
+            .expect("compact config fixture should serialize to TOML");
         let actual = actual.compact.expect("compact config should deserialize");
 
         assert_eq!(
@@ -243,7 +248,8 @@ mod tests {
         let fixture =
             ForgeConfig::default().updates(Update::default().frequency(UpdateFrequency::Never));
 
-        let toml = toml_edit::ser::to_string_pretty(&fixture).unwrap();
+        let toml = toml_edit::ser::to_string_pretty(&fixture)
+            .expect("compact config fixture should serialize to TOML");
 
         assert!(
             toml.contains("frequency = \"never\"\n"),
@@ -254,7 +260,7 @@ mod tests {
             .read_defaults()
             .read_toml(&toml)
             .build()
-            .unwrap();
+            .expect("compact config fixture should serialize to TOML");
 
         let expected = Some(
             Update::default()

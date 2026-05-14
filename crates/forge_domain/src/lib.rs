@@ -6,6 +6,7 @@
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
+#![cfg_attr(test, allow(clippy::indexing_slicing))]
 mod agent;
 mod attachment;
 mod auth;

@@ -521,7 +521,10 @@ mod tests {
         // the cell border by one char.
         let result = wrap("abcdefgh more text", 8);
         let strip = |s: &str| String::from_utf8(strip_ansi_escapes::strip(s)).unwrap();
-        assert_eq!(strip(&result[0]), "abcdefgh");
+        assert_eq!(
+            strip(result.first().expect("expected first wrapped line")),
+            "abcdefgh"
+        );
         for line in &result {
             assert!(visible_length(line) <= 8);
         }
@@ -579,8 +582,14 @@ mod tests {
         let result = wrap("hello world", 5);
         assert_eq!(result.len(), 2);
         let strip = |s: &str| String::from_utf8(strip_ansi_escapes::strip(s)).unwrap();
-        assert_eq!(strip(&result[0]), "hello");
-        assert_eq!(strip(&result[1]), "world");
+        assert_eq!(
+            strip(result.first().expect("expected first wrapped split line")),
+            "hello"
+        );
+        assert_eq!(
+            strip(result.get(1).expect("expected second wrapped split line")),
+            "world"
+        );
     }
 
     #[test]

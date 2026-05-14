@@ -6,8 +6,8 @@ use derive_setters::Setters;
 use forge_config::ForgeConfig;
 use forge_domain::{
     Agent, AgentId, Attachment, ChatCompletionMessage, ChatResponse, Context, Conversation,
-    Environment, Event, File, MessageEntry, Metrics, ModelId, ProviderId, Role, SteerMessage,
-    Template, ToolCallFull, ToolDefinition, ToolResult,
+    Environment, Event, File, MessageEntry, Metrics, Model, ModelId, ProviderId, Role,
+    SteerMessage, Template, ToolCallFull, ToolDefinition, ToolResult,
 };
 
 use crate::ShellOutput;
@@ -40,6 +40,7 @@ pub struct TestContext {
     pub output: TestOutput,
     pub agent: Agent,
     pub tools: Vec<ToolDefinition>,
+    pub models: Vec<Model>,
     pub initial_context: Option<Context>,
     pub steer_messages: Vec<SteerMessage>,
     /// ForgeConfig used to populate TemplateConfig for
@@ -84,6 +85,10 @@ impl Default for TestContext {
             tools: vec![
                 ToolDefinition::new("fs_read"),
                 ToolDefinition::new("fs_write"),
+            ],
+            models: vec![
+                Model::new(ProviderId::ANTHROPIC, ModelId::new("openai/gpt-1"))
+                    .context_length(200_000_u64),
             ],
         }
     }

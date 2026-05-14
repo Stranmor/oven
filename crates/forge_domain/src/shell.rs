@@ -80,7 +80,8 @@ impl<'de> Deserialize<'de> for ProcessObservationWaitSeconds {
     }
 }
 
-/// Timeout before a shell command is handed off to managed background execution.
+/// Timeout before a shell command is handed off to managed background
+/// execution.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 pub struct ShellHandoffTimeoutSeconds(u64);
 

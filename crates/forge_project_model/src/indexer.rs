@@ -1,5 +1,13 @@
 //! Ignore-aware project indexing, persistence, sharding, and episodes.
 
+use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use ignore::WalkBuilder;
+
 use crate::extraction::{
     extract_cargo_dependency_edges, extract_rust_import_edges, extract_rust_symbols,
 };
@@ -12,12 +20,6 @@ use crate::util::{
     detect_language, edge_sort_key, hash_text, line_count, manifest_hash, normalize_path,
     provenance, ranges_overlap,
 };
-use anyhow::{Context, Result};
-use ignore::WalkBuilder;
-use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
 
 /// Project indexer that owns filesystem scanning and deterministic storage.
 pub struct ProjectIndexer {
@@ -31,7 +33,8 @@ impl ProjectIndexer {
     /// # Arguments
     ///
     /// * `root` - Project root used for ignore-aware walking.
-    /// * `model_dir` - Directory where deterministic JSON and JSONL model files are stored.
+    /// * `model_dir` - Directory where deterministic JSON and JSONL model files
+    ///   are stored.
     pub fn new(root: impl Into<PathBuf>, model_dir: impl Into<PathBuf>) -> Self {
         Self { root: root.into(), model_dir: model_dir.into() }
     }
@@ -40,7 +43,8 @@ impl ProjectIndexer {
     ///
     /// # Errors
     ///
-    /// Returns an error when walking, reading, parsing, or hashing project files fails.
+    /// Returns an error when walking, reading, parsing, or hashing project
+    /// files fails.
     pub fn index(&self) -> Result<ProjectManifest> {
         let mut files = Vec::new();
         let mut rust_sources = BTreeMap::new();
@@ -124,7 +128,8 @@ impl ProjectIndexer {
     ///
     /// # Errors
     ///
-    /// Returns an error when the model directory cannot be created or JSON cannot be written.
+    /// Returns an error when the model directory cannot be created or JSON
+    /// cannot be written.
     pub fn write_manifest(&self, manifest: &ProjectManifest) -> Result<PathBuf> {
         fs::create_dir_all(&self.model_dir).context("create model dir")?;
         let path = self.model_dir.join("project_manifest.json");
@@ -148,7 +153,8 @@ impl ProjectIndexer {
     ///
     /// # Arguments
     ///
-    /// * `episode` - Episode record whose payloads are fingerprints, not raw secret-bearing data.
+    /// * `episode` - Episode record whose payloads are fingerprints, not raw
+    ///   secret-bearing data.
     ///
     /// # Errors
     ///
@@ -170,7 +176,8 @@ impl ProjectIndexer {
     ///
     /// # Errors
     ///
-    /// Returns an error when JSONL cannot be read or any line cannot be decoded.
+    /// Returns an error when JSONL cannot be read or any line cannot be
+    /// decoded.
     pub fn read_episodes(&self) -> Result<Vec<ToolEpisode>> {
         let path = self.model_dir.join("tool_episodes.jsonl");
         if !path.exists() {
@@ -188,7 +195,8 @@ impl ProjectIndexer {
         Ok(episodes)
     }
 
-    /// Computes freshness by comparing a previous manifest with the current filesystem state.
+    /// Computes freshness by comparing a previous manifest with the current
+    /// filesystem state.
     ///
     /// # Arguments
     ///
@@ -308,13 +316,15 @@ fn is_ignore_control_file(path: &str) -> bool {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::collections::BTreeSet;
+
+    use pretty_assertions::assert_eq;
+    use tempfile::TempDir;
+
     use super::*;
     use crate::{
         GraphEdgeKind, RetrievalQuery, SymbolKind, compare_freshness, fingerprint, retrieve,
     };
-    use pretty_assertions::assert_eq;
-    use std::collections::BTreeSet;
-    use tempfile::TempDir;
 
     pub(crate) fn fixture_project() -> Result<(TempDir, PathBuf)> {
         let temp = TempDir::new()?;

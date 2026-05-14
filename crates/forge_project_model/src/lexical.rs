@@ -1,7 +1,8 @@
 //! Deterministic lexical retrieval index with BM25-like scoring.
 
-use crate::types::{LexicalDocument, LexicalDocumentKind, LexicalSearchHit, ProjectManifest};
 use std::collections::{BTreeMap, BTreeSet};
+
+use crate::types::{LexicalDocument, LexicalDocumentKind, LexicalSearchHit, ProjectManifest};
 
 const K1: f32 = 1.2;
 const B: f32 = 0.75;
@@ -19,7 +20,8 @@ impl LexicalIndex {
     ///
     /// # Arguments
     ///
-    /// * `documents` - Searchable documents with deterministic identifiers and display text.
+    /// * `documents` - Searchable documents with deterministic identifiers and
+    ///   display text.
     pub fn new(documents: Vec<LexicalDocument>) -> Self {
         let mut indexed_documents = Vec::new();
         let mut document_frequency = BTreeMap::<String, usize>::new();
@@ -56,7 +58,8 @@ impl LexicalIndex {
     ///
     /// # Arguments
     ///
-    /// * `manifest` - Manifest whose path, symbol, and shard metadata becomes searchable.
+    /// * `manifest` - Manifest whose path, symbol, and shard metadata becomes
+    ///   searchable.
     pub fn from_manifest(manifest: &ProjectManifest) -> Self {
         Self::new(documents_from_manifest(manifest))
     }
@@ -212,11 +215,12 @@ fn split_identifier(part: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Result;
+    use pretty_assertions::assert_eq;
+
     use super::*;
     use crate::indexer::tests::fixture_project;
     use crate::{ProjectIndexer, SymbolKind};
-    use anyhow::Result;
-    use pretty_assertions::assert_eq;
 
     #[test]
     fn lexical_index_scores_symbols_above_file_path_matches() -> Result<()> {

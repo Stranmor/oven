@@ -274,16 +274,18 @@ impl DoomLoopDetector {
         let text = result.output.as_str()?;
         let marker = "path=\"";
         let start = text.find(marker)? + marker.len();
-        let end = text[start..].find('"')?;
-        Some(text[start..start + end].to_string())
+        let rest = text.get(start..)?;
+        let end = rest.find('"')?;
+        Some(rest.get(..end)?.to_string())
     }
 
     fn process_output_attr(result: &ToolResult, name: &str) -> Option<String> {
         let text = result.output.as_str()?;
         let marker = format!("{name}=\"");
         let start = text.find(&marker)? + marker.len();
-        let end = text[start..].find('"')?;
-        Some(text[start..start + end].to_string())
+        let rest = text.get(start..)?;
+        let end = rest.find('"')?;
+        Some(rest.get(..end)?.to_string())
     }
 
     fn process_output_id(result: &ToolResult) -> Option<String> {
@@ -303,8 +305,9 @@ impl DoomLoopDetector {
             .and_then(|text| {
                 let start_marker = "<![CDATA[";
                 let start = text.find(start_marker)? + start_marker.len();
-                let end = text[start..].find("]]>")?;
-                Some(text[start..start + end].trim())
+                let rest = text.get(start..)?;
+                let end = rest.find("]]>")?;
+                Some(rest.get(..end)?.trim())
             })
             .is_some_and(|body| !body.is_empty() && body != "[]")
     }

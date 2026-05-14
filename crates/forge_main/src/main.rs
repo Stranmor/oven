@@ -177,11 +177,13 @@ mod tests {
     fn test_commit_command_diff_field_initially_none() {
         // Test that the diff field in CommitCommandGroup starts as None
         let cli = Cli::parse_from(["forge", "commit", "--preview"]);
-        if let Some(TopLevelCommand::Commit(commit_group)) = cli.subcommands {
-            assert_eq!(commit_group.preview, true);
-            assert_eq!(commit_group.diff, None);
-        } else {
-            panic!("Expected Commit command");
-        }
+        let actual = match cli.subcommands {
+            Some(TopLevelCommand::Commit(commit_group)) => {
+                Some((commit_group.preview, commit_group.diff))
+            }
+            _ => None,
+        };
+        let expected = Some((true, None));
+        assert_eq!(actual, expected);
     }
 }

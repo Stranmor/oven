@@ -545,7 +545,6 @@ impl<
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::BTreeMap;
     use std::fs;
     use std::pin::Pin;
@@ -562,6 +561,8 @@ mod tests {
     };
     use futures::{Stream, StreamExt};
     use tempfile::TempDir;
+
+    use super::*;
     struct LocalSearchInfra {
         cwd: PathBuf,
         credential: Option<AuthCredential>,

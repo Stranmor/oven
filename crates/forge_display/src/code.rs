@@ -179,7 +179,7 @@ mod tests {
         let content = match name {
             "code-01" => include_str!("fixtures/code-01.md"),
             "code-02" => include_str!("fixtures/code-02.md"),
-            _ => panic!("Unknown fixture: {}", name),
+            _ => unreachable!("Unknown fixture: {}", name),
         };
         CodeBlockParser::new(content)
     }
@@ -204,8 +204,12 @@ mod tests {
         let expected = 1;
 
         assert_eq!(actual, expected);
-        assert_eq!(parser.blocks()[0].lang, "rust");
-        assert_eq!(parser.blocks()[0].code, "fn main() {}");
+        let block = parser
+            .blocks()
+            .first()
+            .expect("expected single rust code block");
+        assert_eq!(block.lang, "rust");
+        assert_eq!(block.code, "fn main() {}");
     }
 
     #[test]
@@ -213,7 +217,11 @@ mod tests {
         let fixture = "```rust\n    let x = 1;\n```";
         let parser = CodeBlockParser::new(fixture);
 
-        let actual = &parser.blocks()[0].code;
+        let actual = &parser
+            .blocks()
+            .first()
+            .expect("expected indented code block")
+            .code;
         let expected = "    let x = 1;";
 
         assert_eq!(actual, expected);
@@ -228,7 +236,14 @@ mod tests {
         let expected = 1;
 
         assert_eq!(actual, expected);
-        assert_eq!(parser.blocks()[0].lang, "rust");
+        assert_eq!(
+            parser
+                .blocks()
+                .first()
+                .expect("expected indented fenced code block")
+                .lang,
+            "rust"
+        );
     }
 
     #[test]
@@ -240,8 +255,22 @@ mod tests {
         let expected = 2;
 
         assert_eq!(actual, expected);
-        assert_eq!(parser.blocks()[0].lang, "rust");
-        assert_eq!(parser.blocks()[1].lang, "python");
+        assert_eq!(
+            parser
+                .blocks()
+                .first()
+                .expect("expected first language block")
+                .lang,
+            "rust"
+        );
+        assert_eq!(
+            parser
+                .blocks()
+                .get(1)
+                .expect("expected second language block")
+                .lang,
+            "python"
+        );
     }
 
     #[test]

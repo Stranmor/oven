@@ -147,7 +147,9 @@ mod tests {
     async fn test_buffer_limit_512_bytes() -> Result<()> {
         // Create content larger than 512 bytes with zero byte at position 600
         let mut content = vec![0x48; 600]; // 'H' repeated 600 times
-        content[599] = 0x00; // Zero byte beyond 512 byte limit
+        *content
+            .get_mut(599)
+            .expect("expected byte beyond 512-byte limit") = 0x00; // Zero byte beyond 512 byte limit
 
         let fixture = create_test_file_fixture(&content).await?;
         let actual = is_binary(fixture.path()).await?;

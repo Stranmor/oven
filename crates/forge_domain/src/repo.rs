@@ -52,11 +52,13 @@ pub trait ConversationRepository: Send + Sync {
     ///
     /// # Arguments
     /// * `conversation_id` - The delegated conversation ID.
-    /// * `parent_id` - The parent conversation that should own the delegated conversation.
+    /// * `parent_id` - The parent conversation that should own the delegated
+    ///   conversation.
     ///
     /// # Errors
     /// Returns an error if the conversation is missing, belongs to a different
-    /// parent/workspace, is owned by a different ledger parent, or persistence fails.
+    /// parent/workspace, is owned by a different ledger parent, or persistence
+    /// fails.
     async fn promote_delegated_conversation(
         &self,
         conversation_id: &ConversationId,

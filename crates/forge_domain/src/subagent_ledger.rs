@@ -125,8 +125,10 @@ impl SubagentTaskSession {
     /// # Arguments
     /// * `agent_id` - The delegated agent identifier.
     /// * `conversation_id` - The delegated conversation/session ID.
-    /// * `parent_conversation_id` - The parent conversation that spawned this task.
-    /// * `root_conversation_id` - The root conversation for the delegation tree.
+    /// * `parent_conversation_id` - The parent conversation that spawned this
+    ///   task.
+    /// * `root_conversation_id` - The root conversation for the delegation
+    ///   tree.
     /// * `task` - The task prompt or summary.
     pub fn new(
         agent_id: AgentId,
@@ -216,7 +218,8 @@ impl SubagentTaskSession {
         self.delivered_at = None;
     }
 
-    /// Returns this record classified as zombie when its active heartbeat is stale.
+    /// Returns this record classified as zombie when its active heartbeat is
+    /// stale.
     ///
     /// # Arguments
     /// * `now` - The timestamp to classify against.

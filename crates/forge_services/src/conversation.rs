@@ -184,16 +184,15 @@ mod tests {
                     parent_id
                 );
             }
-            if let Some(existing) = subagent_task_sessions.get(conversation_id) {
-                if existing.parent_conversation_id.is_some()
-                    && existing.parent_conversation_id != parent_id
-                {
-                    anyhow::bail!(
-                        "Subagent session {conversation_id} belongs to parent {:?}; refusing silent reparent to {:?}",
-                        existing.parent_conversation_id,
-                        parent_id
-                    );
-                }
+            if let Some(existing) = subagent_task_sessions.get(conversation_id)
+                && existing.parent_conversation_id.is_some()
+                && existing.parent_conversation_id != parent_id
+            {
+                anyhow::bail!(
+                    "Subagent session {conversation_id} belongs to parent {:?}; refusing silent reparent to {:?}",
+                    existing.parent_conversation_id,
+                    parent_id
+                );
             }
             conversation.ensure_delegated(parent_id);
             Ok(conversation.clone())

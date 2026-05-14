@@ -1869,6 +1869,7 @@ mod tests {
             response_format: None,
             frequency_penalty: None,
             presence_penalty: None,
+            ..Default::default()
         };
 
         let actual = ConverseStreamInput::from_domain(fixture).unwrap();
@@ -1901,6 +1902,7 @@ mod tests {
             response_format: None,
             frequency_penalty: None,
             presence_penalty: None,
+            ..Default::default()
         };
 
         let actual = ConverseStreamInput::from_domain(fixture).unwrap();
@@ -1934,6 +1936,7 @@ mod tests {
             response_format: None,
             frequency_penalty: None,
             presence_penalty: None,
+            ..Default::default()
         };
 
         let actual = ConverseStreamInput::from_domain(fixture).unwrap();
@@ -1970,6 +1973,7 @@ mod tests {
             response_format: None,
             frequency_penalty: None,
             presence_penalty: None,
+            ..Default::default()
         };
 
         let actual = ConverseStreamInput::from_domain(fixture).unwrap();
@@ -2006,6 +2010,7 @@ mod tests {
             response_format: None,
             frequency_penalty: None,
             presence_penalty: None,
+            ..Default::default()
         };
 
         let actual = ConverseStreamInput::from_domain(fixture).unwrap();
@@ -2064,6 +2069,7 @@ mod tests {
             response_format: None,
             frequency_penalty: None,
             presence_penalty: None,
+            ..Default::default()
         };
 
         let actual = ConverseStreamInput::from_domain(fixture).unwrap();
@@ -2109,6 +2115,7 @@ mod tests {
             response_format: None,
             frequency_penalty: None,
             presence_penalty: None,
+            ..Default::default()
         };
 
         let actual = ConverseStreamInput::from_domain(fixture).unwrap();
@@ -2146,6 +2153,7 @@ mod tests {
             response_format: None,
             frequency_penalty: None,
             presence_penalty: None,
+            ..Default::default()
         };
 
         let actual = ConverseStreamInput::from_domain(fixture).unwrap();

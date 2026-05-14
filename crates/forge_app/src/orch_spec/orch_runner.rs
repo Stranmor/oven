@@ -147,6 +147,7 @@ impl Runner {
         let orch = Orchestrator::new(services.clone(), conversation, agent, setup.config.clone())
             .error_tracker(ToolErrorTracker::new(3))
             .tool_definitions(system_tools)
+            .models(setup.models.clone())
             .hook(Arc::new(
                 Hook::default()
                     .on_request(DoomLoopDetector::default())

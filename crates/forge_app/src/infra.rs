@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-
 use std::pin::Pin;
 
 use anyhow::Result;
@@ -109,16 +108,17 @@ pub trait FileReaderInfra: Send + Sync {
 
 #[async_trait::async_trait]
 pub trait PdfRenderInfra: Send + Sync {
-    /// Renders the first PDF page as PNG bytes suitable for image-only model providers.
+    /// Renders the first PDF page as PNG bytes suitable for image-only model
+    /// providers.
     ///
     /// # Arguments
     /// * `path` - Absolute PDF path to render
     /// * `max_image_size_bytes` - Maximum allowed PNG preview size
     ///
     /// # Errors
-    /// Returns an error when the renderer cannot start, the PDF cannot be rendered,
-    /// the preview cannot be read, cleanup fails after successful rendering, or the
-    /// preview exceeds the configured size limit.
+    /// Returns an error when the renderer cannot start, the PDF cannot be
+    /// rendered, the preview cannot be read, cleanup fails after successful
+    /// rendering, or the preview exceeds the configured size limit.
     async fn render_pdf_first_page_to_png(
         &self,
         path: &Path,
@@ -281,7 +281,8 @@ pub trait WalkerInfra: Send + Sync {
     async fn walk(&self, config: Walker) -> anyhow::Result<Vec<WalkedFile>>;
 
     /// Streams filesystem entries from the given directory with the specified
-    /// configuration so callers can stop traversal before all entries are collected.
+    /// configuration so callers can stop traversal before all entries are
+    /// collected.
     async fn walk_stream(&self, config: Walker) -> anyhow::Result<WalkedFileStream>;
 }
 

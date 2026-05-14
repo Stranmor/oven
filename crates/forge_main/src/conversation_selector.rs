@@ -22,8 +22,10 @@ impl ConversationSelector {
     /// Returns the selected conversation, or None if the user cancelled.
     ///
     /// # Arguments
-    /// * `conversations` - Conversations available for primary conversation selection.
-    /// * `current_conversation_id` - Optional conversation ID to focus initially.
+    /// * `conversations` - Conversations available for primary conversation
+    ///   selection.
+    /// * `current_conversation_id` - Optional conversation ID to focus
+    ///   initially.
     /// * `query` - Optional initial fuzzy-search query.
     ///
     /// # Errors
@@ -50,7 +52,8 @@ impl ConversationSelector {
     ///
     /// # Arguments
     /// * `conversations` - Sub-conversations available for selection.
-    /// * `current_conversation_id` - Optional conversation ID to focus initially.
+    /// * `current_conversation_id` - Optional conversation ID to focus
+    ///   initially.
     ///
     /// # Errors
     /// Returns an error if selector rendering or terminal interaction fails.
@@ -181,7 +184,7 @@ mod tests {
     fn create_test_conversation(id: &str, title: Option<&str>) -> Conversation {
         let now = Utc::now();
         Conversation {
-            id: ConversationId::parse(id).unwrap(),
+            id: ConversationId::parse(id).expect("fixture conversation ID should be valid"),
             parent_id: None,
             title: title.map(|t| t.to_string()),
             initiator: forge_domain::Initiator::User,
@@ -196,7 +199,7 @@ mod tests {
         let conversations = vec![];
         let result = ConversationSelector::select_conversation(&conversations, None, None)
             .await
-            .unwrap();
+            .expect("empty conversation list should be selectable");
         assert!(result.is_none());
     }
 
@@ -267,8 +270,15 @@ mod tests {
         let actual = ConversationSelector::conversations_with_context(&conversations);
         let expected = (1, Some(parent_id), forge_domain::Initiator::Agent);
 
+        let actual_conversation = actual
+            .first()
+            .expect("one promoted agent conversation should be present");
         assert_eq!(
-            (actual.len(), actual[0].parent_id, actual[0].initiator),
+            (
+                actual.len(),
+                actual_conversation.parent_id,
+                actual_conversation.initiator
+            ),
             expected
         );
     }

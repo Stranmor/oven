@@ -281,7 +281,8 @@ pub trait ConversationService: Send + Sync {
     ///
     /// # Arguments
     /// * `id` - The delegated conversation ID.
-    /// * `parent_id` - The parent conversation that owns this delegated session.
+    /// * `parent_id` - The parent conversation that owns this delegated
+    ///   session.
     ///
     /// # Errors
     /// Returns an error if the conversation is missing or ownership is invalid.
@@ -294,7 +295,8 @@ pub trait ConversationService: Send + Sync {
     /// Resolves the root conversation ID for a delegated parent chain.
     ///
     /// # Arguments
-    /// * `parent_id` - The immediate parent conversation, when the task is delegated.
+    /// * `parent_id` - The immediate parent conversation, when the task is
+    ///   delegated.
     ///
     /// # Errors
     /// Returns an error if reading the persisted parent chain fails.

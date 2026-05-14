@@ -361,16 +361,19 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
         })
     }
 
-    /// Returns tool definitions for a chat execution using the resolved agent, model, and provider.
+    /// Returns tool definitions for a chat execution using the resolved agent,
+    /// model, and provider.
     ///
     /// # Arguments
-    /// * `agent_id` - Agent whose tool allow-list and agent-tools are being resolved.
-    /// * `model` - Selected model metadata for the current provider-bound chat turn.
+    /// * `agent_id` - Agent whose tool allow-list and agent-tools are being
+    ///   resolved.
+    /// * `model` - Selected model metadata for the current provider-bound chat
+    ///   turn.
     /// * `provider` - Provider that will receive the chat request.
     ///
     /// # Errors
-    /// Returns an error when MCP, agent, indexing, authentication, configuration, or cache-key
-    /// source discovery fails.
+    /// Returns an error when MCP, agent, indexing, authentication,
+    /// configuration, or cache-key source discovery fails.
     pub async fn list(
         &self,
         agent_id: &AgentId,

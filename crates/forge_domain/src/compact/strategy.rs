@@ -347,8 +347,8 @@ mod tests {
         // Strategy skips system messages, so calculation for non-system messages:
         // - User message (index 1): 3 tokens → budget: 4 - 3 = 1 token remaining
         // - Assistant message (index 2): 3 tokens → budget: 1 - 3 = 0 (saturating_sub)
-        // Result: Eviction budget exhausted at index 2 (Assistant), so we want to preserve
-        // length (3) - index (2) - 1 = 0 messages.
+        // Result: Eviction budget exhausted at index 2 (Assistant), so we want to
+        // preserve length (3) - index (2) - 1 = 0 messages.
         let percentage_strategy = CompactionStrategy::evict(0.4);
         let actual = percentage_strategy.to_fixed(&fixture);
         let expected = 0;

@@ -106,6 +106,7 @@ mod tests {
             response_format: None,
             frequency_penalty: None,
             presence_penalty: None,
+            ..Default::default()
         };
 
         let request = ConverseStreamInput::from_domain(context).expect("Failed to convert context");
@@ -136,6 +137,7 @@ mod tests {
             response_format: None,
             frequency_penalty: None,
             presence_penalty: None,
+            ..Default::default()
         };
 
         let request = ConverseStreamInput::from_domain(context).expect("Failed to convert context");
@@ -168,6 +170,7 @@ mod tests {
             response_format: None,
             frequency_penalty: None,
             presence_penalty: None,
+            ..Default::default()
         };
 
         let request = ConverseStreamInput::from_domain(context).expect("Failed to convert context");

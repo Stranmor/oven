@@ -988,6 +988,23 @@ mod tests {
         assert_eq!(result, None);
     }
 
+    fn parse_command(fixture: &ForgeCommandManager, command: &str) -> AppCommand {
+        fixture
+            .parse(command)
+            .expect("fixture command should parse successfully")
+    }
+
+    fn parse_url(fixture: &str) -> Url {
+        Url::parse(fixture).expect("fixture URL should be valid")
+    }
+
+    fn parse_error(fixture: &ForgeCommandManager, command: &str) -> String {
+        fixture
+            .parse(command)
+            .expect_err("fixture command should fail to parse")
+            .to_string()
+    }
+
     #[test]
     fn test_extract_command_value_provided_overrides_default() {
         // Setup
@@ -1017,13 +1034,12 @@ mod tests {
         let cmd_manager = ForgeCommandManager::default();
 
         // Execute
-        let result = cmd_manager.parse("!ls -la").unwrap();
-
-        // Verify
-        match result {
-            AppCommand::Shell(cmd) => assert_eq!(cmd, "ls -la"),
-            _ => panic!("Expected Shell command, got {result:?}"),
-        }
+        let actual = match parse_command(&cmd_manager, "!ls -la") {
+            AppCommand::Shell(cmd) => Some(cmd),
+            _ => None,
+        };
+        let expected = Some("ls -la".to_string());
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -1032,13 +1048,12 @@ mod tests {
         let cmd_manager = ForgeCommandManager::default();
 
         // Execute
-        let result = cmd_manager.parse("!").unwrap();
-
-        // Verify
-        match result {
-            AppCommand::Shell(cmd) => assert_eq!(cmd, ""),
-            _ => panic!("Expected Shell command, got {result:?}"),
-        }
+        let actual = match parse_command(&cmd_manager, "!") {
+            AppCommand::Shell(cmd) => Some(cmd),
+            _ => None,
+        };
+        let expected = Some(String::new());
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -1047,13 +1062,12 @@ mod tests {
         let cmd_manager = ForgeCommandManager::default();
 
         // Execute
-        let result = cmd_manager.parse("!   echo 'test'   ").unwrap();
-
-        // Verify
-        match result {
-            AppCommand::Shell(cmd) => assert_eq!(cmd, "echo 'test'"),
-            _ => panic!("Expected Shell command, got {result:?}"),
-        }
+        let actual = match parse_command(&cmd_manager, "!   echo 'test'   ") {
+            AppCommand::Shell(cmd) => Some(cmd),
+            _ => None,
+        };
+        let expected = Some("echo 'test'".to_string());
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -1075,15 +1089,12 @@ mod tests {
         let cmd_manager = ForgeCommandManager::default();
 
         // Execute
-        let result = cmd_manager.parse("/conversation").unwrap();
-
-        // Verify
-        match result {
-            AppCommand::Conversations { .. } => {
-                // Command parsed correctly
-            }
-            _ => panic!("Expected List command, got {result:?}"),
-        }
+        let actual = matches!(
+            parse_command(&cmd_manager, "/conversation"),
+            AppCommand::Conversations { .. }
+        );
+        let expected = true;
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -1092,9 +1103,10 @@ mod tests {
         let cmd_manager = ForgeCommandManager::default();
 
         // Execute
-        let actual = cmd_manager
-            .parse("/conversation 550e8400-e29b-41d4-a716-446655440000")
-            .unwrap();
+        let actual = parse_command(
+            &cmd_manager,
+            "/conversation 550e8400-e29b-41d4-a716-446655440000",
+        );
 
         // Verify
         let expected = AppCommand::Conversations {
@@ -1211,13 +1223,12 @@ mod tests {
         let _result = fixture.register_agent_commands(agents);
 
         // Execute
-        let actual = fixture.parse("/agent-test-agent").unwrap();
-
-        // Verify
-        match actual {
-            AppCommand::AgentSwitch(agent_id) => assert_eq!(agent_id, "test-agent"),
-            _ => panic!("Expected AgentSwitch command, got {actual:?}"),
-        }
+        let actual = match parse_command(&fixture, "/agent-test-agent") {
+            AppCommand::AgentSwitch(agent_id) => Some(agent_id),
+            _ => None,
+        };
+        let expected = Some("test-agent".to_string());
+        assert_eq!(actual, expected);
     }
 
     fn create_model_fixture(
@@ -1343,14 +1354,14 @@ mod tests {
             id: ProviderId::OPENAI,
             provider_type: forge_domain::ProviderType::Llm,
             response: Some(ProviderResponse::OpenAI),
-            url: Url::parse("https://api.openai.com/v1/chat/completions").unwrap(),
+            url: parse_url("https://api.openai.com/v1/chat/completions"),
             auth_methods: vec![forge_domain::AuthMethod::ApiKey],
             url_params: vec![],
             credential: None,
             custom_headers: None,
-            models: Some(ModelSource::Url(
-                Url::parse("https://api.openai.com/v1/models").unwrap(),
-            )),
+            models: Some(ModelSource::Url(parse_url(
+                "https://api.openai.com/v1/models",
+            ))),
         });
         let formatted = format!("{}", CliProvider(fixture));
         let actual = strip_ansi_codes(&formatted);
@@ -1364,14 +1375,14 @@ mod tests {
             id: ProviderId::OPEN_ROUTER,
             provider_type: forge_domain::ProviderType::Llm,
             response: Some(ProviderResponse::OpenAI),
-            url: Url::parse("https://openrouter.ai/api/v1/chat/completions").unwrap(),
+            url: parse_url("https://openrouter.ai/api/v1/chat/completions"),
             auth_methods: vec![forge_domain::AuthMethod::ApiKey],
             url_params: vec![],
             credential: None,
             custom_headers: None,
-            models: Some(ModelSource::Url(
-                Url::parse("https://openrouter.ai/api/v1/models").unwrap(),
-            )),
+            models: Some(ModelSource::Url(parse_url(
+                "https://openrouter.ai/api/v1/models",
+            ))),
         });
         let formatted = format!("{}", CliProvider(fixture));
         let actual = strip_ansi_codes(&formatted);
@@ -1385,14 +1396,12 @@ mod tests {
             id: ProviderId::FORGE,
             provider_type: forge_domain::ProviderType::Llm,
             response: Some(ProviderResponse::OpenAI),
-            url: Url::parse("http://localhost:8080/chat/completions").unwrap(),
+            url: parse_url("http://localhost:8080/chat/completions"),
             auth_methods: vec![forge_domain::AuthMethod::ApiKey],
             url_params: vec![],
             credential: None,
             custom_headers: None,
-            models: Some(ModelSource::Url(
-                Url::parse("http://localhost:8080/models").unwrap(),
-            )),
+            models: Some(ModelSource::Url(parse_url("http://localhost:8080/models"))),
         });
         let formatted = format!("{}", CliProvider(fixture));
         let actual = strip_ansi_codes(&formatted);
@@ -1427,14 +1436,14 @@ mod tests {
             id: ProviderId::FORGE,
             provider_type: forge_domain::ProviderType::Llm,
             response: Some(ProviderResponse::OpenAI),
-            url: Url::parse("http://192.168.1.1:8080/chat/completions").unwrap(),
+            url: parse_url("http://192.168.1.1:8080/chat/completions"),
             auth_methods: vec![forge_domain::AuthMethod::ApiKey],
             url_params: vec![],
             credential: None,
             custom_headers: None,
-            models: Some(ModelSource::Url(
-                Url::parse("http://192.168.1.1:8080/models").unwrap(),
-            )),
+            models: Some(ModelSource::Url(parse_url(
+                "http://192.168.1.1:8080/models",
+            ))),
         });
         let formatted = format!("{}", CliProvider(fixture));
         let actual = strip_ansi_codes(&formatted);
@@ -1445,49 +1454,45 @@ mod tests {
     #[test]
     fn test_parse_commit_command() {
         let fixture = ForgeCommandManager::default();
-        let actual = fixture.parse("/commit").unwrap();
-        match actual {
-            AppCommand::Commit { max_diff_size, .. } => {
-                assert_eq!(max_diff_size, None);
-            }
-            _ => panic!("Expected Commit command, got {actual:?}"),
-        }
+        let actual = match parse_command(&fixture, "/commit") {
+            AppCommand::Commit { max_diff_size, .. } => Some(max_diff_size),
+            _ => None,
+        };
+        let expected = Some(None);
+        assert_eq!(actual, expected);
     }
 
     #[test]
     fn test_parse_commit_command_with_preview() {
         let fixture = ForgeCommandManager::default();
-        let actual = fixture.parse("/commit preview").unwrap();
-        match actual {
-            AppCommand::Commit { max_diff_size, .. } => {
-                assert_eq!(max_diff_size, None);
-            }
-            _ => panic!("Expected Commit command with preview, got {actual:?}"),
-        }
+        let actual = match parse_command(&fixture, "/commit preview") {
+            AppCommand::Commit { max_diff_size, .. } => Some(max_diff_size),
+            _ => None,
+        };
+        let expected = Some(None);
+        assert_eq!(actual, expected);
     }
 
     #[test]
     fn test_parse_commit_command_with_max_diff() {
         let fixture = ForgeCommandManager::default();
-        let actual = fixture.parse("/commit 5000").unwrap();
-        match actual {
-            AppCommand::Commit { max_diff_size, .. } => {
-                assert_eq!(max_diff_size, Some(5000));
-            }
-            _ => panic!("Expected Commit command with max_diff_size, got {actual:?}"),
-        }
+        let actual = match parse_command(&fixture, "/commit 5000") {
+            AppCommand::Commit { max_diff_size, .. } => Some(max_diff_size),
+            _ => None,
+        };
+        let expected = Some(Some(5000));
+        assert_eq!(actual, expected);
     }
 
     #[test]
     fn test_parse_commit_command_with_all_flags() {
         let fixture = ForgeCommandManager::default();
-        let actual = fixture.parse("/commit preview 10000").unwrap();
-        match actual {
-            AppCommand::Commit { max_diff_size, .. } => {
-                assert_eq!(max_diff_size, Some(10000));
-            }
-            _ => panic!("Expected Commit command with all flags, got {actual:?}"),
-        }
+        let actual = match parse_command(&fixture, "/commit preview 10000") {
+            AppCommand::Commit { max_diff_size, .. } => Some(max_diff_size),
+            _ => None,
+        };
+        let expected = Some(Some(10000));
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -1507,22 +1512,14 @@ mod tests {
         let fixture = ForgeCommandManager::default();
 
         // Execute
-        let result = fixture.parse("/agent-nonexistent");
-
-        // Verify
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("not a valid agent command")
-        );
+        let actual = parse_error(&fixture, "/agent-nonexistent");
+        assert!(actual.contains("not a valid agent command"));
     }
 
     #[test]
     fn test_parse_invalid_command_with_colon_returns_helpful_error() {
         let fixture = ForgeCommandManager::default();
-        let actual = fixture.parse(":celar").unwrap_err().to_string();
+        let actual = parse_error(&fixture, ":celar");
         let expected =
             "Unknown command ':celar'. Run ':help' to list available commands.".to_string();
         assert_eq!(actual, expected);
@@ -1531,7 +1528,7 @@ mod tests {
     #[test]
     fn test_parse_invalid_command_with_slash_returns_helpful_error() {
         let fixture = ForgeCommandManager::default();
-        let actual = fixture.parse("/celar").unwrap_err().to_string();
+        let actual = parse_error(&fixture, "/celar");
         let expected =
             "Unknown command '/celar'. Run '/help' to list available commands.".to_string();
         assert_eq!(actual, expected);
@@ -1543,15 +1540,9 @@ mod tests {
         let fixture = ForgeCommandManager::default();
 
         // Execute
-        let result = fixture.parse("/tools").unwrap();
-
-        // Verify
-        match result {
-            AppCommand::Tools => {
-                // Command parsed correctly
-            }
-            _ => panic!("Expected Tool command, got {result:?}"),
-        }
+        let actual = matches!(parse_command(&fixture, "/tools"), AppCommand::Tools);
+        let expected = true;
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -1560,7 +1551,7 @@ mod tests {
         let fixture = ForgeCommandManager::default();
 
         // Execute
-        let actual = fixture.parse("/dump").unwrap();
+        let actual = parse_command(&fixture, "/dump");
 
         // Verify
         let expected = AppCommand::Dump { html: false };
@@ -1573,7 +1564,7 @@ mod tests {
         let fixture = ForgeCommandManager::default();
 
         // Execute
-        let actual = fixture.parse("/dump --html").unwrap();
+        let actual = parse_command(&fixture, "/dump --html");
 
         // Verify
         let expected = AppCommand::Dump { html: true };
@@ -1583,7 +1574,7 @@ mod tests {
     #[test]
     fn test_parse_rename_command() {
         let fixture = ForgeCommandManager::default();
-        let actual = fixture.parse("/rename my-session").unwrap();
+        let actual = parse_command(&fixture, "/rename my-session");
         assert_eq!(
             actual,
             AppCommand::Rename { name: vec!["my-session".to_string()] }
@@ -1593,7 +1584,7 @@ mod tests {
     #[test]
     fn test_parse_rename_command_multi_word() {
         let fixture = ForgeCommandManager::default();
-        let actual = fixture.parse("/rename auth refactor work").unwrap();
+        let actual = parse_command(&fixture, "/rename auth refactor work");
         assert_eq!(
             actual,
             AppCommand::Rename {
@@ -1611,13 +1602,14 @@ mod tests {
         let fixture = ForgeCommandManager::default();
         let result = fixture.parse("/rename");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("provide a name"));
+        let actual = parse_error(&fixture, "/rename");
+        assert!(actual.contains("provide a name"));
     }
 
     #[test]
     fn test_parse_rename_alias() {
         let fixture = ForgeCommandManager::default();
-        let actual = fixture.parse("/rn my-session").unwrap();
+        let actual = parse_command(&fixture, "/rn my-session");
         assert_eq!(
             actual,
             AppCommand::Rename { name: vec!["my-session".to_string()] }
@@ -1627,7 +1619,7 @@ mod tests {
     #[test]
     fn test_parse_rename_trims_whitespace() {
         let fixture = ForgeCommandManager::default();
-        let actual = fixture.parse("/rename   my title   ").unwrap();
+        let actual = parse_command(&fixture, "/rename   my title   ");
         assert_eq!(
             actual,
             AppCommand::Rename { name: vec!["my".to_string(), "title".to_string()] }
@@ -1652,7 +1644,7 @@ mod tests {
         let cmd_manager = ForgeCommandManager::default();
 
         // Execute
-        let result = cmd_manager.parse(":suggest --- date").unwrap();
+        let result = parse_command(&cmd_manager, ":suggest --- date");
 
         // Verify
         assert_eq!(
@@ -1667,7 +1659,7 @@ mod tests {
         let cmd_manager = ForgeCommandManager::default();
 
         // Execute
-        let result = cmd_manager.parse(":suggest --date tomorrow").unwrap();
+        let result = parse_command(&cmd_manager, ":suggest --date tomorrow");
 
         // Verify
         assert_eq!(
@@ -1684,7 +1676,7 @@ mod tests {
         let cmd_manager = ForgeCommandManager::default();
 
         // Execute
-        let result = cmd_manager.parse(":suggest -v file.txt").unwrap();
+        let result = parse_command(&cmd_manager, ":suggest -v file.txt");
 
         // Verify
         assert_eq!(

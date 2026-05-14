@@ -183,7 +183,8 @@ mod tests {
 
             // Generate the formatted output
             let formatter = match pattern {
-                Some(pattern) => GrepFormat::new(input.clone()).regex(Regex::new(pattern).unwrap()),
+                Some(pattern) => GrepFormat::new(input.clone())
+                    .regex(Regex::new(pattern).expect("grep test pattern should compile")),
                 None => GrepFormat::new(input.clone()),
             };
 

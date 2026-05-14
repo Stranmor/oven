@@ -1,3 +1,4 @@
+use forge_domain::{ContextMessage, ToolOutput, ToolResult};
 use pretty_assertions::assert_eq;
 
 use super::fixtures::{
@@ -6,7 +7,6 @@ use super::fixtures::{
     tool_call,
 };
 use super::*;
-use forge_domain::{ContextMessage, ToolOutput, ToolResult};
 
 #[test]
 fn test_doom_loop_detector_detects_repeating_pattern_123_123_123() {

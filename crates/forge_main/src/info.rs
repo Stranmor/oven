@@ -1097,7 +1097,8 @@ mod tests {
 
         // Strip ANSI codes for easier assertion
         let stripped = strip_ansi_escapes::strip(&actual);
-        let actual_str = String::from_utf8(stripped).unwrap();
+        let actual_str =
+            String::from_utf8(stripped).expect("stripped ANSI output should remain valid UTF-8");
 
         // Verify that keys are padded within each section
         // In SECTION ONE, all keys should be padded to length of "Very Long Key" (13)
@@ -1115,13 +1116,15 @@ mod tests {
         let section_one_start = lines
             .iter()
             .position(|l| l.contains("SECTION ONE"))
-            .unwrap();
+            .expect("SECTION ONE title should be rendered");
         let section_two_start = lines
             .iter()
             .position(|l| l.contains("SECTION TWO"))
-            .unwrap();
+            .expect("SECTION TWO title should be rendered");
 
-        let section_one_items: Vec<&str> = lines[section_one_start + 1..section_two_start]
+        let section_one_items: Vec<&str> = lines
+            .get(section_one_start + 1..section_two_start)
+            .expect("SECTION ONE item range should be valid")
             .iter()
             .filter(|l| !l.trim().is_empty() && !l.contains("SECTION"))
             .copied()
@@ -1131,17 +1134,19 @@ mod tests {
         // Find where "value" starts in each line
         let value_positions: Vec<usize> = section_one_items
             .iter()
-            .map(|line| line.find("value").unwrap())
+            .map(|line| line.find("value").expect("item line should contain value"))
             .collect();
 
         assert!(
-            value_positions.windows(2).all(|w| w[0] == w[1]),
+            value_positions.windows(2).all(|w| w.first() == w.get(1)),
             "Values in SECTION ONE should be aligned. Value positions: {:?}",
             value_positions
         );
 
         // Check SECTION TWO items
-        let section_two_items: Vec<&str> = lines[section_two_start + 1..]
+        let section_two_items: Vec<&str> = lines
+            .get(section_two_start + 1..)
+            .expect("SECTION TWO item range should be valid")
             .iter()
             .filter(|l| !l.trim().is_empty() && !l.contains("SECTION"))
             .copied()
@@ -1149,19 +1154,27 @@ mod tests {
 
         let value_positions_two: Vec<usize> = section_two_items
             .iter()
-            .map(|line| line.find("value").unwrap())
+            .map(|line| line.find("value").expect("item line should contain value"))
             .collect();
 
         assert!(
-            value_positions_two.windows(2).all(|w| w[0] == w[1]),
+            value_positions_two
+                .windows(2)
+                .all(|w| w.first() == w.get(1)),
             "Values in SECTION TWO should be aligned. Value positions: {:?}",
             value_positions_two
         );
 
         // Verify that different sections can have different padding
         // (SECTION ONE should have wider padding than SECTION TWO)
+        let first_section_value_position = value_positions
+            .first()
+            .expect("SECTION ONE should have value positions");
+        let second_section_value_position = value_positions_two
+            .first()
+            .expect("SECTION TWO should have value positions");
         assert!(
-            value_positions[0] > value_positions_two[0],
+            first_section_value_position > second_section_value_position,
             "SECTION ONE should have wider padding than SECTION TWO"
         );
     }

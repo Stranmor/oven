@@ -53,7 +53,9 @@ mod test {
     #[tokio::test]
     async fn test_stream_receives_messages() {
         let mut stream = MpscStream::spawn(|tx| async move {
-            tx.send("test message").await.unwrap();
+            tx.send("test message")
+                .await
+                .expect("stream receiver should accept test message");
         });
 
         let result = stream.next().await;

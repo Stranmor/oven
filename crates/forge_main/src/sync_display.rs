@@ -162,7 +162,7 @@ mod tests {
         assert!(
             fixture
                 .message()
-                .unwrap()
+                .expect("discovering files progress should render a message")
                 .contains(workspace_id.to_string().as_str())
         );
     }

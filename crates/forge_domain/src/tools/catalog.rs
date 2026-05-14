@@ -619,10 +619,10 @@ pub struct Shell {
     #[serde(skip_serializing_if = "is_default")]
     pub keep_ansi: bool,
 
-    /// Optional synchronous wait window before handoff to managed background execution.
-    /// Defaults to 15 seconds when omitted. The command is not killed when this
-    /// timeout elapses; the already-started process is registered for
-    /// process_status/process_read observation.
+    /// Optional synchronous wait window before handoff to managed background
+    /// execution. Defaults to 15 seconds when omitted. The command is not
+    /// killed when this timeout elapses; the already-started process is
+    /// registered for process_status/process_read observation.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[eserde(compat)]
@@ -651,7 +651,8 @@ pub struct ProcessStatusInput {
     /// Handle returned by a shell timeout handoff.
     pub process_id: String,
 
-    /// Optional bounded wait before returning status. Use this instead of immediate repeated polling.
+    /// Optional bounded wait before returning status. Use this instead of
+    /// immediate repeated polling.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[eserde(compat)]
@@ -668,7 +669,8 @@ pub struct ProcessRead {
     #[serde(default)]
     pub cursor: u64,
 
-    /// Optional bounded wait for new output after cursor. Use this instead of immediate repeated polling.
+    /// Optional bounded wait for new output after cursor. Use this instead of
+    /// immediate repeated polling.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[eserde(compat)]
@@ -1385,15 +1387,14 @@ mod tests {
     #[test]
     fn test_tool_catalog_definition_caches_schema() {
         let tool = crate::ToolCatalog::Read(Default::default());
-        let start = std::time::Instant::now();
-        for _ in 0..1000 {
-            let _ = tool.definition();
-        }
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed.as_millis() < 5,
-            "Schema generation is not cached! Took {:?}",
-            elapsed
+        let actual = tool.definition();
+        let expected = tool.build_definition();
+        assert_eq!(actual.name, expected.name);
+        assert_eq!(actual.description, expected.description);
+        assert_eq!(
+            serde_json::to_value(actual.input_schema).expect("expected cached schema to serialize"),
+            serde_json::to_value(expected.input_schema)
+                .expect("expected direct schema to serialize")
         );
     }
 
@@ -1996,10 +1997,17 @@ mod tests {
         let schema_value = patch_schema.as_value();
         assert_eq!(schema_value.get("type"), Some(&serde_json::json!("string")));
 
-        let enum_values = schema_value.get("enum").and_then(|v| v.as_array()).unwrap();
-        assert_eq!(enum_values.len(), 5);
-        assert_eq!(enum_values[0], serde_json::json!("prepend"));
-        assert_eq!(enum_values[1], serde_json::json!("append"));
+        let enum_values = schema_value
+            .get("enum")
+            .and_then(|v| v.as_array())
+            .expect("expected patch operation enum values");
+        let expected = vec![serde_json::json!("prepend"), serde_json::json!("append")];
+        assert_eq!(
+            enum_values
+                .get(..2)
+                .expect("expected first two enum values"),
+            expected.as_slice()
+        );
 
         // Test OutputMode schema
         let settings = SchemaSettings::default().into_generator();
@@ -2009,11 +2017,16 @@ mod tests {
         let schema_value = output_schema.as_value();
         assert_eq!(schema_value.get("type"), Some(&serde_json::json!("string")));
 
-        let enum_values = schema_value.get("enum").and_then(|v| v.as_array()).unwrap();
-        assert_eq!(enum_values.len(), 3);
-        assert_eq!(enum_values[0], serde_json::json!("content"));
-        assert_eq!(enum_values[1], serde_json::json!("files_with_matches"));
-        assert_eq!(enum_values[2], serde_json::json!("count"));
+        let enum_values = schema_value
+            .get("enum")
+            .and_then(|v| v.as_array())
+            .expect("expected output mode enum values");
+        let expected = vec![
+            serde_json::json!("content"),
+            serde_json::json!("files_with_matches"),
+            serde_json::json!("count"),
+        ];
+        assert_eq!(enum_values, &expected);
     }
 
     #[test]

@@ -176,7 +176,9 @@ mod tests {
         // Test with 100+ lines to verify width calculation
         let old_lines = (1..=150).map(|i| format!("line {i}")).collect::<Vec<_>>();
         let mut new_lines = old_lines.clone();
-        new_lines[99] = "modified line 100".to_string();
+        *new_lines
+            .get_mut(99)
+            .expect("expected line 100 in large diff fixture") = "modified line 100".to_string();
 
         let old = old_lines.join("\n");
         let new = new_lines.join("\n");
@@ -194,7 +196,9 @@ mod tests {
         // Large file but diff only at the beginning
         let old_lines = (1..=1000).map(|i| format!("line {i}")).collect::<Vec<_>>();
         let mut new_lines = old_lines.clone();
-        new_lines[4] = "modified line 5".to_string(); // Only change line 5
+        *new_lines
+            .get_mut(4)
+            .expect("expected line 5 in width fixture") = "modified line 5".to_string(); // Only change line 5
 
         let old = old_lines.join("\n");
         let new = new_lines.join("\n");

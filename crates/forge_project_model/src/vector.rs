@@ -1,8 +1,9 @@
 //! Provider-neutral vector search and reranking boundaries.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use crate::lexical::tokenize;
 use crate::types::{RerankCandidate, RerankScore, VectorQuery, VectorSearchHit};
-use std::collections::{BTreeMap, BTreeSet};
 
 /// Typed vector search boundary implemented by external embedding integrations.
 pub trait VectorIndex {
@@ -113,8 +114,9 @@ fn cosine_similarity(left: &[f32], right: &[f32]) -> Option<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use pretty_assertions::assert_eq;
+
+    use super::*;
 
     #[test]
     fn deterministic_vector_index_returns_cosine_ranked_hits() {

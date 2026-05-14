@@ -157,19 +157,36 @@ mod tests {
         let fixture = MessagePattern::new("ssusususaasa");
         let actual = fixture.build();
 
-        assert_eq!(actual.messages.len(), 12);
-        assert!(actual.messages[0].has_role(Role::System));
-        assert!(actual.messages[1].has_role(Role::System));
-        assert!(actual.messages[2].has_role(Role::User));
-        assert!(actual.messages[3].has_role(Role::System));
-        assert!(actual.messages[4].has_role(Role::User));
-        assert!(actual.messages[5].has_role(Role::System));
-        assert!(actual.messages[6].has_role(Role::User));
-        assert!(actual.messages[7].has_role(Role::System));
-        assert!(actual.messages[8].has_role(Role::Assistant));
-        assert!(actual.messages[9].has_role(Role::Assistant));
-        assert!(actual.messages[10].has_role(Role::System));
-        assert!(actual.messages[11].has_role(Role::Assistant));
+        let actual_roles: Vec<_> = actual
+            .messages
+            .iter()
+            .filter_map(|message| {
+                if message.has_role(Role::System) {
+                    Some(Role::System)
+                } else if message.has_role(Role::User) {
+                    Some(Role::User)
+                } else if message.has_role(Role::Assistant) {
+                    Some(Role::Assistant)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let expected_roles = vec![
+            Role::System,
+            Role::System,
+            Role::User,
+            Role::System,
+            Role::User,
+            Role::System,
+            Role::User,
+            Role::System,
+            Role::Assistant,
+            Role::Assistant,
+            Role::System,
+            Role::Assistant,
+        ];
+        assert_eq!(actual_roles, expected_roles);
     }
 
     #[test]
@@ -215,9 +232,18 @@ mod tests {
         let fixture = MessagePattern::new("uau");
         let actual = fixture.build();
 
-        assert_eq!(actual.messages[0].content().unwrap(), "Message 1");
-        assert_eq!(actual.messages[1].content().unwrap(), "Message 2");
-        assert_eq!(actual.messages[2].content().unwrap(), "Message 3");
+        let actual: Vec<_> = actual
+            .messages
+            .iter()
+            .map(|message| {
+                message
+                    .content()
+                    .expect("expected message content")
+                    .to_string()
+            })
+            .collect();
+        let expected = vec!["Message 1", "Message 2", "Message 3"];
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -225,11 +251,29 @@ mod tests {
         let fixture = MessagePattern::new("utr");
         let actual = fixture.build();
 
-        assert_eq!(actual.messages.len(), 3);
-        assert!(actual.messages[0].has_role(Role::User));
-        assert!(actual.messages[1].has_role(Role::Assistant));
-        assert!(actual.messages[1].has_tool_call());
-        assert!(actual.messages[2].has_tool_result());
+        let actual_roles = actual
+            .messages
+            .iter()
+            .map(|message| {
+                if message.has_role(Role::User) {
+                    "user"
+                } else if message.has_role(Role::Assistant) {
+                    "assistant"
+                } else if message.has_tool_result() {
+                    "tool_result"
+                } else {
+                    "other"
+                }
+            })
+            .collect::<Vec<_>>();
+        let expected_roles = vec!["user", "assistant", "tool_result"];
+        assert_eq!(actual_roles, expected_roles);
+        assert!(
+            actual
+                .messages
+                .iter()
+                .any(|message| message.has_tool_call())
+        );
     }
 
     #[test]
@@ -237,11 +281,19 @@ mod tests {
         let fixture = MessagePattern::new("utrtr");
         let actual = fixture.build();
 
-        assert_eq!(actual.messages.len(), 5);
-        assert!(actual.messages[1].has_tool_call());
-        assert!(actual.messages[2].has_tool_result());
-        assert!(actual.messages[3].has_tool_call());
-        assert!(actual.messages[4].has_tool_result());
+        let actual = actual
+            .messages
+            .iter()
+            .map(|message| (message.has_tool_call(), message.has_tool_result()))
+            .collect::<Vec<_>>();
+        let expected = vec![
+            (false, false),
+            (true, false),
+            (false, true),
+            (true, false),
+            (false, true),
+        ];
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -249,14 +301,39 @@ mod tests {
         let fixture = MessagePattern::new("sutruaua");
         let actual = fixture.build();
 
-        assert_eq!(actual.messages.len(), 8);
-        assert!(actual.messages[0].has_role(Role::System));
-        assert!(actual.messages[1].has_role(Role::User));
-        assert!(actual.messages[2].has_tool_call());
-        assert!(actual.messages[3].has_tool_result());
-        assert!(actual.messages[4].has_role(Role::User));
-        assert!(actual.messages[5].has_role(Role::Assistant));
-        assert!(actual.messages[6].has_role(Role::User));
-        assert!(actual.messages[7].has_role(Role::Assistant));
+        let actual_roles = actual
+            .messages
+            .iter()
+            .map(|message| {
+                if message.has_role(Role::System) {
+                    "system"
+                } else if message.has_role(Role::User) {
+                    "user"
+                } else if message.has_role(Role::Assistant) {
+                    "assistant"
+                } else if message.has_tool_result() {
+                    "tool_result"
+                } else {
+                    "other"
+                }
+            })
+            .collect::<Vec<_>>();
+        let expected_roles = vec![
+            "system",
+            "user",
+            "assistant",
+            "tool_result",
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+        ];
+        assert_eq!(actual_roles, expected_roles);
+        assert!(
+            actual
+                .messages
+                .iter()
+                .any(|message| message.has_tool_call())
+        );
     }
 }

@@ -397,7 +397,8 @@ mod tests {
         let messages = actual.context.unwrap().messages;
         assert_eq!(messages.len(), 3);
 
-        // Verify order: main message first, runtime context second, then additional context
+        // Verify order: main message first, runtime context second, then additional
+        // context
         assert_eq!(messages[0].content().unwrap(), "First Message");
         assert!(messages[1].content().unwrap().contains("<runtime_context"));
         assert_eq!(messages[2].content().unwrap(), "Second Message");
@@ -762,7 +763,8 @@ mod tests {
         // Execute
         let actual = generator.add_user_prompt(conversation).await.unwrap();
 
-        // Assert - Should have system, previous user, new user message, runtime context, and todo list
+        // Assert - Should have system, previous user, new user message, runtime
+        // context, and todo list
         let messages = actual.context.unwrap().messages;
         assert_eq!(messages.len(), 5, "Should have 5 messages");
 

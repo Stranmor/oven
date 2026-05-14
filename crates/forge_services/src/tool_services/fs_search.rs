@@ -7,9 +7,8 @@ use forge_app::{
     FileInfoInfra, FileReaderInfra, FsSearchService, Match, MatchResult, SearchResult, Walker,
     WalkerInfra,
 };
-use futures::StreamExt;
-
 use forge_domain::{FSSearch, OutputMode};
+use futures::StreamExt;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkContext, SinkContextKind, SinkMatch};
@@ -212,14 +211,23 @@ impl<W: WalkerInfra + FileReaderInfra + FileInfoInfra> ForgeFsSearch<W> {
             return vec![pattern.to_string()];
         };
         let search_start = open.saturating_add(1);
-        let Some(close_offset) = pattern[search_start..].find('}') else {
+        let Some(rest) = pattern.get(search_start..) else {
+            return vec![pattern.to_string()];
+        };
+        let Some(close_offset) = rest.find('}') else {
             return vec![pattern.to_string()];
         };
         let close = search_start.saturating_add(close_offset);
-        let prefix = &pattern[..open];
+        let Some(prefix) = pattern.get(..open) else {
+            return vec![pattern.to_string()];
+        };
         let suffix_start = close.saturating_add(1);
-        let suffix = &pattern[suffix_start..];
-        let body = &pattern[search_start..close];
+        let Some(suffix) = pattern.get(suffix_start..) else {
+            return vec![pattern.to_string()];
+        };
+        let Some(body) = pattern.get(search_start..close) else {
+            return vec![pattern.to_string()];
+        };
 
         body.split(',')
             .filter(|part| !part.is_empty())

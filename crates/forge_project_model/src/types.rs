@@ -1,10 +1,11 @@
 //! Public project-model DTOs and type surfaces.
 
-use anyhow::{Result, bail};
-use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+
+use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
 
 /// A deterministic project manifest generated from a workspace root.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -132,12 +133,14 @@ pub struct GraphEdge {
 /// Semantic confidence carried by graph edges.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum EdgeConfidence {
-    /// Compiler, LSP, or SCIP fact imported from an authoritative external source.
+    /// Compiler, LSP, or SCIP fact imported from an authoritative external
+    /// source.
     ExactCompiler,
     /// High-confidence syntax heuristic produced without type resolution.
     #[default]
     HeuristicHigh,
-    /// Low-confidence syntax heuristic that may require later compiler validation.
+    /// Low-confidence syntax heuristic that may require later compiler
+    /// validation.
     HeuristicLow,
 }
 
@@ -156,13 +159,16 @@ pub enum GraphEdgeKind {
     ExternCrate,
     /// Cargo dependency declared in Cargo.toml.
     CargoDependency,
-    /// Symbol or callable invokes another callable by name or imported compiler fact.
+    /// Symbol or callable invokes another callable by name or imported compiler
+    /// fact.
     Calls,
     /// Symbol or file references another symbol.
     References,
-    /// Task depends on file, symbol, shard, decision, retrieved evidence, tool episode, or eval evidence.
+    /// Task depends on file, symbol, shard, decision, retrieved evidence, tool
+    /// episode, or eval evidence.
     TaskDependsOn,
-    /// Decision is supported by file, symbol, shard, task, retrieved evidence, tool episode, or eval evidence.
+    /// Decision is supported by file, symbol, shard, task, retrieved evidence,
+    /// tool episode, or eval evidence.
     DecisionSupportedBy,
     /// Retrieved evidence cites a file, symbol, or shard.
     EvidenceCites,
@@ -186,9 +192,11 @@ pub enum KnowledgeGraphNodeId {
     Shard(String),
     /// Agent task node keyed by durable task identifier.
     Task(String),
-    /// Architecture or product decision node keyed by durable decision identifier.
+    /// Architecture or product decision node keyed by durable decision
+    /// identifier.
     Decision(String),
-    /// Retrieved external or internal evidence node keyed by durable evidence identifier.
+    /// Retrieved external or internal evidence node keyed by durable evidence
+    /// identifier.
     RetrievedEvidence(String),
     /// Tool episode node keyed by durable tool episode identifier.
     ToolEpisode(String),
@@ -432,12 +440,14 @@ pub struct KnowledgeGraphEdge {
     pub provenance: Provenance,
 }
 
-/// Typed knowledge graph with validated node endpoints and deterministic ordering.
+/// Typed knowledge graph with validated node endpoints and deterministic
+/// ordering.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct KnowledgeGraph {
     /// Graph nodes in deterministic identifier order.
     pub nodes: Vec<KnowledgeGraphNode>,
-    /// Graph edges in deterministic source-target-kind-confidence-provenance order.
+    /// Graph edges in deterministic source-target-kind-confidence-provenance
+    /// order.
     pub edges: Vec<KnowledgeGraphEdge>,
 }
 
@@ -451,8 +461,9 @@ impl KnowledgeGraph {
     ///
     /// # Errors
     ///
-    /// Returns an error when an edge endpoint is absent from the node set, a node identifier is
-    /// duplicated, or an edge confidence is outside the closed 0.0 to 1.0 range.
+    /// Returns an error when an edge endpoint is absent from the node set, a
+    /// node identifier is duplicated, or an edge confidence is outside the
+    /// closed 0.0 to 1.0 range.
     pub fn new(
         mut nodes: Vec<KnowledgeGraphNode>,
         mut edges: Vec<KnowledgeGraphEdge>,
@@ -487,7 +498,8 @@ impl KnowledgeGraph {
         Ok(Self { nodes, edges })
     }
 
-    /// Builds file, symbol, shard, and legacy graph edges from a project manifest.
+    /// Builds file, symbol, shard, and legacy graph edges from a project
+    /// manifest.
     ///
     /// # Arguments
     ///
@@ -495,7 +507,8 @@ impl KnowledgeGraph {
     ///
     /// # Errors
     ///
-    /// Returns an error when manifest edges point to nodes absent from the graph surface.
+    /// Returns an error when manifest edges point to nodes absent from the
+    /// graph surface.
     pub fn from_manifest(manifest: &ProjectManifest) -> Result<Self> {
         let mut nodes = Vec::new();
         for file in &manifest.files {
@@ -626,17 +639,22 @@ fn typed_legacy_node_id(
         .find(|candidate| known_ids.contains(candidate))
 }
 
-/// Freshness classification for evidence included in context packaging or graph evidence.
+/// Freshness classification for evidence included in context packaging or graph
+/// evidence.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum EvidenceFreshness {
-    /// Evidence path is absent from the freshness state or explicitly unchanged.
+    /// Evidence path is absent from the freshness state or explicitly
+    /// unchanged.
     #[default]
     Fresh,
-    /// Evidence path was added after the baseline and should be treated as fresh current evidence.
+    /// Evidence path was added after the baseline and should be treated as
+    /// fresh current evidence.
     Added,
-    /// Evidence path changed relative to the baseline and must be reviewed before use.
+    /// Evidence path changed relative to the baseline and must be reviewed
+    /// before use.
     Changed,
-    /// Evidence path was deleted relative to the baseline and cannot be used as current evidence.
+    /// Evidence path was deleted relative to the baseline and cannot be used as
+    /// current evidence.
     Deleted,
 }
 
@@ -650,14 +668,16 @@ pub enum StaleEvidencePolicy {
     Mark,
 }
 
-/// Selected retrieval result, shard, or ad-hoc evidence used to build a context pack.
+/// Selected retrieval result, shard, or ad-hoc evidence used to build a context
+/// pack.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContextPackSelection {
     /// Retrieved results selected by the retrieval layer.
     pub retrieval_results: Vec<RetrievalResult>,
     /// Shard manifests selected by structural or graph expansion.
     pub shards: Vec<ShardManifest>,
-    /// Additional typed evidence selected by external evaluators or integrations.
+    /// Additional typed evidence selected by external evaluators or
+    /// integrations.
     pub evidence: Vec<ContextPackEvidence>,
     /// Freshness state used to classify included paths.
     pub freshness: FreshnessState,
@@ -703,14 +723,16 @@ pub struct ContextPack {
     pub version: u32,
     /// Manifest hash used to build this context pack.
     pub manifest_hash: String,
-    /// Evidence entries sorted deterministically by freshness, path, identifier, source, score, and provenance.
+    /// Evidence entries sorted deterministically by freshness, path,
+    /// identifier, source, score, and provenance.
     pub evidence: Vec<ContextPackEvidence>,
     /// All provenance records required to audit the pack.
     pub provenance: Vec<Provenance>,
 }
 
 impl ContextPack {
-    /// Builds a deterministic context pack from selected retrieval, shard, and direct evidence.
+    /// Builds a deterministic context pack from selected retrieval, shard, and
+    /// direct evidence.
     ///
     /// # Arguments
     ///
@@ -719,8 +741,8 @@ impl ContextPack {
     ///
     /// # Errors
     ///
-    /// Returns an error when provenance is incomplete, a score is not finite, or stale evidence is
-    /// rejected by policy.
+    /// Returns an error when provenance is incomplete, a score is not finite,
+    /// or stale evidence is rejected by policy.
     pub fn from_selection(
         manifest: &ProjectManifest,
         selection: ContextPackSelection,
@@ -874,7 +896,8 @@ pub struct RetrievalResult {
 /// Freshness state for a file relative to a previous manifest.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FreshnessState {
-    /// Changed files where path exists in both manifests with different content hashes.
+    /// Changed files where path exists in both manifests with different content
+    /// hashes.
     pub changed: Vec<String>,
     /// Deleted files from the previous manifest.
     pub deleted: Vec<String>,
@@ -1014,7 +1037,8 @@ pub struct RerankScore {
     pub score: f32,
 }
 
-/// Typed external fact source accepted at the compiler/LSP/SCIP ingestion boundary.
+/// Typed external fact source accepted at the compiler/LSP/SCIP ingestion
+/// boundary.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ExternalFactSource {
     /// Language Server Protocol facts.
@@ -1077,7 +1101,8 @@ pub struct TypedExternalSymbolFact {
     pub source: ExternalFactSource,
 }
 
-/// External compiler, LSP, or SCIP relationship fact accepted by the typed importer.
+/// External compiler, LSP, or SCIP relationship fact accepted by the typed
+/// importer.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypedExternalReferenceFact {
     /// Stable source node identifier.
@@ -1105,7 +1130,8 @@ pub struct TypedExternalFacts {
     pub references: Vec<TypedExternalReferenceFact>,
 }
 
-/// Legacy external compiler, LSP, or SCIP symbol fact accepted for public API compatibility.
+/// Legacy external compiler, LSP, or SCIP symbol fact accepted for public API
+/// compatibility.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalSymbolFact {
     /// Stable external symbol identifier.
@@ -1124,7 +1150,8 @@ pub struct ExternalSymbolFact {
     pub source: String,
 }
 
-/// Legacy external compiler, LSP, or SCIP relationship fact accepted for public API compatibility.
+/// Legacy external compiler, LSP, or SCIP relationship fact accepted for public
+/// API compatibility.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalReferenceFact {
     /// Stable source node identifier.
@@ -1216,13 +1243,13 @@ pub struct FutureVectorRetrievalScaffold {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::ProjectIndexer;
-    use crate::indexer::tests::fixture_project;
-    use crate::retrieve;
-    use crate::util::{fingerprint, provenance};
     use anyhow::Result;
     use pretty_assertions::assert_eq;
+
+    use super::*;
+    use crate::indexer::tests::fixture_project;
+    use crate::util::{fingerprint, provenance};
+    use crate::{ProjectIndexer, retrieve};
 
     #[test]
     fn knowledge_graph_connects_tasks_decisions_and_retrieved_evidence_to_code_evidence()

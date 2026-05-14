@@ -1,13 +1,15 @@
 //! Typed ingestion boundary for external compiler, LSP, or SCIP facts.
 
+use std::collections::BTreeSet;
+
 use crate::types::{
     EdgeConfidence, ExternalFactSource, ExternalFacts, GraphEdge, ProjectManifest, Provenance,
     SymbolNode, TypedExternalFacts, TypedExternalReferenceFact, TypedExternalSymbolFact,
 };
 use crate::util::{edge, edge_sort_key, fingerprint, provenance};
-use std::collections::BTreeSet;
 
-/// Imports legacy external compiler/LSP/SCIP facts into an in-memory project manifest.
+/// Imports legacy external compiler/LSP/SCIP facts into an in-memory project
+/// manifest.
 ///
 /// # Arguments
 ///
@@ -17,7 +19,8 @@ pub fn ingest_external_facts(manifest: &mut ProjectManifest, facts: ExternalFact
     ingest_typed_external_facts(manifest, facts.into());
 }
 
-/// Imports typed external compiler/LSP/SCIP facts into an in-memory project manifest.
+/// Imports typed external compiler/LSP/SCIP facts into an in-memory project
+/// manifest.
 ///
 /// # Arguments
 ///
@@ -135,14 +138,15 @@ impl From<crate::types::ExternalReferenceFact> for TypedExternalReferenceFact {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Result;
+    use pretty_assertions::assert_eq;
+
     use super::*;
     use crate::indexer::tests::fixture_project;
     use crate::{
         ExternalFactSource, ExternalReferenceFact, GraphEdgeKind, ProjectIndexer, SymbolKind,
         TypedExternalFacts, TypedExternalReferenceFact, TypedExternalSymbolFact,
     };
-    use anyhow::Result;
-    use pretty_assertions::assert_eq;
 
     #[test]
     fn imports_typed_lsp_and_scip_facts_as_exact_compiler_edges() -> Result<()> {

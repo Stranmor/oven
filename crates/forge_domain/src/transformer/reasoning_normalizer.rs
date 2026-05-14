@@ -260,14 +260,14 @@ mod tests {
 
         // a1 (model_a) is before the cutoff → stripped
         let msgs: Vec<_> = actual.messages.iter().collect();
-        if let crate::ContextMessage::Text(a1) = &**msgs[1] {
+        if let crate::ContextMessage::Text(a1) = &***msgs.get(1).expect("expected a1 message") {
             assert_eq!(
                 a1.reasoning_details, None,
                 "a1 (model_a) should be stripped"
             );
         }
         // a2 (model_b) is in the same-model tail → preserved
-        if let crate::ContextMessage::Text(a2) = &**msgs[3] {
+        if let crate::ContextMessage::Text(a2) = &***msgs.get(3).expect("expected a2 message") {
             assert_eq!(
                 a2.reasoning_details,
                 Some(reasoning_details()),
@@ -327,21 +327,21 @@ mod tests {
 
         let msgs: Vec<_> = actual.messages.iter().collect();
         // a1 (model_a, before cutoff) → stripped
-        if let crate::ContextMessage::Text(a1) = &**msgs[1] {
+        if let crate::ContextMessage::Text(a1) = &***msgs.get(1).expect("expected a1 message") {
             assert_eq!(
                 a1.reasoning_details, None,
                 "a1 should be stripped (before cutoff)"
             );
         }
         // b2 (model_b, the cutoff itself) → stripped
-        if let crate::ContextMessage::Text(b2) = &**msgs[3] {
+        if let crate::ContextMessage::Text(b2) = &***msgs.get(3).expect("expected b2 message") {
             assert_eq!(
                 b2.reasoning_details, None,
                 "b2 should be stripped (is the cutoff)"
             );
         }
         // a3 (model_a, same-model tail) → preserved
-        if let crate::ContextMessage::Text(a3) = &**msgs[5] {
+        if let crate::ContextMessage::Text(a3) = &***msgs.get(5).expect("expected a3 message") {
             assert_eq!(
                 a3.reasoning_details,
                 Some(reasoning_details()),
@@ -403,8 +403,13 @@ mod tests {
             .filter(|m| m.has_role(Role::Assistant))
             .collect();
 
+        let split_at = assistant_msgs
+            .len()
+            .checked_sub(3)
+            .expect("expected at least three tail assistant messages");
+        let (pre_tail, tail) = assistant_msgs.split_at(split_at);
         // Tail (last 3): b9, b10, b11 → reasoning preserved
-        for tail_msg in &assistant_msgs[assistant_msgs.len() - 3..] {
+        for tail_msg in tail {
             if let crate::ContextMessage::Text(t) = &***tail_msg {
                 assert_eq!(
                     t.reasoning_details,
@@ -416,7 +421,7 @@ mod tests {
         }
 
         // Everything before the tail (a1..a8, b5, c7) → reasoning stripped
-        for pre_msg in &assistant_msgs[..assistant_msgs.len() - 3] {
+        for pre_msg in pre_tail {
             if let crate::ContextMessage::Text(t) = &***pre_msg {
                 assert_eq!(
                     t.reasoning_details, None,

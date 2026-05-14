@@ -1037,30 +1037,49 @@ mod tests {
         let schema = schema_for!(MultiPatchData);
         let actual = coerce_to_schema(fixture, &schema);
 
-        // Should coerce string to an array of objects
-        assert!(actual["edits"].is_array());
-        let edits = actual["edits"].as_array().unwrap();
+        let edits_value = actual.get("edits").expect("expected coerced edits field");
+        assert!(edits_value.is_array());
+        let edits = edits_value
+            .as_array()
+            .expect("coerced edits field should be an array");
         assert_eq!(edits.len(), 2);
+
+        let first_edit = edits.first().expect("expected first coerced edit");
+        let second_edit = edits.get(1).expect("expected second coerced edit");
 
         // Verify first edit object
         assert_eq!(
-            edits[0]["content"],
+            first_edit
+                .get("content")
+                .expect("expected first edit content"),
             "use schemars::schema::{InstanceType, RootSchema, Schema, SchemaObject, SingleOrVec};"
         );
-        assert_eq!(edits[0]["operation"], "replace");
         assert_eq!(
-            edits[0]["path"],
+            first_edit
+                .get("operation")
+                .expect("expected first edit operation"),
+            "replace"
+        );
+        assert_eq!(
+            first_edit.get("path").expect("expected first edit path"),
             "crates/forge_json_repair/src/schema_coercion.rs"
         );
 
         // Verify second edit object
         assert_eq!(
-            edits[1]["content"],
+            second_edit
+                .get("content")
+                .expect("expected second edit content"),
             "fn coerce_value_with_schema(value: Value, schema: &Schema) -> Value {"
         );
-        assert_eq!(edits[1]["operation"], "replace");
         assert_eq!(
-            edits[1]["path"],
+            second_edit
+                .get("operation")
+                .expect("expected second edit operation"),
+            "replace"
+        );
+        assert_eq!(
+            second_edit.get("path").expect("expected second edit path"),
             "crates/forge_json_repair/src/schema_coercion.rs"
         );
     }

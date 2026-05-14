@@ -31,10 +31,9 @@ impl Image {
     /// unsupported MIME type, or contains invalid base64 payload data.
     pub fn canonicalize_data_url(raw: &str) -> anyhow::Result<String> {
         let trimmed = raw.trim();
-        if trimmed.len() < 5 || !trimmed[..5].eq_ignore_ascii_case("data:") {
+        let Some(rest) = strip_ascii_prefix(trimmed, "data:") else {
             anyhow::bail!("Image URL must be a data URI")
-        }
-        let rest = &trimmed[5..];
+        };
         let Some((meta, data)) = rest.split_once(',') else {
             anyhow::bail!("Image data URI is missing comma separator")
         };
@@ -76,6 +75,18 @@ impl Image {
         let content = format!("data:{mime_type};base64,{base64_encoded}");
         Self { url: content, mime_type }
     }
+}
+
+fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let mut rest = value;
+    for expected in prefix.chars() {
+        let actual = rest.chars().next()?;
+        if !actual.eq_ignore_ascii_case(&expected) {
+            return None;
+        }
+        rest = rest.get(actual.len_utf8()..)?;
+    }
+    Some(rest)
 }
 
 #[cfg(test)]

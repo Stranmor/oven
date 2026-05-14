@@ -339,12 +339,12 @@ mod tests {
     /// relative path (which may include spaces) and returns the absolute path
     /// to that file along with the `TempDir` guard to keep it alive.
     fn create_file_with_spaces(relative: &str) -> (String, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("fixture temp directory should be created");
         let file_path = dir.path().join(relative);
         if let Some(parent) = file_path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
+            std::fs::create_dir_all(parent).expect("fixture parent directories should be created");
         }
-        std::fs::write(&file_path, "test").unwrap();
+        std::fs::write(&file_path, "test").expect("fixture file should be written");
         (file_path.to_string_lossy().into_owned(), dir)
     }
 

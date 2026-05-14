@@ -275,7 +275,8 @@ impl Request {
         &mut self.messages
     }
 
-    /// Returns whether the provider message at `index` may receive a prompt-cache marker.
+    /// Returns whether the provider message at `index` may receive a
+    /// prompt-cache marker.
     pub fn is_message_cache_eligible(&self, index: usize) -> bool {
         self.message_cache_eligibility
             .get(index)

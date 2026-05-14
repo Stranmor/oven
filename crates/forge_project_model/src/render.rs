@@ -2,7 +2,8 @@
 
 use crate::fingerprint;
 
-/// Default maximum number of evidence sources rendered for automatic context injection.
+/// Default maximum number of evidence sources rendered for automatic context
+/// injection.
 pub const DEFAULT_RENDERED_SOURCE_LIMIT: usize = 3;
 
 /// A typed rendering budget for dynamic project-model context.
@@ -18,7 +19,8 @@ pub struct ProjectModelContextRenderBudget {
     pub max_source_lines: usize,
     /// Maximum total rendered XML characters for the complete context payload.
     pub max_rendered_chars: usize,
-    /// Maximum characters retained for any metadata attribute value before preview truncation.
+    /// Maximum characters retained for any metadata attribute value before
+    /// preview truncation.
     pub max_metadata_attr_chars: usize,
 }
 
@@ -115,7 +117,8 @@ impl ProjectModelContextSource {
     ///
     /// # Arguments
     ///
-    /// * `content_hash` - Redaction-safe content hash supplied by the source system.
+    /// * `content_hash` - Redaction-safe content hash supplied by the source
+    ///   system.
     pub fn content_hash(mut self, content_hash: impl Into<String>) -> Self {
         self.content_hash = Some(content_hash.into());
         self
@@ -469,8 +472,9 @@ fn xml_cdata(value: impl ToString) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use pretty_assertions::assert_eq;
+
+    use super::*;
 
     fn fixture_source(content: impl Into<String>) -> ProjectModelContextSource {
         ProjectModelContextSource::new(

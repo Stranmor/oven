@@ -992,6 +992,10 @@ mod tests {
 
     use super::*;
 
+    fn conversation_id(fixture: &str) -> ConversationId {
+        ConversationId::parse(fixture).expect("fixture conversation id should be valid")
+    }
+
     #[test]
     fn test_tui_flag_defaults_to_classic_mode() {
         let fixture = Cli::parse_from(["forge", "-p", "hello"]);
@@ -1011,7 +1015,9 @@ mod tests {
     #[test]
     fn test_cli_version_includes_last_updated_date() {
         let fixture = Cli::command();
-        let actual = fixture.get_version().unwrap();
+        let actual = fixture
+            .get_version()
+            .expect("CLI command version should be available");
         let expected = crate::version::VERSION_WITH_LAST_UPDATED;
 
         assert_eq!(actual, expected);
@@ -1044,7 +1050,7 @@ mod tests {
         let fixture = Cli::parse_from(["forge", "commit", "--preview"]);
         let actual = match fixture.subcommands {
             Some(TopLevelCommand::Commit(commit)) => commit.max_diff_size,
-            _ => panic!("Expected Commit command"),
+            _ => None,
         };
         let expected = Some(100000);
         assert_eq!(actual, expected);
@@ -1055,7 +1061,7 @@ mod tests {
         let fixture = Cli::parse_from(["forge", "commit", "--preview", "--max-diff", "50000"]);
         let actual = match fixture.subcommands {
             Some(TopLevelCommand::Commit(commit)) => commit.max_diff_size,
-            _ => panic!("Expected Commit command"),
+            _ => None,
         };
         let expected = Some(50000);
         assert_eq!(actual, expected);
@@ -1107,9 +1113,9 @@ mod tests {
         let actual = match fixture.subcommands {
             Some(TopLevelCommand::Config(config)) => match config.command {
                 ConfigCommand::Get(args) => matches!(args.field, ConfigGetField::Model),
-                _ => panic!("Expected ConfigCommand::Get"),
+                _ => false,
             },
-            _ => panic!("Expected TopLevelCommand::Config"),
+            _ => false,
         };
         assert!(actual);
     }
@@ -1207,10 +1213,7 @@ mod tests {
             },
             _ => (ConversationId::default(), true),
         };
-        assert_eq!(
-            id,
-            ConversationId::parse("550e8400-e29b-41d4-a716-446655440000").unwrap()
-        );
+        assert_eq!(id, conversation_id("550e8400-e29b-41d4-a716-446655440000"));
         assert_eq!(html, false); // JSON is default
     }
 
@@ -1230,10 +1233,7 @@ mod tests {
             },
             _ => (ConversationId::default(), false),
         };
-        assert_eq!(
-            id,
-            ConversationId::parse("550e8400-e29b-41d4-a716-446655440001").unwrap()
-        );
+        assert_eq!(id, conversation_id("550e8400-e29b-41d4-a716-446655440001"));
         assert_eq!(html, true);
     }
 
@@ -1252,10 +1252,7 @@ mod tests {
             },
             _ => ConversationId::default(),
         };
-        assert_eq!(
-            id,
-            ConversationId::parse("550e8400-e29b-41d4-a716-446655440002").unwrap()
-        );
+        assert_eq!(id, conversation_id("550e8400-e29b-41d4-a716-446655440002"));
     }
 
     #[test]
@@ -1273,10 +1270,7 @@ mod tests {
             },
             _ => ConversationId::default(),
         };
-        assert_eq!(
-            id,
-            ConversationId::parse("550e8400-e29b-41d4-a716-446655440003").unwrap()
-        );
+        assert_eq!(id, conversation_id("550e8400-e29b-41d4-a716-446655440003"));
     }
 
     #[test]
@@ -1294,10 +1288,7 @@ mod tests {
             },
             _ => (ConversationId::default(), false),
         };
-        assert_eq!(
-            id,
-            ConversationId::parse("550e8400-e29b-41d4-a716-446655440004").unwrap()
-        );
+        assert_eq!(id, conversation_id("550e8400-e29b-41d4-a716-446655440004"));
         assert_eq!(md, false);
     }
 
@@ -1317,10 +1308,7 @@ mod tests {
             },
             _ => (ConversationId::default(), false),
         };
-        assert_eq!(
-            id,
-            ConversationId::parse("550e8400-e29b-41d4-a716-446655440004").unwrap()
-        );
+        assert_eq!(id, conversation_id("550e8400-e29b-41d4-a716-446655440004"));
         assert_eq!(md, true);
     }
 
@@ -1339,10 +1327,7 @@ mod tests {
             },
             _ => ConversationId::default(),
         };
-        assert_eq!(
-            id,
-            ConversationId::parse("550e8400-e29b-41d4-a716-446655440005").unwrap()
-        );
+        assert_eq!(id, conversation_id("550e8400-e29b-41d4-a716-446655440005"));
     }
 
     #[test]
@@ -1469,7 +1454,7 @@ mod tests {
             Some(TopLevelCommand::Info { conversation_id, .. }) => conversation_id,
             _ => None,
         };
-        let expected = Some(ConversationId::parse("550e8400-e29b-41d4-a716-446655440006").unwrap());
+        let expected = Some(conversation_id("550e8400-e29b-41d4-a716-446655440006"));
         assert_eq!(actual, expected);
     }
 
@@ -1485,7 +1470,7 @@ mod tests {
             Some(TopLevelCommand::Info { conversation_id, .. }) => conversation_id,
             _ => None,
         };
-        let expected = Some(ConversationId::parse("550e8400-e29b-41d4-a716-446655440007").unwrap());
+        let expected = Some(conversation_id("550e8400-e29b-41d4-a716-446655440007"));
         assert_eq!(actual, expected);
     }
 
@@ -1498,15 +1483,15 @@ mod tests {
             "550e8400-e29b-41d4-a716-446655440008",
             "--porcelain",
         ]);
-        let (conversation_id, porcelain) = match fixture.subcommands {
+        let (actual_conversation_id, porcelain) = match fixture.subcommands {
             Some(TopLevelCommand::Info { conversation_id, porcelain }) => {
                 (conversation_id, porcelain)
             }
             _ => (None, false),
         };
         assert_eq!(
-            conversation_id,
-            Some(ConversationId::parse("550e8400-e29b-41d4-a716-446655440008").unwrap())
+            actual_conversation_id,
+            Some(conversation_id("550e8400-e29b-41d4-a716-446655440008"))
         );
         assert_eq!(porcelain, true);
     }
@@ -1595,10 +1580,7 @@ mod tests {
             },
             _ => ConversationId::default(),
         };
-        assert_eq!(
-            id,
-            ConversationId::parse("550e8400-e29b-41d4-a716-446655440009").unwrap()
-        );
+        assert_eq!(id, conversation_id("550e8400-e29b-41d4-a716-446655440009"));
     }
 
     #[test]
@@ -1617,10 +1599,7 @@ mod tests {
             },
             _ => (ConversationId::default(), false),
         };
-        assert_eq!(
-            id,
-            ConversationId::parse("550e8400-e29b-41d4-a716-446655440010").unwrap()
-        );
+        assert_eq!(id, conversation_id("550e8400-e29b-41d4-a716-446655440010"));
         assert_eq!(porcelain, true);
     }
 
@@ -1649,10 +1628,7 @@ mod tests {
             },
             _ => (ConversationId::default(), true),
         };
-        assert_eq!(
-            id,
-            ConversationId::parse("550e8400-e29b-41d4-a716-446655440011").unwrap()
-        );
+        assert_eq!(id, conversation_id("550e8400-e29b-41d4-a716-446655440011"));
         assert_eq!(html, false);
     }
 
@@ -1671,10 +1647,7 @@ mod tests {
             },
             _ => ConversationId::default(),
         };
-        assert_eq!(
-            id,
-            ConversationId::parse("550e8400-e29b-41d4-a716-446655440012").unwrap()
-        );
+        assert_eq!(id, conversation_id("550e8400-e29b-41d4-a716-446655440012"));
     }
 
     #[test]
@@ -1687,7 +1660,7 @@ mod tests {
             "550e8400-e29b-41d4-a716-446655440000",
         ]);
         let actual = fixture.conversation_id;
-        let expected = Some(ConversationId::parse("550e8400-e29b-41d4-a716-446655440000").unwrap());
+        let expected = Some(conversation_id("550e8400-e29b-41d4-a716-446655440000"));
         assert_eq!(actual, expected);
     }
 
@@ -1699,7 +1672,7 @@ mod tests {
             "550e8400-e29b-41d4-a716-446655440000",
         ]);
         let actual = fixture.conversation_id;
-        let expected = Some(ConversationId::parse("550e8400-e29b-41d4-a716-446655440000").unwrap());
+        let expected = Some(conversation_id("550e8400-e29b-41d4-a716-446655440000"));
         assert_eq!(actual, expected);
     }
 
@@ -1718,10 +1691,7 @@ mod tests {
             },
             _ => ConversationId::default(),
         };
-        assert_eq!(
-            id,
-            ConversationId::parse("550e8400-e29b-41d4-a716-446655440013").unwrap()
-        );
+        assert_eq!(id, conversation_id("550e8400-e29b-41d4-a716-446655440013"));
     }
 
     #[test]
@@ -1740,10 +1710,7 @@ mod tests {
             },
             _ => (ConversationId::default(), false),
         };
-        assert_eq!(
-            id,
-            ConversationId::parse("550e8400-e29b-41d4-a716-446655440014").unwrap()
-        );
+        assert_eq!(id, conversation_id("550e8400-e29b-41d4-a716-446655440014"));
         assert_eq!(porcelain, true);
     }
 
@@ -1753,12 +1720,12 @@ mod tests {
             Cli::parse_from(["forge", "cmd", "execute", "custom-command", "arg1", "arg2"]);
         let actual = match fixture.subcommands {
             Some(TopLevelCommand::Cmd(run_group)) => match run_group.command {
-                CmdCommand::Execute { commands } => commands.join(" "),
-                _ => panic!("Expected Execute command"),
+                CmdCommand::Execute { commands } => Some(commands.join(" ")),
+                _ => None,
             },
-            _ => panic!("Expected Cmd command"),
+            _ => None,
         };
-        let expected = "custom-command arg1 arg2".to_string();
+        let expected = Some("custom-command arg1 arg2".to_string());
         assert_eq!(actual, expected);
     }
 
@@ -1774,13 +1741,15 @@ mod tests {
     fn test_commit_with_custom_text() {
         let fixture = Cli::parse_from(["forge", "commit", "fix", "typo", "in", "readme"]);
         let actual = match fixture.subcommands {
-            Some(TopLevelCommand::Commit(commit)) => commit.text,
-            _ => panic!("Expected Commit command"),
+            Some(TopLevelCommand::Commit(commit)) => Some(commit.text),
+            _ => None,
         };
-        let expected = ["fix", "typo", "in", "readme"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<String>>();
+        let expected = Some(
+            ["fix", "typo", "in", "readme"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<String>>(),
+        );
         assert_eq!(actual, expected);
     }
 
@@ -1788,10 +1757,10 @@ mod tests {
     fn test_commit_without_custom_text() {
         let fixture = Cli::parse_from(["forge", "commit", "--preview"]);
         let actual = match fixture.subcommands {
-            Some(TopLevelCommand::Commit(commit)) => commit.text,
-            _ => panic!("Expected Commit command"),
+            Some(TopLevelCommand::Commit(commit)) => Some(commit.text),
+            _ => None,
         };
-        let expected: Vec<String> = vec![];
+        let expected: Option<Vec<String>> = Some(vec![]);
         assert_eq!(actual, expected);
     }
 
@@ -1808,18 +1777,18 @@ mod tests {
         ]);
         let actual = match fixture.subcommands {
             Some(TopLevelCommand::Commit(commit)) => {
-                (commit.preview, commit.max_diff_size, commit.text)
+                Some((commit.preview, commit.max_diff_size, commit.text))
             }
-            _ => panic!("Expected Commit command"),
+            _ => None,
         };
-        let expected = (
+        let expected = Some((
             true,
             Some(50000),
             ["update", "docs"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect::<Vec<String>>(),
-        );
+        ));
         assert_eq!(actual, expected);
     }
 
@@ -1893,10 +1862,10 @@ mod tests {
     fn test_suggest_with_dash_prefixed_prompt() {
         let fixture = Cli::parse_from(["forge", "suggest", "--- date"]);
         let actual = match fixture.subcommands {
-            Some(TopLevelCommand::Suggest { prompt }) => prompt,
-            _ => panic!("Expected suggest subcommand"),
+            Some(TopLevelCommand::Suggest { prompt }) => Some(prompt),
+            _ => None,
         };
-        let expected = "--- date".to_string();
+        let expected = Some("--- date".to_string());
         assert_eq!(actual, expected);
     }
 
@@ -1904,10 +1873,10 @@ mod tests {
     fn test_suggest_with_double_dash_prompt() {
         let fixture = Cli::parse_from(["forge", "suggest", "--date tomorrow"]);
         let actual = match fixture.subcommands {
-            Some(TopLevelCommand::Suggest { prompt }) => prompt,
-            _ => panic!("Expected suggest subcommand"),
+            Some(TopLevelCommand::Suggest { prompt }) => Some(prompt),
+            _ => None,
         };
-        let expected = "--date tomorrow".to_string();
+        let expected = Some("--date tomorrow".to_string());
         assert_eq!(actual, expected);
     }
 
@@ -1915,10 +1884,10 @@ mod tests {
     fn test_suggest_with_single_dash_prompt() {
         let fixture = Cli::parse_from(["forge", "suggest", "-v file.txt"]);
         let actual = match fixture.subcommands {
-            Some(TopLevelCommand::Suggest { prompt }) => prompt,
-            _ => panic!("Expected suggest subcommand"),
+            Some(TopLevelCommand::Suggest { prompt }) => Some(prompt),
+            _ => None,
         };
-        let expected = "-v file.txt".to_string();
+        let expected = Some("-v file.txt".to_string());
         assert_eq!(actual, expected);
     }
 
@@ -2078,19 +2047,21 @@ mod tests {
     fn test_update_with_no_confirm() {
         let fixture = Cli::parse_from(["forge", "update", "--no-confirm"]);
         let actual = match fixture.subcommands {
-            Some(TopLevelCommand::Update(args)) => args.no_confirm,
-            _ => panic!("Expected Update command"),
+            Some(TopLevelCommand::Update(args)) => Some(args.no_confirm),
+            _ => None,
         };
-        assert!(actual);
+        let expected = Some(true);
+        assert_eq!(actual, expected);
     }
 
     #[test]
     fn test_update_without_no_confirm() {
         let fixture = Cli::parse_from(["forge", "update"]);
         let actual = match fixture.subcommands {
-            Some(TopLevelCommand::Update(args)) => args.no_confirm,
-            _ => panic!("Expected Update command"),
+            Some(TopLevelCommand::Update(args)) => Some(args.no_confirm),
+            _ => None,
         };
-        assert!(!actual);
+        let expected = Some(false);
+        assert_eq!(actual, expected);
     }
 }

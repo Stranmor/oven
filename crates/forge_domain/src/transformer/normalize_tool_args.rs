@@ -48,8 +48,13 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::{Role, TextMessage, ToolCallArguments, ToolCallFull, ToolCallId, ToolName};
+    use crate::{
+        ContextMessage, Role, TextMessage, ToolCallArguments, ToolCallFull, ToolCallId, ToolName,
+    };
 
+    fn json_field<'a>(value: &'a serde_json::Value, key: &str) -> &'a serde_json::Value {
+        value.get(key).expect("expected JSON field")
+    }
     #[test]
     fn test_normalize_stringified_tool_call_arguments() {
         // Create a context with stringified tool call arguments (like from old dump)
@@ -95,16 +100,22 @@ mod tests {
             .tool_calls
             .as_ref()
             .expect("Should have tool calls");
-        let tool_call = &tool_calls[0];
+        let tool_call = tool_calls.first().expect("expected first tool call");
 
         // Arguments should now be Parsed, not Unparsed
         match &tool_call.arguments {
             ToolCallArguments::Parsed(value) => {
-                assert_eq!(value["file_path"], "/test/path");
-                assert_eq!(value["range"]["start_line"], 1);
+                assert_eq!(
+                    value.get("file_path").expect("expected file_path"),
+                    "/test/path"
+                );
+                assert_eq!(
+                    json_field(value.get("range").expect("expected range"), "start_line"),
+                    1
+                );
             }
             ToolCallArguments::Unparsed(_) => {
-                panic!("Arguments should be Parsed after normalization")
+                unreachable!("arguments should parse after normalization")
             }
         }
 
@@ -113,15 +124,23 @@ mod tests {
         let reparsed: serde_json::Value =
             serde_json::from_str(&serialized).expect("Should re-parse");
 
-        let messages = reparsed["messages"]
+        let messages = json_field(&reparsed, "messages")
             .as_array()
             .expect("Should have messages");
         let assistant = messages
             .iter()
-            .find(|m| m["text"]["role"] == "Assistant")
+            .find(|m| json_field(json_field(m, "text"), "role") == "Assistant")
             .expect("Should find assistant");
 
-        let args = &assistant["text"]["tool_calls"][0]["arguments"];
+        let serialized_tool_calls = json_field(json_field(assistant, "text"), "tool_calls")
+            .as_array()
+            .expect("expected serialized tool calls");
+        let args = json_field(
+            serialized_tool_calls
+                .first()
+                .expect("expected first serialized tool call"),
+            "arguments",
+        );
         assert!(
             args.is_object(),
             "Arguments must be JSON object for API, got: {}",
@@ -174,11 +193,18 @@ mod tests {
             .as_ref()
             .expect("Should have tool calls");
 
-        match &tool_calls[0].arguments {
+        match &tool_calls
+            .first()
+            .expect("expected first tool call")
+            .arguments
+        {
             ToolCallArguments::Parsed(value) => {
-                assert_eq!(value["file_path"], "/test/path");
+                assert_eq!(
+                    value.get("file_path").expect("expected file_path"),
+                    "/test/path"
+                );
             }
-            ToolCallArguments::Unparsed(_) => panic!("Should remain Parsed"),
+            ToolCallArguments::Unparsed(_) => unreachable!("parsed arguments should stay parsed"),
         }
     }
 

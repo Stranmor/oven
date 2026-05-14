@@ -268,7 +268,7 @@ mod tests {
 
         assert_eq!(actual.len(), 1);
         assert_eq!(
-            actual[0],
+            *actual.first().expect("expected first rule"),
             &Rule::Write(WriteRule { write: "src/**/*.rs".to_string(), dir: None })
         );
     }
@@ -288,7 +288,7 @@ mod tests {
         let actual = fixture.find_rules(&operation);
 
         assert_eq!(actual.len(), 2);
-        assert_eq!(actual[0], &rule1);
-        assert_eq!(actual[1], &rule2);
+        assert_eq!(*actual.first().expect("expected first rule"), &rule1);
+        assert_eq!(*actual.get(1).expect("expected second rule"), &rule2);
     }
 }

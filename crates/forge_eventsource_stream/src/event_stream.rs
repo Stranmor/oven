@@ -310,7 +310,7 @@ mod tests {
             )]))
             .try_collect::<Vec<_>>()
             .await
-            .unwrap(),
+            .expect("event stream should parse valid fixture"),
             vec![Event {
                 event: "message".to_string(),
                 data: "Hello, world!".to_string(),
@@ -324,7 +324,7 @@ mod tests {
             ]))
             .try_collect::<Vec<_>>()
             .await
-            .unwrap(),
+            .expect("event stream should parse valid fixture"),
             vec![Event {
                 event: "message".to_string(),
                 data: "Hello, world!".to_string(),
@@ -339,7 +339,7 @@ mod tests {
             ]))
             .try_collect::<Vec<_>>()
             .await
-            .unwrap(),
+            .expect("event stream should parse valid fixture"),
             vec![Event {
                 event: "message".to_string(),
                 data: "Hello, world!".to_string(),
@@ -352,7 +352,7 @@ mod tests {
             )]))
             .try_collect::<Vec<_>>()
             .await
-            .unwrap(),
+            .expect("event stream should parse valid fixture"),
             vec![]
         );
         assert_eq!(
@@ -361,7 +361,7 @@ mod tests {
             )]))
             .try_collect::<Vec<_>>()
             .await
-            .unwrap(),
+            .expect("event stream should parse valid fixture"),
             vec![Event {
                 event: "message".to_string(),
                 data: "Hello,\nworld!".to_string(),
@@ -374,7 +374,7 @@ mod tests {
             )]))
             .try_collect::<Vec<_>>()
             .await
-            .unwrap(),
+            .expect("event stream should parse valid fixture"),
             vec![
                 Event {
                     event: "message".to_string(),
@@ -405,7 +405,7 @@ data: This is the third message.
             )]))
             .try_collect::<Vec<_>>()
             .await
-            .unwrap(),
+            .expect("event stream should parse valid fixture"),
             vec![
                 Event {
                     event: "message".to_string(),
@@ -439,7 +439,7 @@ data: 113411
             )]))
             .try_collect::<Vec<_>>()
             .await
-            .unwrap(),
+            .expect("event stream should parse valid fixture"),
             vec![
                 Event {
                     event: "add".to_string(),
@@ -468,7 +468,7 @@ data: 10
             )]))
             .try_collect::<Vec<_>>()
             .await
-            .unwrap(),
+            .expect("event stream should parse valid fixture"),
             vec![Event {
                 event: "message".to_string(),
                 data: "YHOO\n+2\n10".to_string(),
@@ -491,7 +491,7 @@ data:  third event
             )]))
             .try_collect::<Vec<_>>()
             .await
-            .unwrap(),
+            .expect("event stream should parse valid fixture"),
             vec![
                 Event {
                     event: "message".to_string(),
@@ -523,7 +523,7 @@ data:
             )]))
             .try_collect::<Vec<_>>()
             .await
-            .unwrap(),
+            .expect("event stream should parse valid fixture"),
             vec![
                 Event {
                     event: "message".to_string(),
@@ -547,7 +547,7 @@ data: test
             )]))
             .try_collect::<Vec<_>>()
             .await
-            .unwrap(),
+            .expect("event stream should parse valid fixture"),
             vec![
                 Event {
                     event: "message".to_string(),

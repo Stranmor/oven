@@ -5410,10 +5410,11 @@ mod tests {
         };
         let mut setup = forge_tui::TuiSession::new(Vec::new(), 64, 9);
 
-        queue_tui_response_and_notify(&mut setup, &fixture).unwrap();
+        queue_tui_response_and_notify(&mut setup, &fixture)
+            .expect("fixture TUI response should render successfully");
         let actual = (
             String::from_utf8(setup.into_output())
-                .unwrap()
+                .expect("fixture TUI output should be valid UTF-8")
                 .contains("shell started"),
             notifier.notified().now_or_never().is_some(),
         );

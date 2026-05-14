@@ -1,8 +1,9 @@
 //! Rust symbol source line range resolution.
 
+use std::collections::BTreeMap;
+
 use crate::types::SymbolKind;
 use crate::util::line_number_from_index;
-use std::collections::BTreeMap;
 
 #[derive(Default)]
 pub(super) struct SymbolRangeResolver {
@@ -169,16 +170,18 @@ fn extract_name_after_keyword(line: &str, keyword: &str) -> Option<String> {
     let trimmed = line.trim_start();
     let needle = format!("{keyword} ");
     let start = trimmed.find(&needle)?;
-    if start > 0 {
-        let previous = trimmed[..start].chars().next_back()?;
-        if previous.is_alphanumeric() || previous == '_' {
-            return None;
-        }
+    let prefix = trimmed.get(..start)?;
+    if prefix
+        .chars()
+        .next_back()
+        .is_some_and(|previous| previous.is_alphanumeric() || previous == '_')
+    {
+        return None;
     }
     let rest_start = start
         .checked_add(needle.len())
         .expect("keyword match offset should be within the line");
-    let rest = &trimmed[rest_start..];
+    let rest = trimmed.get(rest_start..)?;
     Some(
         rest.trim_start()
             .chars()

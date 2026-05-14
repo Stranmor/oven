@@ -644,11 +644,11 @@ mod tests {
         // Expected: Two deltas were sent as TaskMessage with Markdown content
         assert_eq!(deltas.len(), 2);
         assert!(matches!(
-            &deltas[0],
+            deltas.first().expect("expected first delta"),
             ChatResponse::TaskMessage { content: ChatResponseContent::Markdown { text, partial: true }, .. } if text == "Hello "
         ));
         assert!(matches!(
-            &deltas[1],
+            deltas.get(1).expect("expected second delta"),
             ChatResponse::TaskMessage { content: ChatResponseContent::Markdown { text, partial: true }, .. } if text == "world!"
         ));
 
@@ -774,7 +774,10 @@ mod tests {
             arguments: ToolCallArguments::from_json("invalid json {"),
             thought_signature: None,
         };
-        assert_eq!(actual.tool_calls[0], expected);
+        assert_eq!(
+            actual.tool_calls.first().expect("expected tool call"),
+            &expected
+        );
     }
 
     #[tokio::test]
@@ -844,7 +847,10 @@ mod tests {
 
         // Expected: Reasoning details should be collected from all messages
         let expected_reasoning_details = vec![
-            reasoning_full[0].clone(),
+            reasoning_full
+                .first()
+                .expect("expected full reasoning")
+                .clone(),
             ReasoningFull {
                 text: Some("Partial reasoning".to_string()),
                 signature: Some("signature2".to_string()),
@@ -934,7 +940,15 @@ mod tests {
         };
         assert_eq!(actual.usage, expected_final_usage);
         assert_eq!(actual.tool_calls.len(), 1);
-        assert_eq!(actual.tool_calls[0].name.as_str(), "test_tool");
+        assert_eq!(
+            actual
+                .tool_calls
+                .first()
+                .expect("expected XML tool call")
+                .name
+                .as_str(),
+            "test_tool"
+        );
         assert_eq!(actual.content, xml_content);
     }
 
@@ -1160,7 +1174,15 @@ mod tests {
         // but final usage
         assert_eq!(actual.content, xml_content);
         assert_eq!(actual.tool_calls.len(), 1);
-        assert_eq!(actual.tool_calls[0].name.as_str(), "test_tool");
+        assert_eq!(
+            actual
+                .tool_calls
+                .first()
+                .expect("expected XML tool call")
+                .name
+                .as_str(),
+            "test_tool"
+        );
         assert_eq!(actual.usage.total_tokens, TokenCount::Actual(25));
         assert_eq!(actual.usage.completion_tokens, TokenCount::Actual(20));
     }

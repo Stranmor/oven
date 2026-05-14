@@ -5,8 +5,9 @@ use pretty_assertions::assert_eq;
 fn test_parse_valid_json() {
     // Full JSON object
     let text = r#"{"a":2.3e100,"b":"str","c":null,"d":false,"e":[1,2,3]}"#;
-    let actual = json_repair::<serde_json::Value>(text).unwrap();
-    let expected = serde_json::from_str::<serde_json::Value>(text).unwrap();
+    let actual = json_repair::<serde_json::Value>(text).expect("repair should parse valid JSON");
+    let expected =
+        serde_json::from_str::<serde_json::Value>(text).expect("fixture should be valid JSON");
     assert_eq!(actual, expected);
 
     // Whitespace
@@ -65,7 +66,8 @@ fn test_parse_valid_json() {
 
 // Helper function to assert that input is repaired to itself (valid JSON)
 fn assert_repair(text: &str) {
-    let actual = json_repair::<serde_json::Value>(text).unwrap();
-    let expected = serde_json::from_str::<serde_json::Value>(text).unwrap();
+    let actual = json_repair::<serde_json::Value>(text).expect("repair should parse valid JSON");
+    let expected =
+        serde_json::from_str::<serde_json::Value>(text).expect("fixture should be valid JSON");
     assert_eq!(actual, expected);
 }

@@ -278,7 +278,8 @@ pub fn serialize_create_response_with_cache_control(
 /// that can legally receive OpenAI-compatible cache markers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponsesCacheControlMarkerPlan {
-    /// Cache markers should be applied to the first and last eligible input messages.
+    /// Cache markers should be applied to the first and last eligible input
+    /// messages.
     Mark {
         first_index: usize,
         last_index: usize,

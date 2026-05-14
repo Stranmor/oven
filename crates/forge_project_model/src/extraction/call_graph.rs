@@ -1,14 +1,17 @@
 //! Rust call graph extraction from syntax-level call expressions.
 
-use crate::extraction::RustExtraction;
-use crate::types::{EdgeConfidence, GraphEdge, GraphEdgeKind, SymbolKind, SymbolNode};
-use crate::util::{edge, edge_sort_key, provenance};
-use anyhow::{Context, Result};
 use std::collections::BTreeMap;
+
+use anyhow::{Context, Result};
 use syn::visit::Visit;
 use syn::{ExprCall, ExprMethodCall, ImplItem, Item, TraitItem};
 
-/// Extracts syntax-level Rust call graph edges without claiming compiler exactness.
+use crate::extraction::RustExtraction;
+use crate::types::{EdgeConfidence, GraphEdge, GraphEdgeKind, SymbolKind, SymbolNode};
+use crate::util::{edge, edge_sort_key, provenance};
+
+/// Extracts syntax-level Rust call graph edges without claiming compiler
+/// exactness.
 ///
 /// # Arguments
 ///
@@ -322,9 +325,10 @@ pub(super) fn extract_calls_into(
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
+
     use super::*;
     use crate::extract_rust_symbols;
-    use pretty_assertions::assert_eq;
 
     #[test]
     fn records_function_and_method_calls_without_exact_compiler_confidence() -> Result<()> {

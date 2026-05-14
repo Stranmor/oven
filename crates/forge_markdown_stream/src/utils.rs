@@ -543,8 +543,11 @@ mod tests {
         let actual_visible = actual.iter().map(|line| visible(line)).collect::<Vec<_>>();
 
         assert_eq!(actual_visible, expected_visible);
-        assert!(actual[0].contains("\x1b[31m"));
-        assert!(actual[1].contains("\x1b[31m"));
-        assert!(actual[1].ends_with("\x1b[39m"));
+        let first_line = actual.first().expect("expected first wrapped ANSI line");
+        let second_line = actual.get(1).expect("expected second wrapped ANSI line");
+
+        assert!(first_line.contains("\x1b[31m"));
+        assert!(second_line.contains("\x1b[31m"));
+        assert!(second_line.ends_with("\x1b[39m"));
     }
 }

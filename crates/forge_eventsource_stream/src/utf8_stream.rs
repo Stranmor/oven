@@ -94,21 +94,21 @@ mod tests {
             Utf8Stream::new(futures::stream::iter(vec![Ok::<_, ()>(b"Hello, world!")]))
                 .try_collect::<Vec<_>>()
                 .await
-                .unwrap(),
+                .expect("utf8 stream should parse valid fixture"),
             vec!["Hello, world!"]
         );
         assert_eq!(
             Utf8Stream::new(futures::stream::iter(vec![Ok::<_, ()>("Hello, world!")]))
                 .try_collect::<Vec<_>>()
                 .await
-                .unwrap(),
+                .expect("utf8 stream should parse valid fixture"),
             vec!["Hello, world!"]
         );
         assert_eq!(
             Utf8Stream::new(futures::stream::iter(vec![Ok::<_, ()>("")]))
                 .try_collect::<Vec<_>>()
                 .await
-                .unwrap(),
+                .expect("utf8 stream should parse valid fixture"),
             vec![""]
         );
         assert_eq!(
@@ -118,7 +118,7 @@ mod tests {
             ]))
             .try_collect::<Vec<_>>()
             .await
-            .unwrap(),
+            .expect("utf8 stream should parse valid fixture"),
             vec!["Hello", ", world!"]
         );
         assert_eq!(
@@ -127,7 +127,7 @@ mod tests {
             ]),]))
             .try_collect::<Vec<_>>()
             .await
-            .unwrap(),
+            .expect("utf8 stream should parse valid fixture"),
             vec!["👍"]
         );
         assert_eq!(
@@ -137,7 +137,7 @@ mod tests {
             ]))
             .try_collect::<Vec<_>>()
             .await
-            .unwrap(),
+            .expect("utf8 stream should parse valid fixture"),
             vec!["", "👍"]
         );
         assert_eq!(
@@ -147,7 +147,7 @@ mod tests {
             ]))
             .try_collect::<Vec<_>>()
             .await
-            .unwrap(),
+            .expect("utf8 stream should parse valid fixture"),
             vec!["", "👍👍"]
         );
     }
@@ -158,8 +158,11 @@ mod tests {
             .collect::<Vec<_>>()
             .await;
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0], Ok("".to_string()));
-        assert!(matches!(results[1], Err(Utf8StreamError::Utf8(_))));
+        assert_eq!(results.first(), Some(&Ok("".to_string())));
+        assert!(matches!(
+            results.get(1),
+            Some(Err(Utf8StreamError::Utf8(_)))
+        ));
 
         let results = Utf8Stream::new(futures::stream::iter(vec![
             Ok::<_, ()>(vec![240, 159]),
@@ -168,8 +171,11 @@ mod tests {
         .collect::<Vec<_>>()
         .await;
         assert_eq!(results.len(), 3);
-        assert_eq!(results[0], Ok("".to_string()));
-        assert_eq!(results[1], Ok("👍".to_string()));
-        assert!(matches!(results[2], Err(Utf8StreamError::Utf8(_))));
+        assert_eq!(results.first(), Some(&Ok("".to_string())));
+        assert_eq!(results.get(1), Some(&Ok("👍".to_string())));
+        assert!(matches!(
+            results.get(2),
+            Some(Err(Utf8StreamError::Utf8(_)))
+        ));
     }
 }

@@ -27,7 +27,8 @@ impl SteerMessage {
     /// Creates a steer message from non-empty control-plane content.
     ///
     /// # Arguments
-    /// * `content` - The message content to deliver after the current tool batch.
+    /// * `content` - The message content to deliver after the current tool
+    ///   batch.
     ///
     /// # Errors
     /// Returns an error when the steer message is empty or whitespace-only.
@@ -94,7 +95,8 @@ impl SteerRequest {
     /// Creates a typed steer request for a conversation.
     ///
     /// # Arguments
-    /// * `conversation_id` - The primary conversation that should receive steer.
+    /// * `conversation_id` - The primary conversation that should receive
+    ///   steer.
     /// * `message` - The typed steer message to queue.
     pub fn new(conversation_id: ConversationId, message: SteerMessage) -> Self {
         Self { conversation_id, message }

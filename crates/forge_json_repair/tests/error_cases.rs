@@ -27,7 +27,8 @@ fn test_regex_single_slash() {
     // underflow After processing single '/', self.i becomes 2 but chars only
     // has length 1
     let fixture = "/";
-    let actual = json_repair::<serde_json::Value>(fixture).unwrap();
+    let actual =
+        json_repair::<serde_json::Value>(fixture).expect("repair should parse error-case fixture");
     let expected = serde_json::json!("/");
     assert_eq!(actual, expected);
 }
@@ -37,7 +38,8 @@ fn test_regex_with_backslash_slash() {
     // Test regex with escaped slash at the end
     // parse_regex treats the regex as a string literal, so backslash is preserved
     let fixture = r#"/a\/"#;
-    let actual = json_repair::<serde_json::Value>(fixture).unwrap();
+    let actual =
+        json_repair::<serde_json::Value>(fixture).expect("repair should parse error-case fixture");
     let expected = serde_json::json!(r#"/a\/"#);
     assert_eq!(actual, expected);
 }
@@ -47,7 +49,8 @@ fn test_string_with_colon_at_start() {
     // This test case checks for potential index out of bounds at line 445
     // When self.i == 0 and we try to access self.chars.get(self.i - 1)
     let fixture = ":";
-    let actual = json_repair::<serde_json::Value>(fixture).unwrap();
+    let actual =
+        json_repair::<serde_json::Value>(fixture).expect("repair should parse error-case fixture");
     let expected = serde_json::json!(":");
     assert_eq!(actual, expected);
 }
@@ -61,7 +64,8 @@ fn test_multibyte_unicode_missing_end_quote() {
     // whitespace, it initialises `index` from the byte length and then indexes
     // into a Vec<char> at that byte-length position, panicking.
     let fixture = r#""café "#;
-    let actual = json_repair::<serde_json::Value>(fixture).unwrap();
+    let actual =
+        json_repair::<serde_json::Value>(fixture).expect("repair should parse error-case fixture");
     let expected = serde_json::json!("café");
     assert_eq!(actual, expected);
 }
@@ -76,7 +80,8 @@ fn test_multibyte_unicode_missing_comma_in_object() {
     // That function sets index = text.len() = 3 (byte count) and then accesses
     // chars[index - 1] = chars[2] on a Vec<char> of length 2 — panic.
     let fixture = "\"é,\"test\"";
-    let actual = json_repair::<serde_json::Value>(fixture).unwrap();
+    let actual =
+        json_repair::<serde_json::Value>(fixture).expect("repair should parse error-case fixture");
     let expected = serde_json::json!(["é", "test"]);
     assert_eq!(actual, expected);
 }
@@ -90,7 +95,8 @@ fn test_multibyte_unicode_missing_closing_brace() {
     // sets index = text.len() = 6 and accesses chars[5] on a Vec<char> of
     // length 3 — panic.
     let fixture = "\"🎉 ";
-    let actual = json_repair::<serde_json::Value>(fixture).unwrap();
+    let actual =
+        json_repair::<serde_json::Value>(fixture).expect("repair should parse error-case fixture");
     let expected = serde_json::json!("🎉");
     assert_eq!(actual, expected);
 }

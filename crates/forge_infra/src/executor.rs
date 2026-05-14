@@ -439,10 +439,7 @@ where
         tokio::spawn(async move {
             let mut buffer = [0; 1024];
             let mut pending = Vec::<u8>::new();
-            loop {
-                let Ok(count) = reader.read(&mut buffer).await else {
-                    break;
-                };
+            while let Ok(count) = reader.read(&mut buffer).await {
                 if count == 0 {
                     break;
                 }

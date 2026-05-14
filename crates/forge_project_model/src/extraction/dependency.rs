@@ -1,11 +1,13 @@
 //! Rust import and Cargo dependency graph extraction.
 
-use crate::types::{EdgeConfidence, GraphEdge, GraphEdgeKind};
-use crate::util::{edge, edge_sort_key, provenance};
-use anyhow::{Context, Result};
 use std::collections::BTreeSet;
+
+use anyhow::{Context, Result};
 use syn::{Item, UseTree, Visibility};
 use toml_edit::DocumentMut;
+
+use crate::types::{EdgeConfidence, GraphEdge, GraphEdgeKind};
+use crate::util::{edge, edge_sort_key, provenance};
 
 /// Extracts Rust import and module dependency graph edges.
 ///
@@ -135,8 +137,9 @@ fn join_path(prefix: &str, part: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use pretty_assertions::assert_eq;
+
+    use super::*;
 
     #[test]
     fn extracts_import_and_cargo_dependency_graph() -> Result<()> {

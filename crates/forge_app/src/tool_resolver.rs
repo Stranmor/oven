@@ -425,7 +425,8 @@ mod tests {
         )
         .tools(vec![ToolName::new("read"), ToolName::new("write")]);
 
-        // Validation accepts exact tool call names only; aliases are for config resolution.
+        // Validation accepts exact tool call names only; aliases are for config
+        // resolution.
         assert!(ToolResolver::is_allowed(&fixture, &ToolName::new("read")));
         assert!(!ToolResolver::is_allowed(&fixture, &ToolName::new("Read")));
         assert!(ToolResolver::is_allowed(&fixture, &ToolName::new("write")));
@@ -449,7 +450,8 @@ mod tests {
         )
         .tools(vec![ToolName::new("write")]);
 
-        // Validation accepts exact tool call names only; aliases are for config resolution.
+        // Validation accepts exact tool call names only; aliases are for config
+        // resolution.
         assert!(ToolResolver::is_allowed(&fixture, &ToolName::new("write")));
         assert!(!ToolResolver::is_allowed(&fixture, &ToolName::new("Write")));
     }
@@ -468,7 +470,8 @@ mod tests {
         )
         .tools(vec![ToolName::new("task")]);
 
-        // Validation accepts exact tool call names only; aliases are for config resolution.
+        // Validation accepts exact tool call names only; aliases are for config
+        // resolution.
         assert!(ToolResolver::is_allowed(&fixture, &ToolName::new("task")));
         assert!(!ToolResolver::is_allowed(&fixture, &ToolName::new("Task")));
     }

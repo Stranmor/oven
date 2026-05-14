@@ -1,11 +1,12 @@
 //! Rust AST symbol extraction.
 
+use anyhow::{Context, Result};
+use syn::Item;
+
 use super::call_graph::extract_calls_into;
 use super::range::SymbolRangeResolver;
 use crate::types::{EdgeConfidence, GraphEdge, GraphEdgeKind, SymbolKind, SymbolNode};
 use crate::util::{edge, edge_sort_key, provenance};
-use anyhow::{Context, Result};
-use syn::Item;
 
 /// Extracted Rust symbol and edge bundle.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -16,7 +17,8 @@ pub struct RustExtraction {
     pub edges: Vec<GraphEdge>,
 }
 
-/// Extracts Rust AST symbols for structs, enums, traits, impls, functions, methods, tests, and modules.
+/// Extracts Rust AST symbols for structs, enums, traits, impls, functions,
+/// methods, tests, and modules.
 ///
 /// # Arguments
 ///
@@ -288,9 +290,11 @@ fn unique_symbol_id(base_id: &str, extraction: &RustExtraction) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use pretty_assertions::assert_eq;
     use std::collections::BTreeSet;
+
+    use pretty_assertions::assert_eq;
+
+    use super::*;
 
     #[test]
     fn extracts_rust_symbols_with_line_ranges_and_provenance() -> Result<()> {

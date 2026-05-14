@@ -1,4 +1,7 @@
-//! Rust-native evaluation harness for retrieval, graph, freshness, and provenance.
+//! Rust-native evaluation harness for retrieval, graph, freshness, and
+//! provenance.
+
+use std::collections::BTreeSet;
 
 use crate::freshness::compare_freshness;
 use crate::retrieval::retrieve;
@@ -6,13 +9,13 @@ use crate::types::{
     FreshnessEvalReport, GraphCoverageReport, GraphEdge, ProjectManifest,
     ProvenanceCompletenessReport, RetrievalEvalCase, RetrievalEvalReport,
 };
-use std::collections::BTreeSet;
 
 /// Evaluates retrieval precision@k, recall@k, and mean reciprocal rank.
 ///
 /// # Arguments
 ///
-/// * `manifest` - Manifest searched by the deterministic retrieval implementation.
+/// * `manifest` - Manifest searched by the deterministic retrieval
+///   implementation.
 /// * `cases` - Evaluation cases with relevant result identifiers.
 /// * `k` - Cutoff used for precision and recall.
 pub fn evaluate_retrieval(
@@ -144,12 +147,14 @@ fn is_complete(provenance: &crate::types::Provenance) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use anyhow::Result;
+    use pretty_assertions::assert_eq;
+
     use super::*;
     use crate::indexer::tests::fixture_project;
     use crate::{GraphEdgeKind, ProjectIndexer, RetrievalQuery};
-    use anyhow::Result;
-    use pretty_assertions::assert_eq;
-    use std::fs;
 
     #[test]
     fn evaluates_retrieval_metrics_on_fixture() -> Result<()> {

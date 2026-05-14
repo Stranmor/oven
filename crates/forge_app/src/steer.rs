@@ -22,7 +22,8 @@ impl<S: ConversationService + SteerService> SteerHandle<S> {
     /// Accepts a steer message only for primary user conversations.
     ///
     /// # Arguments
-    /// * `request` - Typed steer request containing target conversation and message.
+    /// * `request` - Typed steer request containing target conversation and
+    ///   message.
     ///
     /// # Errors
     /// Returns an error when the conversation does not exist or is not primary.
@@ -70,12 +71,13 @@ impl<S: ConversationService + SteerService> SteerHandle<S> {
 mod tests {
     use std::collections::HashMap;
 
-    use super::*;
     use forge_domain::{
         Context, Conversation, ConversationId, Initiator, SteerMessage, SteerQueue,
     };
     use pretty_assertions::assert_eq;
     use tokio::sync::Mutex;
+
+    use super::*;
 
     #[derive(Default)]
     struct FixtureServices {
