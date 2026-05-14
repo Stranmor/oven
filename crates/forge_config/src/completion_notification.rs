@@ -21,7 +21,7 @@ pub enum CompletionNotification {
 
 /// Telegram completion notification settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, fake::Dummy)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct TelegramCompletionNotification {
     /// Telegram backend discriminator for table-style configuration.
     #[serde(default = "telegram_completion_notification_backend")]
@@ -418,6 +418,25 @@ chat_id_env_var = "CUSTOM_TELEGRAM_CHAT_ID"
 [notification]
 backend = "telegram"
 chat_id = " "
+"#;
+
+        let actual = toml_edit::de::from_str::<Fixture>(fixture).is_err();
+
+        assert!(actual);
+    }
+
+    #[test]
+    fn test_completion_notification_rejects_unknown_telegram_field() {
+        #[derive(Deserialize)]
+        struct Fixture {
+            #[allow(dead_code)]
+            notification: CompletionNotification,
+        }
+
+        let fixture = r#"
+[notification]
+backend = "telegram"
+token_env_vra = "CUSTOM_TELEGRAM_TOKEN"
 "#;
 
         let actual = toml_edit::de::from_str::<Fixture>(fixture).is_err();
