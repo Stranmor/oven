@@ -63,7 +63,7 @@ impl<W: Write> TuiSession<W> {
         write!(
             self.output,
             "{}",
-            render_dashboard_to_string(&self.model, self.width, self.height)
+            render_conversation_to_string(&self.model, self.width, self.height)
         )?;
         self.output.flush()
     }
@@ -169,7 +169,7 @@ impl InteractiveTuiSession {
     /// Returns an error if drawing to the terminal fails.
     pub fn render(&mut self) -> io::Result<()> {
         self.terminal.draw(|frame| {
-            draw_dashboard(frame, &self.model, Some(self.input.as_str()));
+            draw_conversation(frame, &self.model, Some(self.input.as_str()));
         })?;
         self.terminal.backend_mut().flush()?;
         Ok(())
@@ -291,8 +291,18 @@ pub fn stdout_session() -> TuiSession<io::Stdout> {
 /// * `model` - The typed UI model to render.
 /// * `width` - Test backend width in terminal cells.
 /// * `height` - Test backend height in terminal cells.
-pub fn render_dashboard_to_string(model: &UiModel, width: u16, height: u16) -> String {
+pub fn render_conversation_to_string(model: &UiModel, width: u16, height: u16) -> String {
     render_model_to_string(model, width, height, None)
+}
+
+/// Renders a typed UI model into a deterministic `ratatui` test backend string.
+///
+/// # Arguments
+/// * `model` - The typed UI model to render.
+/// * `width` - Test backend width in terminal cells.
+/// * `height` - Test backend height in terminal cells.
+pub fn render_dashboard_to_string(model: &UiModel, width: u16, height: u16) -> String {
+    render_conversation_to_string(model, width, height)
 }
 
 /// Renders the initial interactive TUI shell into a deterministic string.
@@ -308,13 +318,13 @@ fn render_model_to_string(model: &UiModel, width: u16, height: u16, input: Optio
     let backend = TestBackend::new(width, height);
     let mut terminal = infallible(ratatui::Terminal::new(backend));
     infallible(terminal.draw(|frame| {
-        draw_dashboard(frame, model, input);
+        draw_conversation(frame, model, input);
     }));
 
     terminal.backend().to_string()
 }
 
-fn draw_dashboard(frame: &mut ratatui::Frame<'_>, model: &UiModel, input: Option<&str>) {
+fn draw_conversation(frame: &mut ratatui::Frame<'_>, model: &UiModel, input: Option<&str>) {
     let area = frame.area();
     let footer_height = if input.is_some() { 5 } else { 3 };
     let vertical = Layout::default()
@@ -338,17 +348,16 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, model: &UiModel, input: Option
 
     let horizontal = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
         .split(body_area);
 
-    let Some(events_area) = horizontal.first().copied() else {
+    let Some(transcript_area) = horizontal.first().copied() else {
         return;
     };
     let Some(detail_area) = horizontal.get(1).copied() else {
         return;
     };
 
-    let status = status_text(model);
     let header = Paragraph::new(Line::from(vec![
         Span::styled(
             "Forge",
@@ -356,31 +365,27 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, model: &UiModel, input: Option
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" TUI "),
-        Span::styled(status, Style::default().fg(Color::DarkGray)),
+        Span::raw(" conversation  "),
+        Span::styled(status_text(model), status_style(model)),
     ]))
-    .block(Block::default().borders(Borders::ALL).title("status"));
+    .block(Block::default().borders(Borders::ALL).title("Session"));
     frame.render_widget(header, header_area);
 
-    let events = Paragraph::new(render_event_lines(model))
+    let transcript = Paragraph::new(render_transcript_lines(model))
         .wrap(Wrap { trim: false })
-        .block(Block::default().borders(Borders::ALL).title("events"));
-    frame.render_widget(events, events_area);
+        .block(Block::default().borders(Borders::ALL).title("Conversation"));
+    frame.render_widget(transcript, transcript_area);
 
-    let detail = Paragraph::new(render_detail_lines(model))
+    let detail = Paragraph::new(render_tool_detail_lines(model))
         .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("detail/output"),
-        );
+        .block(Block::default().borders(Borders::ALL).title("Tool details"));
     frame.render_widget(detail, detail_area);
 
     let footer = if let Some(input) = input {
         Paragraph::new(vec![
             Line::from(vec![
                 Span::styled(
-                    "Input ",
+                    "Message ",
                     Style::default()
                         .fg(Color::Green)
                         .add_modifier(Modifier::BOLD),
@@ -408,10 +413,10 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, model: &UiModel, input: Option
                         .fg(Color::Green)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(" interactive"),
+                Span::raw(" opt-in conversation UI"),
             ]),
         ])
-        .block(Block::default().borders(Borders::ALL).title("input"))
+        .block(Block::default().borders(Borders::ALL).title("Compose"))
     } else {
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -427,9 +432,9 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, model: &UiModel, input: Option
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" opt-in preview"),
+            Span::raw(" opt-in conversation view"),
         ]))
-        .block(Block::default().borders(Borders::ALL).title("help"))
+        .block(Block::default().borders(Borders::ALL).title("Shortcuts"))
     };
     frame.render_widget(footer, footer_area);
 }
@@ -442,8 +447,62 @@ fn infallible<T>(result: Result<T, Infallible>) -> T {
 }
 
 fn status_text(model: &UiModel) -> String {
-    let total = model.blocks.len();
-    let running = model
+    let running = running_tool_count(model);
+    let failed = model.blocks.iter().any(
+        |block| matches!(block, UiBlock::ToolStatus(status) if status.phase == UiToolPhase::Failed),
+    );
+    let completed = model
+        .blocks
+        .iter()
+        .any(|block| matches!(block, UiBlock::Completion));
+    let turn_phase = latest_turn_phase(model);
+
+    if failed {
+        "Attention - tool reported an error".to_string()
+    } else if completed {
+        "Complete - response finished".to_string()
+    } else if running > 0 {
+        "Working - tool activity in progress".to_string()
+    } else if turn_phase == Some(UiTurnPhase::Running) {
+        "Working - assistant is responding".to_string()
+    } else if turn_phase == Some(UiTurnPhase::Pending) {
+        "Waiting - preparing response".to_string()
+    } else {
+        "Ready - start a conversation".to_string()
+    }
+}
+
+fn status_style(model: &UiModel) -> Style {
+    let failed = model.blocks.iter().any(
+        |block| matches!(block, UiBlock::ToolStatus(status) if status.phase == UiToolPhase::Failed),
+    );
+    if failed {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else if model
+        .blocks
+        .iter()
+        .any(|block| matches!(block, UiBlock::Completion))
+    {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else if running_tool_count(model) > 0
+        || latest_turn_phase(model) == Some(UiTurnPhase::Running)
+    {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else if latest_turn_phase(model) == Some(UiTurnPhase::Pending) {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
+fn running_tool_count(model: &UiModel) -> usize {
+    model
         .blocks
         .iter()
         .fold(0usize, |active, block| match block {
@@ -456,13 +515,11 @@ fn status_text(model: &UiModel) -> String {
                 active.saturating_sub(1)
             }
             _ => active,
-        });
-    let failed = model
-        .blocks
-        .iter()
-        .filter(|block| matches!(block, UiBlock::ToolStatus(status) if status.phase == UiToolPhase::Failed))
-        .count();
-    let turn_phase = model.blocks.iter().rev().find_map(|block| match block {
+        })
+}
+
+fn latest_turn_phase(model: &UiModel) -> Option<UiTurnPhase> {
+    model.blocks.iter().rev().find_map(|block| match block {
         UiBlock::TurnStatus(status) => Some(status.phase.clone()),
         UiBlock::Markdown { .. }
         | UiBlock::Reasoning(_)
@@ -471,158 +528,389 @@ fn status_text(model: &UiModel) -> String {
         | UiBlock::ToolStatus(_)
         | UiBlock::ToolDetail(_)
         | UiBlock::Retry { .. }
-        | UiBlock::Completion
         | UiBlock::Interrupt(_) => Some(UiTurnPhase::Running),
+        UiBlock::Completion => None,
         UiBlock::UserMessage(_) => None,
-    });
-    let completed = model
-        .blocks
-        .iter()
-        .any(|block| matches!(block, UiBlock::Completion));
-    let state = if completed {
-        "complete"
-    } else if running > 0 || turn_phase == Some(UiTurnPhase::Running) {
-        "running"
-    } else if turn_phase == Some(UiTurnPhase::Pending) {
-        "pending"
-    } else {
-        "streaming"
-    };
-    format!("events={total} tools_running={running} failed={failed} state={state}")
+    })
 }
 
-fn render_event_lines(model: &UiModel) -> Vec<Line<'static>> {
+fn render_transcript_lines(model: &UiModel) -> Vec<Line<'static>> {
     if model.is_empty() {
+        return vec![
+            Line::from(Span::styled(
+                "Start a conversation. Assistant replies, tool activity, and status updates appear here.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "Tool cards stay compact here; the side pane keeps arguments, output, and errors discoverable.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+    }
+
+    let mut lines = Vec::new();
+    for block in model
+        .blocks
+        .iter()
+        .filter(|block| !matches!(block, UiBlock::ToolDetail(_)))
+    {
+        lines.extend(render_transcript_block(block));
+    }
+    lines
+}
+
+fn render_transcript_block(block: &UiBlock) -> Vec<Line<'static>> {
+    match block {
+        UiBlock::UserMessage(text) => actor_block("You", text, Color::Green),
+        UiBlock::TurnStatus(status) => vec![status_line(
+            "Assistant",
+            &status.display_text().replace("turn ", ""),
+            match status.phase {
+                UiTurnPhase::Pending => Color::Yellow,
+                UiTurnPhase::Running => Color::Cyan,
+            },
+        )],
+        UiBlock::Markdown { text, partial } => markdown_block(text, *partial),
+        UiBlock::Reasoning(text) => actor_block("Reasoning", text, Color::Blue),
+        UiBlock::ToolInput(title) => vec![status_line(
+            "Tool request",
+            &title.display_text(),
+            Color::Yellow,
+        )],
+        UiBlock::ToolOutput(text) => vec![status_line(
+            "Tool output",
+            &preview_text(text),
+            Color::Green,
+        )],
+        UiBlock::ToolStatus(status) => vec![tool_status_line(status)],
+        UiBlock::ToolDetail(detail) => vec![status_line("Tool detail", &detail.name, Color::Cyan)],
+        UiBlock::Retry { cause, delay } => vec![status_line(
+            "Retry",
+            &format!("waiting {} - {cause}", delay.display_text()),
+            Color::Magenta,
+        )],
+        UiBlock::Completion => vec![status_line("Assistant", "complete", Color::Green)],
+        UiBlock::Interrupt(reason) => vec![status_line("Interrupted", reason, Color::Red)],
+    }
+}
+
+fn actor_block(label: &'static str, text: &str, color: Color) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        label,
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    ))];
+    lines.extend(render_body_lines(text, "  ", Color::White));
+    lines
+}
+
+fn markdown_block(text: &str, partial: bool) -> Vec<Line<'static>> {
+    let label = if partial {
+        "Assistant - streaming"
+    } else {
+        "Assistant"
+    };
+    let mut lines = vec![Line::from(Span::styled(
+        label,
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    lines.extend(render_markdown_lines(text));
+    lines
+}
+
+fn render_markdown_lines(text: &str) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut in_code = false;
+
+    for raw_line in text.lines() {
+        let trimmed = raw_line.trim_end();
+        if trimmed.trim_start().starts_with("```") {
+            in_code = !in_code;
+            let label = if in_code { "  code" } else { "  end code" };
+            lines.push(Line::from(Span::styled(
+                label,
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            continue;
+        }
+
+        if in_code {
+            lines.push(Line::from(vec![
+                Span::styled("  | ", Style::default().fg(Color::DarkGray)),
+                Span::styled(trimmed.to_string(), Style::default().fg(Color::Yellow)),
+            ]));
+            continue;
+        }
+
+        let cleaned = trimmed.trim_start_matches('#').trim_start();
+        if cleaned.is_empty() {
+            lines.push(Line::from(""));
+        } else if trimmed.starts_with('#') {
+            lines.push(Line::from(Span::styled(
+                format!("  {cleaned}"),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        } else if let Some(item) = cleaned
+            .strip_prefix("- ")
+            .or_else(|| cleaned.strip_prefix("* "))
+        {
+            lines.push(Line::from(vec![
+                Span::styled("  - ", Style::default().fg(Color::Cyan)),
+                Span::raw(item.to_string()),
+            ]));
+        } else {
+            lines.extend(render_body_lines(cleaned, "  ", Color::White));
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  Assistant response is streaming...",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines
+}
+
+fn render_body_lines(text: &str, prefix: &'static str, color: Color) -> Vec<Line<'static>> {
+    if text.is_empty() {
         return vec![Line::from(Span::styled(
-            "no events",
+            prefix,
             Style::default().fg(Color::DarkGray),
         ))];
     }
 
-    model
-        .blocks
-        .iter()
-        .filter(|block| !matches!(block, UiBlock::ToolDetail(_)))
-        .map(render_block)
+    text.lines()
+        .map(|line| {
+            Line::from(vec![
+                Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+                Span::styled(line.to_string(), Style::default().fg(color)),
+            ])
+        })
         .collect()
 }
 
-fn render_detail_lines(model: &UiModel) -> Vec<Line<'static>> {
-    let mut details: Vec<Line<'static>> = model
-        .blocks
-        .iter()
-        .filter_map(|block| match block {
-            UiBlock::ToolDetail(detail) => Some(render_tool_detail(detail)),
-            UiBlock::ToolOutput(text) => Some(tagged_line("output", text, Color::Green)),
-            _ => None,
-        })
-        .collect();
-
-    if details.is_empty() {
-        details.push(Line::from(Span::styled(
-            "select a tool event for details",
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-    details
-}
-
-fn render_block(block: &UiBlock) -> Line<'static> {
-    match block {
-        UiBlock::UserMessage(text) => tagged_line("user", text, Color::Green),
-        UiBlock::TurnStatus(status) => {
-            let color = match status.phase {
-                UiTurnPhase::Pending => Color::Yellow,
-                UiTurnPhase::Running => Color::Cyan,
-            };
-            tagged_line("turn", &status.display_text(), color)
-        }
-        UiBlock::Markdown { text, partial } => {
-            let marker = if *partial { "markdown~" } else { "markdown" };
-            tagged_line(marker, text, Color::White)
-        }
-        UiBlock::Reasoning(text) => tagged_line("reason", text, Color::Blue),
-        UiBlock::ToolInput(title) => tagged_line("tool", &title.display_text(), Color::Yellow),
-        UiBlock::ToolOutput(text) => tagged_line("output", text, Color::Green),
-        UiBlock::ToolStatus(status) => {
-            let color = match status.phase {
-                UiToolPhase::Started => Color::Yellow,
-                UiToolPhase::Finished => Color::Green,
-                UiToolPhase::Failed => Color::Red,
-            };
-            tagged_line("tool", &status.display_text(), color)
-        }
-        UiBlock::ToolDetail(detail) => render_tool_detail(detail),
-        UiBlock::Retry { cause, delay } => tagged_line(
-            "retry",
-            &format!("{} {cause}", delay.display_text()),
-            Color::Magenta,
-        ),
-        UiBlock::Completion => tagged_line("done", "complete", Color::Green),
-        UiBlock::Interrupt(reason) => tagged_line("interrupt", reason, Color::Red),
-    }
-}
-
-fn render_tool_detail(detail: &UiToolDetail) -> Line<'static> {
-    tagged_line(
-        "detail",
-        &detail.display_text(),
-        if detail.is_error {
-            Color::Red
-        } else {
-            Color::Cyan
-        },
-    )
-}
-
-fn tagged_line(tag: &'static str, text: &str, color: Color) -> Line<'static> {
+fn status_line(label: &'static str, text: &str, color: Color) -> Line<'static> {
     Line::from(vec![
         Span::styled(
-            format!("[{tag}] "),
+            format!("{label} "),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
         Span::raw(text.to_string()),
     ])
 }
 
+fn tool_status_line(status: &forge_ui_model::UiToolStatus) -> Line<'static> {
+    let (phase, color) = match status.phase {
+        UiToolPhase::Started => ("running", Color::Yellow),
+        UiToolPhase::Finished => ("done", Color::Green),
+        UiToolPhase::Failed => ("failed", Color::Red),
+    };
+    let summary = status
+        .summary
+        .as_deref()
+        .map(preview_text)
+        .unwrap_or_default();
+    let detail_hint = if summary.is_empty() {
+        "details in side pane".to_string()
+    } else {
+        format!("{summary} - details in side pane")
+    };
+
+    Line::from(vec![
+        Span::styled(
+            "Tool ",
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(status.name.clone(), Style::default().fg(Color::White)),
+        Span::raw(" "),
+        Span::styled(phase, Style::default().fg(color)),
+        Span::raw(" - "),
+        Span::styled(detail_hint, Style::default().fg(Color::DarkGray)),
+    ])
+}
+
+fn render_tool_detail_lines(model: &UiModel) -> Vec<Line<'static>> {
+    if let Some(detail) = model.blocks.iter().rev().find_map(|block| match block {
+        UiBlock::ToolDetail(detail) => Some(detail),
+        _ => None,
+    }) {
+        return render_tool_detail(detail);
+    }
+
+    if let Some(output) = model.blocks.iter().rev().find_map(|block| match block {
+        UiBlock::ToolOutput(output) => Some(output),
+        _ => None,
+    }) {
+        let mut lines = vec![section_header("Latest tool output", Color::Green)];
+        lines.extend(render_body_lines(output, "  ", Color::White));
+        return lines;
+    }
+
+    vec![
+        section_header("Tool activity", Color::Cyan),
+        Line::from(Span::styled(
+            "No tool activity yet.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "Arguments, output, and errors appear here as soon as tools run.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]
+}
+
+fn render_tool_detail(detail: &UiToolDetail) -> Vec<Line<'static>> {
+    let mut lines = vec![section_header(
+        if detail.is_error {
+            "Latest tool error"
+        } else {
+            "Latest tool activity"
+        },
+        if detail.is_error {
+            Color::Red
+        } else {
+            Color::Cyan
+        },
+    )];
+    lines.push(Line::from(vec![
+        Span::styled("Tool ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            detail.name.clone(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    if let Some(call_id) = &detail.call_id {
+        lines.push(Line::from(vec![
+            Span::styled("Call ", Style::default().fg(Color::DarkGray)),
+            Span::raw(call_id.clone()),
+        ]));
+    }
+
+    if let Some(arguments) = &detail.arguments {
+        lines.push(section_header("Arguments", Color::Yellow));
+        lines.extend(render_body_lines(arguments, "  ", Color::White));
+    }
+
+    if let Some(output) = &detail.output {
+        lines.push(section_header(
+            if detail.is_error { "Error" } else { "Output" },
+            if detail.is_error {
+                Color::Red
+            } else {
+                Color::Green
+            },
+        ));
+        lines.extend(render_body_lines(output, "  ", Color::White));
+    }
+
+    if detail.arguments.is_none() && detail.output.is_none() {
+        lines.push(Line::from(Span::styled(
+            "Waiting for tool payload...",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    lines
+}
+
+fn section_header(label: &'static str, color: Color) -> Line<'static> {
+    Line::from(Span::styled(
+        label,
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn preview_text(text: &str) -> String {
+    const LIMIT: usize = 96;
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= LIMIT {
+        return normalized;
+    }
+
+    let mut preview = normalized.chars().take(LIMIT).collect::<String>();
+    preview.push_str("...");
+    preview
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
+    use super::*;
     use forge_ui_model::{
         UiBlock, UiModel, UiRetryDelay, UiToolDetail, UiToolPhase, UiToolStatus, UiTurnStatus,
         submitted_user_turn,
     };
-    use pretty_assertions::assert_eq;
-
-    use super::*;
 
     #[test]
-    fn test_ratatui_dashboard_renders_submitted_user_and_pending_turn() {
+    fn test_conversation_layout_renders_submitted_user_and_pending_turn() {
         let fixture = submitted_user_turn("Hello from TUI");
 
-        let actual = render_dashboard_to_string(&fixture, 80, 10);
+        let actual = render_conversation_to_string(&fixture, 92, 12);
 
-        assert!(actual.contains("events=2"));
-        assert!(actual.contains("state=pending"));
-        assert!(actual.contains("[user] Hello from TUI"));
-        assert!(actual.contains("[turn] turn pending: waiting"));
+        assert!(actual.contains("Session"));
+        assert!(actual.contains("Conversation"));
+        assert!(actual.contains("Tool details"));
+        assert!(actual.contains("Waiting - preparing response"));
+        assert!(actual.contains("You"));
+        assert!(actual.contains("Hello from TUI"));
+        assert!(actual.contains("Assistant"));
+        assert!(actual.contains("pending: waiting for provider response"));
+        assert!(!actual.contains("events="));
+        assert!(!actual.contains("state="));
     }
 
     #[test]
-    fn test_ratatui_dashboard_renders_running_turn_state() {
+    fn test_conversation_layout_renders_running_turn_state() {
         let fixture = UiModel::new(vec![UiBlock::TurnStatus(UiTurnStatus::running())]);
 
-        let actual = render_dashboard_to_string(&fixture, 80, 9);
+        let actual = render_conversation_to_string(&fixture, 90, 10);
 
-        assert!(actual.contains("state=running"));
-        assert!(actual.contains("[turn] turn running: provider"));
+        assert!(actual.contains("Working - assistant is responding"));
+        assert!(actual.contains("Assistant"));
+        assert!(actual.contains("running: provider stream running"));
     }
 
     #[test]
-    fn test_ratatui_dashboard_renders_deterministic_model_output() {
+    fn test_conversation_layout_renders_markdown_without_debug_tag() {
+        let fixture = UiModel::new(vec![UiBlock::Markdown {
+            text: "# Plan\n- inspect\n```rust\nlet ok = true;\n```".to_string(),
+            partial: false,
+        }]);
+
+        let actual = render_conversation_to_string(&fixture, 100, 14);
+        let expected = vec![
+            "Assistant",
+            "Plan",
+            "- inspect",
+            "code",
+            "let ok = true;",
+            "end code",
+        ];
+
+        for fragment in expected {
+            assert!(
+                actual.contains(fragment),
+                "missing rendered fragment: {fragment}"
+            );
+        }
+        assert!(!actual.contains("[markdown]"));
+        assert!(!actual.contains("markdown~"));
+    }
+
+    #[test]
+    fn test_conversation_layout_renders_tool_cards_and_structured_detail() {
         let fixture = UiModel::new(vec![
-            UiBlock::Markdown { text: "Hello markdown".to_string(), partial: false },
+            UiBlock::Markdown { text: "Checking project".to_string(), partial: false },
             UiBlock::ToolStatus(UiToolStatus {
                 name: "shell".to_string(),
                 phase: UiToolPhase::Finished,
@@ -637,37 +925,58 @@ mod tests {
             }),
         ]);
 
-        let actual = render_dashboard_to_string(&fixture, 80, 10);
-        let expected = render_dashboard_to_string(&fixture, 80, 10);
+        let actual = render_conversation_to_string(&fixture, 104, 16);
+        let expected = vec![
+            "Assistant",
+            "Checking project",
+            "Tool shell done",
+            "details in side pane",
+            "Latest tool activity",
+            "Tool shell",
+            "Call call-1",
+            "Arguments",
+            "{\"command\":\"true\"}",
+            "Output",
+            "exit 0",
+        ];
 
-        assert_eq!(actual, expected);
-        assert!(actual.contains("Forge TUI"));
-        assert!(actual.contains("events=3"));
-        assert!(actual.contains("[markdown] Hello markdown"));
-        assert!(actual.contains("[tool] shell finished: exit 0"));
-        assert!(actual.contains("call_id=call-1"));
-        assert!(actual.contains("args={\"command\":\"true\"}"));
+        for fragment in expected {
+            assert!(
+                actual.contains(fragment),
+                "missing rendered fragment: {fragment}"
+            );
+        }
+        assert!(!actual.contains("[tool]"));
+        assert!(!actual.contains("detail/output"));
     }
 
     #[test]
-    fn test_ratatui_dashboard_renders_retry_delay_through_ui_retry_delay() {
+    fn test_conversation_layout_renders_retry_without_placeholder_detail_copy() {
         let fixture = UiModel::new(vec![UiBlock::Retry {
             cause: "network".to_string(),
             delay: UiRetryDelay::from_duration(Duration::from_millis(250)),
         }]);
 
-        let actual = render_dashboard_to_string(&fixture, 64, 9);
-        let expected = render_dashboard_to_string(&fixture, 64, 9);
+        let actual = render_conversation_to_string(&fixture, 78, 11);
+        let expected = vec![
+            "Forge conversation",
+            "Retry",
+            "waiting 250ms - network",
+            "Tool activity",
+            "No tool activity yet.",
+        ];
 
-        assert_eq!(actual, expected);
-        assert!(actual.contains("Forge TUI"));
-        assert!(actual.contains("events=1"));
-        assert!(actual.contains("[retry] 250ms network"));
-        assert!(actual.contains("select a tool event for"));
+        for fragment in expected {
+            assert!(
+                actual.contains(fragment),
+                "missing rendered fragment: {fragment}"
+            );
+        }
+        assert!(!actual.contains("select a tool event"));
     }
 
     #[test]
-    fn test_ratatui_dashboard_clears_running_tool_after_finish() {
+    fn test_conversation_layout_clears_running_tool_after_finish() {
         let fixture = UiModel::new(vec![
             UiBlock::ToolStatus(UiToolStatus {
                 name: "shell".to_string(),
@@ -681,27 +990,33 @@ mod tests {
             }),
         ]);
 
-        let actual = render_dashboard_to_string(&fixture, 80, 9);
+        let actual = render_conversation_to_string(&fixture, 90, 10);
 
-        assert!(actual.contains("tools_running=0"));
+        assert!(actual.contains("Working - assistant is responding"));
+        assert!(!actual.contains("tools_running="));
     }
 
     #[test]
-    fn test_interactive_shell_initial_frame_is_visibly_tui() {
-        let actual = render_interactive_shell_to_string(80, 12);
+    fn test_interactive_shell_initial_frame_is_meaningful_conversation_ui() {
+        let actual = render_interactive_shell_to_string(92, 14);
 
-        assert!(actual.contains("Forge TUI"));
-        assert!(actual.contains("events"));
-        assert!(actual.contains("detail/output"));
-        assert!(actual.contains("Input"));
+        assert!(actual.contains("Forge conversation"));
+        assert!(actual.contains("Ready - start a conversation"));
+        assert!(actual.contains("Conversation"));
+        assert!(actual.contains("Start a conversation"));
+        assert!(actual.contains("Tool details"));
+        assert!(actual.contains("No tool activity yet."));
+        assert!(actual.contains("Message"));
         assert!(actual.contains("Enter send"));
-        assert!(actual.contains("--tui interactive"));
+        assert!(actual.contains("--tui opt-in conversation UI"));
+        assert!(!actual.contains("events"));
+        assert!(!actual.contains("detail/output"));
     }
 
     #[test]
-    fn test_tui_session_queues_and_renders_frames() {
+    fn test_tui_session_queues_and_renders_nonblank_post_submit_frame() {
         let output = Vec::new();
-        let mut fixture = TuiSession::new(output, 80, 9);
+        let mut fixture = TuiSession::new(output, 92, 10);
         let setup = UiModel::new(vec![UiBlock::Completion]);
 
         fixture
@@ -710,8 +1025,10 @@ mod tests {
         let actual = String::from_utf8(fixture.into_output())
             .expect("expected rendered TUI frame to be valid UTF-8");
 
-        assert!(actual.contains("Forge TUI"));
-        assert!(actual.contains("state=complete"));
-        assert!(actual.contains("[done] complete"));
+        assert!(actual.contains("Forge conversation"));
+        assert!(actual.contains("Complete - response finished"));
+        assert!(actual.contains("Assistant"));
+        assert!(actual.contains("complete"));
+        assert!(!actual.trim().is_empty());
     }
 }
