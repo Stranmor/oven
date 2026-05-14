@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -21,7 +23,6 @@ use crate::orch::Orchestrator;
 use crate::services::{
     AgentRegistry, CustomInstructionsService, ProviderAuthService, SteerService,
 };
-
 use crate::set_conversation_id::SetConversationId;
 use crate::steer::SteerHandle;
 use crate::system_prompt::SystemPrompt;
@@ -53,53 +54,284 @@ struct ProjectContextInjection<S> {
     agent: Agent,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ProjectContextTarget {
+    workspace_root: PathBuf,
+    path_filter: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TargetResolutionBudget {
+    remaining_candidates: usize,
+    remaining_index_probes: usize,
+}
+
+impl TargetResolutionBudget {
+    fn new(explicit_target_candidates: usize, index_probes: usize) -> Self {
+        Self {
+            remaining_candidates: explicit_target_candidates.saturating_add(1),
+            remaining_index_probes: index_probes,
+        }
+    }
+
+    fn claim_candidate(&mut self) -> bool {
+        let Some(remaining) = self.remaining_candidates.checked_sub(1) else {
+            return false;
+        };
+        self.remaining_candidates = remaining;
+        true
+    }
+
+    fn claim_index_probe(&mut self) -> bool {
+        let Some(remaining) = self.remaining_index_probes.checked_sub(1) else {
+            return false;
+        };
+        self.remaining_index_probes = remaining;
+        true
+    }
+}
+
 impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
     ProjectContextInjection<S>
 {
+    const MAX_TARGETS: usize = 4;
+    const MAX_EXPLICIT_TARGET_CANDIDATES: usize = 8;
+    const MAX_INDEX_PROBES: usize = 32;
+
     fn new(services: Arc<S>, agent: Agent) -> Self {
         Self { services, agent }
     }
 
     async fn inject(&self, mut conversation: Conversation) -> Conversation {
-        let cwd = self.services.get_environment().cwd;
-        let is_indexed = match self.services.is_indexed(&cwd).await {
-            Ok(indexed) => indexed,
-            Err(error) => {
-                tracing::debug!(error = ?error, path = %cwd.display(), "Skipping project-model context injection because index availability could not be checked");
-                return conversation;
-            }
-        };
-        if !is_indexed {
-            return conversation;
-        }
-
+        let environment = self.services.get_environment();
         let Some(query) = Self::query_from_conversation(&conversation) else {
             return conversation;
         };
-        let params = SearchParams::new(&query, "automatic project-model context injection")
-            .limit(ProjectModelContextRenderBudget::default().max_sources);
-        let nodes = match self.services.query_workspace(cwd.clone(), params).await {
-            Ok(nodes) => nodes,
-            Err(error) => {
-                tracing::debug!(error = ?error, path = %cwd.display(), "Skipping project-model context injection because local retrieval failed");
-                return conversation;
-            }
-        };
-        if nodes.is_empty() {
+        let targets = self.resolve_targets(&environment, &query).await;
+        if targets.is_empty() {
             return conversation;
         }
 
-        let content = Self::render_context(&cwd, nodes);
+        let max_sources = ProjectModelContextRenderBudget::default().max_sources;
+        let mut rendered_contexts = Vec::new();
+        for target in targets {
+            let mut params = SearchParams::new(&query, "automatic project-model context injection")
+                .limit(max_sources);
+            if let Some(path_filter) = target.path_filter.clone() {
+                params = params.starts_with(path_filter);
+            }
+            let nodes = match self
+                .services
+                .query_workspace(target.workspace_root.clone(), params)
+                .await
+            {
+                Ok(nodes) => nodes,
+                Err(error) => {
+                    tracing::debug!(error = ?error, path = %target.workspace_root.display(), "Skipping project-model context target because local retrieval failed");
+                    continue;
+                }
+            };
+            if nodes.is_empty() {
+                continue;
+            }
+            rendered_contexts.push(Self::render_context(&target.workspace_root, nodes));
+        }
+        if rendered_contexts.is_empty() {
+            return conversation;
+        }
+
         let mut context = conversation.context.take().unwrap_or_default();
-        let message = TextMessage::new(Role::User, content)
-            .model(self.agent.model.clone())
-            .droppable(true)
-            .cacheable(false);
-        context = context.add_message(ContextMessage::Text(message));
+        for content in rendered_contexts {
+            let message = TextMessage::new(Role::User, content)
+                .model(self.agent.model.clone())
+                .droppable(true)
+                .cacheable(false);
+            context = context.add_message(ContextMessage::Text(message));
+        }
         conversation.context(context)
     }
 
+    async fn resolve_targets(
+        &self,
+        environment: &Environment,
+        latest_user_message: &str,
+    ) -> Vec<ProjectContextTarget> {
+        let mut candidates = vec![environment.cwd.clone()];
+        candidates.extend(Self::mentioned_paths(
+            latest_user_message,
+            &environment.cwd,
+            environment.home.as_deref(),
+        ));
+
+        let mut budget = TargetResolutionBudget::new(
+            Self::MAX_EXPLICIT_TARGET_CANDIDATES,
+            Self::MAX_INDEX_PROBES,
+        );
+        let mut targets = Vec::new();
+        let mut seen = BTreeSet::new();
+        for candidate in candidates {
+            if !budget.claim_candidate() {
+                break;
+            }
+            let Some(target) = self.resolve_target(candidate, &mut budget).await else {
+                continue;
+            };
+            if seen.insert(target.clone()) {
+                targets.push(target);
+            }
+            if targets.len() >= Self::MAX_TARGETS {
+                break;
+            }
+        }
+        targets
+    }
+
+    async fn resolve_target(
+        &self,
+        path: PathBuf,
+        budget: &mut TargetResolutionBudget,
+    ) -> Option<ProjectContextTarget> {
+        for ancestor in path.ancestors() {
+            if !budget.claim_index_probe() {
+                return None;
+            }
+            let is_indexed = match self.services.is_indexed(ancestor).await {
+                Ok(indexed) => indexed,
+                Err(error) => {
+                    tracing::debug!(error = ?error, path = %ancestor.display(), "Skipping project-model context target because index availability could not be checked");
+                    false
+                }
+            };
+            if !is_indexed {
+                continue;
+            }
+            let workspace_root = ancestor.to_path_buf();
+            let path_filter = Self::directory_path_filter(&path, &workspace_root);
+            return Some(ProjectContextTarget { workspace_root, path_filter });
+        }
+        None
+    }
+
+    fn directory_path_filter(path: &Path, workspace_root: &Path) -> Option<String> {
+        let relative = path
+            .strip_prefix(workspace_root)
+            .ok()
+            .filter(|relative| !relative.as_os_str().is_empty())?;
+        if !path.is_dir() {
+            return None;
+        }
+        let mut filter = relative.to_string_lossy().replace('\\', "/");
+        if !filter.ends_with('/') {
+            filter.push('/');
+        }
+        Some(filter)
+    }
+
+    fn mentioned_paths(message: &str, cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        let mut seen = BTreeSet::new();
+        for tag in Attachment::parse_all(message) {
+            if let Some(path) = Self::resolve_mentioned_path(&tag.path, cwd, home) {
+                if seen.insert(path.clone()) {
+                    paths.push(path);
+                }
+            }
+        }
+        for token in Self::path_like_tokens(message) {
+            if let Some(path) = Self::resolve_mentioned_path(&token, cwd, home) {
+                if seen.insert(path.clone()) {
+                    paths.push(path);
+                }
+            }
+        }
+        paths
+    }
+
+    fn path_like_tokens(message: &str) -> Vec<String> {
+        message
+            .split_whitespace()
+            .filter_map(Self::normalize_path_token)
+            .collect()
+    }
+
+    fn normalize_path_token(raw: &str) -> Option<String> {
+        let token = raw.trim_matches(|character: char| {
+            matches!(
+                character,
+                '`' | '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+            )
+        });
+        let token = token.trim_end_matches(['.', ':', '!']);
+        if token.is_empty()
+            || token.contains("://")
+            || token.starts_with('<')
+            || token.ends_with('>')
+            || token.starts_with("@[")
+        {
+            return None;
+        }
+        let token = Self::trim_line_suffix(token);
+        if token.starts_with('/')
+            || token.starts_with('~')
+            || token.starts_with("./")
+            || token.starts_with("../")
+            || Self::is_relative_path_token(token)
+        {
+            Some(token.to_string())
+        } else {
+            None
+        }
+    }
+
+    fn is_relative_path_token(token: &str) -> bool {
+        if !token.contains('/') {
+            return false;
+        }
+        let components = token
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .collect::<Vec<_>>();
+        components.len() > 2
+            || components
+                .last()
+                .is_some_and(|component| component.contains('.'))
+    }
+
+    fn trim_line_suffix(token: &str) -> &str {
+        let Some((prefix, suffix)) = token.rsplit_once(':') else {
+            return token;
+        };
+        if suffix.chars().all(|character| character.is_ascii_digit()) {
+            Self::trim_line_suffix(prefix)
+        } else {
+            token
+        }
+    }
+
+    fn resolve_mentioned_path(raw_path: &str, cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
+        if raw_path.is_empty() || raw_path.contains("://") {
+            return None;
+        }
+        let path = if raw_path == "~" {
+            home?.to_path_buf()
+        } else if let Some(stripped) = raw_path.strip_prefix("~/") {
+            home?.join(stripped)
+        } else {
+            let path = PathBuf::from(raw_path);
+            if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            }
+        };
+        Some(path)
+    }
+
     fn query_from_conversation(conversation: &Conversation) -> Option<String> {
+        Self::latest_real_user_message(conversation).map(ToOwned::to_owned)
+    }
+
+    fn latest_real_user_message(conversation: &Conversation) -> Option<&str> {
         conversation
             .context
             .as_ref()?
@@ -117,7 +349,6 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
             .and_then(|message| message.content())
             .map(str::trim)
             .filter(|content| !content.is_empty())
-            .map(ToOwned::to_owned)
     }
 
     fn render_context(workspace_root: &std::path::Path, nodes: Vec<Node>) -> String {
@@ -552,16 +783,42 @@ mod tests {
 
     struct ProjectContextHarness {
         cwd: PathBuf,
+        empty_paths: Vec<PathBuf>,
+        error_paths: Vec<PathBuf>,
         captured_context: Mutex<Option<Context>>,
         workspace_queries: AtomicUsize,
+        queried_workspaces: Mutex<Vec<PathBuf>>,
+        query_filters: Mutex<Vec<Option<String>>>,
+        index_checks: AtomicUsize,
     }
 
     impl ProjectContextHarness {
         fn new(cwd: PathBuf) -> Arc<Self> {
+            Self::new_with_empty_and_error_paths(cwd, Vec::new(), Vec::new())
+        }
+
+        fn new_with_empty_paths(cwd: PathBuf, empty_paths: Vec<PathBuf>) -> Arc<Self> {
+            Self::new_with_empty_and_error_paths(cwd, empty_paths, Vec::new())
+        }
+
+        fn new_with_error_paths(cwd: PathBuf, error_paths: Vec<PathBuf>) -> Arc<Self> {
+            Self::new_with_empty_and_error_paths(cwd, Vec::new(), error_paths)
+        }
+
+        fn new_with_empty_and_error_paths(
+            cwd: PathBuf,
+            empty_paths: Vec<PathBuf>,
+            error_paths: Vec<PathBuf>,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 cwd,
+                empty_paths,
+                error_paths,
                 captured_context: Mutex::new(None),
                 workspace_queries: AtomicUsize::new(0),
+                queried_workspaces: Mutex::new(Vec::new()),
+                query_filters: Mutex::new(Vec::new()),
+                index_checks: AtomicUsize::new(0),
             })
         }
     }
@@ -607,12 +864,32 @@ mod tests {
 
         async fn query_workspace(
             &self,
-            _path: PathBuf,
+            path: PathBuf,
             params: SearchParams<'_>,
         ) -> Result<Vec<Node>> {
             self.workspace_queries.fetch_add(1, Ordering::SeqCst);
             assert!(params.query.contains("automatic injection needle"));
             assert_eq!(params.limit, Some(3));
+            self.queried_workspaces.lock().await.push(path.clone());
+            self.query_filters
+                .lock()
+                .await
+                .push(params.starts_with.clone());
+            if self
+                .error_paths
+                .iter()
+                .any(|error_path| error_path == &path)
+            {
+                anyhow::bail!("fixture query failure for {}", path.display());
+            }
+            if self
+                .empty_paths
+                .iter()
+                .any(|empty_path| empty_path == &path)
+            {
+                return Ok(Vec::new());
+            }
+            let file_path = params.starts_with.as_deref().unwrap_or("src/lib.rs");
             let long_content = (0..40)
                 .map(|index| format!("pub fn long_{index}() -> usize {{ {index} }}"))
                 .collect::<Vec<_>>()
@@ -621,7 +898,7 @@ mod tests {
                 Node {
                     node_id: NodeId::new("symbol:src/lib.rs:automatic_injection_needle"),
                     node: NodeData::FileChunk(FileChunk {
-                        file_path: "src/lib.rs".to_string(),
+                        file_path: file_path.to_string(),
                         content: "pub fn automatic_injection_needle() -> usize { 42 }".to_string(),
                         start_line: 3,
                         end_line: 3,
@@ -681,6 +958,7 @@ mod tests {
         }
 
         async fn is_indexed(&self, path: &Path) -> Result<bool> {
+            self.index_checks.fetch_add(1, Ordering::SeqCst);
             Ok(path
                 .join(".forge_project_model/project_manifest.json")
                 .is_file())
@@ -742,6 +1020,11 @@ mod tests {
     fn fixture_workspace() -> Result<(TempDir, PathBuf)> {
         let fixture = TempDir::new()?;
         let root = fixture.path().join("workspace");
+        create_indexed_workspace(&root)?;
+        Ok((fixture, root))
+    }
+
+    fn create_indexed_workspace(root: &Path) -> Result<()> {
         fs::create_dir_all(root.join("src"))?;
         fs::create_dir_all(root.join(".forge_project_model"))?;
         fs::write(
@@ -752,7 +1035,7 @@ mod tests {
             root.join(".forge_project_model/project_manifest.json"),
             r#"{"version":1,"root":"fixture","files":[],"file_nodes":[],"symbols":[],"edges":[],"shards":[],"manifest_hash":"fixture"}"#,
         )?;
-        Ok((fixture, root))
+        Ok(())
     }
 
     #[tokio::test]
@@ -808,6 +1091,289 @@ mod tests {
         .unwrap();
         let expected = "explain the literal <runtime_context tag in prompts";
         assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_model_context_queries_absolute_file_tag_workspace_outside_cwd() -> Result<()> {
+        let fixture = TempDir::new()?;
+        let cwd = fixture.path().join("cwd-workspace");
+        let other = fixture.path().join("other-workspace");
+        create_indexed_workspace(&cwd)?;
+        create_indexed_workspace(&other)?;
+        let setup = ProjectContextHarness::new(cwd.clone());
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let mentioned_file = other.join("src/lib.rs");
+        let conversation =
+            Conversation::generate().context(Context::default().add_message(ContextMessage::user(
+                format!(
+                    "find automatic injection needle in @[{}]",
+                    mentioned_file.display()
+                ),
+                Some(model_id),
+            )));
+
+        let actual = ProjectContextInjection::new(setup.clone(), agent)
+            .inject(conversation)
+            .await;
+        let expected_workspaces = vec![cwd, other];
+        assert_eq!(*setup.queried_workspaces.lock().await, expected_workspaces);
+        let expected_filters = vec![None, None];
+        assert_eq!(*setup.query_filters.lock().await, expected_filters);
+        assert_eq!(
+            actual
+                .context
+                .unwrap()
+                .messages
+                .iter()
+                .filter(|message| message
+                    .content()
+                    .is_some_and(|content| content.contains("<project_model_context")))
+                .count(),
+            2usize,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_model_context_queries_backticked_path_inside_cwd_with_filter() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root);
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let conversation =
+            Conversation::generate().context(Context::default().add_message(ContextMessage::user(
+                "find automatic injection needle in `src/lib.rs`",
+                Some(model_id),
+            )));
+
+        ProjectContextInjection::new(setup.clone(), agent)
+            .inject(conversation)
+            .await;
+        let actual = setup.query_filters.lock().await.clone();
+        let expected = vec![None];
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_model_context_queries_directory_path_inside_cwd_with_safe_filter() -> Result<()>
+    {
+        let (_fixture, root) = fixture_workspace()?;
+        let src_dir = root.join("src");
+        let setup = ProjectContextHarness::new(root);
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let conversation =
+            Conversation::generate().context(Context::default().add_message(ContextMessage::user(
+                format!("find automatic injection needle in {}", src_dir.display()),
+                Some(model_id),
+            )));
+
+        ProjectContextInjection::new(setup.clone(), agent)
+            .inject(conversation)
+            .await;
+        let actual = setup.query_filters.lock().await.clone();
+        let expected = vec![None, Some("src/".to_string())];
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_model_context_exact_file_path_does_not_emit_prefix_filter() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root);
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let conversation =
+            Conversation::generate().context(Context::default().add_message(ContextMessage::user(
+                "find automatic injection needle in `src/lib.rs`",
+                Some(model_id),
+            )));
+
+        ProjectContextInjection::new(setup.clone(), agent)
+            .inject(conversation)
+            .await;
+        let actual = setup.query_filters.lock().await.clone();
+        let expected = vec![None];
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_model_context_ignores_unindexed_mentioned_path_and_keeps_cwd() -> Result<()> {
+        let fixture = TempDir::new()?;
+        let cwd = fixture.path().join("workspace");
+        create_indexed_workspace(&cwd)?;
+        let unindexed_file = fixture.path().join("unindexed/src/lib.rs");
+        fs::create_dir_all(unindexed_file.parent().unwrap())?;
+        fs::write(&unindexed_file, "pub fn automatic_injection_needle() {}")?;
+        let setup = ProjectContextHarness::new(cwd.clone());
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let conversation =
+            Conversation::generate().context(Context::default().add_message(ContextMessage::user(
+                format!(
+                    "find automatic injection needle in {}",
+                    unindexed_file.display()
+                ),
+                Some(model_id),
+            )));
+
+        let actual = ProjectContextInjection::new(setup.clone(), agent)
+            .inject(conversation)
+            .await;
+        let expected_workspaces = vec![cwd];
+        assert_eq!(*setup.queried_workspaces.lock().await, expected_workspaces);
+        assert_eq!(setup.workspace_queries.load(Ordering::SeqCst), 1usize);
+        assert!(actual.context.unwrap().messages.iter().any(|message| {
+            message
+                .content()
+                .is_some_and(|content| content.contains("<project_model_context"))
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_model_context_queries_cwd_baseline_without_mentioned_path() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root.clone());
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let conversation = Conversation::generate().context(Context::default().add_message(
+            ContextMessage::user("find automatic injection needle", Some(model_id)),
+        ));
+
+        ProjectContextInjection::new(setup.clone(), agent)
+            .inject(conversation)
+            .await;
+        let expected_workspaces = vec![root];
+        assert_eq!(*setup.queried_workspaces.lock().await, expected_workspaces);
+        let expected_filters = vec![None];
+        assert_eq!(*setup.query_filters.lock().await, expected_filters);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_model_context_path_target_scan_is_bounded_for_unindexed_mentions() -> Result<()>
+    {
+        let fixture = TempDir::new()?;
+        let cwd = fixture.path().join("workspace");
+        create_indexed_workspace(&cwd)?;
+        let setup = ProjectContextHarness::new(cwd.clone());
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let mentions = (0..64)
+            .map(|index| {
+                fixture
+                    .path()
+                    .join(format!("unindexed-{index}/src/lib.rs"))
+                    .display()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let conversation =
+            Conversation::generate().context(Context::default().add_message(ContextMessage::user(
+                format!("find automatic injection needle in {mentions}"),
+                Some(model_id),
+            )));
+
+        ProjectContextInjection::new(setup.clone(), agent)
+            .inject(conversation)
+            .await;
+        let actual = setup.index_checks.load(Ordering::SeqCst);
+        let expected_maximum = ProjectContextInjection::<ProjectContextHarness>::MAX_INDEX_PROBES;
+        assert!(
+            actual <= expected_maximum,
+            "path-aware injection should bound index checks for untrusted path-like prompt text; got {actual}, expected at most {expected_maximum}"
+        );
+        let expected_queries = 1usize;
+        assert_eq!(
+            setup.workspace_queries.load(Ordering::SeqCst),
+            expected_queries
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_model_context_continues_when_path_target_is_empty() -> Result<()> {
+        let fixture = TempDir::new()?;
+        let cwd = fixture.path().join("cwd-workspace");
+        let other = fixture.path().join("other-workspace");
+        create_indexed_workspace(&cwd)?;
+        create_indexed_workspace(&other)?;
+        let setup = ProjectContextHarness::new_with_empty_paths(cwd.clone(), vec![other.clone()]);
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let mentioned_file = other.join("src/lib.rs");
+        let conversation =
+            Conversation::generate().context(Context::default().add_message(ContextMessage::user(
+                format!(
+                    "find automatic injection needle in {}",
+                    mentioned_file.display()
+                ),
+                Some(model_id),
+            )));
+
+        let actual = ProjectContextInjection::new(setup.clone(), agent)
+            .inject(conversation)
+            .await;
+        let expected_workspaces = vec![cwd, other];
+        assert_eq!(*setup.queried_workspaces.lock().await, expected_workspaces);
+        assert_eq!(
+            actual
+                .context
+                .unwrap()
+                .messages
+                .iter()
+                .filter(|message| message
+                    .content()
+                    .is_some_and(|content| content.contains("<project_model_context")))
+                .count(),
+            1usize,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_model_context_continues_when_path_target_query_errors() -> Result<()> {
+        let fixture = TempDir::new()?;
+        let cwd = fixture.path().join("cwd-workspace");
+        let other = fixture.path().join("other-workspace");
+        create_indexed_workspace(&cwd)?;
+        create_indexed_workspace(&other)?;
+        let setup = ProjectContextHarness::new_with_error_paths(cwd.clone(), vec![other.clone()]);
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let mentioned_file = other.join("src/lib.rs");
+        let conversation =
+            Conversation::generate().context(Context::default().add_message(ContextMessage::user(
+                format!(
+                    "find automatic injection needle in {}",
+                    mentioned_file.display()
+                ),
+                Some(model_id),
+            )));
+
+        let actual = ProjectContextInjection::new(setup.clone(), agent)
+            .inject(conversation)
+            .await;
+        let expected_workspaces = vec![cwd, other];
+        assert_eq!(*setup.queried_workspaces.lock().await, expected_workspaces);
+        assert_eq!(
+            actual
+                .context
+                .unwrap()
+                .messages
+                .iter()
+                .filter(|message| message
+                    .content()
+                    .is_some_and(|content| content.contains("<project_model_context")))
+                .count(),
+            1usize,
+        );
         Ok(())
     }
 
@@ -870,6 +1436,32 @@ mod tests {
             actual.chars().count() <= ProjectModelContextRenderBudget::default().max_rendered_chars,
             "project-model context should stay inside the typed render budget"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_model_query_ignores_droppable_user_messages() -> Result<()> {
+        let (_fixture, _root) = fixture_workspace()?;
+        let model_id = ModelId::new("test-model");
+        let conversation = Conversation::generate().context(
+            Context::default()
+                .add_message(ContextMessage::user(
+                    "find automatic injection needle",
+                    Some(model_id.clone()),
+                ))
+                .add_message(ContextMessage::Text(
+                    TextMessage::new(Role::User, "ignore automatic injection needle")
+                        .model(model_id)
+                        .droppable(true),
+                )),
+        );
+
+        let actual = ProjectContextInjection::<ProjectContextHarness>::query_from_conversation(
+            &conversation,
+        )
+        .unwrap();
+        let expected = "find automatic injection needle";
+        assert_eq!(actual, expected);
         Ok(())
     }
 }
