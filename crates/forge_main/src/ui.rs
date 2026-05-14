@@ -745,6 +745,14 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                     crate::cli::WorkspaceCommand::Delete { workspace_ids } => {
                         self.on_delete_workspaces(workspace_ids).await?;
                     }
+                    crate::cli::WorkspaceCommand::ExplainContext { query, porcelain } => {
+                        let query = if query.is_empty() {
+                            None
+                        } else {
+                            Some(query.join(" "))
+                        };
+                        self.on_workspace_explain_context(query, porcelain).await?;
+                    }
                     crate::cli::WorkspaceCommand::Status { path, porcelain } => {
                         self.on_workspace_status(path, porcelain).await?;
                     }
@@ -5254,6 +5262,70 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                 Err(e)
             }
         }
+    }
+
+    async fn on_workspace_explain_context(
+        &mut self,
+        query: Option<String>,
+        porcelain: bool,
+    ) -> anyhow::Result<()> {
+        let explanation = self.api.explain_workspace_context(query).await?;
+        if porcelain {
+            self.writeln(serde_json::to_string_pretty(&explanation)?)?;
+            return Ok(());
+        }
+
+        let mut info = Info::new().add_title("Project Model Context Diagnostics");
+        info = info.add_key_value("Cwd", explanation.cwd.display().to_string());
+        info = info.add_key_value(
+            "Query",
+            explanation.query.as_deref().unwrap_or("<not provided>"),
+        );
+        info = info.add_key_value("Would Inject", explanation.would_inject.to_string());
+        if let Some(reason) = &explanation.skip_reason {
+            info = info.add_key_value("Skip Reason", reason);
+        }
+
+        info = info.add_title(format!("Candidates [{}]", explanation.candidates.len()));
+        for candidate in &explanation.candidates {
+            let mut value = format!("path={}", candidate.candidate_path.display());
+            if let Some(workspace) = &candidate.selected_workspace {
+                value.push_str(&format!(" selected_workspace={}", workspace.display()));
+            }
+            if let Some(path_filter) = &candidate.path_filter {
+                value.push_str(&format!(" path_filter={path_filter}"));
+            }
+            if let Some(skip_reason) = &candidate.skip_reason {
+                value.push_str(&format!(" skip_reason={skip_reason}"));
+            }
+            info = info.add_key_value("Candidate", value);
+        }
+
+        info = info.add_title(format!(
+            "Selected Targets [{}]",
+            explanation.selected_targets.len()
+        ));
+        for target in &explanation.selected_targets {
+            info = info.add_key_value(
+                "Target",
+                format!(
+                    "workspace={} manifest_found={} manifest_path={} freshness={}",
+                    target.workspace_root.display(),
+                    target.manifest_found,
+                    target.manifest_path.display(),
+                    target.freshness.label()
+                ),
+            );
+        }
+
+        if !explanation.retrieval_empty_targets.is_empty() {
+            info = info.add_title("Retrieval Empty Targets");
+            for target in &explanation.retrieval_empty_targets {
+                info = info.add_key_value("Empty", target.display().to_string());
+            }
+        }
+
+        self.writeln(info)
     }
 
     /// Displays sync status for all files in the workspace.

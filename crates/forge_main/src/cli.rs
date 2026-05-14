@@ -399,6 +399,17 @@ pub enum WorkspaceCommand {
         workspace_ids: Vec<String>,
     },
 
+    /// Explain automatic project-model context injection diagnostics.
+    ExplainContext {
+        /// Optional query text used to simulate the latest user message.
+        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+        query: Vec<String>,
+
+        /// Output in machine-readable format
+        #[arg(short, long)]
+        porcelain: bool,
+    },
+
     /// Show sync status of all files in the workspace.
     Status {
         /// Path to the directory to check status for

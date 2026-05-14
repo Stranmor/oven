@@ -7,11 +7,12 @@ use async_trait::async_trait;
 use forge_app::{CommandInfra, EnvironmentInfra, FileReaderInfra, WalkerInfra, WorkspaceService};
 use forge_domain::{
     AuthCredential, AuthDetails, FileChunk, Node, NodeData, NodeId, ProviderId, ProviderRepository,
-    SearchParams, SyncProgress, UserId, WorkspaceId, WorkspaceIndexRepository,
+    SearchParams, SyncProgress, UserId, WorkspaceContextFreshness,
+    WorkspaceContextManifestDiagnostic, WorkspaceId, WorkspaceIndexRepository,
 };
 use forge_project_model::{
-    ContextPack, ContextPackSelection, FreshnessState, ProjectIndexer, RetrievalQuery,
-    StaleEvidencePolicy, retrieve,
+    ContextPack, ContextPackSelection, ProjectIndexer, RetrievalQuery, StaleEvidencePolicy,
+    retrieve,
 };
 use forge_stream::MpscStream;
 use futures::future::join_all;
@@ -237,6 +238,19 @@ impl<
                 local_project_model_manifest(&root).display()
             )
         })?;
+        let freshness = indexer.freshness(&manifest).with_context(|| {
+            format!(
+                "Workspace project model freshness cannot be proven at {}",
+                local_project_model_manifest(&root).display()
+            )
+        })?;
+        if !freshness.fresh {
+            anyhow::bail!(
+                "Workspace project model is stale at {}. Run `forge workspace sync {}` before using project-model context.",
+                local_project_model_manifest(&root).display(),
+                root.display()
+            );
+        }
         let retrieval_query = RetrievalQuery {
             text: Some(params.query.to_string()),
             path: params.starts_with.clone(),
@@ -251,18 +265,8 @@ impl<
                 retrieval_results: results,
                 shards: Vec::new(),
                 evidence: Vec::new(),
-                freshness: FreshnessState {
-                    changed: Vec::new(),
-                    deleted: Vec::new(),
-                    added: Vec::new(),
-                    unchanged: manifest
-                        .files
-                        .iter()
-                        .map(|file| file.path.clone())
-                        .collect(),
-                    fresh: true,
-                },
-                stale_policy: StaleEvidencePolicy::Mark,
+                freshness,
+                stale_policy: StaleEvidencePolicy::Reject,
             },
         )?;
         let mut nodes = Vec::new();
@@ -349,8 +353,39 @@ fn local_project_model_manifest(path: &Path) -> PathBuf {
     local_project_model_dir(path).join("project_manifest.json")
 }
 
-fn local_workspace_has_project_model(path: &Path) -> bool {
-    path.is_dir() && local_project_model_manifest(path).is_file()
+fn evaluate_project_model_context(path: &Path) -> WorkspaceContextManifestDiagnostic {
+    let manifest_path = local_project_model_manifest(path);
+    if !path.is_dir() || !manifest_path.is_file() {
+        return WorkspaceContextManifestDiagnostic {
+            workspace_root: path.to_path_buf(),
+            manifest_path,
+            manifest_found: false,
+            freshness: WorkspaceContextFreshness::Unknown {
+                reason: "project-model manifest not found".to_string(),
+            },
+        };
+    }
+
+    let indexer = ProjectIndexer::new(path, local_project_model_dir(path));
+    let freshness = match indexer
+        .read_manifest()
+        .and_then(|manifest| indexer.freshness(&manifest))
+    {
+        Ok(state) if state.fresh => WorkspaceContextFreshness::Fresh,
+        Ok(state) => WorkspaceContextFreshness::Stale {
+            changed: state.changed,
+            deleted: state.deleted,
+            added: state.added,
+        },
+        Err(error) => WorkspaceContextFreshness::Unknown { reason: error.to_string() },
+    };
+
+    WorkspaceContextManifestDiagnostic {
+        workspace_root: path.to_path_buf(),
+        manifest_path,
+        manifest_found: true,
+        freshness,
+    }
 }
 
 #[async_trait]
@@ -463,7 +498,14 @@ impl<
     }
 
     async fn is_indexed(&self, path: &std::path::Path) -> Result<bool> {
-        Ok(local_workspace_has_project_model(path))
+        Ok(evaluate_project_model_context(path).can_inject())
+    }
+
+    async fn project_model_context_diagnostic(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<WorkspaceContextManifestDiagnostic> {
+        Ok(evaluate_project_model_context(path))
     }
 
     async fn get_workspace_status(&self, path: PathBuf) -> Result<Vec<forge_domain::FileStatus>> {
@@ -500,7 +542,10 @@ impl<
             return Ok(true);
         }
         let cwd = self.infra.get_environment().cwd;
-        Ok(local_workspace_has_project_model(&cwd))
+        if evaluate_project_model_context(&cwd).can_inject() {
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     async fn init_auth_credentials(&self) -> Result<forge_domain::WorkspaceAuth> {
@@ -559,6 +604,7 @@ mod tests {
         ProcessStartOutput, ProcessStatus, ProviderTemplate, ShellHandoffTimeoutSeconds,
         WorkspaceFiles, WorkspaceInfo,
     };
+    use forge_project_model::FreshnessState;
     use futures::{Stream, StreamExt};
     use tempfile::TempDir;
 
@@ -900,6 +946,69 @@ mod tests {
         assert!(chunk.0.contains("src/lib.rs"));
         assert!(!remote_search_called.load(Ordering::SeqCst));
         assert!(range_read_called.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_workspace_rejects_stale_project_model_manifest() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        fs::write(
+            root.join("src").join("lib.rs"),
+            "pub struct RuntimeNeedle {\n    pub value: usize,\n}\n\npub fn build_runtime_needle() -> RuntimeNeedle {\n    RuntimeNeedle { value: 8 }\n}\n",
+        )?;
+        let range_read_called = Arc::new(AtomicBool::new(false));
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::clone(&range_read_called),
+            }),
+            Arc::new(NoopDiscovery),
+        );
+        let params = SearchParams::new("build runtime needle", "runtime integration proof");
+        let actual = WorkspaceService::query_workspace(&setup, root, params).await;
+        let actual_error = match actual {
+            Ok(nodes) => {
+                anyhow::bail!("expected stale manifest error, got {} nodes", nodes.len())
+            }
+            Err(error) => error.to_string(),
+        };
+        let expected = "Workspace project model is stale";
+
+        assert!(actual_error.contains(expected));
+        assert!(!range_read_called.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_model_context_diagnostic_reports_fresh_and_stale_manifest() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::new(AtomicBool::new(false)),
+            }),
+            Arc::new(NoopDiscovery),
+        );
+        let fresh = WorkspaceService::project_model_context_diagnostic(&setup, &root).await?;
+        fs::write(root.join("src").join("extra.rs"), "pub fn extra() {}\n")?;
+        let stale = WorkspaceService::project_model_context_diagnostic(&setup, &root).await?;
+        let actual = (
+            fresh.manifest_found,
+            fresh.freshness.label().to_string(),
+            stale.manifest_found,
+            stale.freshness.label().to_string(),
+        );
+        let expected = (true, "fresh".to_string(), true, "stale".to_string());
+
+        assert_eq!(actual, expected);
         Ok(())
     }
 

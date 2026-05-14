@@ -260,6 +260,12 @@ pub trait API: Sync + Send {
     /// Delete one or more workspaces in parallel
     async fn delete_workspaces(&self, workspace_ids: Vec<forge_domain::WorkspaceId>) -> Result<()>;
 
+    /// Explain automatic project-model context injection for the current workspace.
+    async fn explain_workspace_context(
+        &self,
+        query: Option<String>,
+    ) -> Result<forge_domain::WorkspaceContextExplanation>;
+
     /// Get sync status for all files in workspace
     async fn get_workspace_status(&self, path: PathBuf) -> Result<Vec<forge_domain::FileStatus>>;
 

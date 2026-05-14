@@ -10,7 +10,7 @@ use forge_domain::{
     ProcessReadOutput, ProcessStartOutput, ProcessStatus, Provider, ProviderId, ResultStream,
     Scope, SearchParams, SteerMessage, SubagentTaskId, SubagentTaskSession,
     SubagentTaskSessionFilter, SyncProgress, SyntaxError, Template, ToolCallFull, ToolOutput,
-    WorkspaceAuth, WorkspaceId, WorkspaceInfo,
+    WorkspaceAuth, WorkspaceContextManifestDiagnostic, WorkspaceId, WorkspaceInfo,
 };
 use forge_eventsource::EventSource;
 use reqwest::Response;
@@ -472,14 +472,20 @@ pub trait WorkspaceService: Send + Sync {
     /// Get workspace information for a specific path
     async fn get_workspace_info(&self, path: PathBuf) -> anyhow::Result<Option<WorkspaceInfo>>;
 
+    /// Checks whether a path belongs to an indexed workspace.
+    async fn is_indexed(&self, path: &Path) -> anyhow::Result<bool>;
+
     /// Delete a workspace and all its indexed data
     async fn delete_workspace(&self, workspace_id: &WorkspaceId) -> anyhow::Result<()>;
 
     /// Delete multiple workspaces in parallel and all their indexed data
     async fn delete_workspaces(&self, workspace_ids: &[WorkspaceId]) -> anyhow::Result<()>;
 
-    /// Checks if workspace is indexed.
-    async fn is_indexed(&self, path: &Path) -> anyhow::Result<bool>;
+    /// Checks if workspace project-model context is available and fresh.
+    async fn project_model_context_diagnostic(
+        &self,
+        path: &Path,
+    ) -> anyhow::Result<WorkspaceContextManifestDiagnostic>;
 
     /// Get sync status for all files in workspace
     async fn get_workspace_status(&self, path: PathBuf) -> anyhow::Result<Vec<FileStatus>>;
@@ -1387,6 +1393,10 @@ impl<I: Services> WorkspaceService for I {
         self.workspace_service().get_workspace_info(path).await
     }
 
+    async fn is_indexed(&self, path: &Path) -> anyhow::Result<bool> {
+        self.workspace_service().is_indexed(path).await
+    }
+
     async fn delete_workspace(&self, workspace_id: &WorkspaceId) -> anyhow::Result<()> {
         self.workspace_service()
             .delete_workspace(workspace_id)
@@ -1399,8 +1409,13 @@ impl<I: Services> WorkspaceService for I {
             .await
     }
 
-    async fn is_indexed(&self, path: &Path) -> anyhow::Result<bool> {
-        self.workspace_service().is_indexed(path).await
+    async fn project_model_context_diagnostic(
+        &self,
+        path: &Path,
+    ) -> anyhow::Result<WorkspaceContextManifestDiagnostic> {
+        self.workspace_service()
+            .project_model_context_diagnostic(path)
+            .await
     }
 
     async fn get_workspace_status(&self, path: PathBuf) -> anyhow::Result<Vec<FileStatus>> {
@@ -1970,6 +1985,10 @@ mod tests {
             anyhow::bail!("unused workspace service")
         }
 
+        async fn is_indexed(&self, _path: &Path) -> anyhow::Result<bool> {
+            anyhow::bail!("unused workspace service")
+        }
+
         async fn delete_workspace(&self, _workspace_id: &WorkspaceId) -> anyhow::Result<()> {
             anyhow::bail!("unused workspace service")
         }
@@ -1978,7 +1997,10 @@ mod tests {
             anyhow::bail!("unused workspace service")
         }
 
-        async fn is_indexed(&self, _path: &Path) -> anyhow::Result<bool> {
+        async fn project_model_context_diagnostic(
+            &self,
+            _path: &Path,
+        ) -> anyhow::Result<WorkspaceContextManifestDiagnostic> {
             anyhow::bail!("unused workspace service")
         }
 

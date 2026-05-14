@@ -419,6 +419,13 @@ impl<
         self.services.delete_workspaces(&workspace_ids).await
     }
 
+    async fn explain_workspace_context(
+        &self,
+        query: Option<String>,
+    ) -> Result<forge_domain::WorkspaceContextExplanation> {
+        Ok(self.app().explain_workspace_context(query).await)
+    }
+
     async fn get_workspace_status(&self, path: PathBuf) -> Result<Vec<forge_domain::FileStatus>> {
         self.services.get_workspace_status(path).await
     }
