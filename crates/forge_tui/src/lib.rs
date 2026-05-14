@@ -181,8 +181,17 @@ fn status_text(model: &UiModel) -> String {
     let running = model
         .blocks
         .iter()
-        .filter(|block| matches!(block, UiBlock::ToolStatus(status) if status.phase == UiToolPhase::Started))
-        .count();
+        .fold(0usize, |active, block| match block {
+            UiBlock::ToolStatus(status) if status.phase == UiToolPhase::Started => {
+                active.saturating_add(1)
+            }
+            UiBlock::ToolStatus(status)
+                if matches!(status.phase, UiToolPhase::Finished | UiToolPhase::Failed) =>
+            {
+                active.saturating_sub(1)
+            }
+            _ => active,
+        });
     let failed = model
         .blocks
         .iter()
@@ -342,6 +351,26 @@ mod tests {
         assert!(actual.contains("events=1"));
         assert!(actual.contains("[retry] 250ms network"));
         assert!(actual.contains("select a tool event for"));
+    }
+
+    #[test]
+    fn test_ratatui_dashboard_clears_running_tool_after_finish() {
+        let fixture = UiModel::new(vec![
+            UiBlock::ToolStatus(UiToolStatus {
+                name: "shell".to_string(),
+                phase: UiToolPhase::Started,
+                summary: None,
+            }),
+            UiBlock::ToolStatus(UiToolStatus {
+                name: "shell".to_string(),
+                phase: UiToolPhase::Finished,
+                summary: Some("exit 0".to_string()),
+            }),
+        ]);
+
+        let actual = render_dashboard_to_string(&fixture, 80, 9);
+
+        assert!(actual.contains("tools_running=0"));
     }
 
     #[test]
