@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use chrono::Utc;
+#[cfg(not(target_os = "android"))]
 use image::ImageBuffer;
+#[cfg(not(target_os = "android"))]
 use url::Url;
 
 pub fn paste_image() -> Vec<PathBuf> {
@@ -18,19 +20,27 @@ pub fn paste_image() -> Vec<PathBuf> {
         return vec![path];
     }
 
-    let mut clipboard = match arboard::Clipboard::new() {
-        Ok(clipboard) => clipboard,
-        Err(error) => {
-            eprintln!("\n[Forge] Error getting clipboard: {error:?}");
-            return Vec::new();
-        }
-    };
-
-    if let Some(path) = paste_clipboard_pixels(&images_dir, &mut clipboard) {
-        return vec![path];
+    #[cfg(target_os = "android")]
+    {
+        Vec::new()
     }
 
-    paste_clipboard_paths(&mut clipboard)
+    #[cfg(not(target_os = "android"))]
+    {
+        let mut clipboard = match arboard::Clipboard::new() {
+            Ok(clipboard) => clipboard,
+            Err(error) => {
+                eprintln!("\n[Forge] Error getting clipboard: {error:?}");
+                return Vec::new();
+            }
+        };
+
+        if let Some(path) = paste_clipboard_pixels(&images_dir, &mut clipboard) {
+            return vec![path];
+        }
+
+        paste_clipboard_paths(&mut clipboard)
+    }
 }
 
 enum ClipboardTool {
@@ -74,6 +84,7 @@ fn paste_external_png(images_dir: &Path, tool: ClipboardTool) -> Option<PathBuf>
     Some(path)
 }
 
+#[cfg(not(target_os = "android"))]
 fn paste_clipboard_pixels(
     images_dir: &Path,
     clipboard: &mut arboard::Clipboard,
@@ -90,6 +101,7 @@ fn paste_clipboard_pixels(
     Some(path)
 }
 
+#[cfg(not(target_os = "android"))]
 fn paste_clipboard_paths(clipboard: &mut arboard::Clipboard) -> Vec<PathBuf> {
     let Ok(text) = clipboard.get_text() else {
         eprintln!("\n[Forge] Clipboard does not contain an image or valid image paths.");
@@ -112,6 +124,7 @@ fn paste_clipboard_paths(clipboard: &mut arboard::Clipboard) -> Vec<PathBuf> {
     parse_image_path(unquote(text.trim())).into_iter().collect()
 }
 
+#[cfg(not(target_os = "android"))]
 fn unquote(value: &str) -> &str {
     value
         .strip_prefix('"')
@@ -124,6 +137,7 @@ fn unquote(value: &str) -> &str {
         .unwrap_or(value)
 }
 
+#[cfg(not(target_os = "android"))]
 fn parse_image_path(value: &str) -> Option<PathBuf> {
     let path = if value.starts_with("file://") {
         Url::parse(value).ok()?.to_file_path().ok()?
@@ -136,6 +150,7 @@ fn parse_image_path(value: &str) -> Option<PathBuf> {
     is_image_file(&path).then_some(path)
 }
 
+#[cfg(not(target_os = "android"))]
 fn is_image_file(path: &Path) -> bool {
     let Some(ext) = path.extension() else {
         return false;
