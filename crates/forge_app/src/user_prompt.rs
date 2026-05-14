@@ -78,18 +78,7 @@ impl<S: AttachmentService + EnvironmentInfra<Config = forge_config::ForgeConfig>
     }
 
     fn is_stale_runtime_context_message(message: &MessageEntry) -> bool {
-        match &message.message {
-            ContextMessage::Text(text) if text.is_runtime_context() => true,
-            ContextMessage::Text(text) => {
-                text.role == Role::User
-                    && text.cacheable == Some(false)
-                    && text.raw_content.is_none()
-                    && text.content.trim_start().starts_with(
-                        "<runtime_context freshness=\"live\" cache=\"uncached\">",
-                    )
-            }
-            _ => false,
-        }
+        matches!(&message.message, ContextMessage::Text(text) if text.is_runtime_context())
     }
 
     /// Adds existing todos as a user message when resuming a conversation
@@ -548,38 +537,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_runtime_context_replaces_legacy_persisted_context_without_kind() {
+    async fn test_runtime_context_preserves_untyped_legacy_context_without_kind() {
         let agent = fixture_agent_without_user_prompt();
         let event = Event::new("Second task");
+        let literal_user_text = "<runtime_context freshness=\"live\" cache=\"uncached\">\n<current_date>2026-05-12</current_date>\n</runtime_context>";
         let conversation = fixture_conversation().context(
             Context::default()
                 .add_message(ContextMessage::user("First task", None))
                 .add_message(ContextMessage::Text(
-                    TextMessage::new(
-                        Role::User,
-                        "<runtime_context freshness=\"live\" cache=\"uncached\">\n<current_date>2026-05-12</current_date>\n</runtime_context>",
-                    )
-                    .model(ModelId::new("test-model"))
-                    .cacheable(false),
+                    TextMessage::new(Role::User, literal_user_text)
+                        .model(ModelId::new("test-model"))
+                        .cacheable(false),
                 )),
         );
         let generator = fixture_generator(agent.clone(), event);
 
         let actual = generator.add_user_prompt(conversation).await.unwrap();
 
-        let runtime_messages = actual
-            .context
-            .unwrap()
-            .messages
-            .into_iter()
+        let messages = actual.context.unwrap().messages;
+        let untyped_literal_messages = messages
+            .iter()
+            .filter(|message| message.content() == Some(literal_user_text))
+            .count();
+        let runtime_messages = messages
+            .iter()
             .filter(|message| {
-                message
-                    .content()
-                    .is_some_and(|content| content.contains("<runtime_context"))
+                matches!(&message.message, ContextMessage::Text(text) if text.is_runtime_context())
             })
             .count();
+        assert_eq!(untyped_literal_messages, 1);
+        assert_eq!(runtime_messages, 1);
+    }
+
+    #[tokio::test]
+    async fn test_runtime_context_replacement_preserves_user_text_that_mentions_runtime_context() {
+        let agent = fixture_agent_without_user_prompt();
+        let event = Event::new("Second task");
+        let literal_user_text = "<runtime_context freshness=\"live\" cache=\"uncached\">\nthis is user supplied text, not internal runtime context\n</runtime_context>";
+        let conversation = fixture_conversation().context(
+            Context::default()
+                .add_message(ContextMessage::user("First task", None))
+                .add_message(ContextMessage::Text(
+                    TextMessage::new(Role::User, literal_user_text)
+                        .model(ModelId::new("test-model"))
+                        .cacheable(false),
+                )),
+        );
+        let generator = fixture_generator(agent.clone(), event);
+
+        let actual = generator.add_user_prompt(conversation).await.unwrap();
+
+        let messages = actual.context.unwrap().messages;
+        let user_literal_messages = messages
+            .iter()
+            .filter(|message| message.content() == Some(literal_user_text))
+            .count();
         let expected = 1;
-        assert_eq!(runtime_messages, expected);
+        assert_eq!(user_literal_messages, expected);
     }
 
     #[tokio::test]
