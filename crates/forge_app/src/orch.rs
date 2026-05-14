@@ -31,6 +31,12 @@ pub struct Orchestrator<S> {
     config: forge_config::ForgeConfig,
 }
 
+#[derive(Debug)]
+struct PreflightContexts {
+    canonical: Context,
+    outbound: Context,
+}
+
 impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orchestrator<S> {
     pub fn new(
         services: Arc<S>,
@@ -234,17 +240,16 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
         context_budget.effective_input_budget()
     }
 
-    /// Compacts context before provider dispatch when the projected request
-    /// would exceed the model window.
+    /// Compacts canonical context and prepares its final outbound projection before
+    /// provider dispatch when the projected request would exceed the model window.
     ///
     /// # Arguments
-    /// * `context` - The fully transformed context that would be sent to the
-    ///   provider.
+    /// * `context` - Canonical conversation context before outbound-only normalization.
     ///
     /// # Errors
     /// Returns an actionable local error when the request cannot fit inside the
     /// selected model window.
-    fn preflight_context_window(&self, context: Context) -> anyhow::Result<Context> {
+    fn preflight_context_window(&self, context: Context) -> anyhow::Result<PreflightContexts> {
         let model = self.model_for_agent()?;
         let context_window = model
             .context_length
@@ -257,15 +262,18 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
                 )
             })?;
 
-        let context = context.model_context_length(u64::try_from(context_window).map_err(|_| {
+        let canonical = context.model_context_length(u64::try_from(context_window).map_err(|_| {
             anyhow::anyhow!(
                 "Selected model '{}' context window {} tokens cannot be represented in provider safety metadata.",
                 self.agent.model,
                 context_window
             )
         })?);
+        let reasoning_supported = canonical.is_reasoning_supported();
+        let outbound =
+            self.final_outbound_context(&self.agent.model, canonical.clone(), reasoning_supported)?;
 
-        let output_reservation = Self::output_token_reservation(&context);
+        let output_reservation = Self::output_token_reservation(&outbound);
         let input_budget = Self::effective_input_budget(context_window, output_reservation)
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -276,16 +284,26 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
                 )
             })?;
 
-        let estimated_tokens = self.estimated_request_tokens(&context)?;
+        let estimated_tokens = self.estimated_request_tokens(&outbound)?;
         if estimated_tokens <= input_budget {
-            return Ok(context);
+            return Ok(PreflightContexts { canonical, outbound });
         }
 
-        let compacted = Compactor::new(self.agent.compact.clone(), self.services.get_environment())
-            .compact(context, true)?;
-        let compacted_estimated_tokens = self.estimated_request_tokens(&compacted)?;
+        let compacted_canonical =
+            Compactor::new(self.agent.compact.clone(), self.services.get_environment())
+                .compact(canonical, true)?;
+        let compacted_reasoning_supported = compacted_canonical.is_reasoning_supported();
+        let compacted_outbound = self.final_outbound_context(
+            &self.agent.model,
+            compacted_canonical.clone(),
+            compacted_reasoning_supported,
+        )?;
+        let compacted_estimated_tokens = self.estimated_request_tokens(&compacted_outbound)?;
         if compacted_estimated_tokens <= input_budget {
-            return Ok(compacted);
+            return Ok(PreflightContexts {
+                canonical: compacted_canonical,
+                outbound: compacted_outbound,
+            });
         }
 
         anyhow::bail!(
@@ -318,12 +336,22 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
         Ok(tool_supported)
     }
 
-    async fn execute_chat_turn(
+    /// Applies the final outbound context transformations used immediately before
+    /// provider dispatch.
+    ///
+    /// # Arguments
+    /// * `model_id` - Model identifier used for model-specific normalization.
+    /// * `context` - Conversation context before outbound-only normalization.
+    /// * `reasoning_supported` - Whether the selected model accepts reasoning payloads.
+    ///
+    /// # Errors
+    /// Returns an error when tool support metadata cannot be resolved.
+    fn final_outbound_context(
         &self,
         model_id: &ModelId,
         context: Context,
         reasoning_supported: bool,
-    ) -> anyhow::Result<ChatCompletionMessageFull> {
+    ) -> anyhow::Result<Context> {
         let tool_supported = self.is_tool_supported()?;
         let mut transformers = DefaultTransformation::default()
             .pipe(SortTools::new(self.agent.tool_order()))
@@ -347,7 +375,15 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
                     .when(|_| model_id.as_str().to_lowercase().contains("claude")),
             );
         let context = context.initiator(self.conversation.initiator);
-        let context = transformers.transform(context);
+        Ok(transformers.transform(context))
+    }
+
+    async fn execute_prepared_chat_turn(
+        &self,
+        model_id: &ModelId,
+        context: Context,
+    ) -> anyhow::Result<ChatCompletionMessageFull> {
+        let tool_supported = self.is_tool_supported()?;
         let response = self
             .services
             .chat_agent(model_id, context, Some(self.agent.provider.clone()))
@@ -359,15 +395,12 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
             .await
     }
 
-    async fn execute_chat_turn_vetted(
+    async fn execute_prepared_chat_turn_vetted(
         &self,
         model_id: &ModelId,
         context: Context,
-        reasoning_supported: bool,
     ) -> anyhow::Result<ChatCompletionMessageFull> {
-        let msg = self
-            .execute_chat_turn(model_id, context, reasoning_supported)
-            .await?;
+        let msg = self.execute_prepared_chat_turn(model_id, context).await?;
 
         let trimmed = msg.content.trim();
 
@@ -450,19 +483,15 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
                 context = updated_context.clone();
             }
 
-            context = self.preflight_context_window(context)?;
+            let preflight = self.preflight_context_window(context)?;
+            context = preflight.canonical;
+            let outbound_context = preflight.outbound;
             self.conversation.context = Some(context.clone());
             self.services.update(self.conversation.clone()).await?;
 
             let message = crate::retry::retry_with_config(
                 &self.config.clone().retry.unwrap_or_default(),
-                || {
-                    self.execute_chat_turn_vetted(
-                        &model_id,
-                        context.clone(),
-                        context.is_reasoning_supported(),
-                    )
-                },
+                || self.execute_prepared_chat_turn_vetted(&model_id, outbound_context.clone()),
                 self.sender.as_ref().map(|sender| {
                     let sender = sender.clone();
                     let agent_id = self.agent.id.clone();
@@ -659,9 +688,10 @@ mod tests {
     use std::sync::Arc;
 
     use forge_domain::{
-        Agent, AgentId, ChatCompletionMessage, Compact, Context, ContextMessage, Environment,
-        InputModality, Model, ModelId, ProviderId, ResultStream, Role, TextMessage,
-        ToolCallContext, ToolCallFull, ToolDefinition, ToolResult,
+        Agent, AgentId, ChatCompletionMessage, Compact, Context, ContextMessage,
+        DefaultTransformation, Environment, Image, ImageHandling, InputModality, Model, ModelId,
+        ProviderId, ResultStream, Role, TextMessage, ToolCallContext, ToolCallFull, ToolCallId,
+        ToolDefinition, ToolName, ToolOutput, ToolResult, ToolValue, Transformer,
     };
     use pretty_assertions::assert_eq;
 
@@ -817,11 +847,11 @@ mod tests {
         let expected = true;
 
         assert_eq!(
-            fixture.estimated_request_tokens(&actual).unwrap() < original_estimated_tokens,
+            fixture.estimated_request_tokens(&actual.outbound).unwrap() < original_estimated_tokens,
             expected
         );
         assert_eq!(
-            fixture.estimated_request_tokens(&actual).unwrap() <= input_budget,
+            fixture.estimated_request_tokens(&actual.outbound).unwrap() <= input_budget,
             expected
         );
     }
@@ -995,6 +1025,76 @@ mod tests {
         let expected = true;
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_preflight_estimate_matches_final_context_after_image_handling() {
+        let fixture = orchestrator_fixture(Compact::new().retention_window(1_usize), 128_000);
+        let context = Context::default()
+            .add_tool_results(vec![ToolResult {
+                name: ToolName::new("image_tool"),
+                call_id: Some(ToolCallId::new("call_image")),
+                output: ToolOutput {
+                    values: vec![ToolValue::Image(Image::new_base64(
+                        "A".repeat(60_000),
+                        "image/png",
+                    ))],
+                    is_error: false,
+                },
+            }])
+            .max_tokens(512_usize);
+        let preflight_estimate = fixture.estimated_request_tokens(&context).unwrap();
+        let final_context = DefaultTransformation::default()
+            .pipe(ImageHandling::new())
+            .transform(context.clone());
+        let final_estimate = fixture.estimated_request_tokens(&final_context).unwrap();
+        let context_window = (8_000_usize..128_000)
+            .find(|context_window| {
+                Orchestrator::<FixtureServices>::effective_input_budget(*context_window, 512)
+                    .is_some_and(|budget| preflight_estimate <= budget && final_estimate > budget)
+            })
+            .expect("fixture should expose image-handling transform estimation gap");
+        let fixture = orchestrator_fixture(
+            Compact::new().retention_window(1_usize),
+            context_window as u64,
+        );
+
+        let actual = fixture.preflight_context_window(context);
+        let expected = true;
+
+        assert_eq!(actual.is_err(), expected);
+    }
+
+    #[test]
+    fn test_preflight_keeps_outbound_projection_separate_from_canonical_context() {
+        let context_window = 128_000_u64;
+        let fixture =
+            orchestrator_fixture(Compact::new().retention_window(1_usize), context_window);
+        let context = Context::default()
+            .add_tool_results(vec![ToolResult {
+                name: ToolName::new("image_tool"),
+                call_id: Some(ToolCallId::new("call_image")),
+                output: ToolOutput {
+                    values: vec![ToolValue::Image(Image::new_base64(
+                        "A".repeat(1_000),
+                        "image/png",
+                    ))],
+                    is_error: false,
+                },
+            }])
+            .max_tokens(512_usize);
+        let expected_canonical = context.clone().model_context_length(context_window);
+
+        let actual = fixture.preflight_context_window(context).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&actual.canonical).unwrap(),
+            serde_json::to_value(&expected_canonical).unwrap()
+        );
+        assert!(
+            fixture.estimated_request_tokens(&actual.outbound).unwrap()
+                > fixture.estimated_request_tokens(&actual.canonical).unwrap()
+        );
     }
 
     #[test]
