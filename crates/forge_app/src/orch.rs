@@ -174,80 +174,75 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
         Ok(())
     }
 
-    fn model_for_agent(&self) -> Option<&Model> {
+    fn model_for_agent(&self) -> anyhow::Result<&Model> {
         self.models
             .iter()
             .find(|model| model.id == self.agent.model && model.provider_id == self.agent.provider)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Selected model '{}' for provider '{}' is missing from resolved provider metadata; context-window safety cannot be proven before provider dispatch.",
+                    self.agent.model,
+                    self.agent.provider
+                )
+            })
     }
 
     /// Returns the configured output token reservation for a request.
     fn output_token_reservation(context: &Context) -> usize {
-        const DEFAULT_OUTPUT_TOKEN_RESERVATION: usize = 4_096;
-
         context
             .max_tokens
-            .unwrap_or(DEFAULT_OUTPUT_TOKEN_RESERVATION)
-    }
-
-    /// Returns the non-message token estimate that is serialized with the request.
-    fn request_overhead_token_count(context: &Context) -> usize {
-        let tool_tokens = context
-            .tools
-            .iter()
-            .map(|tool| {
-                serde_json::to_string(tool)
-                    .unwrap_or_default()
-                    .chars()
-                    .count()
-                    .div_ceil(4)
-            })
-            .sum::<usize>();
-
-        tool_tokens + context.messages.len().saturating_mul(4)
+            .unwrap_or(ContextWindowBudget::DEFAULT_OUTPUT_TOKEN_RESERVATION)
     }
 
     /// Returns the estimated token count for the outbound provider request.
     fn estimated_request_tokens(context: &Context) -> usize {
-        context
-            .token_count_approx()
-            .saturating_add(Self::request_overhead_token_count(context))
+        serde_json::to_vec(context)
+            .map(|payload| payload.len())
+            .unwrap_or_else(|_| context.token_count_approx())
     }
 
     /// Returns a conservative provider context-window safety margin.
     fn context_window_safety_margin(context_window: usize) -> usize {
-        const MIN_MARGIN: usize = 4_096;
-        const MAX_MARGIN: usize = 32_768;
-        const PERCENTAGE: usize = 20;
-
-        context_window
-            .saturating_mul(PERCENTAGE)
-            .saturating_div(100)
-            .clamp(MIN_MARGIN, MAX_MARGIN)
+        ContextWindowBudget::context_window_safety_margin(context_window)
     }
 
-    /// Returns the maximum input token budget after reserving output and margin.
+    /// Returns the maximum input token budget after reserving output and
+    /// margin.
     fn effective_input_budget(context_window: usize, output_reservation: usize) -> Option<usize> {
-        let safety_margin = Self::context_window_safety_margin(context_window);
-        context_window
-            .checked_sub(output_reservation)?
-            .checked_sub(safety_margin)
+        let context_budget = ContextWindowBudget::new(context_window, output_reservation);
+        context_budget.effective_input_budget()
     }
 
-    /// Compacts context before provider dispatch when the projected request would exceed the model window.
+    /// Compacts context before provider dispatch when the projected request
+    /// would exceed the model window.
     ///
     /// # Arguments
-    /// * `context` - The fully transformed context that would be sent to the provider.
+    /// * `context` - The fully transformed context that would be sent to the
+    ///   provider.
     ///
     /// # Errors
-    /// Returns an actionable local error when the request cannot fit inside the selected model window.
+    /// Returns an actionable local error when the request cannot fit inside the
+    /// selected model window.
     fn preflight_context_window(&self, context: Context) -> anyhow::Result<Context> {
-        let Some(context_window) = self
-            .model_for_agent()
-            .and_then(|model| model.context_length)
+        let model = self.model_for_agent()?;
+        let context_window = model
+            .context_length
             .and_then(|value| usize::try_from(value).ok())
-        else {
-            return Ok(context);
-        };
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Selected model '{}' for provider '{}' does not expose a configured context_length; context-window safety cannot be proven before provider dispatch. Add context_length to the model metadata or select a model with known context window.",
+                    self.agent.model,
+                    self.agent.provider
+                )
+            })?;
+
+        let context = context.model_context_length(u64::try_from(context_window).map_err(|_| {
+            anyhow::anyhow!(
+                "Selected model '{}' context window {} tokens cannot be represented in provider safety metadata.",
+                self.agent.model,
+                context_window
+            )
+        })?);
 
         let output_reservation = Self::output_token_reservation(&context);
         let input_budget = Self::effective_input_budget(context_window, output_reservation)
@@ -293,6 +288,7 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
 
                 let model = self.model_for_agent();
                 model
+                    .ok()
                     .and_then(|model| model.tools_supported)
                     .unwrap_or_default()
             }
@@ -797,7 +793,7 @@ mod tests {
     }
 
     #[test]
-    fn test_preflight_skips_unknown_context_window_without_data_loss() {
+    fn test_preflight_errors_on_unknown_context_window_before_provider_dispatch() {
         let fixture =
             orchestrator_fixture(Compact::new().retention_window(1_usize), 40_000).models(vec![
                 Model { context_length: None, ..model_fixture(40_000) },
@@ -806,10 +802,16 @@ mod tests {
             .add_message(ContextMessage::user(large_text(50_000), None))
             .max_tokens(2_000_usize);
 
-        let actual = fixture.preflight_context_window(context.clone()).unwrap();
-        let expected = context;
+        let actual = fixture
+            .preflight_context_window(context)
+            .unwrap_err()
+            .to_string();
+        let expected = true;
 
-        assert_eq!(actual, expected);
+        assert_eq!(
+            actual.contains("does not expose a configured context_length"),
+            expected
+        );
     }
 
     #[test]
@@ -822,10 +824,16 @@ mod tests {
             .add_message(ContextMessage::user(large_text(50_000), None))
             .max_tokens(2_000_usize);
 
-        let actual = fixture.preflight_context_window(context.clone()).unwrap();
-        let expected = context;
+        let actual = fixture
+            .preflight_context_window(context)
+            .unwrap_err()
+            .to_string();
+        let expected = true;
 
-        assert_eq!(actual, expected);
+        assert_eq!(
+            actual.contains("is missing from resolved provider metadata"),
+            expected
+        );
     }
 
     #[test]
@@ -845,7 +853,7 @@ mod tests {
         let fixture = Context::default();
 
         let actual = Orchestrator::<FixtureServices>::output_token_reservation(&fixture);
-        let expected = 4_096;
+        let expected = forge_domain::ContextWindowBudget::DEFAULT_OUTPUT_TOKEN_RESERVATION;
 
         assert_eq!(actual, expected);
     }

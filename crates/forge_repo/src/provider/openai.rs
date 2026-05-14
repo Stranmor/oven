@@ -215,6 +215,7 @@ impl<H: HttpInfra> OpenAIProvider<H> {
 
         let json_bytes =
             serde_json::to_vec(&request).with_context(|| "Failed to serialize request")?;
+        request.validate_context_window(&json_bytes)?;
 
         let es = self
             .http
@@ -570,6 +571,10 @@ mod tests {
         ))
     }
 
+    fn large_text(tokens: usize) -> String {
+        "x".repeat(tokens.saturating_mul(4))
+    }
+
     fn create_mock_models_response() -> serde_json::Value {
         serde_json::json!({
             "data": [
@@ -699,6 +704,68 @@ mod tests {
         mock.assert_async().await;
         assert!(actual.is_err());
         insta::assert_snapshot!(normalize_ports(format!("{:#?}", actual.unwrap_err())));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_final_context_window_guard_blocks_after_pipeline_before_http_send()
+    -> anyhow::Result<()> {
+        let provider = openai("test-key");
+        let http_client = Arc::new(MockHttpClient::new());
+        let openai_provider = OpenAIProvider::new(provider, http_client);
+        let context = ChatContext::default()
+            .add_message(forge_domain::ContextMessage::user(large_text(10_000), None))
+            .max_tokens(512_usize)
+            .model_context_length(8_000_u64);
+
+        let actual = openai_provider
+            .chat(
+                &forge_app::domain::ModelId::new("context-guard-model"),
+                context,
+                false,
+            )
+            .await;
+        let actual = match actual {
+            Ok(_) => {
+                anyhow::bail!("expected final context window guard to reject oversized payload")
+            }
+            Err(error) => error.to_string(),
+        };
+        let expected = true;
+
+        assert_eq!(actual.contains("before HTTP dispatch"), expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_final_context_window_guard_errors_when_context_length_missing()
+    -> anyhow::Result<()> {
+        let provider = openai("test-key");
+        let http_client = Arc::new(MockHttpClient::new());
+        let openai_provider = OpenAIProvider::new(provider, http_client);
+        let context = ChatContext::default()
+            .add_message(forge_domain::ContextMessage::user("short", None))
+            .max_tokens(512_usize);
+
+        let actual = openai_provider
+            .chat(
+                &forge_app::domain::ModelId::new("unknown-context-model"),
+                context,
+                false,
+            )
+            .await;
+        let actual = match actual {
+            Ok(_) => {
+                anyhow::bail!("expected final context window guard to require context metadata")
+            }
+            Err(error) => error.to_string(),
+        };
+        let expected = true;
+
+        assert_eq!(
+            actual.contains("context_length metadata is missing"),
+            expected
+        );
         Ok(())
     }
 

@@ -50,7 +50,8 @@ pub trait AgentService: Send + Sync + 'static {
     /// Drains typed steer messages for the current conversation.
     ///
     /// # Arguments
-    /// * `conversation_id` - The conversation whose steer queue should be drained.
+    /// * `conversation_id` - The conversation whose steer queue should be
+    ///   drained.
     async fn drain_steer_messages(
         &self,
         conversation_id: &forge_domain::ConversationId,
@@ -78,6 +79,25 @@ impl<T: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> AgentSe
                 .ok_or_else(|| forge_domain::Error::NoDefaultSession)?
         };
         let provider = self.get_provider(provider_id).await?;
+        let models = self.models(provider.clone()).await?;
+        let selected_model = models
+            .iter()
+            .find(|model| model.id == *id && model.provider_id == provider.id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Selected model '{}' for provider '{}' is missing from resolved provider metadata; context-window safety cannot be proven before provider dispatch.",
+                    id,
+                    provider.id
+                )
+            })?;
+        let context_length = selected_model.context_length.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Selected model '{}' for provider '{}' does not expose a configured context_length; context-window safety cannot be proven before provider dispatch. Add context_length to the model metadata or select a model with known context window.",
+                id,
+                provider.id
+            )
+        })?;
+        let context = context.model_context_length(context_length);
 
         self.chat(id, context, provider).await
     }
