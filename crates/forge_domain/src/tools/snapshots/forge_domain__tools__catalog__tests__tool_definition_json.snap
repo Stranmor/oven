@@ -305,7 +305,7 @@ expression: tools
       "nullable": true
     },
     "handoff_timeout_seconds": {
-      "description": "Optional synchronous wait window before handoff to managed background execution.\nDefaults to 15 seconds when omitted. The command is not killed when this\ntimeout elapses; the already-started process is registered for\nprocess_status/process_read observation.",
+      "description": "Optional synchronous wait window before handoff to managed background\nexecution. Defaults to 15 seconds when omitted. The command is not\nkilled when this timeout elapses; the already-started process is\nregistered for process_status/process_read observation.",
       "type": "integer",
       "format": "uint64",
       "minimum": 1,
@@ -329,7 +329,7 @@ expression: tools
       "type": "string"
     },
     "wait_seconds": {
-      "description": "Optional bounded wait before returning status. Use this instead of immediate repeated polling.",
+      "description": "Optional bounded wait before returning status. Use this instead of\nimmediate repeated polling.",
       "type": "integer",
       "format": "uint64",
       "maximum": 30,
@@ -357,7 +357,7 @@ expression: tools
       "type": "string"
     },
     "wait_seconds": {
-      "description": "Optional bounded wait for new output after cursor. Use this instead of immediate repeated polling.",
+      "description": "Optional bounded wait for new output after cursor. Use this instead of\nimmediate repeated polling.",
       "type": "integer",
       "format": "uint64",
       "maximum": 30,
