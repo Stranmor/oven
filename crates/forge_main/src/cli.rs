@@ -84,6 +84,19 @@ impl Cli {
     pub fn is_interactive(&self) -> bool {
         self.prompt.is_none() && self.piped_input.is_none() && self.subcommands.is_none()
     }
+
+    /// Determines whether `--tui` should own the bare interactive session.
+    ///
+    /// This is intentionally narrower than response rendering: direct prompts,
+    /// piped input, subcommands, and dispatched events keep their existing
+    /// entry paths and may render TUI output later.
+    pub fn starts_tui_interactive(&self) -> bool {
+        self.tui
+            && self.prompt.is_none()
+            && self.piped_input.is_none()
+            && self.subcommands.is_none()
+            && self.event.is_none()
+    }
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1007,8 +1020,28 @@ mod tests {
     #[test]
     fn test_tui_flag_parses_for_direct_prompt() {
         let fixture = Cli::parse_from(["forge", "--tui", "-p", "hello"]);
-        let actual = (fixture.tui, fixture.prompt);
-        let expected = (true, Some("hello".to_string()));
+        let actual = (
+            fixture.tui,
+            fixture.prompt.clone(),
+            fixture.starts_tui_interactive(),
+        );
+        let expected = (true, Some("hello".to_string()), false);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_bare_tui_starts_interactive_tui() {
+        let fixture = Cli::parse_from(["forge", "--tui"]);
+        let actual = (fixture.tui, fixture.starts_tui_interactive());
+        let expected = (true, true);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_classic_default_does_not_start_interactive_tui() {
+        let fixture = Cli::parse_from(["forge"]);
+        let actual = (fixture.tui, fixture.starts_tui_interactive());
+        let expected = (false, false);
         assert_eq!(actual, expected);
     }
 

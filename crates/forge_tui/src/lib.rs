@@ -5,13 +5,17 @@
 //! `forge_main`.
 
 use std::convert::Infallible;
-use std::io::{self, Write};
+use std::io::{self, Stdout, Write};
 
 use crossterm::cursor::MoveTo;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
-use crossterm::terminal::{Clear, ClearType};
+use crossterm::terminal::{
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use forge_ui_model::{UiBlock, UiModel, UiToolDetail, UiToolPhase};
-use ratatui::backend::TestBackend;
+use ratatui::Terminal;
+use ratatui::backend::{CrosstermBackend, TestBackend};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -70,6 +74,140 @@ impl<W: Write> TuiSession<W> {
     }
 }
 
+impl<W: Write> TuiRenderer for TuiSession<W> {
+    fn queue_and_render(&mut self, event_model: UiModel) -> io::Result<()> {
+        TuiSession::queue_and_render(self, event_model)
+    }
+}
+
+/// Common renderer boundary for stdout and alternate-screen TUI sessions.
+pub trait TuiRenderer {
+    /// Appends a typed response model and renders the next visible frame.
+    ///
+    /// # Arguments
+    /// * `event_model` - Non-empty typed model produced from one chat response.
+    ///
+    /// # Errors
+    /// Returns an error if rendering or terminal I/O fails.
+    fn queue_and_render(&mut self, event_model: UiModel) -> io::Result<()>;
+}
+
+/// Result of one interactive TUI input read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TuiInput {
+    /// User submitted a line of text.
+    Submitted(String),
+    /// User requested session exit with Ctrl+C, Ctrl+D, or terminal EOF.
+    Exit,
+}
+
+/// Owns an alternate-screen interactive terminal session.
+pub struct InteractiveTuiSession {
+    model: UiModel,
+    terminal: Terminal<CrosstermBackend<Stdout>>,
+    input: String,
+}
+
+impl InteractiveTuiSession {
+    /// Creates an alternate-screen TUI session on stdout.
+    ///
+    /// # Errors
+    /// Returns an error if terminal raw mode, alternate-screen setup, or
+    /// initial terminal construction fails.
+    pub fn new() -> io::Result<Self> {
+        let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        enable_raw_mode()?;
+
+        let alternate_screen_result = execute!(terminal.backend_mut(), EnterAlternateScreen);
+        if let Err(error) = alternate_screen_result {
+            let _ = disable_raw_mode();
+            return Err(error);
+        }
+
+        Ok(Self { model: UiModel::default(), terminal, input: String::new() })
+    }
+
+    /// Renders the current interactive shell frame.
+    ///
+    /// # Errors
+    /// Returns an error if drawing to the terminal fails.
+    pub fn render(&mut self) -> io::Result<()> {
+        self.terminal.draw(|frame| {
+            draw_dashboard(frame, &self.model, Some(self.input.as_str()));
+        })?;
+        Ok(())
+    }
+
+    /// Reads one submitted input line from the TUI input area.
+    ///
+    /// # Errors
+    /// Returns an error if terminal event reading or redraw fails.
+    pub fn read_input(&mut self) -> io::Result<TuiInput> {
+        loop {
+            match event::read()? {
+                Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers, .. })
+                    if modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    return Ok(TuiInput::Exit);
+                }
+                Event::Key(KeyEvent { code: KeyCode::Char('d'), modifiers, .. })
+                    if modifiers.contains(KeyModifiers::CONTROL) && self.input.is_empty() =>
+                {
+                    return Ok(TuiInput::Exit);
+                }
+                Event::Key(KeyEvent { code: KeyCode::Enter, .. }) => {
+                    let submitted = self.input.trim().to_string();
+                    self.input.clear();
+                    self.render()?;
+                    if submitted.is_empty() {
+                        continue;
+                    }
+                    return Ok(TuiInput::Submitted(submitted));
+                }
+                Event::Key(KeyEvent { code: KeyCode::Backspace, .. }) => {
+                    self.input.pop();
+                    self.render()?;
+                }
+                Event::Key(KeyEvent { code: KeyCode::Char(value), modifiers, .. }) => {
+                    if !modifiers.contains(KeyModifiers::CONTROL)
+                        && !modifiers.contains(KeyModifiers::ALT)
+                    {
+                        self.input.push(value);
+                        self.render()?;
+                    }
+                }
+                Event::Resize(_, _) => self.render()?,
+                _ => {}
+            }
+        }
+    }
+}
+
+impl TuiRenderer for InteractiveTuiSession {
+    fn queue_and_render(&mut self, event_model: UiModel) -> io::Result<()> {
+        for block in event_model.blocks {
+            self.model.push(block);
+        }
+        self.render()
+    }
+}
+
+impl Drop for InteractiveTuiSession {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = self.terminal.show_cursor();
+    }
+}
+
+/// Creates an interactive alternate-screen session targeting stdout.
+///
+/// # Errors
+/// Returns an error if terminal setup or initial rendering fails.
+pub fn interactive_session() -> io::Result<InteractiveTuiSession> {
+    InteractiveTuiSession::new()
+}
+
 /// Creates a TUI session targeting stdout with the current terminal size.
 pub fn stdout_session() -> TuiSession<io::Stdout> {
     let (width, height) = crossterm::terminal::size().unwrap_or((100, 30));
@@ -83,70 +221,128 @@ pub fn stdout_session() -> TuiSession<io::Stdout> {
 /// * `width` - Test backend width in terminal cells.
 /// * `height` - Test backend height in terminal cells.
 pub fn render_dashboard_to_string(model: &UiModel, width: u16, height: u16) -> String {
+    render_model_to_string(model, width, height, None)
+}
+
+/// Renders the initial interactive TUI shell into a deterministic string.
+///
+/// # Arguments
+/// * `width` - Test backend width in terminal cells.
+/// * `height` - Test backend height in terminal cells.
+pub fn render_interactive_shell_to_string(width: u16, height: u16) -> String {
+    render_model_to_string(&UiModel::default(), width, height, Some(""))
+}
+
+fn render_model_to_string(model: &UiModel, width: u16, height: u16, input: Option<&str>) -> String {
     let backend = TestBackend::new(width, height);
     let mut terminal = infallible(ratatui::Terminal::new(backend));
     infallible(terminal.draw(|frame| {
-        let area = frame.area();
-        let vertical = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(0),
-                Constraint::Length(3),
-            ])
-            .split(area);
+        draw_dashboard(frame, model, input);
+    }));
 
-        let Some(header_area) = vertical.first().copied() else {
-            return;
-        };
-        let Some(body_area) = vertical.get(1).copied() else {
-            return;
-        };
-        let Some(footer_area) = vertical.get(2).copied() else {
-            return;
-        };
+    terminal.backend().to_string()
+}
 
-        let horizontal = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-            .split(body_area);
+fn draw_dashboard(frame: &mut ratatui::Frame<'_>, model: &UiModel, input: Option<&str>) {
+    let area = frame.area();
+    let footer_height = if input.is_some() { 5 } else { 3 };
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(footer_height),
+        ])
+        .split(area);
 
-        let Some(events_area) = horizontal.first().copied() else {
-            return;
-        };
-        let Some(detail_area) = horizontal.get(1).copied() else {
-            return;
-        };
+    let Some(header_area) = vertical.first().copied() else {
+        return;
+    };
+    let Some(body_area) = vertical.get(1).copied() else {
+        return;
+    };
+    let Some(footer_area) = vertical.get(2).copied() else {
+        return;
+    };
 
-        let status = status_text(model);
-        let header = Paragraph::new(Line::from(vec![
-            Span::styled(
-                "Forge",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" TUI "),
-            Span::styled(status, Style::default().fg(Color::DarkGray)),
-        ]))
-        .block(Block::default().borders(Borders::ALL).title("status"));
-        frame.render_widget(header, header_area);
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(body_area);
 
-        let events = Paragraph::new(render_event_lines(model))
-            .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title("events"));
-        frame.render_widget(events, events_area);
+    let Some(events_area) = horizontal.first().copied() else {
+        return;
+    };
+    let Some(detail_area) = horizontal.get(1).copied() else {
+        return;
+    };
 
-        let detail = Paragraph::new(render_detail_lines(model))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("detail/output"),
-            );
-        frame.render_widget(detail, detail_area);
+    let status = status_text(model);
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled(
+            "Forge",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" TUI "),
+        Span::styled(status, Style::default().fg(Color::DarkGray)),
+    ]))
+    .block(Block::default().borders(Borders::ALL).title("status"));
+    frame.render_widget(header, header_area);
 
-        let footer = Paragraph::new(Line::from(vec![
+    let events = Paragraph::new(render_event_lines(model))
+        .wrap(Wrap { trim: false })
+        .block(Block::default().borders(Borders::ALL).title("events"));
+    frame.render_widget(events, events_area);
+
+    let detail = Paragraph::new(render_detail_lines(model))
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("detail/output"),
+        );
+    frame.render_widget(detail, detail_area);
+
+    let footer = if let Some(input) = input {
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    "Input ",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(input.to_string()),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "Enter",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" send  "),
+                Span::styled(
+                    "Ctrl+C",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" exit  "),
+                Span::styled(
+                    "--tui",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" interactive"),
+            ]),
+        ])
+        .block(Block::default().borders(Borders::ALL).title("input"))
+    } else {
+        Paragraph::new(Line::from(vec![
             Span::styled(
                 "Ctrl+C",
                 Style::default()
@@ -162,11 +358,9 @@ pub fn render_dashboard_to_string(model: &UiModel, width: u16, height: u16) -> S
             ),
             Span::raw(" opt-in preview"),
         ]))
-        .block(Block::default().borders(Borders::ALL).title("help"));
-        frame.render_widget(footer, footer_area);
-    }));
-
-    terminal.backend().to_string()
+        .block(Block::default().borders(Borders::ALL).title("help"))
+    };
+    frame.render_widget(footer, footer_area);
 }
 
 fn infallible<T>(result: Result<T, Infallible>) -> T {
@@ -371,6 +565,18 @@ mod tests {
         let actual = render_dashboard_to_string(&fixture, 80, 9);
 
         assert!(actual.contains("tools_running=0"));
+    }
+
+    #[test]
+    fn test_interactive_shell_initial_frame_is_visibly_tui() {
+        let actual = render_interactive_shell_to_string(80, 12);
+
+        assert!(actual.contains("Forge TUI"));
+        assert!(actual.contains("events"));
+        assert!(actual.contains("detail/output"));
+        assert!(actual.contains("Input"));
+        assert!(actual.contains("Enter send"));
+        assert!(actual.contains("--tui interactive"));
     }
 
     #[test]

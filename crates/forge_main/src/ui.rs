@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -393,6 +392,12 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                 }
             }
             return Ok(());
+        }
+
+        // Bare --tui must enter a visible alternate interactive surface before
+        // any classic prompt is shown.
+        if self.cli.starts_tui_interactive() {
+            return self.run_tui_interactive().await;
         }
 
         // Get initial input from prompt
@@ -4011,7 +4016,47 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         Ok(())
     }
 
-    async fn on_message(&mut self, content: Option<String>) -> Result<()> {
+    async fn run_tui_interactive(&mut self) -> Result<()> {
+        self.spinner.stop(None)?;
+        self.spinner.reset();
+        let mut session = forge_tui::interactive_session()?;
+        session.render()?;
+
+        loop {
+            match session.read_input()? {
+                forge_tui::TuiInput::Submitted(input) => {
+                    tracker::prompt(input.clone());
+                    let command = self.command.parse(&input)?;
+                    match command {
+                        AppCommand::Message(content) => {
+                            self.on_tui_message_with_session(content, &mut session)
+                                .await?;
+                        }
+                        AppCommand::Exit => return Ok(()),
+                        command => {
+                            let should_exit = self.on_command(command).await?;
+                            if should_exit {
+                                return Ok(());
+                            }
+                            session.render()?;
+                        }
+                    }
+                }
+                forge_tui::TuiInput::Exit => return Ok(()),
+            }
+        }
+    }
+
+    async fn on_tui_message_with_session(
+        &mut self,
+        content: String,
+        session: &mut impl forge_tui::TuiRenderer,
+    ) -> Result<()> {
+        let chat = self.build_chat_request(Some(content)).await?;
+        self.on_tui_chat_with_session(chat, session).await
+    }
+
+    async fn build_chat_request(&mut self, content: Option<String>) -> Result<ChatRequest> {
         let conversation_id = self.init_conversation().await?;
 
         self.install_vscode_extension();
@@ -4046,8 +4091,11 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             event = event.additional_context(piped);
         }
 
-        // Create the chat request with the event
-        let chat = ChatRequest::new(event, conversation_id);
+        Ok(ChatRequest::new(event, conversation_id))
+    }
+
+    async fn on_message(&mut self, content: Option<String>) -> Result<()> {
+        let chat = self.build_chat_request(content).await?;
 
         self.on_chat(chat).await
     }
@@ -4082,14 +4130,22 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
     }
 
     async fn on_tui_chat(&mut self, chat: ChatRequest) -> Result<()> {
+        let mut session = forge_tui::stdout_session();
+        self.on_tui_chat_with_session(chat, &mut session).await
+    }
+
+    async fn on_tui_chat_with_session(
+        &mut self,
+        chat: ChatRequest,
+        session: &mut impl forge_tui::TuiRenderer,
+    ) -> Result<()> {
         self.spinner.stop(None)?;
         self.spinner.reset();
         let mut stream = self.api.chat(chat).await?;
-        let mut session = forge_tui::stdout_session();
 
         while let Some(message) = stream.next().await {
             match message {
-                Ok(message) => self.handle_tui_chat_response(message, &mut session).await?,
+                Ok(message) => self.handle_tui_chat_response(message, session).await?,
                 Err(err) => {
                     self.spinner.stop(None)?;
                     self.spinner.reset();
@@ -4103,10 +4159,10 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         Ok(())
     }
 
-    async fn handle_tui_chat_response<W: Write>(
+    async fn handle_tui_chat_response(
         &mut self,
         message: ChatResponse,
-        session: &mut forge_tui::TuiSession<W>,
+        session: &mut impl forge_tui::TuiRenderer,
     ) -> Result<()> {
         if message.is_empty() {
             return Ok(());
@@ -5351,8 +5407,8 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
     }
 }
 
-fn queue_tui_response_and_notify<W: Write>(
-    session: &mut forge_tui::TuiSession<W>,
+fn queue_tui_response_and_notify(
+    session: &mut impl forge_tui::TuiRenderer,
     message: &ChatResponse,
 ) -> Result<()> {
     if message.is_empty() {
