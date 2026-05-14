@@ -6,12 +6,13 @@
 use std::convert::Infallible;
 
 use forge_ui_model::{UiBlock, UiModel, UiToolPhase};
-use ratatui::Terminal;
-use ratatui::backend::TestBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::{
+    backend::TestBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph, Wrap},
+};
 
 /// Renders a typed UI model into a deterministic `ratatui` test backend string.
 ///
@@ -21,7 +22,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 /// * `height` - Test backend height in terminal cells.
 pub fn render_dashboard_to_string(model: &UiModel, width: u16, height: u16) -> String {
     let backend = TestBackend::new(width, height);
-    let mut terminal = infallible(Terminal::new(backend));
+    let mut terminal = infallible(ratatui::Terminal::new(backend));
     infallible(terminal.draw(|frame| {
         let area = frame.area();
         let chunks = Layout::default()
