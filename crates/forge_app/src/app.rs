@@ -411,7 +411,11 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
                 }
             };
             if !diagnostic.can_inject() {
-                tracing::debug!(path = %ancestor.display(), freshness = diagnostic.freshness.label(), "Skipping project-model context target because manifest is unavailable or stale");
+                if diagnostic.manifest_found {
+                    tracing::debug!(path = %ancestor.display(), freshness = diagnostic.freshness.label(), "Stopping project-model context target resolution because nearest manifest is not injectable");
+                    return None;
+                }
+                tracing::debug!(path = %ancestor.display(), freshness = diagnostic.freshness.label(), "Skipping project-model context target because manifest is unavailable");
                 continue;
             }
             let workspace_root = ancestor.to_path_buf();
@@ -1012,6 +1016,7 @@ mod tests {
         empty_paths: Vec<PathBuf>,
         error_paths: Vec<PathBuf>,
         stale_paths: Vec<PathBuf>,
+        unknown_paths: Vec<PathBuf>,
         captured_context: Mutex<Option<Context>>,
         workspace_queries: AtomicUsize,
         queried_workspaces: Mutex<Vec<PathBuf>>,
@@ -1021,32 +1026,68 @@ mod tests {
 
     impl ProjectContextHarness {
         fn new(cwd: PathBuf) -> Arc<Self> {
-            Self::new_with_empty_error_and_stale_paths(cwd, Vec::new(), Vec::new(), Vec::new())
+            Self::new_with_empty_error_stale_and_unknown_paths(
+                cwd,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
         }
 
         fn new_with_empty_paths(cwd: PathBuf, empty_paths: Vec<PathBuf>) -> Arc<Self> {
-            Self::new_with_empty_error_and_stale_paths(cwd, empty_paths, Vec::new(), Vec::new())
+            Self::new_with_empty_error_stale_and_unknown_paths(
+                cwd,
+                empty_paths,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
         }
 
         fn new_with_error_paths(cwd: PathBuf, error_paths: Vec<PathBuf>) -> Arc<Self> {
-            Self::new_with_empty_error_and_stale_paths(cwd, Vec::new(), error_paths, Vec::new())
+            Self::new_with_empty_error_stale_and_unknown_paths(
+                cwd,
+                Vec::new(),
+                error_paths,
+                Vec::new(),
+                Vec::new(),
+            )
         }
 
         fn new_with_stale_paths(cwd: PathBuf, stale_paths: Vec<PathBuf>) -> Arc<Self> {
-            Self::new_with_empty_error_and_stale_paths(cwd, Vec::new(), Vec::new(), stale_paths)
+            Self::new_with_empty_error_stale_and_unknown_paths(
+                cwd,
+                Vec::new(),
+                Vec::new(),
+                stale_paths,
+                Vec::new(),
+            )
         }
 
-        fn new_with_empty_error_and_stale_paths(
+        fn new_with_unknown_paths(cwd: PathBuf, unknown_paths: Vec<PathBuf>) -> Arc<Self> {
+            Self::new_with_empty_error_stale_and_unknown_paths(
+                cwd,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                unknown_paths,
+            )
+        }
+
+        fn new_with_empty_error_stale_and_unknown_paths(
             cwd: PathBuf,
             empty_paths: Vec<PathBuf>,
             error_paths: Vec<PathBuf>,
             stale_paths: Vec<PathBuf>,
+            unknown_paths: Vec<PathBuf>,
         ) -> Arc<Self> {
             Arc::new(Self {
                 cwd,
                 empty_paths,
                 error_paths,
                 stale_paths,
+                unknown_paths,
                 captured_context: Mutex::new(None),
                 workspace_queries: AtomicUsize::new(0),
                 queried_workspaces: Mutex::new(Vec::new()),
@@ -1208,6 +1249,14 @@ mod tests {
                     changed: vec!["src/lib.rs".to_string()],
                     deleted: Vec::new(),
                     added: Vec::new(),
+                }
+            } else if self
+                .unknown_paths
+                .iter()
+                .any(|unknown_path| unknown_path == path)
+            {
+                WorkspaceContextFreshness::Unknown {
+                    reason: "fixture freshness unavailable".to_string(),
                 }
             } else if manifest_found {
                 WorkspaceContextFreshness::Fresh
@@ -1543,6 +1592,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_model_context_nearest_stale_manifest_blocks_parent_fallback() -> Result<()> {
+        let fixture = TempDir::new()?;
+        let parent = fixture.path().join("workspace");
+        create_indexed_workspace(&parent)?;
+        let nested = parent.join("nested");
+        create_indexed_workspace(&nested)?;
+        let setup = ProjectContextHarness::new_with_stale_paths(nested.clone(), vec![nested]);
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let conversation = Conversation::generate().context(Context::default().add_message(
+            ContextMessage::user("find automatic injection needle", Some(model_id)),
+        ));
+
+        let actual = ProjectContextInjection::new(setup.clone(), agent)
+            .inject(conversation)
+            .await;
+        let expected_queries = 0usize;
+
+        assert_eq!(
+            setup.workspace_queries.load(Ordering::SeqCst),
+            expected_queries
+        );
+        assert!(!actual.context.unwrap().messages.iter().any(|message| {
+            message
+                .content()
+                .is_some_and(|content| content.contains("<project_model_context"))
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_model_context_nearest_unknown_manifest_blocks_parent_fallback() -> Result<()> {
+        let fixture = TempDir::new()?;
+        let parent = fixture.path().join("workspace");
+        create_indexed_workspace(&parent)?;
+        let nested = parent.join("nested");
+        create_indexed_workspace(&nested)?;
+        let setup = ProjectContextHarness::new_with_unknown_paths(nested.clone(), vec![nested]);
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let conversation = Conversation::generate().context(Context::default().add_message(
+            ContextMessage::user("find automatic injection needle", Some(model_id)),
+        ));
+
+        let actual = ProjectContextInjection::new(setup.clone(), agent)
+            .inject(conversation)
+            .await;
+        let expected_queries = 0usize;
+
+        assert_eq!(
+            setup.workspace_queries.load(Ordering::SeqCst),
+            expected_queries
+        );
+        assert!(!actual.context.unwrap().messages.iter().any(|message| {
+            message
+                .content()
+                .is_some_and(|content| content.contains("<project_model_context"))
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn explain_context_reports_fresh_target_and_injection_decision() -> Result<()> {
         let (_fixture, root) = fixture_workspace()?;
         let setup = ProjectContextHarness::new(root.clone());
@@ -1596,6 +1707,88 @@ mod tests {
                 .skip_reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("project-model manifest stale"))
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_context_nearest_stale_manifest_blocks_parent_fallback() -> Result<()> {
+        let fixture = TempDir::new()?;
+        let parent = fixture.path().join("parent-workspace");
+        create_indexed_workspace(&parent)?;
+        let child = parent.join("nested-child");
+        create_indexed_workspace(&child)?;
+        let setup = ProjectContextHarness::new_with_stale_paths(child.clone(), vec![child]);
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
+
+        let actual = ProjectContextInjection::new(setup, agent)
+            .explain(Some("find automatic injection needle".to_string()))
+            .await;
+        let expected = (
+            false,
+            Vec::<PathBuf>::new(),
+            Some("no fresh project-model manifest target selected".to_string()),
+        );
+
+        assert_eq!(
+            (
+                actual.would_inject,
+                actual
+                    .selected_targets
+                    .iter()
+                    .map(|target| target.workspace_root.clone())
+                    .collect::<Vec<_>>(),
+                actual.skip_reason,
+            ),
+            expected
+        );
+        assert!(actual.candidates.iter().any(|candidate| {
+            candidate
+                .skip_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("project-model manifest stale"))
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_context_nearest_unknown_manifest_blocks_parent_fallback() -> Result<()> {
+        let fixture = TempDir::new()?;
+        let parent = fixture.path().join("parent-workspace");
+        create_indexed_workspace(&parent)?;
+        let child = parent.join("nested-child");
+        create_indexed_workspace(&child)?;
+        let setup = ProjectContextHarness::new_with_unknown_paths(child.clone(), vec![child]);
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
+
+        let actual = ProjectContextInjection::new(setup, agent)
+            .explain(Some("find automatic injection needle".to_string()))
+            .await;
+        let expected = (
+            false,
+            Vec::<PathBuf>::new(),
+            Some("no fresh project-model manifest target selected".to_string()),
+        );
+
+        assert_eq!(
+            (
+                actual.would_inject,
+                actual
+                    .selected_targets
+                    .iter()
+                    .map(|target| target.workspace_root.clone())
+                    .collect::<Vec<_>>(),
+                actual.skip_reason,
+            ),
+            expected
+        );
+        assert!(actual.candidates.iter().any(|candidate| {
+            candidate
+                .skip_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("project-model manifest freshness unknown"))
         }));
         Ok(())
     }
