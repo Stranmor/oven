@@ -1,0 +1,17 @@
+[package]
+name = "forge_ui_model"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "forge_ui_model"
+path = "src/lib.rs"
+
+[dependencies]
+forge_domain.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+pretty_assertions.workspace = true
+tokio.workspace = true
