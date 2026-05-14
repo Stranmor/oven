@@ -75,7 +75,6 @@ impl Section {
 /// # Output Format
 ///
 /// ```text
-/// 
 /// CONFIGURATION
 ///   model gpt-4
 /// provider openai
