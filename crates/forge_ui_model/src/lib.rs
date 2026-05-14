@@ -59,7 +59,8 @@ pub enum UiBlock {
 }
 
 impl UiBlock {
-    /// Returns the primary text payload for renderers that need a plain fallback.
+    /// Returns the primary text payload for renderers that need a plain
+    /// fallback.
     pub fn plain_text(&self) -> String {
         match self {
             UiBlock::Markdown { text, .. }
@@ -88,7 +89,8 @@ pub struct UiTitle {
 }
 
 impl UiTitle {
-    /// Formats the title and subtitle as a single deterministic fallback string.
+    /// Formats the title and subtitle as a single deterministic fallback
+    /// string.
     pub fn display_text(&self) -> String {
         match &self.subtitle {
             Some(subtitle) if !subtitle.is_empty() => format!("{} — {subtitle}", self.title),

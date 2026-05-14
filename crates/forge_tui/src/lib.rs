@@ -6,12 +6,12 @@
 use std::convert::Infallible;
 
 use forge_ui_model::{UiBlock, UiModel, UiToolPhase};
-use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::Terminal;
 
 /// Renders a typed UI model into a deterministic `ratatui` test backend string.
 ///
