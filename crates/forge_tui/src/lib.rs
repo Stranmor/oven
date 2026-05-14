@@ -90,6 +90,24 @@ pub trait TuiRenderer {
     /// # Errors
     /// Returns an error if rendering or terminal I/O fails.
     fn queue_and_render(&mut self, event_model: UiModel) -> io::Result<()>;
+
+    /// Temporarily leaves any raw alternate-screen terminal mode before external
+    /// stdout/stderr is released to a tool.
+    ///
+    /// # Errors
+    /// Returns an error if restoring the terminal to ordinary stdout mode fails.
+    fn suspend_for_stdout(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Re-enters the renderer's terminal mode after a stdout/stderr tool has
+    /// completed.
+    ///
+    /// # Errors
+    /// Returns an error if re-entering the renderer mode or redrawing fails.
+    fn resume_after_stdout(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Result of one interactive TUI input read.
@@ -106,6 +124,7 @@ pub struct InteractiveTuiSession {
     model: UiModel,
     terminal: Terminal<CrosstermBackend<Stdout>>,
     input: String,
+    suspended_for_stdout: bool,
 }
 
 impl InteractiveTuiSession {
@@ -124,7 +143,12 @@ impl InteractiveTuiSession {
             return Err(error);
         }
 
-        Ok(Self { model: UiModel::default(), terminal, input: String::new() })
+        Ok(Self {
+            model: UiModel::default(),
+            terminal,
+            input: String::new(),
+            suspended_for_stdout: false,
+        })
     }
 
     /// Renders the current interactive shell frame.
@@ -191,12 +215,41 @@ impl TuiRenderer for InteractiveTuiSession {
         }
         self.render()
     }
+
+    fn suspend_for_stdout(&mut self) -> io::Result<()> {
+        if self.suspended_for_stdout {
+            return Ok(());
+        }
+
+        disable_raw_mode()?;
+        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
+        self.terminal.show_cursor()?;
+        self.suspended_for_stdout = true;
+        Ok(())
+    }
+
+    fn resume_after_stdout(&mut self) -> io::Result<()> {
+        if !self.suspended_for_stdout {
+            return Ok(());
+        }
+
+        enable_raw_mode()?;
+        let alternate_screen_result = execute!(self.terminal.backend_mut(), EnterAlternateScreen);
+        if let Err(error) = alternate_screen_result {
+            let _ = disable_raw_mode();
+            return Err(error);
+        }
+        self.suspended_for_stdout = false;
+        self.render()
+    }
 }
 
 impl Drop for InteractiveTuiSession {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        if !self.suspended_for_stdout {
+            let _ = disable_raw_mode();
+            let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        }
         let _ = self.terminal.show_cursor();
     }
 }

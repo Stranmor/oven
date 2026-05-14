@@ -24,6 +24,7 @@ use forge_fs::ForgeFS;
 use forge_select::{ForgeWidget, SelectRow};
 use forge_spinner::SpinnerManager;
 use forge_tracker::ToolCallPayload;
+use forge_tui::TuiRenderer;
 use forge_walker::Walker;
 use futures::future;
 use strum::IntoEnumIterator;
@@ -4033,7 +4034,12 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             match session.read_input()? {
                 forge_tui::TuiInput::Submitted(input) => {
                     if !initialized {
-                        self.init_tui_interactive_state(&mut session).await?;
+                        session.suspend_for_stdout()?;
+                        let init_result = self.init_tui_interactive_state().await;
+                        let resume_result = session.resume_after_stdout();
+                        init_result?;
+                        resume_result?;
+                        session.queue_and_render(forge_ui_model::UiModel::default())?;
                         initialized = true;
                     }
                     tracker::prompt(input.clone());
@@ -4058,15 +4064,11 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         }
     }
 
-    async fn init_tui_interactive_state(
-        &mut self,
-        session: &mut impl forge_tui::TuiRenderer,
-    ) -> Result<()> {
+    async fn init_tui_interactive_state(&mut self) -> Result<()> {
         self.init_state(true).await?;
         self.trace_user();
         self.hydrate_caches();
         self.init_conversation().await?;
-        session.queue_and_render(forge_ui_model::UiModel::default())?;
         Ok(())
     }
 
@@ -4191,7 +4193,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             return Ok(());
         }
 
-        queue_tui_response_and_notify(session, &message)?;
+        queue_tui_response_with_lifecycle(session, &message)?;
 
         match message {
             ChatResponse::ToolCallStart { tool_call, .. } => {
@@ -5494,6 +5496,17 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
     }
 }
 
+fn queue_tui_response_with_lifecycle(
+    session: &mut impl forge_tui::TuiRenderer,
+    message: &ChatResponse,
+) -> Result<()> {
+    if matches!(message, ChatResponse::ToolCallEnd(_)) {
+        session.resume_after_stdout()?;
+    }
+
+    queue_tui_response_and_notify(session, message)
+}
+
 fn queue_tui_response_and_notify(
     session: &mut impl forge_tui::TuiRenderer,
     message: &ChatResponse,
@@ -5516,6 +5529,11 @@ fn queue_tui_response_and_notify(
     };
 
     session.queue_and_render(forge_ui_model::UiModel::from(message))?;
+    if let ChatResponse::ToolCallStart { tool_call, .. } = message
+        && tool_call.requires_stdout()
+    {
+        session.suspend_for_stdout()?;
+    }
     drop(notify_guard);
     Ok(())
 }
@@ -5525,7 +5543,8 @@ mod tests {
     use std::io::{self, Write};
     use std::sync::Arc;
 
-    use forge_domain::ToolCallFull;
+    use forge_domain::{ToolCallFull, ToolResult};
+    use forge_ui_model::UiModel;
     use futures::FutureExt;
     use pretty_assertions::assert_eq;
     use tokio::sync::Notify;
@@ -5542,6 +5561,131 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    struct ObservingRenderer {
+        notifier: Arc<Notify>,
+        saw_suspend_before_notify: bool,
+        saw_resume_before_render: bool,
+        render_count: usize,
+        suspend_count: usize,
+        resume_count: usize,
+    }
+
+    impl ObservingRenderer {
+        fn new(notifier: Arc<Notify>) -> Self {
+            Self {
+                notifier,
+                saw_suspend_before_notify: false,
+                saw_resume_before_render: false,
+                render_count: 0,
+                suspend_count: 0,
+                resume_count: 0,
+            }
+        }
+    }
+
+    impl forge_tui::TuiRenderer for ObservingRenderer {
+        fn queue_and_render(&mut self, _event_model: UiModel) -> io::Result<()> {
+            self.render_count = self
+                .render_count
+                .checked_add(1)
+                .expect("fixture render count should not overflow");
+            self.saw_resume_before_render = self.resume_count > 0;
+            Ok(())
+        }
+
+        fn suspend_for_stdout(&mut self) -> io::Result<()> {
+            self.suspend_count = self
+                .suspend_count
+                .checked_add(1)
+                .expect("fixture suspend count should not overflow");
+            self.saw_suspend_before_notify = self.notifier.notified().now_or_never().is_none();
+            Ok(())
+        }
+
+        fn resume_after_stdout(&mut self) -> io::Result<()> {
+            self.resume_count = self
+                .resume_count
+                .checked_add(1)
+                .expect("fixture resume count should not overflow");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_tui_stdout_tool_start_suspends_before_notifier_fires() {
+        let notifier = Arc::new(Notify::new());
+        let fixture = ChatResponse::ToolCallStart {
+            tool_call: ToolCallFull::new("shell"),
+            notifier: notifier.clone(),
+        };
+        let mut setup = ObservingRenderer::new(notifier.clone());
+
+        queue_tui_response_and_notify(&mut setup, &fixture)
+            .expect("fixture TUI response should render and suspend successfully");
+        let actual = (
+            setup.render_count,
+            setup.suspend_count,
+            setup.saw_suspend_before_notify,
+            notifier.notified().now_or_never().is_some(),
+        );
+        let expected = (1, 1, true, true);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_tui_non_stdout_tool_start_notifies_without_suspending() {
+        let notifier = Arc::new(Notify::new());
+        let fixture = ChatResponse::ToolCallStart {
+            tool_call: ToolCallFull::new("read"),
+            notifier: notifier.clone(),
+        };
+        let mut setup = ObservingRenderer::new(notifier.clone());
+
+        queue_tui_response_and_notify(&mut setup, &fixture)
+            .expect("fixture TUI response should render successfully");
+        let actual = (
+            setup.render_count,
+            setup.suspend_count,
+            notifier.notified().now_or_never().is_some(),
+        );
+        let expected = (1, 0, true);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_tui_tool_end_resumes_before_rendering_result() {
+        let fixture = ChatResponse::ToolCallEnd(ToolResult::new("shell").success("exit 0"));
+        let mut setup = ObservingRenderer::new(Arc::new(Notify::new()));
+
+        queue_tui_response_with_lifecycle(&mut setup, &fixture)
+            .expect("fixture TUI tool result should resume and render successfully");
+        let actual = (
+            setup.resume_count,
+            setup.render_count,
+            setup.saw_resume_before_render,
+        );
+        let expected = (1, 1, true);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_tui_initialization_can_be_wrapped_by_stdout_suspension() {
+        let mut setup = ObservingRenderer::new(Arc::new(Notify::new()));
+
+        setup
+            .suspend_for_stdout()
+            .expect("fixture TUI renderer should suspend successfully");
+        setup
+            .resume_after_stdout()
+            .expect("fixture TUI renderer should resume successfully");
+        setup
+            .queue_and_render(UiModel::default())
+            .expect("fixture TUI renderer should render successfully");
+        let actual = (setup.suspend_count, setup.resume_count, setup.render_count);
+        let expected = (1, 1, 1);
+        assert_eq!(actual, expected);
     }
 
     #[test]
