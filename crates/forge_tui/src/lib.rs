@@ -371,12 +371,20 @@ fn draw_conversation(frame: &mut ratatui::Frame<'_>, model: &UiModel, input: Opt
     .block(Block::default().borders(Borders::ALL).title("Session"));
     frame.render_widget(header, header_area);
 
-    let transcript = Paragraph::new(render_transcript_lines(model))
+    let transcript_lines = viewport_lines_latest(
+        render_transcript_lines(model),
+        transcript_area.height.saturating_sub(2),
+    );
+    let transcript = Paragraph::new(transcript_lines)
         .wrap(Wrap { trim: false })
         .block(Block::default().borders(Borders::ALL).title("Conversation"));
     frame.render_widget(transcript, transcript_area);
 
-    let detail = Paragraph::new(render_tool_detail_lines(model))
+    let detail_lines = viewport_lines_latest(
+        render_tool_detail_lines(model),
+        detail_area.height.saturating_sub(2),
+    );
+    let detail = Paragraph::new(detail_lines)
         .wrap(Wrap { trim: false })
         .block(Block::default().borders(Borders::ALL).title("Tool details"));
     frame.render_widget(detail, detail_area);
@@ -467,6 +475,8 @@ fn status_text(model: &UiModel) -> String {
         "Working - assistant is responding".to_string()
     } else if turn_phase == Some(UiTurnPhase::Pending) {
         "Waiting - preparing response".to_string()
+    } else if latest_tool_phase(model).is_some() {
+        "Ready - tool activity complete".to_string()
     } else {
         "Ready - start a conversation".to_string()
     }
@@ -496,6 +506,10 @@ fn status_style(model: &UiModel) -> Style {
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD)
+    } else if latest_tool_phase(model).is_some() {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::DarkGray)
     }
@@ -518,20 +532,52 @@ fn running_tool_count(model: &UiModel) -> usize {
         })
 }
 
+fn latest_tool_phase(model: &UiModel) -> Option<UiToolPhase> {
+    model.blocks.iter().rev().find_map(|block| match block {
+        UiBlock::ToolStatus(status) => Some(status.phase.clone()),
+        _ => None,
+    })
+}
+
 fn latest_turn_phase(model: &UiModel) -> Option<UiTurnPhase> {
     model.blocks.iter().rev().find_map(|block| match block {
         UiBlock::TurnStatus(status) => Some(status.phase.clone()),
+        UiBlock::Markdown { partial, .. } if *partial => Some(UiTurnPhase::Running),
+        UiBlock::Reasoning(_) => Some(UiTurnPhase::Running),
         UiBlock::Markdown { .. }
-        | UiBlock::Reasoning(_)
         | UiBlock::ToolInput(_)
         | UiBlock::ToolOutput(_)
         | UiBlock::ToolStatus(_)
         | UiBlock::ToolDetail(_)
         | UiBlock::Retry { .. }
-        | UiBlock::Interrupt(_) => Some(UiTurnPhase::Running),
-        UiBlock::Completion => None,
-        UiBlock::UserMessage(_) => None,
+        | UiBlock::Interrupt(_)
+        | UiBlock::Completion
+        | UiBlock::UserMessage(_) => None,
     })
+}
+
+fn viewport_lines_latest(lines: Vec<Line<'static>>, visible_height: u16) -> Vec<Line<'static>> {
+    let visible_height = usize::from(visible_height);
+    if visible_height == 0 || lines.len() <= visible_height {
+        return lines;
+    }
+
+    if visible_height == 1 {
+        return vec![viewport_marker(lines.len())];
+    }
+
+    let visible_tail = visible_height.saturating_sub(1);
+    let hidden_count = lines.len().saturating_sub(visible_tail);
+    let mut visible = vec![viewport_marker(hidden_count)];
+    visible.extend(lines.into_iter().skip(hidden_count));
+    visible
+}
+
+fn viewport_marker(hidden_count: usize) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("↑ {hidden_count} hidden"),
+        Style::default().fg(Color::DarkGray),
+    ))
 }
 
 fn render_transcript_lines(model: &UiModel) -> Vec<Line<'static>> {
@@ -992,8 +1038,59 @@ mod tests {
 
         let actual = render_conversation_to_string(&fixture, 90, 10);
 
-        assert!(actual.contains("Working - assistant is responding"));
+        assert!(actual.contains("Ready - tool activity complete"));
+        assert!(!actual.contains("Working - assistant is responding"));
         assert!(!actual.contains("tools_running="));
+    }
+
+    #[test]
+    fn test_conversation_layout_keeps_latest_transcript_visible_when_content_overflows() {
+        let mut setup = Vec::new();
+        for index in 0..24 {
+            setup.push(UiBlock::Markdown {
+                text: format!("older assistant line {index}"),
+                partial: false,
+            });
+        }
+        setup.push(UiBlock::Markdown {
+            text: "NEWEST ASSISTANT ANSWER".to_string(),
+            partial: false,
+        });
+        setup.push(UiBlock::ToolStatus(UiToolStatus {
+            name: "shell".to_string(),
+            phase: UiToolPhase::Finished,
+            summary: Some("LATEST".to_string()),
+        }));
+        let fixture = UiModel::new(setup);
+
+        let actual = render_conversation_to_string(&fixture, 100, 12);
+
+        assert!(actual.contains("hidden"));
+        assert!(actual.contains("NEWEST ASSISTANT ANSWER"));
+        assert!(actual.contains("LATEST"));
+        assert!(!actual.contains("older assistant line 0"));
+    }
+
+    #[test]
+    fn test_tool_detail_layout_keeps_latest_output_visible_when_detail_overflows() {
+        let mut long_output = (0..30)
+            .map(|index| format!("older output line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        long_output.push_str("\nZENDMARK");
+        let fixture = UiModel::new(vec![UiBlock::ToolDetail(UiToolDetail {
+            call_id: Some("call-overflow".to_string()),
+            name: "shell".to_string(),
+            arguments: Some("{\"command\":\"long-output\"}".to_string()),
+            output: Some(long_output),
+            is_error: false,
+        })]);
+
+        let actual = render_conversation_to_string(&fixture, 110, 12);
+
+        assert!(actual.contains("hidden"));
+        assert!(actual.contains("ZENDMARK"));
+        assert!(!actual.contains("older output line 0"));
     }
 
     #[test]
