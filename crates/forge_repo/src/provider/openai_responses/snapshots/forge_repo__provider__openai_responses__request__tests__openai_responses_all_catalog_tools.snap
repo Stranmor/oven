@@ -487,7 +487,7 @@ expression: actual.tools
               "type": "null"
             }
           ],
-          "description": "Optional synchronous wait window before handoff to managed background execution.\nDefaults to 2 seconds when omitted. The command is not killed when this\ntimeout elapses; the already-started process is registered for\nprocess_status/process_read observation."
+          "description": "Optional synchronous wait window before handoff to managed background\nexecution. Defaults to 15 seconds when omitted. The command is not\nkilled when this timeout elapses; the already-started process is\nregistered for process_status/process_read observation."
         },
         "keep_ansi": {
           "description": "Whether to preserve ANSI escape codes in the output.\nIf true, ANSI escape codes will be preserved in the output.\nIf false (default), ANSI escape codes will be stripped from the output.",
@@ -505,65 +505,7 @@ expression: actual.tools
       "type": "object"
     },
     "strict": true,
-    "description": "Executes shell commands. The `cwd` parameter sets the working directory for command execution. If not specified, defaults to `{{env.cwd}}`.\n\nShort commands remain synchronous and return stdout, stderr, and exit code directly. Commands that exceed the synchronous startup window are automatically handed off to the managed background process subsystem; the shell result then has no exit code, includes the process handle in the output attributes, and should be followed with `process_status` and `process_read` using the returned `process_id`. The `handoff_timeout_seconds` parameter controls this per command: omit it for the default 2 second window, or set a positive integer (for example `15`) when the command needs a longer synchronous wait before background handoff. Handoff does not kill or restart the command; the already-started process continues exactly once under managed process tracking.\n\nCRITICAL: Do NOT use `cd` commands in the command string. This is FORBIDDEN. Always use the `cwd` parameter to set the working directory instead. Any use of `cd` in the command is redundant, incorrect, and violates the tool contract.\n\nIMPORTANT: This tool is for terminal operations like git, npm, docker, etc. DO NOT use it for file operations (reading, writing, editing, searching, finding files) - use the specialized tools for this instead.\n\nBefore executing the command, please follow these steps:\n\n1. Directory Verification:\n   - If the command will create new directories or files, first use `shell` with `ls` to verify the parent directory exists and is the correct location\n   - For example, before running \"mkdir foo/bar\", first use `ls foo` to check that \"foo\" exists and is the intended parent directory\n\n2. Command Execution:\n   - Always quote file paths that contain spaces with double quotes (e.g., python \"path with spaces/script.py\")\n   - Examples of proper quoting:\n     - mkdir \"/Users/name/My Documents\" (correct)\n     - mkdir /Users/name/My Documents (incorrect - will fail)\n     - python \"/path/with spaces/script.py\" (correct)\n     - python /path/with spaces/script.py (incorrect - will fail)\n   - After ensuring proper quoting, execute the command.\n   - Capture the output of the command.\n\nUsage notes:\n  - The command argument is required.\n  - `handoff_timeout_seconds` is optional and must be a positive integer when provided. It changes only how long shell waits synchronously before returning a managed process handle; it is not a kill timeout and does not duplicate execution.\n  - It is very helpful if you write a clear, concise description of what this command does in 5-10 words.\n  - If the output exceeds {{config.stdoutMaxPrefixLength}} prefix lines or {{config.stdoutMaxSuffixLength}} suffix lines, or if a line exceeds {{config.stdoutMaxLineLength}} characters, it will be truncated and the full output will be written to a temporary file. You can use read with start_line/end_line to read specific sections or fs_search to search the full content. Because of this, you should NOT use `head`, `tail`, or other truncation commands to limit output - just run the command directly.\n  - Do not use {{tool_names.shell}} with the `find`, `grep`, `cat`, `head`, `tail`, `sed`, `awk`, or `echo` commands, unless explicitly instructed or when these commands are truly necessary for the task. Instead, always prefer using the dedicated tools for these commands:\n    - File search: Use `{{tool_names.fs_search}}` (NOT find or ls)\n    - Content search: Use `{{tool_names.fs_search}}` with regex (NOT grep or rg)\n    - Read files: Use `{{tool_names.read}}` (NOT cat/head/tail)\n    - Edit files: Use `{{tool_names.patch}}`(NOT sed/awk)\n    - Write files: Use `{{tool_names.write}}` (NOT echo >/cat <<EOF)\n    - Communication: Output text directly (NOT echo/printf)\n  - When issuing multiple commands:\n    - If the commands are independent and can run in parallel, make multiple `{{tool_names.shell}}` tool calls in a single message. For example, if you need to run \"git status\" and \"git diff\", send a single message with two `{{tool_names.shell}}` tool calls in parallel.\n    - If the commands depend on each other and must run sequentially, use a single `{{tool_names.shell}}` call with '&&' to chain them together (e.g., `git add . && git commit -m \"message\" && git push`). For instance, if one operation must complete before another starts (like mkdir before cp, write before shell for git operations, or git add before git commit), run these operations sequentially instead.\n    - Use ';' only when you need to run commands sequentially but don't care if earlier commands fail\n    - DO NOT use newlines to separate commands (newlines are ok in quoted strings)\n  - DO NOT use `cd <directory> && <command>`. Use the `cwd` parameter to change directories instead.\n\nGood examples:\n  - With explicit cwd: cwd=\"/foo/bar\" with command: pytest tests\n\nBad example:\n  cd /foo/bar && pytest tests\n\nReturns complete output including stdout, stderr, and exit code for synchronous commands, or a managed process handle for commands handed off after the startup window."
-  },
-  {
-    "type": "function",
-    "name": "process_start",
-    "parameters": {
-      "additionalProperties": false,
-      "properties": {
-        "command": {
-          "description": "The shell command to start as a managed background process.",
-          "type": "string"
-        },
-        "cwd": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The working directory where the process should start."
-        },
-        "description": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Clear, concise description of what this background process does."
-        },
-        "env": {
-          "anyOf": [
-            {
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Environment variable names to pass to the process."
-        }
-      },
-      "required": [
-        "command",
-        "cwd",
-        "description",
-        "env"
-      ],
-      "type": "object"
-    },
-    "strict": true,
-    "description": "Starts a shell command as a managed background process and returns immediately with a `process_id` handle.\n\nUse this for long-running servers, watchers, REPL-adjacent daemons, and commands expected to run longer than an interactive foreground turn. Do not use it for short commands; use `shell` instead.\n\nThe process captures stdout/stderr asynchronously. Use `process_status` to inspect lifecycle state, `process_read` to read captured output with a cursor, `process_list` to see active handles, and `process_kill` to stop a process.\n\nThe `cwd` parameter sets the working directory. Do not put `cd` in the command string."
+    "description": "Executes shell commands. The `cwd` parameter sets the working directory for command execution. If not specified, defaults to `{{env.cwd}}`.\n\nShort commands remain synchronous and return stdout, stderr, and exit code directly. Commands that exceed the synchronous startup window are automatically handed off to the managed background process subsystem; the shell result then has no exit code, includes the process handle in the output attributes, and should be followed with `process_status` and `process_read` using the returned `process_id`. The `handoff_timeout_seconds` parameter controls this per command: omit it for the default 15 second window, or set a positive integer (for example `30`) when the command needs a longer synchronous wait before background handoff. Handoff does not kill or restart the command; the already-started process continues exactly once under managed process tracking.\n\nCRITICAL: Do NOT use `cd` commands in the command string. This is FORBIDDEN. Always use the `cwd` parameter to set the working directory instead. Any use of `cd` in the command is redundant, incorrect, and violates the tool contract.\n\nIMPORTANT: This tool is for terminal operations like git, npm, docker, etc. DO NOT use it for file operations (reading, writing, editing, searching, finding files) - use the specialized tools for this instead.\n\nBefore executing the command, please follow these steps:\n\n1. Directory Verification:\n   - If the command will create new directories or files, first use `shell` with `ls` to verify the parent directory exists and is the correct location\n   - For example, before running \"mkdir foo/bar\", first use `ls foo` to check that \"foo\" exists and is the intended parent directory\n\n2. Command Execution:\n   - Always quote file paths that contain spaces with double quotes (e.g., python \"path with spaces/script.py\")\n   - Examples of proper quoting:\n     - mkdir \"/Users/name/My Documents\" (correct)\n     - mkdir /Users/name/My Documents (incorrect - will fail)\n     - python \"/path/with spaces/script.py\" (correct)\n     - python /path/with spaces/script.py (incorrect - will fail)\n   - After ensuring proper quoting, execute the command.\n   - Capture the output of the command.\n\nUsage notes:\n  - The command argument is required.\n  - `handoff_timeout_seconds` is optional and must be a positive integer when provided. It changes only how long shell waits synchronously before returning a managed process handle; it is not a kill timeout and does not duplicate execution.\n  - It is very helpful if you write a clear, concise description of what this command does in 5-10 words.\n  - If the output exceeds {{config.stdoutMaxPrefixLength}} prefix lines or {{config.stdoutMaxSuffixLength}} suffix lines, or if a line exceeds {{config.stdoutMaxLineLength}} characters, it will be truncated and the full output will be written to a temporary file. You can use read with start_line/end_line to read specific sections or fs_search to search the full content. Because of this, you should NOT use `head`, `tail`, or other truncation commands to limit output - just run the command directly.\n  - Do not use {{tool_names.shell}} with the `find`, `grep`, `cat`, `head`, `tail`, `sed`, `awk`, or `echo` commands, unless explicitly instructed or when these commands are truly necessary for the task. Instead, always prefer using the dedicated tools for these commands:\n    - File search: Use `{{tool_names.fs_search}}` (NOT find or ls)\n    - Content search: Use `{{tool_names.fs_search}}` with regex (NOT grep or rg)\n    - Read files: Use `{{tool_names.read}}` (NOT cat/head/tail)\n    - Edit files: Use `{{tool_names.patch}}`(NOT sed/awk)\n    - Write files: Use `{{tool_names.write}}` (NOT echo >/cat <<EOF)\n    - Communication: Output text directly (NOT echo/printf)\n  - When issuing multiple commands:\n    - If the commands are independent and can run in parallel, make multiple `{{tool_names.shell}}` tool calls in a single message. For example, if you need to run \"git status\" and \"git diff\", send a single message with two `{{tool_names.shell}}` tool calls in parallel.\n    - If the commands depend on each other and must run sequentially, use a single `{{tool_names.shell}}` call with '&&' to chain them together (e.g., `git add . && git commit -m \"message\" && git push`). For instance, if one operation must complete before another starts (like mkdir before cp, write before shell for git operations, or git add before git commit), run these operations sequentially instead.\n    - Use ';' only when you need to run commands sequentially but don't care if earlier commands fail\n    - DO NOT use newlines to separate commands (newlines are ok in quoted strings)\n  - DO NOT use `cd <directory> && <command>`. Use the `cwd` parameter to change directories instead.\n\nGood examples:\n  - With explicit cwd: cwd=\"/foo/bar\" with command: pytest tests\n\nBad example:\n  cd /foo/bar && pytest tests\n\nReturns complete output including stdout, stderr, and exit code for synchronous commands, or a managed process handle for commands handed off after the startup window."
   },
   {
     "type": "function",
@@ -572,7 +514,7 @@ expression: actual.tools
       "additionalProperties": false,
       "properties": {
         "process_id": {
-          "description": "Handle returned by process_start or shell timeout handoff.",
+          "description": "Handle returned by a shell timeout handoff.",
           "type": "string"
         },
         "wait_seconds": {
@@ -585,7 +527,7 @@ expression: actual.tools
               "type": "null"
             }
           ],
-          "description": "Optional bounded wait before returning status. Use this instead of immediate repeated polling."
+          "description": "Optional bounded wait before returning status. Use this instead of\nimmediate repeated polling."
         }
       },
       "required": [
@@ -595,7 +537,7 @@ expression: actual.tools
       "type": "object"
     },
     "strict": true,
-    "description": "Returns structured lifecycle status for a managed background process. The `process_id` handle may come from `process_start` or from a shell timeout handoff when a shell command exceeds the synchronous execution window.\n\nThe result includes the typed `process_id`, command, working directory, and status: running, exited with exit code, or killed.\n\nUse `wait_seconds` when a process is expected to finish soon. The bounded wait returns early when the process leaves `running`, and otherwise returns the current status after the requested delay. Prefer this over repeated immediate status polling."
+    "description": "Returns structured lifecycle status for a managed background process. The `process_id` handle comes from a shell timeout handoff when a shell command exceeds the synchronous execution window.\n\nThe result includes the typed `process_id`, command, working directory, and status: running, exited with exit code, or killed. Recent completed process ids can still be queried after they disappear from `process_list`.\n\nUse `wait_seconds` when a process is expected to finish soon. The bounded wait returns early when the process leaves `running`, and otherwise returns the current status after the requested delay. Prefer this over repeated immediate status polling."
   },
   {
     "type": "function",
@@ -610,7 +552,7 @@ expression: actual.tools
           "type": "integer"
         },
         "process_id": {
-          "description": "Handle returned by process_start or shell timeout handoff.",
+          "description": "Handle returned by a shell timeout handoff.",
           "type": "string"
         },
         "wait_seconds": {
@@ -623,7 +565,7 @@ expression: actual.tools
               "type": "null"
             }
           ],
-          "description": "Optional bounded wait for new output after cursor. Use this instead of immediate repeated polling."
+          "description": "Optional bounded wait for new output after cursor. Use this instead of\nimmediate repeated polling."
         }
       },
       "required": [
@@ -634,7 +576,7 @@ expression: actual.tools
       "type": "object"
     },
     "strict": true,
-    "description": "Reads captured stdout/stderr from a managed background process. The `process_id` handle may come from `process_start` or from a shell timeout handoff when a shell command exceeds the synchronous execution window.\n\nPass the `cursor` returned by the previous `process_read` call to receive only new output. Omit it or pass `0` to read from the beginning. The result returns `next_cursor` for idempotent continuation.\n\nUse `wait_seconds` when the same cursor previously returned no entries and more output is expected. The bounded wait returns early as soon as new output is captured or the process exits, and otherwise returns after the requested delay without advancing `next_cursor`. Prefer this over repeated immediate polling of the same cursor."
+    "description": "Reads captured stdout/stderr from a managed background process. The `process_id` handle comes from a shell timeout handoff when a shell command exceeds the synchronous execution window.\n\nPass the `cursor` returned by the previous `process_read` call to receive only new output. Omit it or pass `0` to read from the beginning. The result returns `next_cursor` for idempotent continuation. Recent completed process ids can still return captured output after they disappear from `process_list`.\n\nUse `wait_seconds` when the same cursor previously returned no entries and more output is expected. The bounded wait returns early as soon as new output is captured or the process exits, and otherwise returns after the requested delay without advancing `next_cursor`. Prefer this over repeated immediate polling of the same cursor."
   },
   {
     "type": "function",
@@ -646,7 +588,7 @@ expression: actual.tools
       "type": "object"
     },
     "strict": true,
-    "description": "Lists all managed background process handles known to the current Forge runtime.\n\nUse this before starting duplicate servers or to discover handles for status, log reading, and cleanup."
+    "description": "Lists currently running managed background process handles known to the current Forge runtime.\n\nCompleted or killed managed processes are intentionally omitted from this inventory. Recent completed process ids may still be queried directly with `process_status` and `process_read` for status and captured-output readback.\n\nUse this to discover active handles for status, log reading, and cleanup before starting duplicate servers or watchers."
   },
   {
     "type": "function",
@@ -655,7 +597,7 @@ expression: actual.tools
       "additionalProperties": false,
       "properties": {
         "process_id": {
-          "description": "Handle returned by process_start or shell timeout handoff.",
+          "description": "Handle returned by a shell timeout handoff.",
           "type": "string"
         }
       },
@@ -665,7 +607,7 @@ expression: actual.tools
       "type": "object"
     },
     "strict": true,
-    "description": "Stops a managed background process. The `process_id` handle may come from `process_start` or from a shell timeout handoff when a shell command exceeds the synchronous execution window.\n\nUse this to clean up servers, watchers, or long-running commands after verification. The result reports the final process status."
+    "description": "Stops a managed background process. The `process_id` handle comes from a shell timeout handoff when a shell command exceeds the synchronous execution window.\n\nUse this to clean up servers, watchers, or long-running commands after verification. The result reports the final process status."
   },
   {
     "type": "function",
