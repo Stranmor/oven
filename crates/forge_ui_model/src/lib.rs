@@ -45,6 +45,10 @@ impl UiModel {
 /// A typed render block that preserves the semantics of a chat response.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UiBlock {
+    /// Submitted user message for a turn that has been accepted by the UI.
+    UserMessage(String),
+    /// Typed lifecycle status for an assistant turn before or during provider work.
+    TurnStatus(UiTurnStatus),
     /// Assistant/user markdown content, including streaming partial state.
     Markdown { text: String, partial: bool },
     /// Reasoning text separated from user-visible markdown.
@@ -70,6 +74,8 @@ impl UiBlock {
     /// fallback.
     pub fn plain_text(&self) -> String {
         match self {
+            UiBlock::UserMessage(text) => text.clone(),
+            UiBlock::TurnStatus(status) => status.display_text(),
             UiBlock::Markdown { text, .. }
             | UiBlock::Reasoning(text)
             | UiBlock::ToolOutput(text)
@@ -83,6 +89,70 @@ impl UiBlock {
             UiBlock::Completion => "complete".to_string(),
         }
     }
+}
+
+/// Lifecycle state for a submitted interactive turn.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UiTurnPhase {
+    /// The user message has been submitted and the provider request is being prepared.
+    Pending,
+    /// The provider stream has started and is running.
+    Running,
+}
+
+/// Presentation-safe typed turn status.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UiTurnStatus {
+    /// Turn lifecycle phase.
+    pub phase: UiTurnPhase,
+    /// Human-readable status summary.
+    pub summary: Option<String>,
+}
+
+impl UiTurnStatus {
+    /// Creates a pending turn status for a submitted user message.
+    pub fn pending() -> Self {
+        Self {
+            phase: UiTurnPhase::Pending,
+            summary: Some("waiting for provider response".to_string()),
+        }
+    }
+
+    /// Creates a running turn status for a provider stream.
+    pub fn running() -> Self {
+        Self {
+            phase: UiTurnPhase::Running,
+            summary: Some("provider stream running".to_string()),
+        }
+    }
+
+    /// Formats the turn status as deterministic presentation text.
+    pub fn display_text(&self) -> String {
+        let phase = match self.phase {
+            UiTurnPhase::Pending => "pending",
+            UiTurnPhase::Running => "running",
+        };
+        match &self.summary {
+            Some(summary) if !summary.is_empty() => format!("turn {phase}: {summary}"),
+            _ => format!("turn {phase}"),
+        }
+    }
+}
+
+/// Creates the typed UI blocks shown immediately after user submission.
+///
+/// # Arguments
+/// * `message` - Submitted user message text.
+pub fn submitted_user_turn(message: impl Into<String>) -> UiModel {
+    UiModel::new(vec![
+        UiBlock::UserMessage(message.into()),
+        UiBlock::TurnStatus(UiTurnStatus::pending()),
+    ])
+}
+
+/// Creates the typed UI block shown when the provider stream starts.
+pub fn running_turn() -> UiModel {
+    UiModel::new(vec![UiBlock::TurnStatus(UiTurnStatus::running())])
 }
 
 /// Presentation-safe title metadata for status lines.
@@ -370,6 +440,31 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
+
+    #[test]
+    fn test_submitted_user_turn_model_contains_user_and_pending_blocks() {
+        let actual = submitted_user_turn("Hello Forge");
+
+        let expected = UiModel::new(vec![
+            UiBlock::UserMessage("Hello Forge".to_string()),
+            UiBlock::TurnStatus(UiTurnStatus::pending()),
+        ]);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_turn_status_formats_deterministic_lifecycle_text() {
+        let actual = (
+            UiTurnStatus::pending().display_text(),
+            UiTurnStatus::running().display_text(),
+        );
+
+        let expected = (
+            "turn pending: waiting for provider response".to_string(),
+            "turn running: provider stream running".to_string(),
+        );
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn test_markdown_chat_response_maps_to_ui_model_block() {

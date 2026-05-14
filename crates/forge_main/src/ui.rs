@@ -4039,7 +4039,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                         let resume_result = session.resume_after_stdout();
                         init_result?;
                         resume_result?;
-                        session.queue_and_render(forge_ui_model::UiModel::default())?;
+                        session.render_current()?;
                         initialized = true;
                     }
                     tracker::prompt(input.clone());
@@ -4051,16 +4051,13 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                         }
                         AppCommand::Exit => return Ok(()),
                         command => {
-                            let should_exit = run_tui_command_with_suspended_stdout(
-                                self,
-                                &mut session,
-                                command,
-                            )
-                            .await?;
+                            let should_exit =
+                                run_tui_command_with_suspended_stdout(self, &mut session, command)
+                                    .await?;
                             if should_exit {
                                 return Ok(());
                             }
-                            session.render()?;
+                            session.render_current()?;
                         }
                     }
                 }
@@ -4169,9 +4166,11 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         chat: ChatRequest,
         session: &mut impl forge_tui::TuiRenderer,
     ) -> Result<()> {
+        queue_tui_submitted_turn(session, &chat)?;
         self.spinner.stop(None)?;
         self.spinner.reset();
         let mut stream = self.api.chat(chat).await?;
+        session.queue_and_render(forge_ui_model::running_turn())?;
 
         while let Some(message) = stream.next().await {
             match message {
@@ -5501,6 +5500,23 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
     }
 }
 
+fn queue_tui_submitted_turn(
+    session: &mut impl forge_tui::TuiRenderer,
+    chat: &ChatRequest,
+) -> Result<()> {
+    let Some(prompt) = chat
+        .event
+        .value
+        .as_ref()
+        .and_then(|value| value.as_user_prompt())
+    else {
+        return Ok(());
+    };
+
+    session.queue_and_render(forge_ui_model::submitted_user_turn(prompt.as_str()))?;
+    Ok(())
+}
+
 fn queue_tui_response_with_lifecycle(
     session: &mut impl forge_tui::TuiRenderer,
     message: &ChatResponse,
@@ -5548,7 +5564,7 @@ async fn run_tui_suspended_stdout_boundary(
     session.suspend_for_stdout()?;
     let command_result = operation.await;
     let resume_result = session.resume_after_stdout();
-    let redraw_result = session.queue_and_render(forge_ui_model::UiModel::default());
+    let redraw_result = session.render_current();
     let should_exit = command_result?;
     resume_result?;
     redraw_result?;
@@ -5560,8 +5576,8 @@ mod tests {
     use std::io;
     use std::sync::Arc;
 
-    use forge_domain::{ToolCallFull, ToolResult};
-    use forge_ui_model::UiModel;
+    use forge_domain::{EventValue, ToolCallFull, ToolResult};
+    use forge_ui_model::{UiBlock, UiModel, UiTurnPhase};
     use futures::FutureExt;
     use pretty_assertions::assert_eq;
     use tokio::sync::Notify;
@@ -5576,8 +5592,10 @@ mod tests {
         fail_render: bool,
         fail_suspend: bool,
         render_count: usize,
+        render_current_count: usize,
         suspend_count: usize,
         resume_count: usize,
+        queued_models: Vec<UiModel>,
     }
 
     impl ObservingRenderer {
@@ -5590,8 +5608,10 @@ mod tests {
                 fail_render: false,
                 fail_suspend: false,
                 render_count: 0,
+                render_current_count: 0,
                 suspend_count: 0,
                 resume_count: 0,
+                queued_models: Vec::new(),
             }
         }
 
@@ -5605,7 +5625,8 @@ mod tests {
     }
 
     impl forge_tui::TuiRenderer for ObservingRenderer {
-        fn queue_and_render(&mut self, _event_model: UiModel) -> io::Result<()> {
+        fn queue_and_render(&mut self, event_model: UiModel) -> io::Result<()> {
+            self.queued_models.push(event_model);
             self.render_count = self
                 .render_count
                 .checked_add(1)
@@ -5637,6 +5658,81 @@ mod tests {
             self.saw_notify_before_resume = self.notifier.notified().now_or_never().is_some();
             Ok(())
         }
+
+        fn render_current(&mut self) -> io::Result<()> {
+            self.render_current_count = self
+                .render_current_count
+                .checked_add(1)
+                .expect("fixture render current count should not overflow");
+            self.saw_resume_before_render = self.resume_count > 0;
+            if self.fail_render {
+                return Err(io::Error::other("render failed"));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_tui_submitted_turn_queues_user_and_pending_before_provider_response() {
+        let notifier = Arc::new(Notify::new());
+        let mut setup = ObservingRenderer::new(notifier);
+        let chat = ChatRequest::new(Event::new("Hello TUI"), ConversationId::generate());
+
+        queue_tui_submitted_turn(&mut setup, &chat)
+            .expect("fixture submitted turn should render successfully");
+        let actual = setup.queued_models;
+        let expected = vec![forge_ui_model::submitted_user_turn("Hello TUI")];
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_tui_submitted_turn_ignores_empty_or_command_events() {
+        let notifier = Arc::new(Notify::new());
+        let mut setup = ObservingRenderer::new(notifier);
+        let command = UserCommand::new("help", forge_domain::Template::new("help"), Vec::new());
+        let chat = ChatRequest::new(
+            Event::new(EventValue::Command(command)),
+            ConversationId::generate(),
+        );
+
+        queue_tui_submitted_turn(&mut setup, &chat)
+            .expect("fixture command event should not render submitted turn");
+        let actual = setup.queued_models;
+        let expected: Vec<UiModel> = Vec::new();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_tui_running_turn_is_queued_after_submitted_turn() {
+        let mut setup = ObservingRenderer::new(Arc::new(Notify::new()));
+
+        setup
+            .queue_and_render(forge_ui_model::submitted_user_turn("Hello"))
+            .expect("fixture submitted turn should render");
+        setup
+            .queue_and_render(forge_ui_model::running_turn())
+            .expect("fixture running turn should render");
+        let actual = setup.queued_models;
+        let expected = vec![
+            forge_ui_model::submitted_user_turn("Hello"),
+            UiModel::new(vec![UiBlock::TurnStatus(forge_ui_model::UiTurnStatus {
+                phase: UiTurnPhase::Running,
+                summary: Some("provider stream running".to_string()),
+            })]),
+        ];
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_tui_current_redraw_does_not_append_empty_model() {
+        let mut setup = ObservingRenderer::new(Arc::new(Notify::new()));
+
+        setup
+            .render_current()
+            .expect("fixture current redraw should render successfully");
+        let actual = (setup.render_current_count, setup.queued_models);
+        let expected = (1, Vec::new());
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -5709,10 +5805,11 @@ mod tests {
             setup.suspend_count,
             setup.resume_count,
             setup.render_count,
+            setup.render_current_count,
             setup.saw_notify_before_resume,
             notifier.notified().now_or_never().is_some(),
         );
-        let expected = (false, 1, 1, 1, false, false);
+        let expected = (false, 1, 1, 0, 1, false, false);
         assert_eq!(actual, expected);
     }
 

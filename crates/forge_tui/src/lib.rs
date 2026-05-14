@@ -13,7 +13,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use forge_ui_model::{UiBlock, UiModel, UiToolDetail, UiToolPhase};
+use forge_ui_model::{UiBlock, UiModel, UiToolDetail, UiToolPhase, UiTurnPhase};
 use ratatui::Terminal;
 use ratatui::backend::{CrosstermBackend, TestBackend};
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -78,6 +78,10 @@ impl<W: Write> TuiRenderer for TuiSession<W> {
     fn queue_and_render(&mut self, event_model: UiModel) -> io::Result<()> {
         TuiSession::queue_and_render(self, event_model)
     }
+
+    fn render_current(&mut self) -> io::Result<()> {
+        self.render()
+    }
 }
 
 /// Common renderer boundary for stdout and alternate-screen TUI sessions.
@@ -106,6 +110,14 @@ pub trait TuiRenderer {
     /// # Errors
     /// Returns an error if re-entering the renderer mode or redrawing fails.
     fn resume_after_stdout(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Renders the current append-only typed model without appending a response.
+    ///
+    /// # Errors
+    /// Returns an error if rendering or terminal I/O fails.
+    fn render_current(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
@@ -182,11 +194,12 @@ impl InteractiveTuiSession {
                 }
                 Event::Key(KeyEvent { code: KeyCode::Enter, .. }) => {
                     let submitted = self.input.trim().to_string();
-                    self.input.clear();
-                    self.render()?;
                     if submitted.is_empty() {
+                        self.input.clear();
+                        self.render()?;
                         continue;
                     }
+                    self.input.clear();
                     return Ok(TuiInput::Submitted(submitted));
                 }
                 Event::Key(KeyEvent { code: KeyCode::Backspace, .. }) => {
@@ -240,6 +253,10 @@ impl TuiRenderer for InteractiveTuiSession {
             return Err(error);
         }
         self.suspended_for_stdout = false;
+        self.render()
+    }
+
+    fn render_current(&mut self) -> io::Result<()> {
         self.render()
     }
 }
@@ -445,14 +462,29 @@ fn status_text(model: &UiModel) -> String {
         .iter()
         .filter(|block| matches!(block, UiBlock::ToolStatus(status) if status.phase == UiToolPhase::Failed))
         .count();
+    let turn_phase = model.blocks.iter().rev().find_map(|block| match block {
+        UiBlock::TurnStatus(status) => Some(status.phase.clone()),
+        UiBlock::Markdown { .. }
+        | UiBlock::Reasoning(_)
+        | UiBlock::ToolInput(_)
+        | UiBlock::ToolOutput(_)
+        | UiBlock::ToolStatus(_)
+        | UiBlock::ToolDetail(_)
+        | UiBlock::Retry { .. }
+        | UiBlock::Completion
+        | UiBlock::Interrupt(_) => Some(UiTurnPhase::Running),
+        UiBlock::UserMessage(_) => None,
+    });
     let completed = model
         .blocks
         .iter()
         .any(|block| matches!(block, UiBlock::Completion));
     let state = if completed {
         "complete"
-    } else if running > 0 {
+    } else if running > 0 || turn_phase == Some(UiTurnPhase::Running) {
         "running"
+    } else if turn_phase == Some(UiTurnPhase::Pending) {
+        "pending"
     } else {
         "streaming"
     };
@@ -497,6 +529,14 @@ fn render_detail_lines(model: &UiModel) -> Vec<Line<'static>> {
 
 fn render_block(block: &UiBlock) -> Line<'static> {
     match block {
+        UiBlock::UserMessage(text) => tagged_line("user", text, Color::Green),
+        UiBlock::TurnStatus(status) => {
+            let color = match status.phase {
+                UiTurnPhase::Pending => Color::Yellow,
+                UiTurnPhase::Running => Color::Cyan,
+            };
+            tagged_line("turn", &status.display_text(), color)
+        }
         UiBlock::Markdown { text, partial } => {
             let marker = if *partial { "markdown~" } else { "markdown" };
             tagged_line(marker, text, Color::White)
@@ -549,10 +589,35 @@ fn tagged_line(tag: &'static str, text: &str, color: Color) -> Line<'static> {
 mod tests {
     use std::time::Duration;
 
-    use forge_ui_model::{UiBlock, UiModel, UiRetryDelay, UiToolDetail, UiToolPhase, UiToolStatus};
+    use forge_ui_model::{
+        UiBlock, UiModel, UiRetryDelay, UiToolDetail, UiToolPhase, UiToolStatus, UiTurnStatus,
+        submitted_user_turn,
+    };
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn test_ratatui_dashboard_renders_submitted_user_and_pending_turn() {
+        let fixture = submitted_user_turn("Hello from TUI");
+
+        let actual = render_dashboard_to_string(&fixture, 80, 10);
+
+        assert!(actual.contains("events=2"));
+        assert!(actual.contains("state=pending"));
+        assert!(actual.contains("[user] Hello from TUI"));
+        assert!(actual.contains("[turn] turn pending: waiting"));
+    }
+
+    #[test]
+    fn test_ratatui_dashboard_renders_running_turn_state() {
+        let fixture = UiModel::new(vec![UiBlock::TurnStatus(UiTurnStatus::running())]);
+
+        let actual = render_dashboard_to_string(&fixture, 80, 9);
+
+        assert!(actual.contains("state=running"));
+        assert!(actual.contains("[turn] turn running: provider"));
+    }
 
     #[test]
     fn test_ratatui_dashboard_renders_deterministic_model_output() {
