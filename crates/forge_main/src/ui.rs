@@ -363,6 +363,10 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             return self.handle_subcommands(cmd).await;
         }
 
+        if self.cli.starts_tui_interactive() {
+            return self.run_tui_interactive().await;
+        }
+
         // Display the banner in dimmed colors since we're in interactive mode
         self.display_banner()?;
         self.init_state(true).await?;
@@ -392,12 +396,6 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                 }
             }
             return Ok(());
-        }
-
-        // Bare --tui must enter a visible alternate interactive surface before
-        // any classic prompt is shown.
-        if self.cli.starts_tui_interactive() {
-            return self.run_tui_interactive().await;
         }
 
         // Get initial input from prompt
@@ -4020,6 +4018,11 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         self.spinner.stop(None)?;
         self.spinner.reset();
         let mut session = forge_tui::interactive_session()?;
+        session.render()?;
+        self.init_state(true).await?;
+        self.trace_user();
+        self.hydrate_caches();
+        self.init_conversation().await?;
         session.render()?;
 
         loop {
