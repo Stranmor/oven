@@ -4019,15 +4019,15 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         self.spinner.reset();
         let mut session = forge_tui::interactive_session()?;
         session.render()?;
-        self.init_state(true).await?;
-        self.trace_user();
-        self.hydrate_caches();
-        self.init_conversation().await?;
-        session.render()?;
+        let mut initialized = false;
 
         loop {
             match session.read_input()? {
                 forge_tui::TuiInput::Submitted(input) => {
+                    if !initialized {
+                        self.init_tui_interactive_state(&mut session).await?;
+                        initialized = true;
+                    }
                     tracker::prompt(input.clone());
                     let command = self.command.parse(&input)?;
                     match command {
@@ -4048,6 +4048,18 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                 forge_tui::TuiInput::Exit => return Ok(()),
             }
         }
+    }
+
+    async fn init_tui_interactive_state(
+        &mut self,
+        session: &mut impl forge_tui::TuiRenderer,
+    ) -> Result<()> {
+        self.init_state(true).await?;
+        self.trace_user();
+        self.hydrate_caches();
+        self.init_conversation().await?;
+        session.queue_and_render(forge_ui_model::UiModel::default())?;
+        Ok(())
     }
 
     async fn on_tui_message_with_session(

@@ -135,6 +135,7 @@ impl InteractiveTuiSession {
         self.terminal.draw(|frame| {
             draw_dashboard(frame, &self.model, Some(self.input.as_str()));
         })?;
+        self.terminal.backend_mut().flush()?;
         Ok(())
     }
 
