@@ -434,12 +434,16 @@ mod tests {
 
     use super::*;
     use crate::reader::ConfigReader;
+    use crate::{
+        EnvVarName, TelegramChatId, TelegramCompletionNotification,
+        TelegramCompletionNotificationBackend,
+    };
 
     #[test]
     fn test_f32_temperature_round_trip() {
         let fixture = ForgeConfig { temperature: Some(Decimal(0.1)), ..Default::default() };
 
-        let toml = toml_edit::ser::to_string_pretty(&fixture).unwrap();
+        let toml = toml_edit::ser::to_string_pretty(&fixture).expect("config fixture should build");
 
         assert!(
             toml.contains("temperature = 0.1\n"),
@@ -451,7 +455,7 @@ mod tests {
     fn test_f32_top_p_round_trip() {
         let fixture = ForgeConfig { top_p: Some(Decimal(0.9)), ..Default::default() };
 
-        let toml = toml_edit::ser::to_string_pretty(&fixture).unwrap();
+        let toml = toml_edit::ser::to_string_pretty(&fixture).expect("config fixture should build");
 
         assert!(
             toml.contains("top_p = 0.9\n"),
@@ -463,9 +467,12 @@ mod tests {
     fn test_f32_temperature_deserialize_round_trip() {
         let fixture = ForgeConfig { temperature: Some(Decimal(0.1)), ..Default::default() };
 
-        let toml = toml_edit::ser::to_string_pretty(&fixture).unwrap();
+        let toml = toml_edit::ser::to_string_pretty(&fixture).expect("config fixture should build");
 
-        let actual = ConfigReader::default().read_toml(&toml).build().unwrap();
+        let actual = ConfigReader::default()
+            .read_toml(&toml)
+            .build()
+            .expect("config fixture should build");
 
         assert_eq!(actual.temperature, fixture.temperature);
     }
@@ -476,7 +483,10 @@ mod tests {
 completion_notification = "bell"
 "#;
 
-        let actual = ConfigReader::default().read_toml(fixture).build().unwrap();
+        let actual = ConfigReader::default()
+            .read_toml(fixture)
+            .build()
+            .expect("config fixture should build");
 
         let expected = Some(CompletionNotification::Bell);
         assert_eq!(actual.completion_notification, expected);
@@ -488,15 +498,92 @@ completion_notification = "bell"
 completion_notification = "desktop"
 "#;
 
-        let actual = ConfigReader::default().read_toml(fixture).build().unwrap();
+        let actual = ConfigReader::default()
+            .read_toml(fixture)
+            .build()
+            .expect("config fixture should build");
 
         let expected = Some(CompletionNotification::Desktop);
         assert_eq!(actual.completion_notification, expected);
     }
 
     #[test]
+    fn test_completion_notification_telegram_deserialize_round_trip() {
+        let fixture = r#"
+[completion_notification]
+backend = "telegram"
+chat_id = "432567587"
+token_env_var = "CUSTOM_TELEGRAM_TOKEN"
+chat_id_env_var = "CUSTOM_TELEGRAM_CHAT_ID"
+"#;
+
+        let actual = ConfigReader::default()
+            .read_toml(fixture)
+            .build()
+            .expect("config fixture should build");
+
+        let expected = Some(CompletionNotification::Telegram(
+            TelegramCompletionNotification {
+                backend: TelegramCompletionNotificationBackend::Telegram,
+                chat_id: Some(
+                    TelegramChatId::new("432567587").expect("telegram chat id should be valid"),
+                ),
+                token_env_var: EnvVarName::new("CUSTOM_TELEGRAM_TOKEN")
+                    .expect("token env var name should be valid"),
+                chat_id_env_var: EnvVarName::new("CUSTOM_TELEGRAM_CHAT_ID")
+                    .expect("chat id env var name should be valid"),
+            },
+        ));
+        assert_eq!(actual.completion_notification, expected);
+    }
+
+    #[test]
+    fn test_completion_notification_telegram_string_uses_default_env_vars() {
+        let fixture = r#"
+completion_notification = "telegram"
+"#;
+
+        let actual = ConfigReader::default()
+            .read_toml(fixture)
+            .build()
+            .expect("config fixture should build");
+
+        let expected = Some(CompletionNotification::Telegram(
+            TelegramCompletionNotification::default(),
+        ));
+        assert_eq!(actual.completion_notification, expected);
+    }
+
+    #[test]
+    fn test_completion_notification_telegram_serializes_as_table_without_secret() {
+        let fixture = ForgeConfig {
+            completion_notification: Some(CompletionNotification::Telegram(
+                TelegramCompletionNotification {
+                    chat_id: Some(
+                        TelegramChatId::new("432567587").expect("telegram chat id should be valid"),
+                    ),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+
+        let actual =
+            toml_edit::ser::to_string_pretty(&fixture).expect("config fixture should build");
+
+        assert!(actual.contains("[completion_notification]\n"));
+        assert!(actual.contains("backend = \"telegram\"\n"));
+        assert!(actual.contains("chat_id = \"432567587\"\n"));
+        assert!(actual.contains("token_env_var = \"FORGE_TELEGRAM_BOT_TOKEN\"\n"));
+        assert!(!actual.contains("secret-token"));
+    }
+
+    #[test]
     fn test_default_completion_notification_is_desktop() {
-        let actual = ConfigReader::default().read_defaults().build().unwrap();
+        let actual = ConfigReader::default()
+            .read_defaults()
+            .build()
+            .expect("config fixture should build");
 
         let expected = Some(CompletionNotification::Desktop);
         assert_eq!(actual.completion_notification, expected);
@@ -532,7 +619,10 @@ supports_reasoning = false
 input_modalities = ["text"]
 "#;
 
-        let actual = ConfigReader::default().read_toml(fixture).build().unwrap();
+        let actual = ConfigReader::default()
+            .read_toml(fixture)
+            .build()
+            .expect("config fixture should build");
 
         let expected = vec![ProviderEntry {
             id: "ollama".to_string(),
@@ -575,7 +665,10 @@ url = "http://example.com/v1/chat/completions"
 models = "http://example.com/v1/models"
 "#;
 
-        let actual = ConfigReader::default().read_toml(fixture).build().unwrap();
+        let actual = ConfigReader::default()
+            .read_toml(fixture)
+            .build()
+            .expect("config fixture should build");
 
         let expected = vec![ProviderEntry {
             id: "my_provider".to_string(),

@@ -511,7 +511,7 @@
     },
     "CompletionNotification": {
       "description": "Session completion notification backend.",
-      "oneOf": [
+      "anyOf": [
         {
           "description": "Emits a terminal bell character when the main session completes.",
           "type": "string",
@@ -521,6 +521,15 @@
           "description": "Emits an operating-system desktop notification when the main session completes.",
           "type": "string",
           "const": "desktop"
+        },
+        {
+          "description": "Sends a Telegram Bot API message when the main session completes using default environment variable names.",
+          "type": "string",
+          "const": "telegram"
+        },
+        {
+          "description": "Sends a Telegram Bot API message using table-style settings.",
+          "$ref": "#/$defs/TelegramCompletionNotification"
         }
       ]
     },
@@ -563,6 +572,12 @@
           "const": "max"
         }
       ]
+    },
+    "EnvVarName": {
+      "description": "Environment variable name.",
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^=\\u0000]+$"
     },
     "HttpConfig": {
       "description": "HTTP client configuration.",
@@ -1029,6 +1044,53 @@
         "max_attempts",
         "status_codes",
         "suppress_errors"
+      ]
+    },
+    "TelegramChatId": {
+      "description": "Telegram chat identifier.",
+      "type": "string",
+      "minLength": 1
+    },
+    "TelegramCompletionNotification": {
+      "description": "Telegram completion notification settings.",
+      "type": "object",
+      "properties": {
+        "backend": {
+          "description": "Telegram backend discriminator for table-style configuration.",
+          "$ref": "#/$defs/TelegramCompletionNotificationBackend",
+          "default": "telegram"
+        },
+        "chat_id": {
+          "description": "Telegram chat identifier that receives completion messages.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TelegramChatId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "chat_id_env_var": {
+          "description": "Environment variable containing the Telegram chat id when `chat_id` is\nabsent.",
+          "$ref": "#/$defs/EnvVarName",
+          "default": "FORGE_TELEGRAM_CHAT_ID"
+        },
+        "token_env_var": {
+          "description": "Environment variable containing the Telegram bot token.",
+          "$ref": "#/$defs/EnvVarName",
+          "default": "FORGE_TELEGRAM_BOT_TOKEN"
+        }
+      }
+    },
+    "TelegramCompletionNotificationBackend": {
+      "description": "Telegram completion notification backend discriminator.",
+      "oneOf": [
+        {
+          "description": "Telegram Bot API backend.",
+          "type": "string",
+          "const": "telegram"
+        }
       ]
     },
     "TlsBackend": {

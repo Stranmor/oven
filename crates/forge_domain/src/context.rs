@@ -238,7 +238,8 @@ impl ContextMessage {
         }
     }
 
-    /// Returns whether this context message is eligible for provider prompt-cache markers.
+    /// Returns whether this context message is eligible for provider
+    /// prompt-cache markers.
     pub fn is_cache_eligible(&self) -> bool {
         match self {
             ContextMessage::Text(message) => message.is_cache_eligible(),
@@ -345,8 +346,8 @@ pub struct TextMessage {
     /// Overrides provider prompt-cache eligibility for volatile context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cacheable: Option<bool>,
-    /// Semantic kind for agent-internal context messages that must be distinguished
-    /// from real user text.
+    /// Semantic kind for agent-internal context messages that must be
+    /// distinguished from real user text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<TextMessageKind>,
 }
@@ -384,7 +385,8 @@ impl TextMessage {
         self.role == role
     }
 
-    /// Returns whether this message is eligible for provider prompt-cache markers.
+    /// Returns whether this message is eligible for provider prompt-cache
+    /// markers.
     pub fn is_cache_eligible(&self) -> bool {
         self.cacheable.unwrap_or(true)
     }
@@ -458,7 +460,8 @@ impl std::ops::DerefMut for MessageEntry {
 pub struct Context {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<ConversationId>,
-    /// Indicates whether the current conversation turn is user- or agent-initiated.
+    /// Indicates whether the current conversation turn is user- or
+    /// agent-initiated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initiator: Option<Initiator>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -477,6 +480,11 @@ pub struct Context {
     pub top_k: Option<TopK>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<crate::ReasoningConfig>,
+    /// Selected model context length carried from resolved provider metadata
+    /// for final provider-side request guards. This is runtime safety
+    /// metadata, not a provider payload field.
+    #[serde(default, skip)]
+    pub model_context_length: Option<u64>,
     /// Controls whether responses should be streamed. When `true`, responses
     /// are delivered incrementally as they're generated. When `false`, the
     /// complete response is returned at once. Defaults to `true` if not
@@ -894,6 +902,13 @@ mod tests {
     use crate::transformer::Transformer;
     use crate::{DirectoryEntry, FileInfo, estimate_token_count};
 
+    fn message_at(context: &Context, index: usize) -> &MessageEntry {
+        context
+            .messages
+            .get(index)
+            .expect("expected message at index")
+    }
+
     #[test]
     fn test_override_system_message() {
         let request = Context::default()
@@ -901,7 +916,7 @@ mod tests {
             .set_system_messages(vec!["Updated system message"]);
 
         assert_eq!(
-            request.messages[0],
+            *message_at(&request, 0),
             ContextMessage::system("Updated system message").into(),
         );
     }
@@ -911,7 +926,7 @@ mod tests {
         let request = Context::default().set_system_messages(vec!["A system message"]);
 
         assert_eq!(
-            request.messages[0],
+            *message_at(&request, 0),
             ContextMessage::system("A system message").into(),
         );
     }
@@ -924,7 +939,7 @@ mod tests {
             .set_system_messages(vec!["A system message"]);
 
         assert_eq!(
-            request.messages[0],
+            *message_at(&request, 0),
             ContextMessage::system("A system message").into(),
         );
     }
@@ -1326,7 +1341,7 @@ mod tests {
         assert_eq!(actual.messages.len(), 1);
 
         // Verify the message is droppable
-        let message = &actual.messages[0];
+        let message = message_at(&actual, 0);
         assert!(
             message.is_droppable(),
             "File content attachments should be marked as droppable"
@@ -1351,7 +1366,7 @@ mod tests {
 
         // Verify the image message is NOT droppable (images use different
         // ContextMessage variant)
-        let message = &actual.messages[0];
+        let message = message_at(&actual, 0);
         assert!(
             !message.is_droppable(),
             "Image attachments should not be marked as droppable"
@@ -1410,7 +1425,10 @@ mod tests {
         assert_eq!(actual.messages.len(), 1);
 
         // Verify directory listing is formatted correctly as XML
-        let message = actual.messages.first().unwrap();
+        let message = actual
+            .messages
+            .first()
+            .expect("expected directory listing message");
         assert!(
             message.is_droppable(),
             "Directory listing should be marked as droppable"
@@ -1502,7 +1520,11 @@ mod tests {
         }];
 
         let actual = Context::default().add_attachments(fixture_attachments, None);
-        let text = actual.messages.first().unwrap().to_text();
+        let text = actual
+            .messages
+            .first()
+            .expect("expected directory listing message")
+            .to_text();
 
         // Extract the order of entries from the XML
         let dir_entries: Vec<&str> = text
@@ -1521,12 +1543,13 @@ mod tests {
         ];
 
         for (i, expected) in expected_order.iter().enumerate() {
+            let actual = dir_entries.get(i).expect("expected directory entry");
             assert!(
-                dir_entries[i].starts_with(expected),
+                actual.starts_with(expected),
                 "Expected entry {} to start with '{}', but got '{}'",
                 i,
                 expected,
-                dir_entries[i]
+                actual
             );
         }
     }

@@ -9,8 +9,8 @@ use strum::IntoEnumIterator;
 use super::response::{ExtraContent, FunctionCall, ToolCall};
 use super::tool_choice::ToolChoice;
 use crate::domain::{
-    Context, ContextMessage, ModelId, ToolCallFull, ToolCallId, ToolCatalog, ToolDefinition,
-    ToolName, ToolResult, ToolValue,
+    Context, ContextMessage, ContextWindowBudget, ModelId, ToolCallFull, ToolCallId, ToolCatalog,
+    ToolDefinition, ToolName, ToolResult, ToolValue,
 };
 use crate::dto::openai::ReasoningDetail;
 
@@ -94,6 +94,15 @@ impl MessageContent {
             }),
         }
     }
+
+    fn media_token_padding(&self) -> usize {
+        match self {
+            MessageContent::Text(_) => 0,
+            MessageContent::Parts(parts) => {
+                parts.iter().map(ContentPart::media_token_padding).sum()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -132,6 +141,19 @@ impl ContentPart {
             }
             ContentPart::ImageUrl { cache_control, .. } => {
                 *cache_control = src_cache_control;
+            }
+        }
+    }
+
+    fn media_token_padding(&self) -> usize {
+        match self {
+            ContentPart::Text { .. } => 0,
+            ContentPart::ImageUrl { image_url, .. } => {
+                if image_url.url.trim_start().starts_with("data:") {
+                    image_url.url.len().div_ceil(3)
+                } else {
+                    2_048
+                }
             }
         }
     }
@@ -290,6 +312,8 @@ pub struct Request {
     pub thinking: Option<ThinkingConfig>,
     #[serde(skip)]
     pub message_cache_eligibility: Vec<bool>,
+    #[serde(skip)]
+    pub context_window: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -304,7 +328,9 @@ impl Request {
                 for part in parts {
                     if let ContentPart::ImageUrl { image_url, .. } = part {
                         let trimmed_url = image_url.url.trim();
-                        if trimmed_url.len() >= 5 && trimmed_url[..5].eq_ignore_ascii_case("data:")
+                        if trimmed_url
+                            .get(.."data:".len())
+                            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"))
                         {
                             image_url.url =
                                 crate::domain::Image::canonicalize_data_url(&image_url.url)?;
@@ -334,12 +360,100 @@ impl Request {
             .unwrap_or(0)
     }
 
-    /// Returns whether the provider message at `index` may receive a prompt-cache marker.
+    /// Returns whether the provider message at `index` may receive a
+    /// prompt-cache marker.
     pub fn is_message_cache_eligible(&self, index: usize) -> bool {
         self.message_cache_eligibility
             .get(index)
             .copied()
             .unwrap_or(true)
+    }
+
+    /// Returns the output-token reservation encoded by this provider request.
+    pub fn output_token_reservation(&self) -> usize {
+        self.max_completion_tokens
+            .or(self.max_tokens)
+            .and_then(|tokens| usize::try_from(tokens).ok())
+            .unwrap_or(ContextWindowBudget::DEFAULT_OUTPUT_TOKEN_RESERVATION)
+    }
+
+    /// Returns a conservative estimate of the request input tokens after
+    /// provider pipeline transformations and JSON serialization.
+    ///
+    /// # Arguments
+    /// * `serialized_request` - Final JSON payload bytes that would be sent to
+    ///   the provider.
+    pub fn estimated_input_tokens_from_serialized(&self, serialized_request: &[u8]) -> usize {
+        serialized_request
+            .len()
+            .saturating_add(self.media_token_padding())
+    }
+
+    /// Validates that the final serialized provider request fits the known
+    /// model context window.
+    ///
+    /// # Arguments
+    /// * `serialized_request` - Final JSON payload bytes that would be sent to
+    ///   the provider.
+    ///
+    /// # Errors
+    /// Returns a local actionable error when context-window safety cannot be
+    /// proven or the final request is too large.
+    pub fn validate_context_window(&self, serialized_request: &[u8]) -> anyhow::Result<()> {
+        let context_window = self
+            .context_window
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "OpenAI-compatible context-window guard cannot prove safety for model '{}' because context_length metadata is missing. Add context_length to the model metadata or select a model with known context window.",
+                    self.model
+                        .as_ref()
+                        .map(|model| model.as_str())
+                        .unwrap_or("<unknown>")
+                )
+            })?;
+
+        let output_reservation = self.output_token_reservation();
+        let context_budget = ContextWindowBudget::new(context_window, output_reservation);
+        let input_budget = context_budget.effective_input_budget().ok_or_else(|| {
+            anyhow::anyhow!(
+                "OpenAI-compatible context-window guard blocked request for model '{}'. Context window is {} tokens, reserved output is {} tokens, and safety margin is {} tokens, leaving no safe prompt budget. Lower max_tokens/max_completion_tokens or select a larger-context model.",
+                self.model
+                    .as_ref()
+                    .map(|model| model.as_str())
+                    .unwrap_or("<unknown>"),
+                context_budget.context_window(),
+                context_budget.output_reservation(),
+                context_budget.safety_margin()
+            )
+        })?;
+        let estimated_input = self.estimated_input_tokens_from_serialized(serialized_request);
+
+        if estimated_input <= input_budget {
+            return Ok(());
+        }
+
+        anyhow::bail!(
+            "OpenAI-compatible context-window guard blocked an oversized request before HTTP dispatch. Model '{}' has context window {} tokens; reserved output is {} tokens; safety margin is {} tokens; effective input budget is {} tokens; final serialized request estimate is {} tokens. Reduce context, lower max_tokens/max_completion_tokens, or select a larger-context model.",
+            self.model
+                .as_ref()
+                .map(|model| model.as_str())
+                .unwrap_or("<unknown>"),
+            context_budget.context_window(),
+            context_budget.output_reservation(),
+            context_budget.safety_margin(),
+            input_budget,
+            estimated_input
+        )
+    }
+
+    fn media_token_padding(&self) -> usize {
+        self.messages
+            .iter()
+            .flatten()
+            .flat_map(|message| message.content.as_ref())
+            .map(MessageContent::media_token_padding)
+            .sum()
     }
 }
 
@@ -453,6 +567,7 @@ impl From<Context> for Request {
             max_completion_tokens: Default::default(),
             thinking: Default::default(),
             message_cache_eligibility,
+            context_window: context.model_context_length,
         }
     }
 }
@@ -609,6 +724,152 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn test_context_window_guard_counts_max_completion_tokens_after_pipeline_mapping() {
+        let fixture = Request {
+            model: Some(ModelId::new("context-guard-model")),
+            messages: Some(vec![Message {
+                role: super::Role::User,
+                content: Some(MessageContent::Text("short".to_string())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_details: None,
+                reasoning_text: None,
+                reasoning_opaque: None,
+                reasoning_content: None,
+                extra_content: None,
+            }]),
+            max_completion_tokens: Some(7_000),
+            context_window: Some(8_000),
+            ..Default::default()
+        };
+        let serialized = serde_json::to_vec(&fixture).unwrap();
+
+        let actual = fixture
+            .validate_context_window(&serialized)
+            .unwrap_err()
+            .to_string();
+        let expected = true;
+
+        assert_eq!(actual.contains("leaving no safe prompt budget"), expected);
+    }
+
+    #[test]
+    fn test_context_window_guard_blocks_high_output_budget_oversized_request() {
+        let fixture = Request {
+            model: Some(ModelId::new("context-guard-model")),
+            messages: Some(vec![Message {
+                role: super::Role::User,
+                content: Some(MessageContent::Text("x".repeat(920_000))),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_details: None,
+                reasoning_text: None,
+                reasoning_opaque: None,
+                reasoning_content: None,
+                extra_content: None,
+            }]),
+            max_completion_tokens: Some(60_000),
+            context_window: Some(266_300),
+            ..Default::default()
+        };
+        let serialized = serde_json::to_vec(&fixture).unwrap();
+
+        let actual = fixture.validate_context_window(&serialized);
+
+        assert!(actual.is_err());
+    }
+
+    #[test]
+    fn test_context_window_guard_must_not_divide_ascii_text_below_character_count() {
+        let content = "x ".repeat(4_500);
+        let fixture = Request {
+            model: Some(ModelId::new("context-guard-model")),
+            messages: Some(vec![Message {
+                role: super::Role::User,
+                content: Some(MessageContent::Text(content.clone())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_details: None,
+                reasoning_text: None,
+                reasoning_opaque: None,
+                reasoning_content: None,
+                extra_content: None,
+            }]),
+            context_window: Some(12_000),
+            max_completion_tokens: Some(512),
+            ..Default::default()
+        };
+        let serialized = serde_json::to_vec(&fixture).unwrap();
+
+        let actual =
+            fixture.estimated_input_tokens_from_serialized(&serialized) >= content.chars().count();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_context_window_guard_includes_tool_and_media_padding() {
+        let request_without_media = Request {
+            model: Some(ModelId::new("context-guard-model")),
+            messages: Some(vec![Message {
+                role: super::Role::User,
+                content: Some(MessageContent::Text("short".to_string())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_details: None,
+                reasoning_text: None,
+                reasoning_opaque: None,
+                reasoning_content: None,
+                extra_content: None,
+            }]),
+            tools: Some(vec![Tool::Function {
+                function: FunctionDescription {
+                    description: Some("x".repeat(12_000)),
+                    name: ToolName::new("large_tool"),
+                    parameters: schemars::schema_for!(()),
+                },
+            }]),
+            context_window: Some(64_000),
+            ..Default::default()
+        };
+        let fixture = Request {
+            messages: Some(vec![Message {
+                role: super::Role::User,
+                content: Some(MessageContent::Parts(vec![ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "https://example.com/image.png".to_string(),
+                        detail: None,
+                    },
+                    cache_control: None,
+                }])),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_details: None,
+                reasoning_text: None,
+                reasoning_opaque: None,
+                reasoning_content: None,
+                extra_content: None,
+            }]),
+            ..request_without_media.clone()
+        };
+        let serialized_without_media = serde_json::to_vec(&request_without_media).unwrap();
+        let serialized_with_media = serde_json::to_vec(&fixture).unwrap();
+
+        let actual = fixture.estimated_input_tokens_from_serialized(&serialized_with_media)
+            > request_without_media
+                .estimated_input_tokens_from_serialized(&serialized_without_media);
+        let expected = true;
+
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn validate_and_canonicalize_images_rejects_unsupported_mime() {

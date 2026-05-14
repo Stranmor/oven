@@ -838,6 +838,7 @@ impl TryFrom<ContextRecord> for Context {
             top_p: record.top_p.map(forge_domain::TopP::new_unchecked),
             top_k: record.top_k.map(forge_domain::TopK::new_unchecked),
             reasoning: record.reasoning.map(Into::into),
+            model_context_length: None,
             stream: record.stream,
             response_format: None,
             frequency_penalty: record.frequency_penalty,

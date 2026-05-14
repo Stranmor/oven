@@ -5359,15 +5359,27 @@ fn queue_tui_response_and_notify<W: Write>(
         return Ok(());
     }
 
-    session.queue_and_render(forge_ui_model::UiModel::from(message))?;
-    if let ChatResponse::ToolCallStart { notifier, .. } = message {
-        notifier.notify_one();
+    struct NotifyGuard<'a>(&'a tokio::sync::Notify);
+    impl Drop for NotifyGuard<'_> {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
     }
+
+    let notify_guard = if let ChatResponse::ToolCallStart { notifier, .. } = message {
+        Some(NotifyGuard(notifier))
+    } else {
+        None
+    };
+
+    session.queue_and_render(forge_ui_model::UiModel::from(message))?;
+    drop(notify_guard);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, Write};
     use std::sync::Arc;
 
     use forge_domain::ToolCallFull;
@@ -5376,6 +5388,18 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
+
+    struct FailingWrite;
+
+    impl Write for FailingWrite {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("write failed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn test_tui_tool_start_notifier_fires_after_render_queue() {
@@ -5391,6 +5415,23 @@ mod tests {
             String::from_utf8(setup.into_output())
                 .unwrap()
                 .contains("shell started"),
+            notifier.notified().now_or_never().is_some(),
+        );
+        let expected = (true, true);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_tui_tool_start_notifier_fires_even_when_render_fails() {
+        let notifier = Arc::new(Notify::new());
+        let fixture = ChatResponse::ToolCallStart {
+            tool_call: ToolCallFull::new("shell"),
+            notifier: notifier.clone(),
+        };
+        let mut setup = forge_tui::TuiSession::new(FailingWrite, 64, 9);
+
+        let actual = (
+            queue_tui_response_and_notify(&mut setup, &fixture).is_err(),
             notifier.notified().now_or_never().is_some(),
         );
         let expected = (true, true);
