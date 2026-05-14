@@ -6,7 +6,10 @@
 
 use std::time::Duration;
 
-use forge_domain::{Category, ChatResponse, ChatResponseContent, InterruptionReason, ToolResult};
+use forge_domain::{
+    Category, ChatResponse, ChatResponseContent, InterruptionReason, ToolCallArguments,
+    ToolCallFull, ToolResult,
+};
 
 /// A complete append-only render document for one UI surface refresh.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -52,6 +55,8 @@ pub enum UiBlock {
     ToolOutput(String),
     /// Tool lifecycle status emitted from typed tool events.
     ToolStatus(UiToolStatus),
+    /// Rich tool detail payload for the side/detail pane.
+    ToolDetail(UiToolDetail),
     /// Retry status emitted from typed retry events.
     Retry { cause: String, delay: UiRetryDelay },
     /// Task completion marker.
@@ -71,6 +76,7 @@ impl UiBlock {
             | UiBlock::Interrupt(text) => text.clone(),
             UiBlock::ToolInput(title) => title.display_text(),
             UiBlock::ToolStatus(status) => status.display_text(),
+            UiBlock::ToolDetail(detail) => detail.display_text(),
             UiBlock::Retry { cause, delay } => {
                 format!("retry in {}: {cause}", delay.display_text())
             }
@@ -101,7 +107,8 @@ impl UiTitle {
     }
 }
 
-/// Presentation-safe retry delay that preserves duration semantics across UI boundaries.
+/// Presentation-safe retry delay that preserves duration semantics across UI
+/// boundaries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UiRetryDelay(Duration);
 
@@ -160,6 +167,71 @@ impl From<&Category> for UiCategory {
     }
 }
 
+/// Rich tool detail for renderers with a detail/output pane.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UiToolDetail {
+    /// Optional provider/model call ID associated with the tool event.
+    pub call_id: Option<String>,
+    /// Tool name from the typed domain event.
+    pub name: String,
+    /// Tool arguments rendered as deterministic JSON/text.
+    pub arguments: Option<String>,
+    /// Tool output rendered as deterministic text.
+    pub output: Option<String>,
+    /// True when the tool output represents a failure.
+    pub is_error: bool,
+}
+
+impl UiToolDetail {
+    /// Formats rich tool detail as a deterministic fallback string.
+    pub fn display_text(&self) -> String {
+        let mut parts = vec![self.name.clone()];
+        if let Some(call_id) = &self.call_id {
+            parts.push(format!("call_id={call_id}"));
+        }
+        if let Some(arguments) = &self.arguments {
+            parts.push(format!("args={arguments}"));
+        }
+        if let Some(output) = &self.output {
+            parts.push(format!("output={output}"));
+        }
+        if self.is_error {
+            parts.push("error=true".to_string());
+        }
+        parts.join(" ")
+    }
+}
+
+impl From<&ToolCallFull> for UiToolDetail {
+    fn from(value: &ToolCallFull) -> Self {
+        Self {
+            call_id: value
+                .call_id
+                .as_ref()
+                .map(|call_id| call_id.as_str().to_string()),
+            name: value.name.as_str().to_string(),
+            arguments: Some(format_tool_arguments(&value.arguments)),
+            output: None,
+            is_error: false,
+        }
+    }
+}
+
+impl From<&ToolResult> for UiToolDetail {
+    fn from(value: &ToolResult) -> Self {
+        Self {
+            call_id: value
+                .call_id
+                .as_ref()
+                .map(|call_id| call_id.as_str().to_string()),
+            name: value.name.as_str().to_string(),
+            arguments: None,
+            output: value.output.as_str().map(ToString::to_string),
+            is_error: value.is_error(),
+        }
+    }
+}
+
 /// Tool lifecycle phase represented without parsing stdout.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UiToolPhase {
@@ -213,12 +285,10 @@ impl From<&ChatResponse> for UiBlock {
             },
             ChatResponse::TaskReasoning { content } => UiBlock::Reasoning(content.clone()),
             ChatResponse::TaskComplete => UiBlock::Completion,
-            ChatResponse::ToolCallStart { tool_call, .. } => UiBlock::ToolStatus(UiToolStatus {
-                name: tool_call.name.as_str().to_string(),
-                phase: UiToolPhase::Started,
-                summary: None,
-            }),
-            ChatResponse::ToolCallEnd(result) => UiBlock::ToolStatus(tool_result_status(result)),
+            ChatResponse::ToolCallStart { tool_call, .. } => {
+                UiBlock::ToolDetail(UiToolDetail::from(tool_call))
+            }
+            ChatResponse::ToolCallEnd(result) => UiBlock::ToolDetail(UiToolDetail::from(result)),
             ChatResponse::RetryAttempt { cause, duration } => UiBlock::Retry {
                 cause: cause.as_str().to_string(),
                 delay: UiRetryDelay::from_duration(*duration),
@@ -228,15 +298,49 @@ impl From<&ChatResponse> for UiBlock {
     }
 }
 
+fn blocks_from_response(value: &ChatResponse) -> Vec<UiBlock> {
+    match value {
+        ChatResponse::ToolCallStart { tool_call, .. } => vec![
+            UiBlock::ToolStatus(UiToolStatus {
+                name: tool_call.name.as_str().to_string(),
+                phase: UiToolPhase::Started,
+                summary: None,
+            }),
+            UiBlock::ToolDetail(UiToolDetail::from(tool_call)),
+        ],
+        ChatResponse::ToolCallEnd(result) => vec![
+            UiBlock::ToolStatus(tool_result_status(result)),
+            UiBlock::ToolDetail(UiToolDetail::from(result)),
+        ],
+        _ => vec![UiBlock::from(value)],
+    }
+}
+
+impl From<&ChatResponse> for UiModel {
+    fn from(value: &ChatResponse) -> Self {
+        if value.is_empty() {
+            return UiModel::default();
+        }
+        UiModel::new(blocks_from_response(value))
+    }
+}
+
 impl From<&[ChatResponse]> for UiModel {
     fn from(value: &[ChatResponse]) -> Self {
         UiModel::new(
             value
                 .iter()
                 .filter(|response| !response.is_empty())
-                .map(UiBlock::from)
+                .flat_map(blocks_from_response)
                 .collect(),
         )
+    }
+}
+
+fn format_tool_arguments(arguments: &ToolCallArguments) -> String {
+    match arguments {
+        ToolCallArguments::Unparsed(value) => value.clone(),
+        ToolCallArguments::Parsed(value) => value.to_string(),
     }
 }
 
@@ -261,7 +365,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use forge_domain::{ChatResponseContent, ToolCallFull, ToolResult};
+    use forge_domain::{ChatResponseContent, ToolCallFull, ToolCallId, ToolResult};
     use pretty_assertions::assert_eq;
     use tokio::sync::Notify;
 
@@ -296,10 +400,70 @@ mod tests {
                 phase: UiToolPhase::Started,
                 summary: None,
             }),
+            UiBlock::ToolDetail(UiToolDetail {
+                call_id: None,
+                name: "shell".to_string(),
+                arguments: Some("{}".to_string()),
+                output: None,
+                is_error: false,
+            }),
             UiBlock::ToolStatus(UiToolStatus {
                 name: "shell".to_string(),
                 phase: UiToolPhase::Finished,
                 summary: Some("exit 0".to_string()),
+            }),
+            UiBlock::ToolDetail(UiToolDetail {
+                call_id: None,
+                name: "shell".to_string(),
+                arguments: None,
+                output: Some("exit 0".to_string()),
+                is_error: false,
+            }),
+        ]);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_tool_detail_maps_call_id_arguments_and_output() {
+        let start = ChatResponse::ToolCallStart {
+            tool_call: ToolCallFull::new("shell")
+                .call_id(ToolCallId::new("call-1"))
+                .arguments(serde_json::json!({"command":"true"})),
+            notifier: Arc::new(Notify::new()),
+        };
+        let end = ChatResponse::ToolCallEnd(
+            ToolResult::new("shell")
+                .call_id(Some(ToolCallId::new("call-1")))
+                .success("exit 0"),
+        );
+        let fixture = [start, end];
+
+        let actual = UiModel::from(fixture.as_slice());
+
+        let expected = UiModel::new(vec![
+            UiBlock::ToolStatus(UiToolStatus {
+                name: "shell".to_string(),
+                phase: UiToolPhase::Started,
+                summary: None,
+            }),
+            UiBlock::ToolDetail(UiToolDetail {
+                call_id: Some("call-1".to_string()),
+                name: "shell".to_string(),
+                arguments: Some("{\"command\":\"true\"}".to_string()),
+                output: None,
+                is_error: false,
+            }),
+            UiBlock::ToolStatus(UiToolStatus {
+                name: "shell".to_string(),
+                phase: UiToolPhase::Finished,
+                summary: Some("exit 0".to_string()),
+            }),
+            UiBlock::ToolDetail(UiToolDetail {
+                call_id: Some("call-1".to_string()),
+                name: "shell".to_string(),
+                arguments: None,
+                output: Some("exit 0".to_string()),
+                is_error: false,
             }),
         ]);
         assert_eq!(actual, expected);

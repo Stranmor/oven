@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -34,7 +35,9 @@ use crate::cli::{
     Cli, CommitCommandGroup, ConversationCommand, ListCommand, McpCommand, SelectCommand,
     TaskCommand, TopLevelCommand,
 };
-use crate::completion_notification::play_completion_notification;
+use crate::completion_notification::{
+    CompletionNotificationContext, play_completion_notification, project_label,
+};
 use crate::conversation_selector::ConversationSelector;
 use crate::display_constants::{CommandType, headers, markers, status};
 use crate::editor::ReadLineError;
@@ -4050,6 +4053,10 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
     }
 
     async fn on_chat(&mut self, chat: ChatRequest) -> Result<()> {
+        if self.cli.tui {
+            return self.on_tui_chat(chat).await;
+        }
+
         let mut stream = self.api.chat(chat).await?;
 
         // Always use streaming content writer
@@ -4071,6 +4078,121 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         self.spinner.stop(None)?;
         self.spinner.reset();
 
+        Ok(())
+    }
+
+    async fn on_tui_chat(&mut self, chat: ChatRequest) -> Result<()> {
+        self.spinner.stop(None)?;
+        self.spinner.reset();
+        let mut stream = self.api.chat(chat).await?;
+        let mut session = forge_tui::stdout_session();
+
+        while let Some(message) = stream.next().await {
+            match message {
+                Ok(message) => self.handle_tui_chat_response(message, &mut session).await?,
+                Err(err) => {
+                    self.spinner.stop(None)?;
+                    self.spinner.reset();
+                    return Err(err);
+                }
+            }
+        }
+
+        self.spinner.stop(None)?;
+        self.spinner.reset();
+        Ok(())
+    }
+
+    async fn handle_tui_chat_response<W: Write>(
+        &mut self,
+        message: ChatResponse,
+        session: &mut forge_tui::TuiSession<W>,
+    ) -> Result<()> {
+        if message.is_empty() {
+            return Ok(());
+        }
+
+        queue_tui_response_and_notify(session, &message)?;
+
+        match message {
+            ChatResponse::ToolCallStart { tool_call, .. } => {
+                if tool_call.requires_stdout() {
+                    self.spinner.stop(None)?;
+                }
+            }
+            ChatResponse::ToolCallEnd(toolcall_result) => {
+                let payload = if toolcall_result.is_error() {
+                    let mut r = ToolCallPayload::new(toolcall_result.name.to_string());
+                    if let Some(cause) = toolcall_result.output.as_str() {
+                        r = r.with_cause(cause.to_string());
+                    }
+                    r
+                } else {
+                    ToolCallPayload::new(toolcall_result.name.to_string())
+                };
+                tracker::tool_call(payload);
+            }
+            ChatResponse::TaskComplete => {
+                self.handle_task_complete_side_effects(false).await?;
+            }
+            ChatResponse::Interrupt { reason } => {
+                let title = match reason {
+                    InterruptionReason::MaxRequestPerTurnLimitReached { limit } => {
+                        format!("Maximum request ({limit}) per turn achieved")
+                    }
+                    InterruptionReason::MaxToolFailurePerTurnLimitReached { limit, .. } => {
+                        format!("Maximum tool failure limit ({limit}) reached for this turn")
+                    }
+                };
+
+                self.writeln_title(TitleFormat::action(title))?;
+                let continued = self.should_continue().await?;
+                if !continued && let Some(conversation_id) = self.state.conversation_id {
+                    self.writeln_title(
+                        TitleFormat::debug("Finished").sub_title(conversation_id.into_string()),
+                    )?;
+                }
+            }
+            ChatResponse::TaskMessage { .. }
+            | ChatResponse::TaskReasoning { .. }
+            | ChatResponse::RetryAttempt { .. } => {}
+        }
+
+        Ok(())
+    }
+
+    async fn handle_task_complete_side_effects(&mut self, print_finished: bool) -> Result<()> {
+        let mut title_str = "Finished".to_string();
+        if let Some(conversation_id) = self.state.conversation_id
+            && let Ok(Some(conversation)) = self.api.conversation(&conversation_id).await
+            && let Some(conv_title) = conversation.title
+        {
+            title_str = format!("Finished: {}", conv_title);
+        }
+
+        let notification_context = CompletionNotificationContext::new(title_str.clone())
+            .project(project_label(&self.state.cwd))
+            .conversation_id(
+                self.state
+                    .conversation_id
+                    .as_ref()
+                    .map(|conversation_id| conversation_id.to_string()),
+            );
+        play_completion_notification(
+            self.config.completion_notification.as_ref(),
+            &mut std::io::stdout(),
+            &notification_context,
+        )
+        .await;
+        if print_finished && let Some(conversation_id) = self.state.conversation_id {
+            self.writeln_title(
+                TitleFormat::debug(title_str).sub_title(conversation_id.into_string()),
+            )?;
+        }
+        if let Some(format) = self.config.auto_dump.clone() {
+            let html = matches!(format, forge_config::AutoDumpFormat::Html);
+            self.on_dump(html).await?;
+        }
         Ok(())
     }
 
@@ -4273,28 +4395,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             }
             ChatResponse::TaskComplete => {
                 writer.finish()?;
-                let mut title_str = "Finished".to_string();
-                if let Some(conversation_id) = self.state.conversation_id
-                    && let Ok(Some(conversation)) = self.api.conversation(&conversation_id).await
-                    && let Some(conv_title) = conversation.title
-                {
-                    title_str = format!("Finished: {}", conv_title);
-                }
-
-                play_completion_notification(
-                    self.config.completion_notification.as_ref(),
-                    &mut std::io::stdout(),
-                    &title_str,
-                );
-                if let Some(conversation_id) = self.state.conversation_id {
-                    self.writeln_title(
-                        TitleFormat::debug(title_str).sub_title(conversation_id.into_string()),
-                    )?;
-                }
-                if let Some(format) = self.config.auto_dump.clone() {
-                    let html = matches!(format, forge_config::AutoDumpFormat::Html);
-                    self.on_dump(html).await?;
-                }
+                self.handle_task_complete_side_effects(true).await?;
             }
         }
         Ok(())
@@ -5250,8 +5351,52 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
     }
 }
 
+fn queue_tui_response_and_notify<W: Write>(
+    session: &mut forge_tui::TuiSession<W>,
+    message: &ChatResponse,
+) -> Result<()> {
+    if message.is_empty() {
+        return Ok(());
+    }
+
+    session.queue_and_render(forge_ui_model::UiModel::from(message))?;
+    if let ChatResponse::ToolCallStart { notifier, .. } = message {
+        notifier.notify_one();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use forge_domain::ToolCallFull;
+    use futures::FutureExt;
+    use pretty_assertions::assert_eq;
+    use tokio::sync::Notify;
+
+    use super::*;
+
+    #[test]
+    fn test_tui_tool_start_notifier_fires_after_render_queue() {
+        let notifier = Arc::new(Notify::new());
+        let fixture = ChatResponse::ToolCallStart {
+            tool_call: ToolCallFull::new("shell"),
+            notifier: notifier.clone(),
+        };
+        let mut setup = forge_tui::TuiSession::new(Vec::new(), 64, 9);
+
+        queue_tui_response_and_notify(&mut setup, &fixture).unwrap();
+        let actual = (
+            String::from_utf8(setup.into_output())
+                .unwrap()
+                .contains("shell started"),
+            notifier.notified().now_or_never().is_some(),
+        );
+        let expected = (true, true);
+        assert_eq!(actual, expected);
+    }
+
     // Note: Tests for confirm_delete_conversation are disabled because
     // ForgeSelect::confirm is not easily mockable in the current
     // architecture. The functionality is tested through integration tests

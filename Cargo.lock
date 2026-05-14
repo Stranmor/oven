@@ -2713,6 +2713,8 @@ dependencies = [
  "forge_select",
  "forge_spinner",
  "forge_tracker",
+ "forge_tui",
+ "forge_ui_model",
  "forge_walker",
  "futures",
  "gix",
@@ -2732,6 +2734,7 @@ dependencies = [
  "pretty_assertions",
  "reedline",
  "regex",
+ "reqwest 0.12.28",
  "rustls 0.23.40",
  "serde",
  "serde_json",
@@ -3025,6 +3028,7 @@ dependencies = [
 name = "forge_tui"
 version = "0.1.0"
 dependencies = [
+ "crossterm 0.29.0",
  "forge_ui_model",
  "pretty_assertions",
  "ratatui",
@@ -3037,6 +3041,7 @@ dependencies = [
  "anyhow",
  "forge_domain",
  "pretty_assertions",
+ "serde_json",
  "tokio",
 ]
 

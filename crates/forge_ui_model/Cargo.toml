@@ -14,4 +14,5 @@ forge_domain.workspace = true
 [dev-dependencies]
 anyhow.workspace = true
 pretty_assertions.workspace = true
+serde_json.workspace = true
 tokio.workspace = true

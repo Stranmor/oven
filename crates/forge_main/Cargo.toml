@@ -25,6 +25,8 @@ bstr.workspace = true
 
 forge_spinner.workspace = true
 forge_select.workspace = true
+forge_tui.workspace = true
+forge_ui_model.workspace = true
 
 merge.workspace = true
 nucleo.workspace = true
@@ -48,6 +50,7 @@ serde.workspace = true
 serde_json.workspace = true
 toml_edit.workspace = true
 regex.workspace = true
+reqwest.workspace = true
 strum.workspace = true
 strum_macros.workspace = true
 

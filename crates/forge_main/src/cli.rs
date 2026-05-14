@@ -23,6 +23,13 @@ pub struct Cli {
     #[arg(long, short = 'p', allow_hyphen_values = true)]
     pub prompt: Option<String>,
 
+    /// Render direct and piped prompt responses with the experimental terminal
+    /// UI.
+    ///
+    /// This opt-in flag leaves the classic streaming renderer as the default.
+    #[arg(long, default_value_t = false)]
+    pub tui: bool,
+
     /// Piped input from stdin (populated internally)
     ///
     /// This field is automatically populated when content is piped to forge
@@ -984,6 +991,22 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn test_tui_flag_defaults_to_classic_mode() {
+        let fixture = Cli::parse_from(["forge", "-p", "hello"]);
+        let actual = fixture.tui;
+        let expected = false;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_tui_flag_parses_for_direct_prompt() {
+        let fixture = Cli::parse_from(["forge", "--tui", "-p", "hello"]);
+        let actual = (fixture.tui, fixture.prompt);
+        let expected = (true, Some("hello".to_string()));
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn test_cli_version_includes_last_updated_date() {

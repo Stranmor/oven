@@ -9,6 +9,7 @@ name = "forge_tui"
 path = "src/lib.rs"
 
 [dependencies]
+crossterm = "0.29.0"
 forge_ui_model.workspace = true
 ratatui.workspace = true
 
