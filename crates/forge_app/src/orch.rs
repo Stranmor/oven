@@ -1706,8 +1706,8 @@ mod tests {
             .expect("provider dispatch should receive recovered context");
         let actual_persisted = updates
             .iter()
-            .filter_map(|context| context.context_window_recovery.as_ref().map(|_| context))
-            .last()
+            .rev()
+            .find(|context| context.context_window_recovery.is_some())
             .expect("recovered canonical context should be persisted");
         let actual_budget = Orchestrator::<FixtureServices>::effective_input_budget(
             12_000,
