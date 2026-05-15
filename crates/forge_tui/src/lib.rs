@@ -1182,7 +1182,7 @@ fn status_line(label: &'static str, text: &str, color: Color) -> Line<'static> {
 
 fn tool_status_line(status: &forge_ui_model::UiToolStatus) -> Line<'static> {
     let (phase, color) = match status.phase {
-        UiToolPhase::Started => ("running", Color::Yellow),
+        UiToolPhase::Started => ("started", Color::Yellow),
         UiToolPhase::Finished => ("done", Color::Green),
         UiToolPhase::Failed => ("failed", Color::Red),
     };
