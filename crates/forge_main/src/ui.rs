@@ -2475,8 +2475,31 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         let compaction_result = self.api.compact_conversation(&conversation_id).await?;
         let token_reduction = compaction_result.token_reduction_percentage();
         let message_reduction = compaction_result.message_reduction_percentage();
+        let provider_estimate = compaction_result
+            .provider_request_reduction_percentage()
+            .map(|reduction| {
+                let compacted = compaction_result
+                    .compacted_provider_request
+                    .as_ref()
+                    .expect("provider reduction requires compacted provider estimate");
+                let fit_status = match compacted.input_budget {
+                    Some(budget) if compacted.estimated_tokens <= budget => {
+                        format!("fits provider budget {budget}")
+                    }
+                    Some(budget) => format!(
+                        "exceeds provider budget {budget} by {}",
+                        compacted.estimated_tokens.saturating_sub(budget)
+                    ),
+                    None => "provider budget unavailable".to_string(),
+                };
+                format!(
+                    ", {reduction:.1}% (provider request estimate: {} tokens, {fit_status})",
+                    compacted.estimated_tokens
+                )
+            })
+            .unwrap_or_default();
         let content = TitleFormat::action(format!(
-            "Context size reduced by {token_reduction:.1}% (tokens), {message_reduction:.1}% (messages)"
+            "Context size reduced by {token_reduction:.1}% (message tokens), {message_reduction:.1}% (messages){provider_estimate}"
         ));
         self.writeln_title(content)?;
         Ok(())

@@ -242,6 +242,25 @@ pub struct ThinkingConfig {
     pub r#type: ThinkingType,
 }
 
+/// Diagnostic estimate for a final serialized provider request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderRequestEstimate {
+    /// Conservative input token estimate used by local context-window guards.
+    pub estimated_input_tokens: usize,
+    /// Final JSON payload byte length before media padding.
+    pub serialized_request_bytes: usize,
+    /// Additional token padding for media payloads.
+    pub media_token_padding: usize,
+    /// Number of provider messages in the final request.
+    pub message_count: usize,
+    /// Number of provider tools in the final request.
+    pub tool_count: usize,
+    /// Serialized bytes of the messages field.
+    pub messages_bytes: usize,
+    /// Serialized bytes of the tools field.
+    pub tools_bytes: usize,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, Setters, Default)]
 #[setters(strip_option)]
 pub struct Request {
@@ -348,6 +367,37 @@ impl Request {
         Ok(request)
     }
 
+    /// Estimates input tokens and serialized payload bytes from the final provider request.
+    ///
+    /// # Arguments
+    /// * `context` - Domain context to convert into the provider request.
+    /// * `model` - Provider-local model identifier attached to the request.
+    /// * `provider` - Provider metadata driving compatibility transformations.
+    /// * `merge_system_messages` - Whether system messages should be merged before dispatch.
+    ///
+    /// # Errors
+    /// Returns an error when request conversion or serialization fails.
+    pub fn estimate_provider_request(
+        context: Context,
+        model: &ModelId,
+        provider: &Provider<Url>,
+        merge_system_messages: bool,
+    ) -> anyhow::Result<ProviderRequestEstimate> {
+        let request =
+            Self::from_context_for_provider(context, model, provider, merge_system_messages)?;
+        let serialized_request = serde_json::to_vec(&request)?;
+        Ok(ProviderRequestEstimate {
+            estimated_input_tokens: request
+                .estimated_input_tokens_from_serialized(&serialized_request),
+            serialized_request_bytes: serialized_request.len(),
+            media_token_padding: request.media_token_padding(),
+            message_count: request.message_count(),
+            tool_count: request.tools.as_ref().map(|tools| tools.len()).unwrap_or(0),
+            messages_bytes: serialized_optional_bytes(&request.messages)?,
+            tools_bytes: serialized_optional_bytes(&request.tools)?,
+        })
+    }
+
     /// Estimates input tokens from the final serialized OpenAI-compatible provider request.
     ///
     /// # Arguments
@@ -364,10 +414,10 @@ impl Request {
         provider: &Provider<Url>,
         merge_system_messages: bool,
     ) -> anyhow::Result<usize> {
-        let request =
-            Self::from_context_for_provider(context, model, provider, merge_system_messages)?;
-        let serialized_request = serde_json::to_vec(&request)?;
-        Ok(request.estimated_input_tokens_from_serialized(&serialized_request))
+        Ok(
+            Self::estimate_provider_request(context, model, provider, merge_system_messages)?
+                .estimated_input_tokens,
+        )
     }
 
     pub fn validate_and_canonicalize_images(&mut self) -> anyhow::Result<()> {
@@ -618,6 +668,15 @@ impl From<Context> for Request {
             context_window: context.model_context_length,
         }
     }
+}
+
+fn serialized_optional_bytes<T: Serialize>(value: &Option<T>) -> anyhow::Result<usize> {
+    value
+        .as_ref()
+        .map(serde_json::to_vec)
+        .transpose()
+        .map(|bytes| bytes.map(|bytes| bytes.len()).unwrap_or(0))
+        .map_err(Into::into)
 }
 
 fn serialize_tool_call_arguments(tool_call: &ToolCallFull) -> String {

@@ -13,7 +13,7 @@ use url::Url;
 
 use crate::agent::AgentService;
 use crate::compact::Compactor;
-use crate::dto::openai::Request;
+use crate::dto::openai::{ProviderRequestEstimate, Request};
 use crate::transformers::{DropReasoningOnlyMessages, ModelSpecificReasoning};
 use crate::{EnvironmentInfra, TemplateEngine};
 
@@ -217,15 +217,81 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
         })
     }
 
+    /// Returns the provider request estimate for the outbound provider request.
+    pub(crate) fn estimate_provider_request(
+        context: Context,
+        model: &ModelId,
+        provider: &Provider<Url>,
+        merge_system_messages: bool,
+    ) -> anyhow::Result<ProviderRequestEstimate> {
+        Request::estimate_provider_request(context, model, provider, merge_system_messages)
+    }
+
     /// Returns the estimated token count for the outbound provider request.
     fn estimated_request_tokens(&self, context: &Context) -> anyhow::Result<usize> {
+        Ok(self.estimated_request(context)?.estimated_input_tokens)
+    }
+
+    /// Returns the provider request estimate for the outbound provider request.
+    fn estimated_request(&self, context: &Context) -> anyhow::Result<ProviderRequestEstimate> {
         let provider = self.estimation_provider()?;
-        Request::estimate_provider_input_tokens(
+        Self::estimate_provider_request(
             context.clone(),
             &self.agent.model,
             &provider,
             self.config.merge_system_messages,
         )
+    }
+
+    /// Returns the provider request estimate and effective input budget using a
+    /// concrete provider serialization path after the same outbound projection used
+    /// by preflight dispatch.
+    ///
+    /// # Arguments
+    /// * `context` - Canonical context to normalize into the provider request.
+    /// * `provider` - Active provider metadata used for request serialization.
+    ///
+    /// # Errors
+    /// Returns an error when model metadata or provider request estimation fails.
+    pub(crate) fn estimate_final_provider_request_for_provider(
+        &self,
+        context: Context,
+        provider: &Provider<Url>,
+    ) -> anyhow::Result<(ProviderRequestEstimate, Option<usize>)> {
+        let model = self.model_for_agent()?;
+        let context_window = model
+            .context_length
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Selected model '{}' for provider '{}' does not expose a configured context_length; context-window safety cannot be proven before provider dispatch. Add context_length to the model metadata or select a model with known context window.",
+                    self.agent.model,
+                    self.agent.provider
+                )
+            })?;
+        let canonical = context.model_context_length(u64::try_from(context_window).map_err(|_| {
+            anyhow::anyhow!(
+                "Selected model '{}' context window {} tokens cannot be represented in provider safety metadata.",
+                self.agent.model,
+                context_window
+            )
+        })?);
+        let outbound = self.final_outbound_context(
+            &self.agent.model,
+            canonical.clone(),
+            canonical.is_reasoning_supported(),
+        )?;
+        let output_reservation = Self::output_token_reservation(&outbound);
+        let input_budget = Self::effective_input_budget(context_window, output_reservation);
+        Ok((
+            Self::estimate_provider_request(
+                outbound,
+                &self.agent.model,
+                provider,
+                self.config.merge_system_messages,
+            )?,
+            input_budget,
+        ))
     }
 
     /// Returns a conservative provider context-window safety margin.
@@ -298,7 +364,8 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
             compacted_canonical.clone(),
             compacted_reasoning_supported,
         )?;
-        let compacted_estimated_tokens = self.estimated_request_tokens(&compacted_outbound)?;
+        let compacted_estimate = self.estimated_request(&compacted_outbound)?;
+        let compacted_estimated_tokens = compacted_estimate.estimated_input_tokens;
         if compacted_estimated_tokens <= input_budget {
             return Ok(PreflightContexts {
                 canonical: compacted_canonical,
@@ -306,14 +373,22 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
             });
         }
 
+        let excess_tokens = compacted_estimated_tokens.saturating_sub(input_budget);
         anyhow::bail!(
-            "Local context-window guard blocked an oversized request before provider dispatch. Model '{}' has context window {} tokens; reserved output is {} tokens; safety margin is {} tokens; effective input budget is {} tokens; estimated request is {} tokens after compaction. Reduce context, lower max_tokens, or select a larger-context model.",
+            "Local context-window guard blocked an oversized request before provider dispatch. Model '{}' has context window {} tokens; reserved output is {} tokens; safety margin is {} tokens; effective input budget is {} tokens; estimated request is {} tokens after compaction; excess is {} tokens. Major contributors after provider transformation: messages={} ({} serialized bytes), tools={} ({} serialized bytes), full serialized request={} bytes, media padding={} tokens. Reduce retained conversation/context, reduce tool surface, lower max_tokens, or select a larger-context model.",
             self.agent.model,
             context_window,
             output_reservation,
             Self::context_window_safety_margin(context_window),
             input_budget,
-            compacted_estimated_tokens
+            compacted_estimated_tokens,
+            excess_tokens,
+            compacted_estimate.message_count,
+            compacted_estimate.messages_bytes,
+            compacted_estimate.tool_count,
+            compacted_estimate.tools_bytes,
+            compacted_estimate.serialized_request_bytes,
+            compacted_estimate.media_token_padding
         )
     }
 
@@ -689,13 +764,15 @@ mod tests {
 
     use forge_domain::{
         Agent, AgentId, ChatCompletionMessage, Compact, Context, ContextMessage,
-        DefaultTransformation, Environment, Image, ImageHandling, InputModality, Model, ModelId,
-        ProviderId, ResultStream, Role, TextMessage, ToolCallContext, ToolCallFull, ToolCallId,
-        ToolDefinition, ToolName, ToolOutput, ToolResult, ToolValue, Transformer,
+        DefaultTransformation, Environment, Image, ImageHandling, InputModality, MessageEntry,
+        Model, ModelId, Provider, ProviderId, ProviderResponse, ProviderType, ResultStream, Role,
+        TextMessage, TokenCount, ToolCallContext, ToolCallFull, ToolCallId, ToolDefinition,
+        ToolName, ToolOutput, ToolResult, ToolValue, Transformer, Usage,
     };
     use pretty_assertions::assert_eq;
 
     use super::Orchestrator;
+    use crate::compact::Compactor;
     use crate::{AgentService, EnvironmentInfra};
 
     struct FixtureServices;
@@ -813,6 +890,22 @@ mod tests {
         context_length: u64,
     ) -> Orchestrator<FixtureServices> {
         orchestrator_fixture_for_provider(compact, context_length, ProviderId::OPENAI)
+    }
+
+    fn provider_fixture(provider_id: ProviderId) -> Provider<url::Url> {
+        Provider {
+            id: provider_id,
+            provider_type: ProviderType::Llm,
+            response: Some(ProviderResponse::OpenAI),
+            url: "https://provider-estimate.example/v1/chat/completions"
+                .parse()
+                .unwrap(),
+            models: None,
+            auth_methods: vec![],
+            url_params: vec![],
+            credential: None,
+            custom_headers: None,
+        }
     }
 
     fn droppable_user_message(content: String) -> ContextMessage {
@@ -1097,6 +1190,18 @@ mod tests {
         );
     }
 
+    fn context_with_preserved_historical_usage(content: &str, actual_tokens: usize) -> Context {
+        let usage = Usage::new(
+            TokenCount::Actual(actual_tokens),
+            TokenCount::Actual(0),
+            TokenCount::Actual(actual_tokens),
+            TokenCount::Actual(0),
+            None,
+        );
+        let entry: MessageEntry = ContextMessage::user(content, None).into();
+        Context::default().add_entry(entry.usage(usage))
+    }
+
     #[test]
     fn test_request_estimate_includes_tool_definitions() {
         let fixture = orchestrator_fixture(Compact::new().retention_window(1_usize), 64_000);
@@ -1113,6 +1218,121 @@ mod tests {
         let expected = true;
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_provider_request_estimate_ignores_preserved_historical_usage() {
+        let fixture = orchestrator_fixture(Compact::new().retention_window(1_usize), 64_000);
+        let setup = context_with_preserved_historical_usage("short current prompt", 1_000_000);
+
+        let actual = fixture.estimated_request_tokens(&setup).unwrap() < *setup.token_count();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_provider_request_estimate_uses_supplied_provider_pipeline() {
+        let fixture = orchestrator_fixture_for_provider(
+            Compact::new().retention_window(1_usize),
+            64_000,
+            ProviderId::FIREWORKS_AI,
+        );
+        let setup = Context::default()
+            .add_message(ContextMessage::system("system prompt"))
+            .add_message(ContextMessage::user("user prompt", None))
+            .add_tool(
+                ToolDefinition::new("schema_tool")
+                    .description("tool description")
+                    .input_schema(schemars::schema_for!(())),
+            )
+            .max_tokens(512_usize);
+        let active_provider = provider_fixture(ProviderId::FIREWORKS_AI);
+        let synthetic_provider = provider_fixture(ProviderId::OPENAI);
+
+        let actual = fixture
+            .estimate_final_provider_request_for_provider(setup.clone(), &active_provider)
+            .unwrap()
+            .0
+            .estimated_input_tokens
+            != fixture
+                .estimate_final_provider_request_for_provider(setup, &synthetic_provider)
+                .unwrap()
+                .0
+                .estimated_input_tokens;
+        let expected = true;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_preflight_error_reports_excess_and_major_request_contributors() {
+        let fixture = orchestrator_fixture(Compact::new().retention_window(1_usize), 8_000);
+        let setup = Context::default()
+            .add_message(ContextMessage::user(large_text(7_000), None))
+            .add_tool(
+                ToolDefinition::new("large_tool")
+                    .description(large_text(500))
+                    .input_schema(schemars::schema_for!(())),
+            )
+            .max_tokens(512_usize);
+
+        let actual = fixture
+            .preflight_context_window(setup)
+            .unwrap_err()
+            .to_string();
+        let expected = true;
+
+        assert_eq!(actual.contains("excess is"), expected);
+        assert_eq!(actual.contains("Major contributors"), expected);
+        assert_eq!(actual.contains("messages="), expected);
+        assert_eq!(actual.contains("tools="), expected);
+        assert_eq!(actual.contains("full serialized request="), expected);
+    }
+
+    #[test]
+    fn test_preflight_blocks_when_messages_drop_but_provider_estimate_stays_over_budget() {
+        let setup = Context::default()
+            .add_message(ContextMessage::system("system prompt"))
+            .add_message(droppable_user_message(large_text(12_000)))
+            .add_message(ContextMessage::user("fresh user request", None))
+            .add_tool(
+                ToolDefinition::new("schema_heavy_tool")
+                    .description(large_text(5_000))
+                    .input_schema(schemars::schema_for!(())),
+            )
+            .max_tokens(512_usize);
+        let estimation_fixture =
+            orchestrator_fixture(Compact::new().retention_window(1_usize), 128_000);
+        let compacted = Compactor::new(
+            Compact::new().retention_window(1_usize),
+            environment_fixture(),
+        )
+        .compact(setup.clone(), true)
+        .unwrap();
+        let compacted_estimate = estimation_fixture
+            .estimated_request_tokens(&compacted)
+            .unwrap();
+        let context_window = (8_000_usize..128_000)
+            .find(|context_window| {
+                Orchestrator::<FixtureServices>::effective_input_budget(*context_window, 512)
+                    .is_some_and(|budget| compacted_estimate > budget)
+            })
+            .expect("fixture should expose retained provider overhead over budget");
+        let fixture = orchestrator_fixture(
+            Compact::new().retention_window(1_usize),
+            context_window as u64,
+        );
+
+        let actual = fixture
+            .preflight_context_window(setup)
+            .unwrap_err()
+            .to_string();
+        let expected = true;
+
+        assert!(compacted.messages.len() < 4);
+        assert_eq!(actual.contains("tools="), expected);
+        assert_eq!(actual.contains("excess is"), expected);
     }
 
     #[test]

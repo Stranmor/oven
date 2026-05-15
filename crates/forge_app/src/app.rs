@@ -10,10 +10,12 @@ use forge_project_model::{
     ProjectModelContextRenderBudget, ProjectModelContextSource, render_project_model_context,
 };
 use forge_stream::MpscStream;
+use url::Url;
 
 use crate::apply_tunable_parameters::ApplyTunableParameters;
 use crate::changed_files::ChangedFiles;
 use crate::dto::ToolsOverview;
+use crate::dto::openai::ProviderRequestEstimate as OpenAiProviderRequestEstimate;
 use crate::hooks::{
     CompactionHandler, DoomLoopDetector, PendingTodosHandler, TitleGenerationHandler,
     TracingHandler,
@@ -632,6 +634,13 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
     }
 }
 
+fn provider_request_compaction_estimate(
+    estimate: OpenAiProviderRequestEstimate,
+    input_budget: Option<usize>,
+) -> ProviderRequestEstimate {
+    ProviderRequestEstimate::new(estimate.estimated_input_tokens, input_budget)
+}
+
 /// ForgeApp handles the core chat functionality by orchestrating various
 /// services. It encapsulates the complex logic previously contained in the
 /// ForgeAPI chat method.
@@ -848,6 +857,71 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig> + SteerS
         Ok(stream)
     }
 
+    fn estimate_compaction_provider_request(
+        &self,
+        context: Context,
+        agent: &Agent,
+        models: Vec<Model>,
+        provider: &Provider<Url>,
+        merge_system_messages: bool,
+    ) -> Result<ProviderRequestEstimate> {
+        let conversation = Conversation::generate().context(context);
+        let orchestrator = Orchestrator::new(
+            self.services.clone(),
+            conversation,
+            agent.clone(),
+            forge_config::ForgeConfig { merge_system_messages, ..Default::default() },
+        )
+        .models(models);
+        let context = orchestrator
+            .get_conversation()
+            .context
+            .clone()
+            .unwrap_or_default();
+        let (estimate, input_budget) =
+            orchestrator.estimate_final_provider_request_for_provider(context, provider)?;
+        Ok(provider_request_compaction_estimate(estimate, input_budget))
+    }
+
+    async fn compaction_provider_request_estimates(
+        &self,
+        original_context: Context,
+        compacted_context: Context,
+        agent: &Agent,
+        merge_system_messages: bool,
+    ) -> Result<(ProviderRequestEstimate, ProviderRequestEstimate)> {
+        let agent_provider_resolver = AgentProviderResolver::new(self.services.clone());
+        let agent_provider = agent_provider_resolver
+            .get_provider(Some(agent.id.clone()))
+            .await?;
+        let agent_provider = self
+            .services
+            .provider_auth_service()
+            .refresh_provider_credential(agent_provider)
+            .await?;
+        let models = self.services.models(agent_provider.clone()).await?;
+        models
+            .iter()
+            .find(|model| model.id == agent.model && model.provider_id == agent.provider)
+            .ok_or_else(|| forge_domain::Error::MissingModel(agent.id.clone()))?;
+
+        let original_provider_request = self.estimate_compaction_provider_request(
+            original_context,
+            agent,
+            models.clone(),
+            &agent_provider,
+            merge_system_messages,
+        )?;
+        let compacted_provider_request = self.estimate_compaction_provider_request(
+            compacted_context,
+            agent,
+            models,
+            &agent_provider,
+            merge_system_messages,
+        )?;
+        Ok((original_provider_request, compacted_provider_request))
+    }
+
     /// Compacts the context of the main agent for the given conversation and
     /// persists it. Returns metrics about the compaction (original vs.
     /// compacted tokens and messages).
@@ -874,9 +948,11 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig> + SteerS
             }
         };
 
-        // Calculate original metrics
+        // Calculate original metrics. User-facing prompt-size metrics deliberately
+        // use the current message approximation instead of historical provider
+        // usage preserved on compacted summary messages.
         let original_messages = context.messages.len();
-        let original_token_count = *context.token_count();
+        let original_token_count = context.token_count_approx();
 
         let forge_config = self.services.get_config()?;
 
@@ -888,17 +964,35 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig> + SteerS
         };
 
         // Get compact config from the agent
-        let compact = agent
+        let agent = agent
             .apply_config(&forge_config)
-            .set_compact_model_if_none()
-            .compact;
+            .set_compact_model_if_none();
+        let compact = agent.compact.clone();
 
         // Apply compaction using the Compactor
         let environment = self.services.get_environment();
-        let compacted_context = Compactor::new(compact, environment).compact(context, true)?;
+        let compacted_context =
+            Compactor::new(compact, environment).compact(context.clone(), true)?;
 
         let compacted_messages = compacted_context.messages.len();
-        let compacted_tokens = *compacted_context.token_count();
+        let compacted_tokens = compacted_context.token_count_approx();
+        let provider_request_estimates = match self
+            .compaction_provider_request_estimates(
+                context,
+                compacted_context.clone(),
+                &agent,
+                forge_config.merge_system_messages,
+            )
+            .await
+        {
+            Ok(estimates) => Some(estimates),
+            Err(error) => {
+                tracing::warn!(
+                    "Compaction provider request metrics unavailable; compacted context will still be saved: {error:#}"
+                );
+                None
+            }
+        };
 
         // Update the conversation with the compacted context
         conversation.context = Some(compacted_context);
@@ -906,12 +1000,21 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig> + SteerS
         // Save the updated conversation
         self.services.upsert_conversation(conversation).await?;
 
-        Ok(CompactionResult::new(
+        let result = CompactionResult::new(
             original_token_count,
             compacted_tokens,
             original_messages,
             compacted_messages,
-        ))
+        );
+
+        if let Some((original_provider_request, compacted_provider_request)) =
+            provider_request_estimates
+        {
+            Ok(result
+                .provider_request_estimates(original_provider_request, compacted_provider_request))
+        } else {
+            Ok(result)
+        }
     }
 
     pub async fn list_tools(&self) -> Result<ToolsOverview> {
@@ -1344,6 +1447,24 @@ mod tests {
             root.join(".forge_project_model/project_manifest.json"),
             r#"{"version":1,"root":"fixture","files":[],"file_nodes":[],"symbols":[],"edges":[],"shards":[],"manifest_hash":"fixture"}"#,
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_provider_request_metrics_do_not_use_historical_usage() -> Result<()> {
+        let setup = OpenAiProviderRequestEstimate {
+            estimated_input_tokens: 512,
+            serialized_request_bytes: 512,
+            media_token_padding: 0,
+            message_count: 1,
+            tool_count: 0,
+            messages_bytes: 128,
+            tools_bytes: 0,
+        };
+        let actual = provider_request_compaction_estimate(setup, Some(3_392));
+        let expected = ProviderRequestEstimate::new(512, Some(3_392));
+
+        assert_eq!(actual, expected);
         Ok(())
     }
 
