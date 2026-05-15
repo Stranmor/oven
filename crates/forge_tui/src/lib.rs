@@ -295,16 +295,6 @@ pub fn render_conversation_to_string(model: &UiModel, width: u16, height: u16) -
     render_model_to_string(model, width, height, None)
 }
 
-/// Renders a typed UI model into a deterministic `ratatui` test backend string.
-///
-/// # Arguments
-/// * `model` - The typed UI model to render.
-/// * `width` - Test backend width in terminal cells.
-/// * `height` - Test backend height in terminal cells.
-pub fn render_dashboard_to_string(model: &UiModel, width: u16, height: u16) -> String {
-    render_conversation_to_string(model, width, height)
-}
-
 /// Renders the initial interactive TUI shell into a deterministic string.
 ///
 /// # Arguments
@@ -454,105 +444,82 @@ fn infallible<T>(result: Result<T, Infallible>) -> T {
     }
 }
 
-fn status_text(model: &UiModel) -> String {
-    let running = running_tool_count(model);
-    let failed = model.blocks.iter().any(
-        |block| matches!(block, UiBlock::ToolStatus(status) if status.phase == UiToolPhase::Failed),
-    );
-    let completed = model
-        .blocks
-        .iter()
-        .any(|block| matches!(block, UiBlock::Completion));
-    let turn_phase = latest_turn_phase(model);
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LatestConversationState {
+    UserSubmitted,
+    TurnPending,
+    TurnRunning,
+    ToolRunning,
+    ToolFinished,
+    ToolFailed,
+    Complete,
+}
 
-    if failed {
-        "Attention - tool reported an error".to_string()
-    } else if completed {
-        "Complete - response finished".to_string()
-    } else if running > 0 {
-        "Working - tool activity in progress".to_string()
-    } else if turn_phase == Some(UiTurnPhase::Running) {
-        "Working - assistant is responding".to_string()
-    } else if turn_phase == Some(UiTurnPhase::Pending) {
-        "Waiting - preparing response".to_string()
-    } else if latest_tool_phase(model).is_some() {
-        "Ready - tool activity complete".to_string()
-    } else {
-        "Ready - start a conversation".to_string()
+fn status_text(model: &UiModel) -> String {
+    match latest_conversation_state(model) {
+        Some(LatestConversationState::ToolFailed) => {
+            "Attention - tool reported an error".to_string()
+        }
+        Some(LatestConversationState::Complete) => "Complete - response finished".to_string(),
+        Some(LatestConversationState::ToolRunning) => {
+            "Working - tool activity in progress".to_string()
+        }
+        Some(LatestConversationState::TurnRunning) => {
+            "Working - assistant is responding".to_string()
+        }
+        Some(LatestConversationState::TurnPending | LatestConversationState::UserSubmitted) => {
+            "Waiting - preparing response".to_string()
+        }
+        Some(LatestConversationState::ToolFinished) => "Ready - tool activity complete".to_string(),
+        None => "Ready - start a conversation".to_string(),
     }
 }
 
 fn status_style(model: &UiModel) -> Style {
-    let failed = model.blocks.iter().any(
-        |block| matches!(block, UiBlock::ToolStatus(status) if status.phase == UiToolPhase::Failed),
-    );
-    if failed {
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-    } else if model
-        .blocks
-        .iter()
-        .any(|block| matches!(block, UiBlock::Completion))
-    {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD)
-    } else if running_tool_count(model) > 0
-        || latest_turn_phase(model) == Some(UiTurnPhase::Running)
-    {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else if latest_turn_phase(model) == Some(UiTurnPhase::Pending) {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else if latest_tool_phase(model).is_some() {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
+    match latest_conversation_state(model) {
+        Some(LatestConversationState::ToolFailed) => {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        }
+        Some(LatestConversationState::Complete | LatestConversationState::ToolFinished) => {
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        }
+        Some(LatestConversationState::ToolRunning | LatestConversationState::TurnRunning) => {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        }
+        Some(LatestConversationState::TurnPending | LatestConversationState::UserSubmitted) => {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        }
+        None => Style::default().fg(Color::DarkGray),
     }
 }
 
-fn running_tool_count(model: &UiModel) -> usize {
-    model
-        .blocks
-        .iter()
-        .fold(0usize, |active, block| match block {
-            UiBlock::ToolStatus(status) if status.phase == UiToolPhase::Started => {
-                active.saturating_add(1)
-            }
-            UiBlock::ToolStatus(status)
-                if matches!(status.phase, UiToolPhase::Finished | UiToolPhase::Failed) =>
-            {
-                active.saturating_sub(1)
-            }
-            _ => active,
-        })
-}
-
-fn latest_tool_phase(model: &UiModel) -> Option<UiToolPhase> {
+fn latest_conversation_state(model: &UiModel) -> Option<LatestConversationState> {
     model.blocks.iter().rev().find_map(|block| match block {
-        UiBlock::ToolStatus(status) => Some(status.phase.clone()),
-        _ => None,
-    })
-}
-
-fn latest_turn_phase(model: &UiModel) -> Option<UiTurnPhase> {
-    model.blocks.iter().rev().find_map(|block| match block {
-        UiBlock::TurnStatus(status) => Some(status.phase.clone()),
-        UiBlock::Markdown { partial, .. } if *partial => Some(UiTurnPhase::Running),
-        UiBlock::Reasoning(_) => Some(UiTurnPhase::Running),
+        UiBlock::TurnStatus(status) => match status.phase {
+            UiTurnPhase::Pending => Some(LatestConversationState::TurnPending),
+            UiTurnPhase::Running => Some(LatestConversationState::TurnRunning),
+        },
+        UiBlock::Markdown { partial, .. } if *partial => Some(LatestConversationState::TurnRunning),
+        UiBlock::Reasoning(_) => Some(LatestConversationState::TurnRunning),
+        UiBlock::ToolStatus(status) => match status.phase {
+            UiToolPhase::Started => Some(LatestConversationState::ToolRunning),
+            UiToolPhase::Finished => Some(LatestConversationState::ToolFinished),
+            UiToolPhase::Failed => Some(LatestConversationState::ToolFailed),
+        },
+        UiBlock::Completion => Some(LatestConversationState::Complete),
+        UiBlock::UserMessage(_) => Some(LatestConversationState::UserSubmitted),
         UiBlock::Markdown { .. }
         | UiBlock::ToolInput(_)
         | UiBlock::ToolOutput(_)
-        | UiBlock::ToolStatus(_)
         | UiBlock::ToolDetail(_)
         | UiBlock::Retry { .. }
-        | UiBlock::Interrupt(_)
-        | UiBlock::Completion
-        | UiBlock::UserMessage(_) => None,
+        | UiBlock::Interrupt(_) => None,
     })
 }
 
@@ -1041,6 +1008,80 @@ mod tests {
         assert!(actual.contains("Ready - tool activity complete"));
         assert!(!actual.contains("Working - assistant is responding"));
         assert!(!actual.contains("tools_running="));
+    }
+
+    #[test]
+    fn test_conversation_status_uses_latest_pending_turn_after_completed_turn() {
+        let fixture = UiModel::new(vec![
+            UiBlock::Completion,
+            UiBlock::UserMessage("Next question".to_string()),
+            UiBlock::TurnStatus(UiTurnStatus::pending()),
+        ]);
+
+        let actual = render_conversation_to_string(&fixture, 92, 12);
+
+        assert!(actual.contains("Waiting - preparing response"));
+        assert!(!actual.contains("Complete - response finished"));
+    }
+
+    #[test]
+    fn test_conversation_status_uses_latest_running_turn_after_completed_turn() {
+        let fixture = UiModel::new(vec![
+            UiBlock::Completion,
+            UiBlock::UserMessage("Next question".to_string()),
+            UiBlock::TurnStatus(UiTurnStatus::running()),
+        ]);
+
+        let actual = render_conversation_to_string(&fixture, 92, 12);
+
+        assert!(actual.contains("Working - assistant is responding"));
+        assert!(!actual.contains("Complete - response finished"));
+    }
+
+    #[test]
+    fn test_conversation_status_uses_latest_pending_turn_after_failed_tool() {
+        let fixture = UiModel::new(vec![
+            UiBlock::ToolStatus(UiToolStatus {
+                name: "shell".to_string(),
+                phase: UiToolPhase::Failed,
+                summary: Some("exit 1".to_string()),
+            }),
+            UiBlock::UserMessage("Retry".to_string()),
+            UiBlock::TurnStatus(UiTurnStatus::pending()),
+        ]);
+
+        let actual = render_conversation_to_string(&fixture, 92, 12);
+
+        assert!(actual.contains("Waiting - preparing response"));
+        assert!(!actual.contains("Attention - tool reported an error"));
+    }
+
+    #[test]
+    fn test_conversation_status_uses_latest_running_turn_after_failed_tool() {
+        let fixture = UiModel::new(vec![
+            UiBlock::ToolStatus(UiToolStatus {
+                name: "shell".to_string(),
+                phase: UiToolPhase::Failed,
+                summary: Some("exit 1".to_string()),
+            }),
+            UiBlock::UserMessage("Retry".to_string()),
+            UiBlock::TurnStatus(UiTurnStatus::running()),
+        ]);
+
+        let actual = render_conversation_to_string(&fixture, 92, 12);
+
+        assert!(actual.contains("Working - assistant is responding"));
+        assert!(!actual.contains("Attention - tool reported an error"));
+    }
+
+    #[test]
+    fn test_rendered_conversation_avoids_dashboard_vocabulary() {
+        let fixture = UiModel::new(vec![UiBlock::Completion]);
+
+        let actual = render_conversation_to_string(&fixture, 92, 10);
+
+        assert!(!actual.to_ascii_lowercase().contains("dashboard"));
+        assert!(!actual.to_ascii_lowercase().contains("debug"));
     }
 
     #[test]
