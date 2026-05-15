@@ -1457,6 +1457,7 @@ mod tests {
             estimated_input_tokens: 512,
             serialized_request_bytes: 512,
             media_token_padding: 0,
+            output_token_reservation: 3_392,
             message_count: 1,
             tool_count: 0,
             messages_bytes: 128,

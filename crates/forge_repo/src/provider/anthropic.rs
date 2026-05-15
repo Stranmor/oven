@@ -172,12 +172,11 @@ impl<T: HttpInfra> Anthropic<T> {
         model: &ModelId,
         context: Context,
     ) -> ResultStream<ChatCompletionMessage, anyhow::Error> {
-        let max_tokens = context.max_tokens.unwrap_or(4000);
         let context_window = context.model_context_length;
         // transform the context to match the request format
         let context = ReasoningTransform.transform(context);
 
-        let mut request = Request::try_from(context)?.max_tokens(max_tokens.min(8192) as u64);
+        let mut request = Request::try_from(context)?;
 
         // For Vertex AI Anthropic, model is in the URL path, not the request body
         if self.provider.id == ProviderId::VERTEX_AI_ANTHROPIC {
@@ -499,6 +498,86 @@ mod tests {
             // For now, return an error since eventsource is not used in the failing tests
             Err(anyhow::anyhow!("EventSource not implemented in mock"))
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturingHttpClient {
+        body: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpInfra for CapturingHttpClient {
+        async fn http_get(
+            &self,
+            _url: &Url,
+            _headers: Option<HeaderMap>,
+        ) -> anyhow::Result<reqwest::Response> {
+            unimplemented!()
+        }
+
+        async fn http_post(
+            &self,
+            _url: &Url,
+            _headers: Option<HeaderMap>,
+            body: Bytes,
+        ) -> anyhow::Result<reqwest::Response> {
+            *self.body.lock().unwrap() = Some(body.to_vec());
+            anyhow::bail!("captured request body")
+        }
+
+        async fn http_delete(&self, _url: &Url) -> anyhow::Result<reqwest::Response> {
+            unimplemented!()
+        }
+
+        async fn http_eventsource(
+            &self,
+            _url: &Url,
+            _headers: Option<HeaderMap>,
+            body: Bytes,
+        ) -> anyhow::Result<EventSource> {
+            *self.body.lock().unwrap() = Some(body.to_vec());
+            anyhow::bail!("captured request body")
+        }
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_chat_preserves_thinking_normalized_max_tokens_before_http() {
+        let http = Arc::new(CapturingHttpClient::default());
+        let provider = Provider {
+            id: forge_app::domain::ProviderId::ANTHROPIC,
+            provider_type: forge_domain::ProviderType::Llm,
+            response: Some(forge_app::domain::ProviderResponse::Anthropic),
+            url: Url::parse("https://anthropic.example/messages").unwrap(),
+            credential: Some(forge_domain::AuthCredential {
+                id: forge_app::domain::ProviderId::ANTHROPIC,
+                auth_details: forge_domain::AuthDetails::ApiKey(forge_domain::ApiKey::from(
+                    "sk-test-key".to_string(),
+                )),
+                url_params: std::collections::HashMap::new(),
+            }),
+            auth_methods: vec![forge_domain::AuthMethod::ApiKey],
+            url_params: vec![],
+            models: None,
+            custom_headers: None,
+        };
+        let fixture = Anthropic::new(http.clone(), provider, "2023-06-01".to_string(), false);
+        let setup = Context::default()
+            .add_message(ContextMessage::user("thinking request", None))
+            .reasoning(
+                forge_domain::ReasoningConfig::default()
+                    .enabled(true)
+                    .max_tokens(2_000),
+            )
+            .max_tokens(1_usize)
+            .model_context_length(128_000_u64);
+
+        let actual = fixture.chat(&ModelId::new("claude-test"), setup).await;
+        let captured = http.body.lock().unwrap().clone().unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&captured).unwrap();
+        let expected = serde_json::json!(3_024);
+
+        assert!(actual.is_err());
+        assert_eq!(payload["max_tokens"], expected);
     }
 
     fn create_anthropic(base_url: &str) -> anyhow::Result<Anthropic<MockHttpClient>> {

@@ -213,6 +213,7 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
     }
 
     /// Returns the configured output token reservation for a request.
+    #[cfg(test)]
     fn output_token_reservation(context: &Context) -> usize {
         context
             .max_tokens
@@ -243,12 +244,8 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
     ) -> anyhow::Result<ProviderRequestEstimate> {
         match provider.response {
             Some(ProviderResponse::Anthropic) => {
-                let output_reservation = context
-                    .max_tokens
-                    .unwrap_or(ContextWindowBudget::DEFAULT_OUTPUT_TOKEN_RESERVATION);
                 let context = anthropic_dto::ReasoningTransform.transform(context);
-                let mut request = anthropic_dto::Request::try_from(context)?
-                    .max_tokens(output_reservation.min(8192) as u64);
+                let mut request = anthropic_dto::Request::try_from(context)?;
                 if provider.id != ProviderId::VERTEX_AI_ANTHROPIC {
                     request = request.model(model.as_str().to_string());
                 }
@@ -256,6 +253,7 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
                 Ok(ProviderRequestEstimate::from_serialized_parts(
                     serialized_request.len(),
                     0,
+                    usize::try_from(request.max_tokens).unwrap_or(usize::MAX),
                     request.messages.len(),
                     request.tools.len(),
                     serde_json::to_vec(&request.messages)?.len(),
@@ -272,9 +270,16 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
                     .as_ref()
                     .map(|tools| tools.len())
                     .unwrap_or_default();
+                let output_reservation = request
+                    .generation_config
+                    .as_ref()
+                    .and_then(|config| config.max_output_tokens)
+                    .and_then(|tokens| usize::try_from(tokens).ok())
+                    .unwrap_or(ContextWindowBudget::DEFAULT_OUTPUT_TOKEN_RESERVATION);
                 Ok(ProviderRequestEstimate::from_serialized_parts(
                     serialized_request.len(),
                     0,
+                    output_reservation,
                     message_count,
                     tool_count,
                     serde_json::to_vec(&request.contents)?.len(),
@@ -292,6 +297,9 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
                 Ok(ProviderRequestEstimate::from_serialized_parts(
                     serialized_context.len(),
                     0,
+                    context
+                        .max_tokens
+                        .unwrap_or(ContextWindowBudget::DEFAULT_OUTPUT_TOKEN_RESERVATION),
                     context.messages.len(),
                     context.tools.len(),
                     serde_json::to_vec(&context.messages)?.len(),
@@ -302,6 +310,7 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
     }
 
     /// Returns the estimated token count for the outbound provider request.
+    #[cfg(test)]
     fn estimated_request_tokens(&self, context: &Context) -> anyhow::Result<usize> {
         Ok(self.estimated_request(context)?.estimated_input_tokens)
     }
@@ -360,17 +369,15 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
             canonical.clone(),
             canonical.is_reasoning_supported(),
         )?;
-        let output_reservation = Self::output_token_reservation(&outbound);
-        let input_budget = Self::effective_input_budget(context_window, output_reservation);
-        Ok((
-            Self::estimate_provider_request(
-                outbound,
-                &self.agent.model,
-                provider,
-                self.config.merge_system_messages,
-            )?,
-            input_budget,
-        ))
+        let estimate = Self::estimate_provider_request(
+            outbound,
+            &self.agent.model,
+            provider,
+            self.config.merge_system_messages,
+        )?;
+        let input_budget =
+            Self::effective_input_budget(context_window, estimate.output_token_reservation);
+        Ok((estimate, input_budget))
     }
 
     /// Returns a conservative provider context-window safety margin.
@@ -461,24 +468,28 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
             let recovered_estimate = self
                 .estimated_request(&recovered_outbound)
                 .map_err(PreflightContextWindowError::other)?;
-            let Some(recovered_budget) = Self::effective_input_budget(context_window, output_cap)
+            let final_output_reservation = recovered_estimate.output_token_reservation;
+            let Some(recovered_budget) =
+                Self::effective_input_budget(context_window, final_output_reservation)
             else {
                 return Ok(None);
             };
 
             if recovered_estimate.estimated_input_tokens <= recovered_budget {
-                let recovered_canonical =
-                    recovered_canonical.context_window_recovery(ContextWindowRecovery {
+                let recovered_canonical = recovered_canonical
+                    .max_tokens(final_output_reservation)
+                    .context_window_recovery(ContextWindowRecovery {
                         context_window,
                         original_output_reservation,
-                        effective_output_cap: output_cap,
+                        effective_output_cap: final_output_reservation,
                         estimated_input_tokens: recovered_estimate.estimated_input_tokens,
                     });
-                let recovered_outbound =
-                    recovered_outbound.context_window_recovery(ContextWindowRecovery {
+                let recovered_outbound = recovered_outbound
+                    .max_tokens(final_output_reservation)
+                    .context_window_recovery(ContextWindowRecovery {
                         context_window,
                         original_output_reservation,
-                        effective_output_cap: output_cap,
+                        effective_output_cap: final_output_reservation,
                         estimated_input_tokens: recovered_estimate.estimated_input_tokens,
                     });
                 return Ok(Some(PreflightContexts {
@@ -541,7 +552,10 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
             .final_outbound_context(&self.agent.model, canonical.clone(), reasoning_supported)
             .map_err(PreflightContextWindowError::other)?;
 
-        let output_reservation = Self::output_token_reservation(&outbound);
+        let initial_estimate = self
+            .estimated_request(&outbound)
+            .map_err(PreflightContextWindowError::other)?;
+        let output_reservation = initial_estimate.output_token_reservation;
         let input_budget = Self::effective_input_budget(context_window, output_reservation)
             .ok_or_else(|| {
                 PreflightContextWindowError::OverBudget(format!(
@@ -552,9 +566,7 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
                 ))
             })?;
 
-        let estimated_tokens = self
-            .estimated_request_tokens(&outbound)
-            .map_err(PreflightContextWindowError::other)?;
+        let estimated_tokens = initial_estimate.estimated_input_tokens;
         if estimated_tokens <= input_budget {
             return Ok(PreflightContexts { canonical, outbound });
         }
@@ -575,7 +587,20 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
             .estimated_request(&compacted_outbound)
             .map_err(PreflightContextWindowError::other)?;
         let compacted_estimated_tokens = compacted_estimate.estimated_input_tokens;
-        if compacted_estimated_tokens <= input_budget {
+        let compacted_output_reservation = compacted_estimate.output_token_reservation;
+        let compacted_input_budget = Self::effective_input_budget(
+            context_window,
+            compacted_output_reservation,
+        )
+        .ok_or_else(|| {
+            PreflightContextWindowError::OverBudget(format!(
+                "Selected model '{}' has a {} token context window, but the configured output reservation is {} tokens and leaves no safe prompt budget after provider transformation. Lower max_tokens or select a larger-context model.",
+                self.agent.model,
+                context_window,
+                compacted_output_reservation
+            ))
+        })?;
+        if compacted_estimated_tokens <= compacted_input_budget {
             return Ok(PreflightContexts {
                 canonical: compacted_canonical,
                 outbound: compacted_outbound,
@@ -593,8 +618,8 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
 
         Err(self.compacted_over_budget_error(
             context_window,
-            output_reservation,
-            input_budget,
+            compacted_output_reservation,
+            compacted_input_budget,
             &compacted_estimate,
         ))
     }
@@ -1389,18 +1414,30 @@ mod tests {
             supports_reasoning: Some(true),
             ..model_fixture_for_provider(128_000, ProviderId::ANTHROPIC)
         }])
-        .active_provider(provider);
+        .active_provider(provider.clone());
         let setup = Context::default()
             .add_message(ContextMessage::user("thinking request", None))
             .reasoning(ReasoningConfig::default().enabled(true).max_tokens(2_000))
             .max_tokens(1_usize);
 
         let actual = fixture.estimated_request(&setup).unwrap();
+        let (provider_actual, provider_budget) = fixture
+            .estimate_final_provider_request_for_provider(setup.clone(), &provider)
+            .unwrap();
         let request = anthropic_dto::Request::try_from(setup).unwrap();
         let expected = true;
+        let expected_budget = Orchestrator::<FixtureServices>::effective_input_budget(
+            128_000,
+            actual.output_token_reservation,
+        );
 
-        assert_eq!(request.max_tokens > 1, expected);
-        assert_eq!(actual.serialized_request_bytes > 0, expected);
+        assert_eq!(actual.output_token_reservation > 1, expected);
+        assert_eq!(request.max_tokens, actual.output_token_reservation as u64);
+        assert_eq!(
+            provider_actual.output_token_reservation,
+            actual.output_token_reservation
+        );
+        assert_eq!(provider_budget, expected_budget);
     }
 
     fn droppable_user_message(content: String) -> ContextMessage {

@@ -251,6 +251,8 @@ pub struct ProviderRequestEstimate {
     pub serialized_request_bytes: usize,
     /// Additional token padding for media payloads.
     pub media_token_padding: usize,
+    /// Output tokens reserved by the final provider request.
+    pub output_token_reservation: usize,
     /// Number of provider messages in the final request.
     pub message_count: usize,
     /// Number of provider tools in the final request.
@@ -267,6 +269,7 @@ impl ProviderRequestEstimate {
     /// # Arguments
     /// * `serialized_request_bytes` - Final JSON payload byte length before media padding.
     /// * `media_token_padding` - Additional media padding included in the input estimate.
+    /// * `output_token_reservation` - Output tokens reserved by the final provider request.
     /// * `message_count` - Number of provider messages in the final request.
     /// * `tool_count` - Number of provider tools in the final request.
     /// * `messages_bytes` - Serialized byte length of the provider messages field.
@@ -274,6 +277,7 @@ impl ProviderRequestEstimate {
     pub fn from_serialized_parts(
         serialized_request_bytes: usize,
         media_token_padding: usize,
+        output_token_reservation: usize,
         message_count: usize,
         tool_count: usize,
         messages_bytes: usize,
@@ -283,6 +287,7 @@ impl ProviderRequestEstimate {
             estimated_input_tokens: serialized_request_bytes.saturating_add(media_token_padding),
             serialized_request_bytes,
             media_token_padding,
+            output_token_reservation,
             message_count,
             tool_count,
             messages_bytes,
@@ -419,6 +424,7 @@ impl Request {
         Ok(ProviderRequestEstimate::from_serialized_parts(
             serialized_request.len(),
             request.media_token_padding(),
+            request.output_token_reservation(),
             request.message_count(),
             request.tools.as_ref().map(|tools| tools.len()).unwrap_or(0),
             serialized_optional_bytes(&request.messages)?,
