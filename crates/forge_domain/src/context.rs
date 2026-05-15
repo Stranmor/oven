@@ -453,6 +453,23 @@ impl std::ops::DerefMut for MessageEntry {
     }
 }
 
+/// Records a typed context-window recovery that lowered output reservation so a
+/// persisted conversation can safely resume without rebuilding the previous
+/// oversized provider request.
+#[derive(Clone, Debug, Deserialize, Serialize, Setters, Default, PartialEq, Eq)]
+#[setters(into)]
+#[serde(rename_all = "snake_case")]
+pub struct ContextWindowRecovery {
+    /// Model context window used when the recovery cap was computed.
+    pub context_window: usize,
+    /// Original output reservation that made the preflight request exceed budget.
+    pub original_output_reservation: usize,
+    /// Effective output cap proven to fit the current provider request.
+    pub effective_output_cap: usize,
+    /// Final estimated input tokens for the recovered provider request.
+    pub estimated_input_tokens: usize,
+}
+
 /// Represents a request being made to the LLM provider. By default the request
 /// is created with assuming the model supports use of external tools.
 #[derive(Clone, Debug, Deserialize, Serialize, Setters, Default, PartialEq)]
@@ -480,6 +497,10 @@ pub struct Context {
     pub top_k: Option<TopK>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<crate::ReasoningConfig>,
+    /// Typed marker proving that context-window recovery reduced the effective
+    /// output cap for persisted oversized conversations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_recovery: Option<ContextWindowRecovery>,
     /// Selected model context length carried from resolved provider metadata
     /// for final provider-side request guards. This is runtime safety
     /// metadata, not a provider payload field.

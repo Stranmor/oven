@@ -320,6 +320,121 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
         context_budget.effective_input_budget()
     }
 
+    fn compacted_over_budget_error(
+        &self,
+        context_window: usize,
+        output_reservation: usize,
+        input_budget: usize,
+        compacted_estimate: &ProviderRequestEstimate,
+    ) -> PreflightContextWindowError {
+        let compacted_estimated_tokens = compacted_estimate.estimated_input_tokens;
+        let excess_tokens = compacted_estimated_tokens.saturating_sub(input_budget);
+        PreflightContextWindowError::OverBudget(format!(
+            "Local context-window guard blocked an oversized request before provider dispatch. Model '{}' has context window {} tokens; reserved output is {} tokens; safety margin is {} tokens; effective input budget is {} tokens; estimated request is {} tokens after compaction; excess is {} tokens. Major contributors after provider transformation: messages={} ({} serialized bytes), tools={} ({} serialized bytes), full serialized request={} bytes, media padding={} tokens. Reduce retained conversation/context, reduce tool surface, lower max_tokens, or select a larger-context model.",
+            self.agent.model,
+            context_window,
+            output_reservation,
+            Self::context_window_safety_margin(context_window),
+            input_budget,
+            compacted_estimated_tokens,
+            excess_tokens,
+            compacted_estimate.message_count,
+            compacted_estimate.messages_bytes,
+            compacted_estimate.tool_count,
+            compacted_estimate.tools_bytes,
+            compacted_estimate.serialized_request_bytes,
+            compacted_estimate.media_token_padding
+        ))
+    }
+
+    fn recovery_output_cap(
+        context_window: usize,
+        estimated_tokens: usize,
+        original_output_reservation: usize,
+    ) -> Option<usize> {
+        let safety_margin = Self::context_window_safety_margin(context_window);
+        let cap = context_window
+            .checked_sub(safety_margin)?
+            .checked_sub(estimated_tokens)?;
+        (cap > 0 && cap < original_output_reservation).then_some(cap)
+    }
+
+    fn try_recover_with_output_cap(
+        &self,
+        compacted_canonical: Context,
+        compacted_estimate: &ProviderRequestEstimate,
+        context_window: usize,
+        original_output_reservation: usize,
+    ) -> std::result::Result<Option<PreflightContexts>, PreflightContextWindowError> {
+        let mut output_cap = match Self::recovery_output_cap(
+            context_window,
+            compacted_estimate.estimated_input_tokens,
+            original_output_reservation,
+        ) {
+            Some(output_cap) => output_cap,
+            None => return Ok(None),
+        };
+
+        while output_cap > 0 {
+            let recovered_canonical = compacted_canonical
+                .clone()
+                .max_tokens(output_cap)
+                .context_window_recovery(ContextWindowRecovery {
+                    context_window,
+                    original_output_reservation,
+                    effective_output_cap: output_cap,
+                    estimated_input_tokens: compacted_estimate.estimated_input_tokens,
+                });
+            let recovered_reasoning_supported = recovered_canonical.is_reasoning_supported();
+            let recovered_outbound = self
+                .final_outbound_context(
+                    &self.agent.model,
+                    recovered_canonical.clone(),
+                    recovered_reasoning_supported,
+                )
+                .map_err(PreflightContextWindowError::other)?;
+            let recovered_estimate = self
+                .estimated_request(&recovered_outbound)
+                .map_err(PreflightContextWindowError::other)?;
+            let Some(recovered_budget) = Self::effective_input_budget(context_window, output_cap)
+            else {
+                return Ok(None);
+            };
+
+            if recovered_estimate.estimated_input_tokens <= recovered_budget {
+                let recovered_canonical =
+                    recovered_canonical.context_window_recovery(ContextWindowRecovery {
+                        context_window,
+                        original_output_reservation,
+                        effective_output_cap: output_cap,
+                        estimated_input_tokens: recovered_estimate.estimated_input_tokens,
+                    });
+                let recovered_outbound =
+                    recovered_outbound.context_window_recovery(ContextWindowRecovery {
+                        context_window,
+                        original_output_reservation,
+                        effective_output_cap: output_cap,
+                        estimated_input_tokens: recovered_estimate.estimated_input_tokens,
+                    });
+                return Ok(Some(PreflightContexts {
+                    canonical: recovered_canonical,
+                    outbound: recovered_outbound,
+                }));
+            }
+
+            let excess = recovered_estimate
+                .estimated_input_tokens
+                .saturating_sub(recovered_budget);
+            let next_output_cap = output_cap.saturating_sub(excess.max(1));
+            if next_output_cap >= output_cap {
+                return Ok(None);
+            }
+            output_cap = next_output_cap;
+        }
+
+        Ok(None)
+    }
+
     /// Compacts canonical context and prepares its final outbound projection before
     /// provider dispatch when the projected request would exceed the model window.
     ///
@@ -402,23 +517,21 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
             });
         }
 
-        let excess_tokens = compacted_estimated_tokens.saturating_sub(input_budget);
-        Err(PreflightContextWindowError::OverBudget(format!(
-            "Local context-window guard blocked an oversized request before provider dispatch. Model '{}' has context window {} tokens; reserved output is {} tokens; safety margin is {} tokens; effective input budget is {} tokens; estimated request is {} tokens after compaction; excess is {} tokens. Major contributors after provider transformation: messages={} ({} serialized bytes), tools={} ({} serialized bytes), full serialized request={} bytes, media padding={} tokens. Reduce retained conversation/context, reduce tool surface, lower max_tokens, or select a larger-context model.",
-            self.agent.model,
+        if let Some(recovered) = self.try_recover_with_output_cap(
+            compacted_canonical,
+            &compacted_estimate,
             context_window,
             output_reservation,
-            Self::context_window_safety_margin(context_window),
+        )? {
+            return Ok(recovered);
+        }
+
+        Err(self.compacted_over_budget_error(
+            context_window,
+            output_reservation,
             input_budget,
-            compacted_estimated_tokens,
-            excess_tokens,
-            compacted_estimate.message_count,
-            compacted_estimate.messages_bytes,
-            compacted_estimate.tool_count,
-            compacted_estimate.tools_bytes,
-            compacted_estimate.serialized_request_bytes,
-            compacted_estimate.media_token_padding
-        )))
+            &compacted_estimate,
+        ))
     }
 
     /// Returns the strongest safe canonical compaction for a context that could
@@ -866,11 +979,11 @@ mod tests {
     use tokio::sync::Mutex;
 
     use forge_domain::{
-        Agent, AgentId, ChatCompletionMessage, Compact, Context, ContextMessage,
-        DefaultTransformation, Environment, Image, ImageHandling, InputModality, MessageEntry,
-        Model, ModelId, Provider, ProviderId, ProviderResponse, ProviderType, ResultStream, Role,
-        TextMessage, TokenCount, ToolCallContext, ToolCallFull, ToolCallId, ToolDefinition,
-        ToolName, ToolOutput, ToolResult, ToolValue, Transformer, Usage,
+        Agent, AgentId, ChatCompletionMessage, Compact, Content, Context, ContextMessage,
+        DefaultTransformation, Environment, FinishReason, Image, ImageHandling, InputModality,
+        MessageEntry, Model, ModelId, Provider, ProviderId, ProviderResponse, ProviderType,
+        ResultStream, Role, TextMessage, TokenCount, ToolCallContext, ToolCallFull, ToolCallId,
+        ToolDefinition, ToolName, ToolOutput, ToolResult, ToolValue, Transformer, Usage,
     };
     use pretty_assertions::assert_eq;
 
@@ -951,6 +1064,89 @@ mod tests {
     }
 
     impl EnvironmentInfra for PersistingFixtureServices {
+        type Config = forge_config::ForgeConfig;
+
+        fn get_env_var(&self, _key: &str) -> Option<String> {
+            None
+        }
+
+        fn get_env_vars(&self) -> BTreeMap<String, String> {
+            BTreeMap::new()
+        }
+
+        fn get_environment(&self) -> Environment {
+            environment_fixture()
+        }
+
+        fn get_config(&self) -> anyhow::Result<Self::Config> {
+            Ok(forge_config::ForgeConfig::default())
+        }
+
+        async fn update_environment(
+            &self,
+            _ops: Vec<forge_domain::ConfigOperation>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct DispatchingFixtureServices {
+        updates: Mutex<Vec<forge_domain::Conversation>>,
+        requests: Mutex<Vec<Context>>,
+    }
+
+    impl DispatchingFixtureServices {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                updates: Mutex::new(Vec::new()),
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+
+        async fn updated_contexts(&self) -> Vec<Context> {
+            self.updates
+                .lock()
+                .await
+                .iter()
+                .filter_map(|conversation| conversation.context.clone())
+                .collect()
+        }
+
+        async fn requested_contexts(&self) -> Vec<Context> {
+            self.requests.lock().await.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentService for DispatchingFixtureServices {
+        async fn chat_agent(
+            &self,
+            _id: &ModelId,
+            context: Context,
+            _provider_id: Option<ProviderId>,
+        ) -> ResultStream<ChatCompletionMessage, anyhow::Error> {
+            self.requests.lock().await.push(context);
+            let message = ChatCompletionMessage::assistant(Content::full("recovered"))
+                .finish_reason(FinishReason::Stop);
+            Ok(Box::pin(tokio_stream::iter(std::iter::once(Ok(message)))))
+        }
+
+        async fn call(
+            &self,
+            _agent: &Agent,
+            _context: &ToolCallContext,
+            _call: ToolCallFull,
+        ) -> ToolResult {
+            panic!("tool calls should not run for stop response")
+        }
+
+        async fn update(&self, conversation: forge_domain::Conversation) -> anyhow::Result<()> {
+            self.updates.lock().await.push(conversation);
+            Ok(())
+        }
+    }
+
+    impl EnvironmentInfra for DispatchingFixtureServices {
         type Config = forge_config::ForgeConfig;
 
         fn get_env_var(&self, _key: &str) -> Option<String> {
@@ -1065,6 +1261,29 @@ mod tests {
         context_length: u64,
     ) -> Orchestrator<FixtureServices> {
         orchestrator_fixture_for_provider(compact, context_length, ProviderId::OPENAI)
+    }
+
+    fn dispatching_orchestrator_fixture(
+        services: Arc<DispatchingFixtureServices>,
+        context: Context,
+        compact: Compact,
+        context_length: u64,
+    ) -> Orchestrator<DispatchingFixtureServices> {
+        let agent = Agent::new(
+            AgentId::new("context_guard_agent"),
+            ProviderId::OPENAI,
+            ModelId::new("context-guard-model"),
+        )
+        .compact(compact);
+        let conversation = forge_domain::Conversation::generate().context(context);
+
+        Orchestrator::new(
+            services,
+            conversation,
+            agent,
+            forge_config::ForgeConfig::default(),
+        )
+        .models(vec![model_fixture(context_length)])
     }
 
     fn provider_fixture(provider_id: ProviderId) -> Provider<url::Url> {
@@ -1239,7 +1458,7 @@ mod tests {
                     .description(large_text(750))
                     .input_schema(schemars::schema_for!(())),
             )
-            .max_tokens(512_usize);
+            .max_tokens(1_usize);
         let estimation_fixture =
             orchestrator_fixture(Compact::new().retention_window(1_usize), 128_000);
         let domain_estimated_tokens = serde_json::to_vec(&context).unwrap().len();
@@ -1248,7 +1467,7 @@ mod tests {
             .unwrap();
         let context_window = (8_000_usize..128_000)
             .find(|context_window| {
-                Orchestrator::<FixtureServices>::effective_input_budget(*context_window, 512)
+                Orchestrator::<FixtureServices>::effective_input_budget(*context_window, 1)
                     .is_some_and(|budget| {
                         domain_estimated_tokens <= budget && provider_estimated_tokens > budget
                     })
@@ -1310,7 +1529,7 @@ mod tests {
                     is_error: false,
                 },
             }])
-            .max_tokens(512_usize);
+            .max_tokens(1_usize);
         let preflight_estimate = fixture.estimated_request_tokens(&context).unwrap();
         let final_context = DefaultTransformation::default()
             .pipe(ImageHandling::new())
@@ -1318,7 +1537,7 @@ mod tests {
         let final_estimate = fixture.estimated_request_tokens(&final_context).unwrap();
         let context_window = (8_000_usize..128_000)
             .find(|context_window| {
-                Orchestrator::<FixtureServices>::effective_input_budget(*context_window, 512)
+                Orchestrator::<FixtureServices>::effective_input_budget(*context_window, 1)
                     .is_some_and(|budget| preflight_estimate <= budget && final_estimate > budget)
             })
             .expect("fixture should expose image-handling transform estimation gap");
@@ -1463,6 +1682,46 @@ mod tests {
         assert_eq!(actual.contains("messages="), expected);
         assert_eq!(actual.contains("tools="), expected);
         assert_eq!(actual.contains("full serialized request="), expected);
+    }
+
+    #[tokio::test]
+    async fn test_run_recovers_max_compacted_context_by_clamping_output_reservation() {
+        let services = DispatchingFixtureServices::new();
+        let setup = Context::default()
+            .add_message(ContextMessage::user(large_text(1_300), None))
+            .max_tokens(4_000_usize);
+        let mut fixture = dispatching_orchestrator_fixture(
+            services.clone(),
+            setup,
+            Compact::new().retention_window(1_usize),
+            12_000,
+        );
+
+        fixture.run().await.unwrap();
+
+        let requested_contexts = services.requested_contexts().await;
+        let updates = services.updated_contexts().await;
+        let actual_request = requested_contexts
+            .last()
+            .expect("provider dispatch should receive recovered context");
+        let actual_persisted = updates
+            .iter()
+            .filter_map(|context| context.context_window_recovery.as_ref().map(|_| context))
+            .last()
+            .expect("recovered canonical context should be persisted");
+        let actual_budget = Orchestrator::<FixtureServices>::effective_input_budget(
+            12_000,
+            actual_request.max_tokens.unwrap(),
+        )
+        .unwrap();
+        let actual_estimate = fixture.estimated_request_tokens(actual_request).unwrap();
+        let expected = true;
+
+        assert_eq!(requested_contexts.len(), 1);
+        assert_eq!(actual_request.max_tokens.unwrap() < 4_000, expected);
+        assert_eq!(actual_request.context_window_recovery.is_some(), expected);
+        assert_eq!(actual_persisted.max_tokens, actual_request.max_tokens);
+        assert_eq!(actual_estimate <= actual_budget, expected);
     }
 
     #[tokio::test]

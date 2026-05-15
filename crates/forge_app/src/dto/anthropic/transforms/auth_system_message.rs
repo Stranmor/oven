@@ -89,6 +89,7 @@ mod tests {
             top_p: None,
             top_k: None,
             reasoning: None,
+            context_window_recovery: None,
             model_context_length: None,
             stream: None,
             response_format: None,

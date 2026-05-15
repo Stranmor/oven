@@ -25,7 +25,13 @@ impl ApplyTunableParameters {
             ctx = ctx.top_k(top_k);
         }
         if let Some(max_tokens) = self.agent.max_tokens {
-            ctx = ctx.max_tokens(max_tokens.value() as usize);
+            let configured_max_tokens = max_tokens.value() as usize;
+            let effective_max_tokens = ctx
+                .context_window_recovery
+                .as_ref()
+                .map(|recovery| recovery.effective_output_cap.min(configured_max_tokens))
+                .unwrap_or(configured_max_tokens);
+            ctx = ctx.max_tokens(effective_max_tokens);
         }
         if let Some(ref reasoning) = self.agent.reasoning {
             ctx = ctx.reasoning(reasoning.clone());
@@ -38,8 +44,8 @@ impl ApplyTunableParameters {
 #[cfg(test)]
 mod tests {
     use forge_domain::{
-        AgentId, Context, ConversationId, MaxTokens, ModelId, ProviderId, ReasoningConfig,
-        Temperature, ToolDefinition, TopK, TopP,
+        AgentId, Context, ContextWindowRecovery, ConversationId, MaxTokens, ModelId, ProviderId,
+        ReasoningConfig, Temperature, ToolDefinition, TopK, TopP,
     };
     use pretty_assertions::assert_eq;
 
@@ -79,5 +85,29 @@ mod tests {
         assert_eq!(ctx.top_p, Some(TopP::new(0.9).unwrap()));
         assert_eq!(ctx.reasoning, Some(reasoning));
         assert_eq!(ctx.tools, vec![tool_def]);
+    }
+
+    #[test]
+    fn test_apply_preserves_recovered_output_cap_below_agent_max_tokens() {
+        let recovery = ContextWindowRecovery {
+            context_window: 8_000,
+            original_output_reservation: 1_000,
+            effective_output_cap: 256,
+            estimated_input_tokens: 3_000,
+        };
+        let agent = Agent::new(
+            AgentId::new("test"),
+            ProviderId::ANTHROPIC,
+            ModelId::new("claude-3-5-sonnet-20241022"),
+        )
+        .max_tokens(MaxTokens::new(1000).unwrap());
+        let conversation = Conversation::new(ConversationId::generate())
+            .context(Context::default().context_window_recovery(recovery.clone()));
+
+        let actual = ApplyTunableParameters::new(agent, vec![]).apply(conversation);
+
+        let ctx = actual.context.unwrap();
+        assert_eq!(ctx.max_tokens, Some(256));
+        assert_eq!(ctx.context_window_recovery, Some(recovery));
     }
 }
