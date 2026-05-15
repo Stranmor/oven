@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
 use forge_app::domain::{
-    ChatCompletionMessage, Context, ContextWindowBudget, Model, ModelId, ProviderResponse,
-    ResultStream,
+    ChatCompletionMessage, Context, Model, ModelId, ProviderResponse, ResultStream,
 };
 use forge_app::{EnvironmentInfra, HttpInfra};
 use forge_domain::{ChatRepository, ModelSource, Provider, ProviderId};
@@ -139,7 +138,7 @@ impl<F: HttpInfra + EnvironmentInfra<Config = forge_config::ForgeConfig> + Sync>
         provider: Provider<Url>,
     ) -> ResultStream<ChatCompletionMessage, anyhow::Error> {
         let context = self
-            .validate_context_window_before_dispatch(model_id, context, &provider)
+            .attach_context_window_before_dispatch(model_id, context, &provider)
             .await?;
 
         match provider.response {
@@ -182,7 +181,7 @@ impl<F: HttpInfra + EnvironmentInfra<Config = forge_config::ForgeConfig> + Sync>
         }
     }
 
-    async fn validate_context_window_before_dispatch(
+    async fn attach_context_window_before_dispatch(
         &self,
         model_id: &ModelId,
         context: Context,
@@ -195,58 +194,14 @@ impl<F: HttpInfra + EnvironmentInfra<Config = forge_config::ForgeConfig> + Sync>
                 .await?
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "Provider dispatch context-window guard cannot prove safety for model '{}' on provider '{}' because context_length metadata is missing. Add context_length to the model metadata or select a model with known context window.",
+                        "Provider dispatch context-window metadata cannot prove safety for model '{}' on provider '{}' because context_length metadata is missing. Add context_length to the model metadata or select a model with known context window.",
                         model_id,
                         provider.id
                     )
                 })?,
         };
 
-        let context_window = usize::try_from(context_window).map_err(|_| {
-            anyhow::anyhow!(
-                "Provider dispatch context-window guard cannot represent context_length {} for model '{}' on provider '{}'.",
-                context_window,
-                model_id,
-                provider.id
-            )
-        })?;
-        let output_reservation = context
-            .max_tokens
-            .unwrap_or(ContextWindowBudget::DEFAULT_OUTPUT_TOKEN_RESERVATION);
-        let context_budget = ContextWindowBudget::new(context_window, output_reservation);
-        let input_budget = context_budget.effective_input_budget().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Provider dispatch context-window guard blocked request for model '{}' on provider '{}'. Context window is {} tokens, reserved output is {} tokens, and safety margin is {} tokens, leaving no safe prompt budget. Lower max_tokens or select a larger-context model.",
-                model_id,
-                provider.id,
-                context_budget.context_window(),
-                context_budget.output_reservation(),
-                context_budget.safety_margin()
-            )
-        })?;
-        let estimated_input = Self::estimated_context_input_tokens(&context);
-
-        if estimated_input > input_budget {
-            anyhow::bail!(
-                "Provider dispatch context-window guard blocked an oversized request before provider backend dispatch. Model '{}' on provider '{}' has context window {} tokens; reserved output is {} tokens; safety margin is {} tokens; effective input budget is {} tokens; conservative request estimate is {} tokens. Reduce context, lower max_tokens, or select a larger-context model.",
-                model_id,
-                provider.id,
-                context_budget.context_window(),
-                context_budget.output_reservation(),
-                context_budget.safety_margin(),
-                input_budget,
-                estimated_input
-            );
-        }
-
-        Ok(context.model_context_length(u64::try_from(context_window).map_err(|_| {
-            anyhow::anyhow!(
-                "Provider dispatch context-window guard cannot reattach context_length {} for model '{}' on provider '{}'.",
-                context_window,
-                model_id,
-                provider.id
-            )
-        })?))
+        Ok(context.model_context_length(context_window))
     }
 
     async fn resolve_model_context_length(
@@ -267,12 +222,6 @@ impl<F: HttpInfra + EnvironmentInfra<Config = forge_config::ForgeConfig> + Sync>
             .into_iter()
             .find(|model| &model.id == model_id && model.provider_id == provider.id)
             .and_then(|model| model.context_length))
-    }
-
-    fn estimated_context_input_tokens(context: &Context) -> usize {
-        serde_json::to_vec(context)
-            .map(|payload| payload.len())
-            .unwrap_or_else(|_| context.token_count_approx())
     }
 
     async fn models(&self, provider: Provider<Url>) -> anyhow::Result<Vec<Model>> {
@@ -298,8 +247,10 @@ mod tests {
 
     use bytes::Bytes;
     use forge_app::domain::{
-        AuthMethod, ContextMessage, Environment, MessageEntry, ModelSource, Role, TextMessage,
+        AuthMethod, ContextMessage, ContextWindowBudget, Environment, EventValue, MessageEntry,
+        ModelSource, Role, TextMessage,
     };
+    use forge_app::dto::openai::Request;
     use forge_eventsource::EventSource;
     use pretty_assertions::assert_eq;
     use reqwest::Response;
@@ -409,7 +360,10 @@ mod tests {
             }])),
             auth_methods: vec![AuthMethod::ApiKey],
             url_params: vec![],
-            credential: None,
+            credential: Some(forge_domain::AuthCredential::new_api_key(
+                provider_id.clone(),
+                forge_domain::ApiKey::from("test-key".to_string()),
+            )),
             custom_headers: None,
         }
     }
@@ -417,6 +371,12 @@ mod tests {
     fn context_fixture(content: String) -> Context {
         Context::default().messages(vec![MessageEntry::from(ContextMessage::Text(
             TextMessage::new(Role::User, content),
+        ))])
+    }
+
+    fn context_with_raw_content_fixture(content: String, raw_content: String) -> Context {
+        Context::default().messages(vec![MessageEntry::from(ContextMessage::Text(
+            TextMessage::new(Role::User, content).raw_content(EventValue::text(raw_content)),
         ))])
     }
 
@@ -458,15 +418,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_provider_dispatch_oversized_context_blocks_before_http() {
+    async fn test_provider_dispatch_openai_uses_exact_request_guard_not_raw_context_json() {
         let infra = Arc::new(MockInfra::default());
         let fixture = router_fixture(infra.clone());
-        let provider = provider_fixture(ProviderResponse::Anthropic, Some(12_000));
+        let provider = provider_fixture(ProviderResponse::OpenAI, Some(12_000));
+        let context = context_with_raw_content_fixture("short".to_string(), "x".repeat(9_000))
+            .max_tokens(100_usize);
+        let context_window = 12_000_usize;
+        let input_budget = ContextWindowBudget::new(context_window, 100)
+            .effective_input_budget()
+            .unwrap();
+        let raw_context_estimate = serde_json::to_vec(&context).unwrap().len();
+        let exact_request = Request::from_context_for_provider(
+            context.clone().model_context_length(context_window as u64),
+            &ModelId::new("test-model"),
+            &provider,
+            false,
+        )
+        .unwrap();
+        let exact_request_bytes = serde_json::to_vec(&exact_request).unwrap();
+        let exact_request_estimate =
+            exact_request.estimated_input_tokens_from_serialized(&exact_request_bytes);
+
+        assert!(raw_context_estimate > input_budget);
+        assert!(exact_request_estimate <= input_budget);
+
+        let actual = match fixture
+            .chat(&ModelId::new("test-model"), context, provider)
+            .await
+        {
+            Ok(_) => panic!("mock HTTP backend should stop the request after exact guard passes"),
+            Err(error) => error.to_string(),
+        };
+        let unexpected = false;
+
+        assert_eq!(
+            actual.contains("Provider dispatch context-window guard blocked"),
+            unexpected
+        );
+        assert_eq!(infra.http_calls.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn test_provider_dispatch_anthropic_exact_guard_blocks_before_http() {
+        let infra = Arc::new(MockInfra::default());
+        let fixture = router_fixture(infra.clone());
+        let provider = provider_fixture(ProviderResponse::Anthropic, Some(5_000));
 
         let actual = match fixture
             .chat(
                 &ModelId::new("test-model"),
-                context_fixture("x ".repeat(9_000)),
+                context_fixture("x ".repeat(20_000)).max_tokens(100_usize),
                 provider,
             )
             .await
@@ -475,8 +476,13 @@ mod tests {
             Err(error) => error.to_string(),
         };
         let expected = true;
+        let unexpected = false;
 
-        assert_eq!(actual.contains("oversized request"), expected);
+        assert_eq!(actual.contains("Anthropic context-window guard"), expected);
+        assert_eq!(
+            actual.contains("Provider dispatch context-window guard blocked"),
+            unexpected
+        );
         assert_eq!(infra.http_calls.load(Ordering::SeqCst), 0);
     }
 }
