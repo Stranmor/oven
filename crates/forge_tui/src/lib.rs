@@ -1356,9 +1356,10 @@ fn render_truncated_payload(text: &str, prefix: &'static str, color: Color) -> V
 }
 
 fn truncated_logical_lines(raw_lines: &[&str]) -> Vec<String> {
-    let head = DETAIL_TRUNCATION_LINES / 2;
-    let tail = DETAIL_TRUNCATION_LINES - head;
-    let retained = head.saturating_add(tail);
+    let marker_rows = 1;
+    let retained = DETAIL_TRUNCATION_LINES.saturating_sub(marker_rows);
+    let head = retained / 2;
+    let tail = retained.saturating_sub(head);
     let omitted = raw_lines.len().saturating_sub(retained);
     let mut lines = Vec::new();
     for line in raw_lines.iter().take(head) {
@@ -1368,6 +1369,7 @@ fn truncated_logical_lines(raw_lines: &[&str]) -> Vec<String> {
     for line in raw_lines.iter().skip(raw_lines.len().saturating_sub(tail)) {
         lines.extend(truncate_visual_line(line));
     }
+    lines.truncate(DETAIL_TRUNCATION_LINES);
     lines
 }
 
@@ -1819,6 +1821,19 @@ mod tests {
         assert!(actual.contains("Tool output available in rail"));
         assert!(!actual.contains("SECRET_RAW_OUTPUT_SHOULD_NOT_RENDER"));
         assert!(!actual.contains("SECRET_TOOL_OUTPUT_BODY_SHOULD_NOT_RENDER"));
+    }
+
+    #[test]
+    fn test_long_tool_detail_retains_at_most_truncation_limit_payload_rows() {
+        let setup = (0..40)
+            .map(|index| format!("output line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let actual = render_truncated_payload(&setup, "  ", Color::White).len();
+
+        let expected = DETAIL_TRUNCATION_LINES;
+        assert_eq!(actual, expected);
     }
 
     #[test]
