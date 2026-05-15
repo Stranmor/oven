@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use forge_app::domain::{
-    ChatCompletionMessage, Context, Model, ModelId, ResultStream, Transformer,
+    ChatCompletionMessage, Context, ContextWindowBudget, Model, ModelId, ResultStream, Transformer,
 };
 use forge_app::dto::anthropic::{
     AuthSystemMessage, CapitalizeToolNames, DropInvalidToolUse, EnforceStrictObjectSchema,
@@ -121,6 +121,45 @@ fn transform_chat_request(
     }
 }
 
+fn validate_anthropic_context_window(
+    model: &ModelId,
+    context_window: Option<u64>,
+    output_reservation: usize,
+    serialized_request: &[u8],
+) -> anyhow::Result<()> {
+    let context_window = context_window
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Anthropic context-window guard cannot prove safety for model '{}' because context_length metadata is missing. Add context_length to the model metadata or select a model with known context window.",
+                model
+            )
+        })?;
+    let context_budget = ContextWindowBudget::new(context_window, output_reservation);
+    let input_budget = context_budget.effective_input_budget().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Anthropic context-window guard blocked request for model '{}'. Context window is {} tokens, reserved output is {} tokens, and safety margin is {} tokens, leaving no safe prompt budget. Lower max_tokens or select a larger-context model.",
+            model,
+            context_budget.context_window(),
+            context_budget.output_reservation(),
+            context_budget.safety_margin()
+        )
+    })?;
+    let estimated_input = serialized_request.len();
+    if estimated_input <= input_budget {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "Anthropic context-window guard blocked an oversized request before HTTP dispatch. Model '{}' has context window {} tokens; reserved output is {} tokens; safety margin is {} tokens; effective input budget is {} tokens; final serialized request estimate is {} tokens. Reduce context, lower max_tokens, or select a larger-context model.",
+        model,
+        context_budget.context_window(),
+        context_budget.output_reservation(),
+        context_budget.safety_margin(),
+        input_budget,
+        estimated_input
+    )
+}
+
 impl<T: HttpInfra> Anthropic<T> {
     /// Determines whether this provider should bypass reqwest-eventsource
     /// content-type validation and parse SSE from raw bytes instead.
@@ -134,6 +173,7 @@ impl<T: HttpInfra> Anthropic<T> {
         context: Context,
     ) -> ResultStream<ChatCompletionMessage, anyhow::Error> {
         let max_tokens = context.max_tokens.unwrap_or(4000);
+        let context_window = context.model_context_length;
         // transform the context to match the request format
         let context = ReasoningTransform.transform(context);
 
@@ -165,6 +205,12 @@ impl<T: HttpInfra> Anthropic<T> {
 
         let json_bytes =
             serde_json::to_vec(&request).with_context(|| "Failed to serialize request")?;
+        validate_anthropic_context_window(
+            model,
+            context_window,
+            usize::try_from(request.max_tokens).unwrap_or(usize::MAX),
+            &json_bytes,
+        )?;
 
         let parsed_url = Url::parse(&url).with_context(|| format!("Invalid URL: {}", url))?;
         let headers = create_headers(self.get_headers(Some(model)));

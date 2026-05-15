@@ -14,6 +14,7 @@ use url::Url;
 use crate::agent::AgentService;
 use crate::compact::Compactor;
 use crate::dto::openai::{ProviderRequestEstimate, Request};
+use crate::dto::{anthropic as anthropic_dto, google as google_dto};
 use crate::transformers::{DropReasoningOnlyMessages, ModelSpecificReasoning};
 use crate::{EnvironmentInfra, TemplateEngine};
 
@@ -25,6 +26,7 @@ pub struct Orchestrator<S> {
     conversation: Conversation,
     tool_definitions: Vec<ToolDefinition>,
     models: Vec<Model>,
+    active_provider: Option<Provider<Url>>,
     agent: Agent,
     error_tracker: ToolErrorTracker,
     hook: Arc<Hook>,
@@ -66,6 +68,7 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
             sender: Default::default(),
             tool_definitions: Default::default(),
             models: Default::default(),
+            active_provider: Default::default(),
             error_tracker: Default::default(),
             hook: Arc::new(Hook::default()),
         }
@@ -238,7 +241,64 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
         provider: &Provider<Url>,
         merge_system_messages: bool,
     ) -> anyhow::Result<ProviderRequestEstimate> {
-        Request::estimate_provider_request(context, model, provider, merge_system_messages)
+        match provider.response {
+            Some(ProviderResponse::Anthropic) => {
+                let output_reservation = context
+                    .max_tokens
+                    .unwrap_or(ContextWindowBudget::DEFAULT_OUTPUT_TOKEN_RESERVATION);
+                let context = anthropic_dto::ReasoningTransform.transform(context);
+                let mut request = anthropic_dto::Request::try_from(context)?
+                    .max_tokens(output_reservation.min(8192) as u64);
+                if provider.id != ProviderId::VERTEX_AI_ANTHROPIC {
+                    request = request.model(model.as_str().to_string());
+                }
+                let serialized_request = serde_json::to_vec(&request)?;
+                Ok(ProviderRequestEstimate::from_serialized_parts(
+                    serialized_request.len(),
+                    0,
+                    request.messages.len(),
+                    request.tools.len(),
+                    serde_json::to_vec(&request.messages)?.len(),
+                    serde_json::to_vec(&request.tools)?.len(),
+                ))
+            }
+            Some(ProviderResponse::Google) => {
+                let request = google_dto::Request::from(context);
+                let serialized_request = serde_json::to_vec(&request)?;
+                let message_count =
+                    request.contents.len() + usize::from(request.system_instruction.is_some());
+                let tool_count = request
+                    .tools
+                    .as_ref()
+                    .map(|tools| tools.len())
+                    .unwrap_or_default();
+                Ok(ProviderRequestEstimate::from_serialized_parts(
+                    serialized_request.len(),
+                    0,
+                    message_count,
+                    tool_count,
+                    serde_json::to_vec(&request.contents)?.len(),
+                    serde_json::to_vec(&request.tools)?.len(),
+                ))
+            }
+            Some(ProviderResponse::OpenAI)
+            | Some(ProviderResponse::OpenAIResponses)
+            | Some(ProviderResponse::OpenCode)
+            | None => {
+                Request::estimate_provider_request(context, model, provider, merge_system_messages)
+            }
+            Some(ProviderResponse::Bedrock) => {
+                let serialized_context = serde_json::to_vec(&context)?;
+                Ok(ProviderRequestEstimate::from_serialized_parts(
+                    serialized_context.len(),
+                    0,
+                    context.messages.len(),
+                    context.tools.len(),
+                    serde_json::to_vec(&context.messages)?.len(),
+                    serde_json::to_vec(&context.tools)?.len(),
+                ))
+            }
+        }
     }
 
     /// Returns the estimated token count for the outbound provider request.
@@ -248,7 +308,12 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
 
     /// Returns the provider request estimate for the outbound provider request.
     fn estimated_request(&self, context: &Context) -> anyhow::Result<ProviderRequestEstimate> {
-        let provider = self.estimation_provider()?;
+        let provider = self
+            .active_provider
+            .as_ref()
+            .cloned()
+            .map(Ok)
+            .unwrap_or_else(|| self.estimation_provider())?;
         Self::estimate_provider_request(
             context.clone(),
             &self.agent.model,
@@ -982,13 +1047,15 @@ mod tests {
         Agent, AgentId, ChatCompletionMessage, Compact, Content, Context, ContextMessage,
         DefaultTransformation, Environment, FinishReason, Image, ImageHandling, InputModality,
         MessageEntry, Model, ModelId, Provider, ProviderId, ProviderResponse, ProviderType,
-        ResultStream, Role, TextMessage, TokenCount, ToolCallContext, ToolCallFull, ToolCallId,
-        ToolDefinition, ToolName, ToolOutput, ToolResult, ToolValue, Transformer, Usage,
+        ReasoningConfig, ResultStream, Role, TextMessage, TokenCount, ToolCallContext,
+        ToolCallFull, ToolCallId, ToolDefinition, ToolName, ToolOutput, ToolResult, ToolValue,
+        Transformer, Usage,
     };
     use pretty_assertions::assert_eq;
 
     use super::Orchestrator;
     use crate::compact::Compactor;
+    use crate::dto::anthropic as anthropic_dto;
     use crate::{AgentService, EnvironmentInfra};
 
     struct FixtureServices;
@@ -1287,10 +1354,17 @@ mod tests {
     }
 
     fn provider_fixture(provider_id: ProviderId) -> Provider<url::Url> {
+        provider_fixture_with_response(provider_id, ProviderResponse::OpenAI)
+    }
+
+    fn provider_fixture_with_response(
+        provider_id: ProviderId,
+        response: ProviderResponse,
+    ) -> Provider<url::Url> {
         Provider {
             id: provider_id,
             provider_type: ProviderType::Llm,
-            response: Some(ProviderResponse::OpenAI),
+            response: Some(response),
             url: "https://provider-estimate.example/v1/chat/completions"
                 .parse()
                 .unwrap(),
@@ -1300,6 +1374,33 @@ mod tests {
             credential: None,
             custom_headers: None,
         }
+    }
+
+    #[test]
+    fn test_preflight_uses_anthropic_final_request_after_thinking_max_tokens_normalization() {
+        let provider =
+            provider_fixture_with_response(ProviderId::ANTHROPIC, ProviderResponse::Anthropic);
+        let fixture = orchestrator_fixture_for_provider(
+            Compact::new().retention_window(1_usize),
+            128_000,
+            ProviderId::ANTHROPIC,
+        )
+        .models(vec![Model {
+            supports_reasoning: Some(true),
+            ..model_fixture_for_provider(128_000, ProviderId::ANTHROPIC)
+        }])
+        .active_provider(provider);
+        let setup = Context::default()
+            .add_message(ContextMessage::user("thinking request", None))
+            .reasoning(ReasoningConfig::default().enabled(true).max_tokens(2_000))
+            .max_tokens(1_usize);
+
+        let actual = fixture.estimated_request(&setup).unwrap();
+        let request = anthropic_dto::Request::try_from(setup).unwrap();
+        let expected = true;
+
+        assert_eq!(request.max_tokens > 1, expected);
+        assert_eq!(actual.serialized_request_bytes > 0, expected);
     }
 
     fn droppable_user_message(content: String) -> ContextMessage {

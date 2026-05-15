@@ -261,6 +261,36 @@ pub struct ProviderRequestEstimate {
     pub tools_bytes: usize,
 }
 
+impl ProviderRequestEstimate {
+    /// Builds a final provider request estimate from serialized request parts.
+    ///
+    /// # Arguments
+    /// * `serialized_request_bytes` - Final JSON payload byte length before media padding.
+    /// * `media_token_padding` - Additional media padding included in the input estimate.
+    /// * `message_count` - Number of provider messages in the final request.
+    /// * `tool_count` - Number of provider tools in the final request.
+    /// * `messages_bytes` - Serialized byte length of the provider messages field.
+    /// * `tools_bytes` - Serialized byte length of the provider tools field.
+    pub fn from_serialized_parts(
+        serialized_request_bytes: usize,
+        media_token_padding: usize,
+        message_count: usize,
+        tool_count: usize,
+        messages_bytes: usize,
+        tools_bytes: usize,
+    ) -> Self {
+        Self {
+            estimated_input_tokens: serialized_request_bytes.saturating_add(media_token_padding),
+            serialized_request_bytes,
+            media_token_padding,
+            message_count,
+            tool_count,
+            messages_bytes,
+            tools_bytes,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, Setters, Default)]
 #[setters(strip_option)]
 pub struct Request {
@@ -386,16 +416,14 @@ impl Request {
         let request =
             Self::from_context_for_provider(context, model, provider, merge_system_messages)?;
         let serialized_request = serde_json::to_vec(&request)?;
-        Ok(ProviderRequestEstimate {
-            estimated_input_tokens: request
-                .estimated_input_tokens_from_serialized(&serialized_request),
-            serialized_request_bytes: serialized_request.len(),
-            media_token_padding: request.media_token_padding(),
-            message_count: request.message_count(),
-            tool_count: request.tools.as_ref().map(|tools| tools.len()).unwrap_or(0),
-            messages_bytes: serialized_optional_bytes(&request.messages)?,
-            tools_bytes: serialized_optional_bytes(&request.tools)?,
-        })
+        Ok(ProviderRequestEstimate::from_serialized_parts(
+            serialized_request.len(),
+            request.media_token_padding(),
+            request.message_count(),
+            request.tools.as_ref().map(|tools| tools.len()).unwrap_or(0),
+            serialized_optional_bytes(&request.messages)?,
+            serialized_optional_bytes(&request.tools)?,
+        ))
     }
 
     /// Estimates input tokens from the final serialized OpenAI-compatible provider request.

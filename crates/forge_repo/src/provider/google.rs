@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use forge_app::domain::{ChatCompletionMessage, Context, Model, ModelId, ResultStream};
+use forge_app::domain::{
+    ChatCompletionMessage, Context, ContextWindowBudget, Model, ModelId, ResultStream,
+};
 use forge_app::dto::google::{EventData, Request};
 use forge_app::{EnvironmentInfra, HttpInfra};
 use forge_domain::{ChatRepository, Provider};
@@ -49,13 +51,59 @@ impl<H: HttpInfra> Google<H> {
     }
 }
 
+fn validate_google_context_window(
+    model: &ModelId,
+    context_window: Option<u64>,
+    output_reservation: usize,
+    serialized_request: &[u8],
+) -> anyhow::Result<()> {
+    let context_window = context_window
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Google context-window guard cannot prove safety for model '{}' because context_length metadata is missing. Add context_length to the model metadata or select a model with known context window.",
+                model
+            )
+        })?;
+    let context_budget = ContextWindowBudget::new(context_window, output_reservation);
+    let input_budget = context_budget.effective_input_budget().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Google context-window guard blocked request for model '{}'. Context window is {} tokens, reserved output is {} tokens, and safety margin is {} tokens, leaving no safe prompt budget. Lower max_tokens or select a larger-context model.",
+            model,
+            context_budget.context_window(),
+            context_budget.output_reservation(),
+            context_budget.safety_margin()
+        )
+    })?;
+    let estimated_input = serialized_request.len();
+    if estimated_input <= input_budget {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "Google context-window guard blocked an oversized request before HTTP dispatch. Model '{}' has context window {} tokens; reserved output is {} tokens; safety margin is {} tokens; effective input budget is {} tokens; final serialized request estimate is {} tokens. Reduce context, lower max_tokens, or select a larger-context model.",
+        model,
+        context_budget.context_window(),
+        context_budget.output_reservation(),
+        context_budget.safety_margin(),
+        input_budget,
+        estimated_input
+    )
+}
+
 impl<T: HttpInfra> Google<T> {
     pub async fn chat(
         &self,
         model: &ModelId,
         context: Context,
     ) -> ResultStream<ChatCompletionMessage, anyhow::Error> {
+        let context_window = context.model_context_length;
         let request = Request::from(context);
+        let output_reservation = request
+            .generation_config
+            .as_ref()
+            .and_then(|config| config.max_output_tokens)
+            .and_then(|tokens| usize::try_from(tokens).ok())
+            .unwrap_or(ContextWindowBudget::DEFAULT_OUTPUT_TOKEN_RESERVATION);
 
         // Google models are specified in the URL path, not the request body
         // URL format: {base_url}/models/{model}:streamGenerateContent?alt=sse
@@ -74,6 +122,7 @@ impl<T: HttpInfra> Google<T> {
 
         let json_bytes =
             serde_json::to_vec(&request).with_context(|| "Failed to serialize request")?;
+        validate_google_context_window(model, context_window, output_reservation, &json_bytes)?;
 
         let source = self
             .http

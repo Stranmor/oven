@@ -733,6 +733,37 @@ impl From<ReasoningConfigRecord> for forge_domain::ReasoningConfig {
     }
 }
 
+/// Repository-specific representation of context-window recovery metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct ContextWindowRecoveryRecord {
+    context_window: usize,
+    original_output_reservation: usize,
+    effective_output_cap: usize,
+    estimated_input_tokens: usize,
+}
+
+impl From<&forge_domain::ContextWindowRecovery> for ContextWindowRecoveryRecord {
+    fn from(recovery: &forge_domain::ContextWindowRecovery) -> Self {
+        Self {
+            context_window: recovery.context_window,
+            original_output_reservation: recovery.original_output_reservation,
+            effective_output_cap: recovery.effective_output_cap,
+            estimated_input_tokens: recovery.estimated_input_tokens,
+        }
+    }
+}
+
+impl From<ContextWindowRecoveryRecord> for forge_domain::ContextWindowRecovery {
+    fn from(record: ContextWindowRecoveryRecord) -> Self {
+        forge_domain::ContextWindowRecovery {
+            context_window: record.context_window,
+            original_output_reservation: record.original_output_reservation,
+            effective_output_cap: record.effective_output_cap,
+            estimated_input_tokens: record.estimated_input_tokens,
+        }
+    }
+}
+
 /// Repository-specific representation of Context
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct ContextRecord {
@@ -757,6 +788,8 @@ pub(super) struct ContextRecord {
     top_k: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reasoning: Option<ReasoningConfigRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_window_recovery: Option<ContextWindowRecoveryRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -786,6 +819,10 @@ impl From<&Context> for ContextRecord {
             top_p: context.top_p.map(|t| t.value()),
             top_k: context.top_k.map(|t| t.value()),
             reasoning: context.reasoning.as_ref().map(ReasoningConfigRecord::from),
+            context_window_recovery: context
+                .context_window_recovery
+                .as_ref()
+                .map(ContextWindowRecoveryRecord::from),
             stream: context.stream,
             frequency_penalty: context.frequency_penalty,
             presence_penalty: context.presence_penalty,
@@ -838,6 +875,7 @@ impl TryFrom<ContextRecord> for Context {
             top_p: record.top_p.map(forge_domain::TopP::new_unchecked),
             top_k: record.top_k.map(forge_domain::TopK::new_unchecked),
             reasoning: record.reasoning.map(Into::into),
+            context_window_recovery: record.context_window_recovery.map(Into::into),
             model_context_length: None,
             stream: record.stream,
             response_format: None,
@@ -1062,5 +1100,36 @@ impl TryFrom<ConversationRecord> for forge_domain::Conversation {
             conv.parent_id = Some(parent_id);
         }
         Ok(conv)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use forge_domain::{ContextMessage, ContextWindowRecovery};
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[test]
+    fn test_context_record_preserves_context_window_recovery_marker() {
+        let recovery = ContextWindowRecovery {
+            context_window: 8_000,
+            original_output_reservation: 1_000,
+            effective_output_cap: 256,
+            estimated_input_tokens: 3_000,
+        };
+        let setup = Context::default()
+            .add_message(ContextMessage::user("persist recovery", None))
+            .context_window_recovery(recovery.clone());
+
+        let actual: Context = serde_json::from_str::<ContextRecord>(
+            &serde_json::to_string(&ContextRecord::from(&setup)).unwrap(),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        let expected = Some(recovery);
+
+        assert_eq!(actual.context_window_recovery, expected);
     }
 }

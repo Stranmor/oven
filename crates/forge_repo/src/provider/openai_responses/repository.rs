@@ -3,7 +3,8 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use async_openai::types::responses as oai;
 use forge_app::domain::{
-    ChatCompletionMessage, Context as ChatContext, Model, ModelId, ResultStream,
+    ChatCompletionMessage, Context as ChatContext, ContextWindowBudget, Model, ModelId,
+    ResultStream,
 };
 use forge_app::{EnvironmentInfra, HttpInfra};
 use forge_domain::{BoxStream, ChatRepository, Provider, ProviderId, ProviderResponse};
@@ -152,12 +153,52 @@ impl<H: HttpInfra> OpenAIResponsesProvider<H> {
     }
 }
 
+fn validate_openai_responses_context_window(
+    model: &ModelId,
+    context_window: Option<u64>,
+    output_reservation: usize,
+    serialized_request: &[u8],
+) -> anyhow::Result<()> {
+    let context_window = context_window
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "OpenAI Responses context-window guard cannot prove safety for model '{}' because context_length metadata is missing. Add context_length to the model metadata or select a model with known context window.",
+                model
+            )
+        })?;
+    let context_budget = ContextWindowBudget::new(context_window, output_reservation);
+    let input_budget = context_budget.effective_input_budget().ok_or_else(|| {
+        anyhow::anyhow!(
+            "OpenAI Responses context-window guard blocked request for model '{}'. Context window is {} tokens, reserved output is {} tokens, and safety margin is {} tokens, leaving no safe prompt budget. Lower max_output_tokens or select a larger-context model.",
+            model,
+            context_budget.context_window(),
+            context_budget.output_reservation(),
+            context_budget.safety_margin()
+        )
+    })?;
+    let estimated_input = serialized_request.len();
+    if estimated_input <= input_budget {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "OpenAI Responses context-window guard blocked an oversized request before HTTP dispatch. Model '{}' has context window {} tokens; reserved output is {} tokens; safety margin is {} tokens; effective input budget is {} tokens; final serialized request estimate is {} tokens. Reduce context, lower max_output_tokens, or select a larger-context model.",
+        model,
+        context_budget.context_window(),
+        context_budget.output_reservation(),
+        context_budget.safety_margin(),
+        input_budget,
+        estimated_input
+    )
+}
+
 impl<T: HttpInfra> OpenAIResponsesProvider<T> {
     pub async fn chat(
         &self,
         model: &ModelId,
         context: ChatContext,
     ) -> ResultStream<ChatCompletionMessage, anyhow::Error> {
+        let context_window = context.model_context_length;
         let conversation_id = context.conversation_id.as_ref().map(ToString::to_string);
         let message_cache_eligibility = responses_input_cache_eligibility(&context);
         let headers = create_headers(self.get_headers_for_conversation(conversation_id.as_deref()));
@@ -185,6 +226,16 @@ impl<T: HttpInfra> OpenAIResponsesProvider<T> {
             &request,
             &message_cache_eligibility,
             enable_cache_control,
+        )?;
+        let output_reservation = request
+            .max_output_tokens
+            .and_then(|tokens| usize::try_from(tokens).ok())
+            .unwrap_or(ContextWindowBudget::DEFAULT_OUTPUT_TOKEN_RESERVATION);
+        validate_openai_responses_context_window(
+            model,
+            context_window,
+            output_reservation,
+            &json_bytes,
         )?;
 
         // The Codex backend at chatgpt.com does not return

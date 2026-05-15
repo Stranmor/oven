@@ -29,7 +29,13 @@ impl ApplyTunableParameters {
             let effective_max_tokens = ctx
                 .context_window_recovery
                 .as_ref()
-                .map(|recovery| recovery.effective_output_cap.min(configured_max_tokens))
+                .and_then(|recovery| {
+                    (recovery.effective_output_cap > 0
+                        && recovery.effective_output_cap < recovery.original_output_reservation
+                        && recovery.effective_output_cap <= recovery.context_window)
+                        .then_some(recovery.effective_output_cap)
+                })
+                .map(|cap| cap.min(configured_max_tokens))
                 .unwrap_or(configured_max_tokens);
             ctx = ctx.max_tokens(effective_max_tokens);
         }
@@ -109,5 +115,28 @@ mod tests {
         let ctx = actual.context.unwrap();
         assert_eq!(ctx.max_tokens, Some(256));
         assert_eq!(ctx.context_window_recovery, Some(recovery));
+    }
+
+    #[test]
+    fn test_apply_ignores_invalid_zero_recovery_output_cap() {
+        let recovery = ContextWindowRecovery {
+            context_window: 8_000,
+            original_output_reservation: 1_000,
+            effective_output_cap: 0,
+            estimated_input_tokens: 3_000,
+        };
+        let agent = Agent::new(
+            AgentId::new("test"),
+            ProviderId::ANTHROPIC,
+            ModelId::new("claude-3-5-sonnet-20241022"),
+        )
+        .max_tokens(MaxTokens::new(1000).unwrap());
+        let conversation = Conversation::new(ConversationId::generate())
+            .context(Context::default().context_window_recovery(recovery));
+
+        let actual = ApplyTunableParameters::new(agent, vec![]).apply(conversation);
+
+        let ctx = actual.context.unwrap();
+        assert_eq!(ctx.max_tokens, Some(1000));
     }
 }

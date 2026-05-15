@@ -821,6 +821,7 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig> + SteerS
         .error_tracker(ToolErrorTracker::new(max_tool_failure_per_turn))
         .tool_definitions(tool_definitions)
         .models(models)
+        .active_provider(agent_provider)
         .hook(Arc::new(hook));
 
         // Create and return the stream

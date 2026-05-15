@@ -5,8 +5,8 @@ use aws_sdk_bedrockruntime::Client;
 use aws_sdk_bedrockruntime::config::Token;
 use forge_config::RetryConfig;
 use forge_domain::{
-    AuthDetails, ChatCompletionMessage, ChatRepository, Context, Model, ModelId, Provider,
-    ResultStream, Transformer,
+    AuthDetails, ChatCompletionMessage, ChatRepository, Context, ContextWindowBudget, Model,
+    ModelId, Provider, ResultStream, Transformer,
 };
 use reqwest::Url;
 use tokio::sync::OnceCell;
@@ -16,6 +16,44 @@ use crate::provider::bedrock_cache::SetCache;
 use crate::provider::bedrock_sanitize_ids::SanitizeToolIds;
 use crate::provider::retry::into_retry;
 use crate::provider::{FromDomain, IntoDomain};
+
+fn validate_bedrock_context_window(
+    model: &ModelId,
+    context_window: Option<u64>,
+    output_reservation: usize,
+    final_request_estimate: usize,
+) -> anyhow::Result<()> {
+    let context_window = context_window
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Bedrock context-window guard cannot prove safety for model '{}' because context_length metadata is missing. Add context_length to the model metadata or select a model with known context window.",
+                model
+            )
+        })?;
+    let context_budget = ContextWindowBudget::new(context_window, output_reservation);
+    let input_budget = context_budget.effective_input_budget().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Bedrock context-window guard blocked request for model '{}'. Context window is {} tokens, reserved output is {} tokens, and safety margin is {} tokens, leaving no safe prompt budget. Lower max_tokens or select a larger-context model.",
+            model,
+            context_budget.context_window(),
+            context_budget.output_reservation(),
+            context_budget.safety_margin()
+        )
+    })?;
+    if final_request_estimate <= input_budget {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "Bedrock context-window guard blocked an oversized request before SDK dispatch. Model '{}' has context window {} tokens; reserved output is {} tokens; safety margin is {} tokens; effective input budget is {} tokens; final request estimate is {} tokens. Reduce context, lower max_tokens, or select a larger-context model.",
+        model,
+        context_budget.context_window(),
+        context_budget.output_reservation(),
+        context_budget.safety_margin(),
+        input_budget,
+        final_request_estimate
+    )
+}
 
 /// Authentication mode for the Bedrock provider
 enum BedrockAuthMode {
@@ -203,6 +241,10 @@ impl BedrockProvider {
         context: Context,
     ) -> ResultStream<ChatCompletionMessage, anyhow::Error> {
         let model_id = self.transform_model_id(model.as_str());
+        let context_window = context.model_context_length;
+        let output_reservation = context
+            .max_tokens
+            .unwrap_or(ContextWindowBudget::DEFAULT_OUTPUT_TOKEN_RESERVATION);
 
         // Convert context to AWS SDK types using FromDomain trait
         let bedrock_input =
@@ -217,6 +259,12 @@ impl BedrockProvider {
             .when(move |_| supports_caching)
             .pipe(SanitizeToolIds)
             .transform(bedrock_input);
+        validate_bedrock_context_window(
+            model,
+            context_window,
+            output_reservation,
+            format!("{bedrock_input:?}").len(),
+        )?;
 
         // Build and send the converse_stream request
         let output = self
