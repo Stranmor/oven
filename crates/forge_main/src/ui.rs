@@ -106,6 +106,47 @@ fn format_mcp_headers(server: &forge_domain::McpServerConfig) -> Option<String> 
     }
 }
 
+fn format_compaction_provider_request_estimate(result: &forge_domain::CompactionResult) -> String {
+    match (
+        result.original_provider_request.as_ref(),
+        result.compacted_provider_request.as_ref(),
+        result.provider_request_estimate_change(),
+    ) {
+        (Some(original), Some(compacted), Some(change)) => {
+            let change = match change {
+                forge_domain::ProviderRequestEstimateChange::Unchanged => {
+                    "0.0% provider request change".to_string()
+                }
+                forge_domain::ProviderRequestEstimateChange::Reduction { percentage } => {
+                    format!("{percentage:.1}% provider request reduction")
+                }
+                forge_domain::ProviderRequestEstimateChange::Growth { percentage } => {
+                    format!("{percentage:.1}% provider request growth")
+                }
+                forge_domain::ProviderRequestEstimateChange::GrowthFromZero => {
+                    "provider request growth from 0 tokens".to_string()
+                }
+            };
+            let fit_status = match compacted.input_budget {
+                Some(budget) if compacted.estimated_tokens <= budget => {
+                    format!("fits provider budget {budget}")
+                }
+                Some(budget) => format!(
+                    "exceeds provider budget {budget} by {}",
+                    compacted.estimated_tokens.saturating_sub(budget)
+                ),
+                None => "provider budget unavailable".to_string(),
+            };
+
+            format!(
+                ", {change} (provider request estimate: {} -> {} tokens, {fit_status})",
+                original.estimated_tokens, compacted.estimated_tokens
+            )
+        }
+        _ => String::new(),
+    }
+}
+
 pub struct UI<A: ConsoleWriter, F: Fn(ForgeConfig) -> A> {
     markdown: MarkdownFormat,
     state: UIState,
@@ -2475,29 +2516,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         let compaction_result = self.api.compact_conversation(&conversation_id).await?;
         let token_reduction = compaction_result.token_reduction_percentage();
         let message_reduction = compaction_result.message_reduction_percentage();
-        let provider_estimate = compaction_result
-            .provider_request_reduction_percentage()
-            .map(|reduction| {
-                let compacted = compaction_result
-                    .compacted_provider_request
-                    .as_ref()
-                    .expect("provider reduction requires compacted provider estimate");
-                let fit_status = match compacted.input_budget {
-                    Some(budget) if compacted.estimated_tokens <= budget => {
-                        format!("fits provider budget {budget}")
-                    }
-                    Some(budget) => format!(
-                        "exceeds provider budget {budget} by {}",
-                        compacted.estimated_tokens.saturating_sub(budget)
-                    ),
-                    None => "provider budget unavailable".to_string(),
-                };
-                format!(
-                    ", {reduction:.1}% (provider request estimate: {} tokens, {fit_status})",
-                    compacted.estimated_tokens
-                )
-            })
-            .unwrap_or_default();
+        let provider_estimate = format_compaction_provider_request_estimate(&compaction_result);
         let content = TitleFormat::action(format!(
             "Context size reduced by {token_reduction:.1}% (message tokens), {message_reduction:.1}% (messages){provider_estimate}"
         ));
@@ -5599,13 +5618,72 @@ mod tests {
     use std::io;
     use std::sync::Arc;
 
-    use forge_domain::{EventValue, ToolCallFull, ToolResult};
+    use forge_domain::{
+        CompactionResult, EventValue, ProviderRequestEstimate, ToolCallFull, ToolResult,
+    };
     use forge_ui_model::{UiBlock, UiModel, UiTurnPhase};
     use futures::FutureExt;
     use pretty_assertions::assert_eq;
     use tokio::sync::Notify;
 
     use super::*;
+
+    #[test]
+    fn test_compaction_provider_estimate_format_includes_before_after_and_fit_status() {
+        let fixture = CompactionResult::new(1000, 500, 20, 10).provider_request_estimates(
+            ProviderRequestEstimate::new(2000, Some(1800)),
+            ProviderRequestEstimate::new(1200, Some(1800)),
+        );
+        let actual = format_compaction_provider_request_estimate(&fixture);
+        let expected = ", 40.0% provider request reduction (provider request estimate: 2000 -> 1200 tokens, fits provider budget 1800)";
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_compaction_provider_estimate_format_reports_growth_distinctly() {
+        let fixture = CompactionResult::new(1000, 1100, 20, 22).provider_request_estimates(
+            ProviderRequestEstimate::new(1200, Some(1800)),
+            ProviderRequestEstimate::new(1500, Some(1800)),
+        );
+        let actual = format_compaction_provider_request_estimate(&fixture);
+        let expected = ", 25.0% provider request growth (provider request estimate: 1200 -> 1500 tokens, fits provider budget 1800)";
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_compaction_provider_estimate_format_reports_zero_baseline_growth_distinctly() {
+        let fixture = CompactionResult::new(0, 100, 0, 1).provider_request_estimates(
+            ProviderRequestEstimate::new(0, Some(1800)),
+            ProviderRequestEstimate::new(1500, Some(1800)),
+        );
+        let actual = format_compaction_provider_request_estimate(&fixture);
+        let expected = ", provider request growth from 0 tokens (provider request estimate: 0 -> 1500 tokens, fits provider budget 1800)";
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_compaction_provider_estimate_format_includes_excess_status() {
+        let fixture = CompactionResult::new(1000, 500, 20, 10).provider_request_estimates(
+            ProviderRequestEstimate::new(2000, Some(1800)),
+            ProviderRequestEstimate::new(1900, Some(1800)),
+        );
+        let actual = format_compaction_provider_request_estimate(&fixture);
+        let expected = ", 5.0% provider request reduction (provider request estimate: 2000 -> 1900 tokens, exceeds provider budget 1800 by 100)";
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_compaction_provider_estimate_format_is_empty_without_diagnostics() {
+        let fixture = CompactionResult::new(1000, 500, 20, 10);
+        let actual = format_compaction_provider_request_estimate(&fixture);
+        let expected = String::new();
+
+        assert_eq!(actual, expected);
+    }
 
     struct ObservingRenderer {
         notifier: Arc<Notify>,

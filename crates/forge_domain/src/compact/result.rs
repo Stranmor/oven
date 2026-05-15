@@ -26,6 +26,31 @@ impl ProviderRequestEstimate {
     }
 }
 
+/// Direction and magnitude of provider request estimate change after compaction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ProviderRequestEstimateChange {
+    /// Provider estimate did not change.
+    Unchanged,
+    /// Provider estimate shrank by the given percentage.
+    Reduction { percentage: f64 },
+    /// Provider estimate grew by the given percentage.
+    Growth { percentage: f64 },
+    /// Provider estimate grew from a zero-token baseline.
+    GrowthFromZero,
+}
+
+impl ProviderRequestEstimateChange {
+    /// Returns the signed percentage used by legacy reduction callers.
+    pub fn signed_reduction_percentage(&self) -> f64 {
+        match self {
+            Self::Unchanged => 0.0,
+            Self::Reduction { percentage } => *percentage,
+            Self::Growth { percentage } => -*percentage,
+            Self::GrowthFromZero => -100.0,
+        }
+    }
+}
+
 /// Contains metrics related to context compaction
 /// This struct provides information about the compaction operation
 /// such as the original and compacted token counts.
@@ -78,14 +103,33 @@ impl CompactionResult {
         self
     }
 
-    /// Calculate the percentage reduction in provider request estimate.
-    pub fn provider_request_reduction_percentage(&self) -> Option<f64> {
+    /// Calculate the provider request estimate change after compaction.
+    pub fn provider_request_estimate_change(&self) -> Option<ProviderRequestEstimateChange> {
         let original = self.original_provider_request.as_ref()?.estimated_tokens;
         let compacted = self.compacted_provider_request.as_ref()?.estimated_tokens;
-        if original == 0 || compacted == 0 {
-            return Some(0.0);
+        match compacted.cmp(&original) {
+            std::cmp::Ordering::Equal => Some(ProviderRequestEstimateChange::Unchanged),
+            std::cmp::Ordering::Less if original == 0 => {
+                Some(ProviderRequestEstimateChange::Unchanged)
+            }
+            std::cmp::Ordering::Less => Some(ProviderRequestEstimateChange::Reduction {
+                percentage: ((original - compacted) as f64 / original as f64) * 100.0,
+            }),
+            std::cmp::Ordering::Greater if original == 0 => {
+                Some(ProviderRequestEstimateChange::GrowthFromZero)
+            }
+            std::cmp::Ordering::Greater => Some(ProviderRequestEstimateChange::Growth {
+                percentage: ((compacted - original) as f64 / original as f64) * 100.0,
+            }),
         }
-        Some(((original.saturating_sub(compacted)) as f64 / original as f64) * 100.0)
+    }
+
+    /// Calculate the signed percentage reduction in provider request estimate.
+    pub fn provider_request_reduction_percentage(&self) -> Option<f64> {
+        Some(
+            self.provider_request_estimate_change()?
+                .signed_reduction_percentage(),
+        )
     }
 
     /// Returns whether the compacted provider request estimate fits its input budget.
@@ -155,13 +199,53 @@ mod tests {
 
     #[test]
     fn test_provider_request_reduction_percentage_and_fit_status() {
-        let result = CompactionResult::new(1000, 500, 20, 10).provider_request_estimates(
+        let fixture = CompactionResult::new(1000, 500, 20, 10).provider_request_estimates(
             ProviderRequestEstimate::new(2000, Some(1800)),
             ProviderRequestEstimate::new(1200, Some(1800)),
         );
+        let actual = (
+            fixture.provider_request_reduction_percentage(),
+            fixture.compacted_provider_request_fits(),
+        );
+        let expected = (Some(40.0), Some(true));
 
-        assert_eq!(result.provider_request_reduction_percentage(), Some(40.0));
-        assert_eq!(result.compacted_provider_request_fits(), Some(true));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_provider_request_reduction_percentage_reports_growth_as_negative() {
+        let fixture = CompactionResult::new(1000, 1100, 20, 22).provider_request_estimates(
+            ProviderRequestEstimate::new(1200, Some(1800)),
+            ProviderRequestEstimate::new(1500, Some(1800)),
+        );
+        let actual = (
+            fixture.provider_request_estimate_change(),
+            fixture.provider_request_reduction_percentage(),
+        );
+        let expected = (
+            Some(ProviderRequestEstimateChange::Growth { percentage: 25.0 }),
+            Some(-25.0),
+        );
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_provider_request_estimate_change_reports_growth_from_zero() {
+        let fixture = CompactionResult::new(0, 100, 0, 1).provider_request_estimates(
+            ProviderRequestEstimate::new(0, Some(1800)),
+            ProviderRequestEstimate::new(1500, Some(1800)),
+        );
+        let actual = (
+            fixture.provider_request_estimate_change(),
+            fixture.provider_request_reduction_percentage(),
+        );
+        let expected = (
+            Some(ProviderRequestEstimateChange::GrowthFromZero),
+            Some(-100.0),
+        );
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
