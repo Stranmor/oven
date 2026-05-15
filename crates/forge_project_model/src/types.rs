@@ -842,6 +842,30 @@ pub fn classify_evidence_freshness(path: &str, freshness: &FreshnessState) -> Ev
     }
 }
 
+/// Strategy used to construct deterministic context shards.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShardStrategy {
+    /// Use semantic Rust symbol ranges when available and line fallback for
+    /// files without supported semantic ranges.
+    #[default]
+    RustSemanticWithLineFallback,
+    /// Use fixed line chunks for all files.
+    FixedLineChunks {
+        /// Maximum lines per fallback chunk.
+        chunk_size: usize,
+    },
+}
+
+impl ShardStrategy {
+    /// Returns the default fallback chunk size.
+    pub fn default_chunk_size(&self) -> usize {
+        match self {
+            Self::RustSemanticWithLineFallback => 80,
+            Self::FixedLineChunks { chunk_size } => *chunk_size,
+        }
+    }
+}
+
 /// A deterministic retrieval shard descriptor.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardManifest {
@@ -859,6 +883,76 @@ pub struct ShardManifest {
     pub symbol_ids: Vec<String>,
     /// Provenance for the shard.
     pub provenance: Provenance,
+}
+
+/// Retrieval scoring weights used by the planner.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RetrievalScoringWeights {
+    /// Score assigned to exact path matches.
+    pub exact_path: f32,
+    /// Score assigned to exact symbol matches.
+    pub exact_symbol: f32,
+    /// Multiplier applied to lexical scores.
+    pub lexical: f32,
+    /// Multiplier applied to vector scores.
+    pub vector: f32,
+    /// Multiplier applied to graph edge confidence.
+    pub graph: f32,
+    /// Multiplier applied to reranker scores.
+    pub rerank: f32,
+}
+
+impl Default for RetrievalScoringWeights {
+    fn default() -> Self {
+        Self {
+            exact_path: 100.0,
+            exact_symbol: 100.0,
+            lexical: 1.0,
+            vector: 1.0,
+            graph: 10.0,
+            rerank: 1.0,
+        }
+    }
+}
+
+impl RetrievalScoringWeights {
+    /// Validates that all weights are finite and non-negative.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any weight is negative, NaN, or infinite.
+    pub fn validate(&self) -> Result<()> {
+        let weights = [
+            self.exact_path,
+            self.exact_symbol,
+            self.lexical,
+            self.vector,
+            self.graph,
+            self.rerank,
+        ];
+        if weights
+            .iter()
+            .any(|weight| !weight.is_finite() || *weight < 0.0)
+        {
+            bail!("retrieval scoring weights must be finite non-negative values");
+        }
+        Ok(())
+    }
+}
+
+/// Planned retrieval phases derived from a query and integration boundaries.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievalScoringPlan {
+    /// Whether exact path/symbol matching is active.
+    pub exact: bool,
+    /// Whether lexical retrieval is active.
+    pub lexical: bool,
+    /// Whether vector retrieval is active.
+    pub vector: bool,
+    /// Whether graph expansion is active.
+    pub graph: bool,
+    /// Whether reranking is active.
+    pub rerank: bool,
 }
 
 /// Retrieval query supporting exact, lexical, and graph expansion phases.

@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -7,7 +7,9 @@ use chrono::Local;
 use forge_config::ForgeConfig;
 use forge_domain::*;
 use forge_project_model::{
-    ProjectModelContextRenderBudget, ProjectModelContextSource, render_project_model_context,
+    ProjectContextTarget, ProjectModelContextRenderBudget, ProjectModelSourceNode,
+    TargetResolutionBudget, directory_path_filter, local_project_model_manifest, mentioned_paths,
+    render_project_model_context, render_sources_from_nodes,
 };
 use forge_stream::MpscStream;
 use url::Url;
@@ -54,43 +56,6 @@ pub(crate) fn build_template_config(config: &ForgeConfig) -> forge_domain::Templ
 struct ProjectContextInjection<S> {
     services: Arc<S>,
     agent: Agent,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct ProjectContextTarget {
-    workspace_root: PathBuf,
-    path_filter: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct TargetResolutionBudget {
-    remaining_candidates: usize,
-    remaining_index_probes: usize,
-}
-
-impl TargetResolutionBudget {
-    fn new(explicit_target_candidates: usize, index_probes: usize) -> Self {
-        Self {
-            remaining_candidates: explicit_target_candidates.saturating_add(1),
-            remaining_index_probes: index_probes,
-        }
-    }
-
-    fn claim_candidate(&mut self) -> bool {
-        let Some(remaining) = self.remaining_candidates.checked_sub(1) else {
-            return false;
-        };
-        self.remaining_candidates = remaining;
-        true
-    }
-
-    fn claim_index_probe(&mut self) -> bool {
-        let Some(remaining) = self.remaining_index_probes.checked_sub(1) else {
-            return false;
-        };
-        self.remaining_index_probes = remaining;
-        true
-    }
 }
 
 impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
@@ -144,7 +109,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
 
         let mut context = conversation.context.take().unwrap_or_default();
         for content in rendered_contexts {
-            let message = TextMessage::new(Role::User, content)
+            let message = TextMessage::project_model_context(Role::User, content)
                 .model(self.agent.model.clone())
                 .droppable(true)
                 .cacheable(false);
@@ -157,7 +122,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
         let environment = self.services.get_environment();
         let mut candidates = vec![environment.cwd.clone()];
         if let Some(query) = query.as_deref() {
-            candidates.extend(Self::mentioned_paths(
+            candidates.extend(mentioned_paths(
                 query,
                 &environment.cwd,
                 environment.home.as_deref(),
@@ -309,11 +274,8 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
                 continue;
             }
             let workspace_root = ancestor.to_path_buf();
-            let path_filter = Self::directory_path_filter(&path, &workspace_root);
-            let target = ProjectContextTarget {
-                workspace_root: workspace_root.clone(),
-                path_filter: path_filter.clone(),
-            };
+            let path_filter = directory_path_filter(&path, &workspace_root);
+            let target = ProjectContextTarget::new(workspace_root.clone(), path_filter.clone());
             return (
                 WorkspaceContextCandidateDiagnostic {
                     candidate_path: candidate_path.clone(),
@@ -363,7 +325,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
         latest_user_message: &str,
     ) -> Vec<ProjectContextTarget> {
         let mut candidates = vec![environment.cwd.clone()];
-        candidates.extend(Self::mentioned_paths(
+        candidates.extend(mentioned_paths(
             latest_user_message,
             &environment.cwd,
             environment.home.as_deref(),
@@ -421,125 +383,10 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
                 continue;
             }
             let workspace_root = ancestor.to_path_buf();
-            let path_filter = Self::directory_path_filter(&path, &workspace_root);
-            return Some(ProjectContextTarget { workspace_root, path_filter });
+            let path_filter = directory_path_filter(&path, &workspace_root);
+            return Some(ProjectContextTarget::new(workspace_root, path_filter));
         }
         None
-    }
-
-    fn directory_path_filter(path: &Path, workspace_root: &Path) -> Option<String> {
-        let relative = path
-            .strip_prefix(workspace_root)
-            .ok()
-            .filter(|relative| !relative.as_os_str().is_empty())?;
-        if !path.is_dir() {
-            return None;
-        }
-        let mut filter = relative.to_string_lossy().replace('\\', "/");
-        if !filter.ends_with('/') {
-            filter.push('/');
-        }
-        Some(filter)
-    }
-
-    fn mentioned_paths(message: &str, cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        let mut seen = BTreeSet::new();
-        for tag in Attachment::parse_all(message) {
-            if let Some(path) = Self::resolve_mentioned_path(&tag.path, cwd, home) {
-                if seen.insert(path.clone()) {
-                    paths.push(path);
-                }
-            }
-        }
-        for token in Self::path_like_tokens(message) {
-            if let Some(path) = Self::resolve_mentioned_path(&token, cwd, home) {
-                if seen.insert(path.clone()) {
-                    paths.push(path);
-                }
-            }
-        }
-        paths
-    }
-
-    fn path_like_tokens(message: &str) -> Vec<String> {
-        message
-            .split_whitespace()
-            .filter_map(Self::normalize_path_token)
-            .collect()
-    }
-
-    fn normalize_path_token(raw: &str) -> Option<String> {
-        let token = raw.trim_matches(|character: char| {
-            matches!(
-                character,
-                '`' | '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
-            )
-        });
-        let token = token.trim_end_matches(['.', ':', '!']);
-        if token.is_empty()
-            || token.contains("://")
-            || token.starts_with('<')
-            || token.ends_with('>')
-            || token.starts_with("@[")
-        {
-            return None;
-        }
-        let token = Self::trim_line_suffix(token);
-        if token.starts_with('/')
-            || token.starts_with('~')
-            || token.starts_with("./")
-            || token.starts_with("../")
-            || Self::is_relative_path_token(token)
-        {
-            Some(token.to_string())
-        } else {
-            None
-        }
-    }
-
-    fn is_relative_path_token(token: &str) -> bool {
-        if !token.contains('/') {
-            return false;
-        }
-        let components = token
-            .split('/')
-            .filter(|component| !component.is_empty())
-            .collect::<Vec<_>>();
-        components.len() > 2
-            || components
-                .last()
-                .is_some_and(|component| component.contains('.'))
-    }
-
-    fn trim_line_suffix(token: &str) -> &str {
-        let Some((prefix, suffix)) = token.rsplit_once(':') else {
-            return token;
-        };
-        if suffix.chars().all(|character| character.is_ascii_digit()) {
-            Self::trim_line_suffix(prefix)
-        } else {
-            token
-        }
-    }
-
-    fn resolve_mentioned_path(raw_path: &str, cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
-        if raw_path.is_empty() || raw_path.contains("://") {
-            return None;
-        }
-        let path = if raw_path == "~" {
-            home?.to_path_buf()
-        } else if let Some(stripped) = raw_path.strip_prefix("~/") {
-            home?.join(stripped)
-        } else {
-            let path = PathBuf::from(raw_path);
-            if path.is_absolute() {
-                path
-            } else {
-                cwd.join(path)
-            }
-        };
-        Some(path)
     }
 
     fn query_from_conversation(conversation: &Conversation) -> Option<String> {
@@ -558,7 +405,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
                     && !message.is_droppable()
                     && !matches!(
                         &message.message,
-                        ContextMessage::Text(text) if text.is_runtime_context()
+                        ContextMessage::Text(text) if text.is_internal_context()
                     )
             })
             .and_then(|message| message.content())
@@ -567,11 +414,12 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
     }
 
     fn render_context(workspace_root: &std::path::Path, nodes: Vec<Node>) -> String {
-        let manifest_path = workspace_root.join(".forge_project_model/project_manifest.json");
-        let sources = nodes
+        let manifest_path = local_project_model_manifest(workspace_root);
+        let source_nodes = nodes
             .into_iter()
-            .map(Self::source_from_node)
+            .map(Self::source_node_from_node)
             .collect::<Vec<_>>();
+        let sources = render_sources_from_nodes(source_nodes);
         render_project_model_context(
             &workspace_root.display().to_string(),
             &manifest_path.display().to_string(),
@@ -582,54 +430,37 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
         )
     }
 
-    fn source_from_node(node: Node) -> ProjectModelContextSource {
+    fn source_node_from_node(node: Node) -> ProjectModelSourceNode {
         let node_id = node.node_id.as_str().to_string();
         let score = node.relevance;
         match node.node {
-            NodeData::FileChunk(chunk) => ProjectModelContextSource::new(
-                chunk.file_path,
-                "manifest_snapshot",
-                "local_project_model_manifest",
+            NodeData::FileChunk(chunk) => ProjectModelSourceNode::FileChunk {
+                path: chunk.file_path,
+                start_line: chunk.start_line,
+                end_line: chunk.end_line,
                 node_id,
-            )
-            .line_range(chunk.start_line, chunk.end_line)
-            .score(score)
-            .content(chunk.content),
-            NodeData::File(file) => ProjectModelContextSource::new(
-                file.file_path,
-                "manifest_snapshot",
-                "local_project_model_manifest",
+                score,
+                content: chunk.content,
+            },
+            NodeData::File(file) => ProjectModelSourceNode::File {
+                path: file.file_path,
                 node_id,
-            )
-            .score(score)
-            .content_hash(file.hash)
-            .content(file.content)
-            .metadata_only("whole_file_metadata_only"),
-            NodeData::FileRef(file_ref) => ProjectModelContextSource::new(
-                file_ref.file_path,
-                "manifest_snapshot",
-                "local_project_model_manifest",
+                score,
+                content_hash: file.hash,
+                content: Some(file.content),
+            },
+            NodeData::FileRef(file_ref) => ProjectModelSourceNode::FileRef {
+                path: file_ref.file_path,
                 node_id,
-            )
-            .score(score)
-            .content_hash(file_ref.file_hash)
-            .metadata_only("file_reference_metadata_only"),
-            NodeData::Note(note) => ProjectModelContextSource::new(
-                "note",
-                "manifest_snapshot",
-                "local_project_model_manifest",
-                node_id,
-            )
-            .score(score)
-            .content(note.content),
-            NodeData::Task(task) => ProjectModelContextSource::new(
-                "task",
-                "manifest_snapshot",
-                "local_project_model_manifest",
-                node_id,
-            )
-            .score(score)
-            .content(task.task),
+                score,
+                content_hash: file_ref.file_hash,
+            },
+            NodeData::Note(note) => {
+                ProjectModelSourceNode::Note { node_id, score, content: note.content }
+            }
+            NodeData::Task(task) => {
+                ProjectModelSourceNode::Task { node_id, score, content: task.task }
+            }
         }
     }
 }
@@ -2139,6 +1970,35 @@ mod tests {
                     TextMessage::new(Role::User, "ignore automatic injection needle")
                         .model(model_id)
                         .droppable(true),
+                )),
+        );
+
+        let actual = ProjectContextInjection::<ProjectContextHarness>::query_from_conversation(
+            &conversation,
+        )
+        .unwrap();
+        let expected = "find automatic injection needle";
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_model_query_ignores_internal_project_model_context_messages() -> Result<()> {
+        let (_fixture, _root) = fixture_workspace()?;
+        let model_id = ModelId::new("test-model");
+        let conversation = Conversation::generate().context(
+            Context::default()
+                .add_message(ContextMessage::user(
+                    "find automatic injection needle",
+                    Some(model_id.clone()),
+                ))
+                .add_message(ContextMessage::Text(
+                    TextMessage::project_model_context(
+                        Role::User,
+                        "<project_model_context>ignore automatic injection needle</project_model_context>",
+                    )
+                    .model(model_id)
+                    .droppable(false),
                 )),
         );
 

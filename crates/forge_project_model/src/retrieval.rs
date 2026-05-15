@@ -4,7 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::lexical::{LexicalIndex, documents_from_manifest};
 use crate::types::{
-    ProjectManifest, RerankCandidate, RetrievalQuery, RetrievalResult, VectorQuery,
+    ProjectManifest, RerankCandidate, RetrievalQuery, RetrievalResult, RetrievalScoringPlan,
+    RetrievalScoringWeights, VectorQuery,
 };
 use crate::vector::{Reranker, VectorIndex};
 
@@ -19,7 +20,41 @@ pub fn retrieve(manifest: &ProjectManifest, query: &RetrievalQuery) -> Vec<Retri
     retrieve_with_boundaries::<
         crate::vector::DeterministicVectorIndex,
         crate::vector::DeterministicReranker,
-    >(manifest, query, None, None, None)
+    >(
+        manifest,
+        query,
+        None,
+        None,
+        None,
+        &RetrievalScoringWeights::default(),
+    )
+}
+
+/// Plans retrieval phases from query content and optional integration boundaries.
+///
+/// # Arguments
+///
+/// * `query` - Retrieval query whose exact/text/graph flags drive phases.
+/// * `has_vector_query` - Whether an embedding query is available.
+/// * `has_vector_index` - Whether a vector index boundary is available.
+/// * `has_reranker` - Whether a reranker boundary is available.
+pub fn plan_retrieval(
+    query: &RetrievalQuery,
+    has_vector_query: bool,
+    has_vector_index: bool,
+    has_reranker: bool,
+) -> RetrievalScoringPlan {
+    let has_text = query
+        .text
+        .as_deref()
+        .is_some_and(|text| !text.trim().is_empty());
+    RetrievalScoringPlan {
+        exact: query.path.is_some() || query.symbol.is_some(),
+        lexical: has_text,
+        vector: has_vector_query && has_vector_index,
+        graph: query.include_graph_expansion,
+        rerank: has_text && has_reranker,
+    }
 }
 
 /// Retrieves project model results with optional vector and reranker
@@ -37,21 +72,38 @@ pub fn retrieve(manifest: &ProjectManifest, query: &RetrievalQuery) -> Vec<Retri
 ///   external integration.
 /// * `vector_index` - Optional vector index implementation.
 /// * `reranker` - Optional reranker implementation.
+/// * `weights` - Typed scoring weights used by the planner.
 pub fn retrieve_with_boundaries<V, R>(
     manifest: &ProjectManifest,
     query: &RetrievalQuery,
     vector_query: Option<&VectorQuery>,
     vector_index: Option<&V>,
     reranker: Option<&R>,
+    weights: &RetrievalScoringWeights,
 ) -> Vec<RetrievalResult>
 where
     V: VectorIndex,
     R: Reranker,
 {
+    if weights.validate().is_err() {
+        return Vec::new();
+    }
     let limit = if query.limit == 0 { 10 } else { query.limit };
-    let mut results = exact_results(manifest, query);
+    let plan = plan_retrieval(
+        query,
+        vector_query.is_some(),
+        vector_index.is_some(),
+        reranker.is_some(),
+    );
+    let mut results = if plan.exact {
+        exact_results(manifest, query, weights)
+    } else {
+        BTreeMap::new()
+    };
 
-    if let Some(text) = &query.text {
+    if plan.lexical
+        && let Some(text) = &query.text
+    {
         let lexical_index = LexicalIndex::from_manifest(manifest);
         for hit in lexical_index.search(text) {
             merge_part(
@@ -60,13 +112,15 @@ where
                 hit.path,
                 hit.symbol,
                 "lexical",
-                hit.score,
+                hit.score * weights.lexical,
                 hit.provenance,
             );
         }
     }
 
-    if let (Some(vector_query), Some(vector_index)) = (vector_query, vector_index) {
+    if plan.vector
+        && let (Some(vector_query), Some(vector_index)) = (vector_query, vector_index)
+    {
         for hit in vector_index.search(vector_query) {
             if let Some((path, symbol, provenance)) = manifest_result_surface(manifest, &hit.id) {
                 merge_part(
@@ -75,22 +129,26 @@ where
                     path,
                     symbol,
                     "vector",
-                    hit.score,
+                    hit.score * weights.vector,
                     provenance,
                 );
             }
         }
     }
 
-    if query.include_graph_expansion {
-        expand_graph(manifest, &mut results);
+    if plan.graph {
+        expand_graph(manifest, &mut results, weights);
     }
 
-    if let (Some(text), Some(reranker)) = (&query.text, reranker) {
+    if plan.rerank
+        && let (Some(text), Some(reranker)) = (&query.text, reranker)
+    {
         let candidates = rerank_candidates(manifest, &results);
         for score in reranker.rerank(text, &candidates) {
             if let Some(result) = results.get_mut(&score.id) {
-                result.score_parts.insert("rerank".to_string(), score.score);
+                result
+                    .score_parts
+                    .insert("rerank".to_string(), score.score * weights.rerank);
                 result.score = result.score_parts.values().sum();
             }
         }
@@ -110,6 +168,7 @@ where
 fn exact_results(
     manifest: &ProjectManifest,
     query: &RetrievalQuery,
+    weights: &RetrievalScoringWeights,
 ) -> BTreeMap<String, RetrievalResult> {
     let mut results = BTreeMap::new();
     for file in &manifest.files {
@@ -120,7 +179,7 @@ fn exact_results(
                 file.path.clone(),
                 None,
                 "exact_path",
-                100.0,
+                weights.exact_path,
                 file.provenance.clone(),
             );
         }
@@ -135,7 +194,7 @@ fn exact_results(
                 symbol.path.clone(),
                 Some(symbol.name.clone()),
                 "exact_symbol",
-                100.0,
+                weights.exact_symbol,
                 symbol.provenance.clone(),
             );
         }
@@ -166,7 +225,11 @@ fn merge_part(
     result.score = result.score_parts.values().sum();
 }
 
-fn expand_graph(manifest: &ProjectManifest, results: &mut BTreeMap<String, RetrievalResult>) {
+fn expand_graph(
+    manifest: &ProjectManifest,
+    results: &mut BTreeMap<String, RetrievalResult>,
+    weights: &RetrievalScoringWeights,
+) {
     let seeds = results.keys().cloned().collect::<BTreeSet<_>>();
     for graph_edge in &manifest.edges {
         if seeds.contains(&graph_edge.from) || seeds.contains(&graph_edge.to) {
@@ -182,7 +245,7 @@ fn expand_graph(manifest: &ProjectManifest, results: &mut BTreeMap<String, Retri
                     path,
                     symbol,
                     "graph",
-                    graph_edge.confidence * 10.0,
+                    graph_edge.confidence * weights.graph,
                     provenance,
                 );
             }
@@ -300,6 +363,7 @@ mod tests {
             Some(&VectorQuery { embedding: vec![1.0, 0.0] }),
             Some(&vector_index),
             Some(&DeterministicReranker),
+            &RetrievalScoringWeights::default(),
         );
         let expected = BTreeSet::from([
             "lexical".to_string(),
@@ -312,6 +376,60 @@ mod tests {
                 .map(|result| result.score_parts.keys().cloned().collect::<BTreeSet<_>>())
                 .expect("retrieval should return at least one fused result"),
             expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn planner_enables_only_available_boundaries() {
+        let setup = RetrievalQuery {
+            text: Some("Root".to_string()),
+            path: Some("src/lib.rs".to_string()),
+            symbol: None,
+            limit: 5,
+            include_graph_expansion: true,
+        };
+        let actual = plan_retrieval(&setup, true, false, true);
+        let expected = RetrievalScoringPlan {
+            exact: true,
+            lexical: true,
+            vector: false,
+            graph: true,
+            rerank: true,
+        };
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn custom_weights_control_score_parts() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let root_symbol = manifest
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "Root")
+            .expect("fixture should include Root symbol");
+        let query = RetrievalQuery {
+            text: None,
+            path: None,
+            symbol: Some("Root".to_string()),
+            limit: 1,
+            include_graph_expansion: false,
+        };
+        let weights =
+            RetrievalScoringWeights { exact_symbol: 42.0, ..RetrievalScoringWeights::default() };
+        let actual = retrieve_with_boundaries::<DeterministicVectorIndex, DeterministicReranker>(
+            &manifest, &query, None, None, None, &weights,
+        );
+        let expected = Some(42.0);
+        assert_eq!(
+            actual
+                .iter()
+                .find(|result| result.id == root_symbol.id)
+                .and_then(|result| result.score_parts.get("exact_symbol"))
+                .copied(),
+            expected,
         );
         Ok(())
     }

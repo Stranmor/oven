@@ -315,6 +315,8 @@ fn reasoning_content_char_count(text_message: &TextMessage) -> usize {
 pub enum TextMessageKind {
     /// Live request-scoped runtime context message.
     RuntimeContext,
+    /// Project-model context injected as an internal user-scoped payload.
+    ProjectModelContext,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, Setters)]
@@ -383,6 +385,25 @@ impl TextMessage {
 
     pub fn has_role(&self, role: Role) -> bool {
         self.role == role
+    }
+
+    /// Returns whether this message is live runtime or project-model context,
+    /// not a real user-authored message.
+    pub fn is_internal_context(&self) -> bool {
+        matches!(
+            self.kind,
+            Some(TextMessageKind::RuntimeContext | TextMessageKind::ProjectModelContext)
+        )
+    }
+
+    /// Returns whether this message is the live project-model context payload.
+    pub fn is_project_model_context(&self) -> bool {
+        self.kind == Some(TextMessageKind::ProjectModelContext)
+    }
+
+    /// Marks this message as a project-model context payload.
+    pub fn project_model_context(role: Role, content: impl Into<String>) -> Self {
+        Self::new(role, content).kind(TextMessageKind::ProjectModelContext)
     }
 
     /// Returns whether this message is eligible for provider prompt-cache

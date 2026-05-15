@@ -1,17 +1,23 @@
 //! Project model primitives, indexing, retrieval, graph, and episodic storage.
 
+mod context_adapter;
 mod eval;
 mod extraction;
 mod freshness;
 mod indexer;
 mod ingestion;
 mod lexical;
+mod policy;
 mod render;
 mod retrieval;
 mod types;
 mod util;
 mod vector;
 
+pub use context_adapter::{
+    ProjectModelContextRenderRoot, ProjectModelSourceNode, evidence_line_range,
+    render_source_from_evidence, render_sources_from_context_pack, render_sources_from_nodes,
+};
 pub use eval::{
     evaluate_freshness, evaluate_graph_coverage, evaluate_provenance_completeness,
     evaluate_retrieval,
@@ -24,11 +30,15 @@ pub use freshness::compare_freshness;
 pub use indexer::ProjectIndexer;
 pub use ingestion::{ingest_external_facts, ingest_typed_external_facts};
 pub use lexical::{LexicalIndex, documents_from_manifest};
+pub use policy::{
+    ProjectContextTarget, TargetResolutionBudget, directory_path_filter, local_project_model_dir,
+    local_project_model_manifest, mentioned_paths, resolve_mentioned_path,
+};
 pub use render::{
     DEFAULT_RENDERED_SOURCE_LIMIT, ProjectModelContextRenderBudget, ProjectModelContextSource,
     render_project_model_context,
 };
-pub use retrieval::{retrieve, retrieve_with_boundaries};
+pub use retrieval::{plan_retrieval, retrieve, retrieve_with_boundaries};
 pub use types::{
     ContextPack, ContextPackEvidence, ContextPackEvidenceSource, ContextPackSelection,
     DecisionGraphNode, EdgeConfidence, EvalCaseGraphNode, EvidenceFreshness, ExternalFactSource,
@@ -38,9 +48,10 @@ pub use types::{
     KnowledgeGraphNode, KnowledgeGraphNodeId, KnowledgeGraphNodeKind, Language, LexicalDocument,
     LexicalDocumentKind, LexicalSearchHit, ProjectManifest, Provenance,
     ProvenanceCompletenessReport, RerankCandidate, RerankScore, RetrievalEvalCase,
-    RetrievalEvalReport, RetrievalQuery, RetrievalResult, RetrievedEvidenceGraphNode,
-    ShardGraphNode, ShardManifest, SourceFile, StaleEvidencePolicy, SymbolGraphNode, SymbolKind,
-    SymbolNode, TaskGraphNode, ToolEpisode, ToolEpisodeGraphNode, TypedExternalFacts,
+    RetrievalEvalReport, RetrievalQuery, RetrievalResult, RetrievalScoringPlan,
+    RetrievalScoringWeights, RetrievedEvidenceGraphNode, ShardGraphNode, ShardManifest,
+    ShardStrategy, SourceFile, StaleEvidencePolicy, SymbolGraphNode, SymbolKind, SymbolNode,
+    TaskGraphNode, ToolEpisode, ToolEpisodeGraphNode, TypedExternalFacts,
     TypedExternalReferenceFact, TypedExternalSymbolFact, VectorQuery, VectorSearchHit,
     classify_evidence_freshness,
 };

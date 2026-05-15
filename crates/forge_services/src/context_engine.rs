@@ -12,7 +12,7 @@ use forge_domain::{
 };
 use forge_project_model::{
     ContextPack, ContextPackSelection, ProjectIndexer, RetrievalQuery, StaleEvidencePolicy,
-    retrieve,
+    evidence_line_range, local_project_model_dir, local_project_model_manifest, retrieve,
 };
 use forge_stream::MpscStream;
 use futures::future::join_all;
@@ -318,39 +318,6 @@ fn matches_path_filters(path: &str, params: &SearchParams<'_>) -> bool {
         return false;
     }
     true
-}
-
-fn evidence_line_range(
-    manifest: &forge_project_model::ProjectManifest,
-    evidence_id: &str,
-) -> Option<(u32, u32)> {
-    manifest
-        .symbols
-        .iter()
-        .find(|symbol| symbol.id == evidence_id)
-        .map(|symbol| (symbol.start_line, symbol.end_line))
-        .or_else(|| {
-            manifest
-                .shards
-                .iter()
-                .find(|shard| shard.id == evidence_id)
-                .map(|shard| (shard.start_line, shard.end_line))
-        })
-        .or_else(|| {
-            manifest
-                .files
-                .iter()
-                .find(|file| file.path == evidence_id)
-                .map(|file| (1, file.lines))
-        })
-}
-
-fn local_project_model_dir(path: &Path) -> PathBuf {
-    path.join(".forge_project_model")
-}
-
-fn local_project_model_manifest(path: &Path) -> PathBuf {
-    local_project_model_dir(path).join("project_manifest.json")
 }
 
 fn evaluate_project_model_context(path: &Path) -> WorkspaceContextManifestDiagnostic {

@@ -12,9 +12,10 @@ use crate::extraction::{
     extract_cargo_dependency_edges, extract_rust_import_edges, extract_rust_symbols,
 };
 use crate::freshness::compare_freshness;
+use crate::policy::LOCAL_PROJECT_MODEL_MANIFEST_FILE_NAME;
 use crate::types::{
-    FileNode, FileNodeKind, FreshnessState, Language, ProjectManifest, ShardManifest, SourceFile,
-    SymbolNode, ToolEpisode,
+    FileNode, FileNodeKind, FreshnessState, Language, ProjectManifest, ShardManifest,
+    ShardStrategy, SourceFile, SymbolNode, ToolEpisode,
 };
 use crate::util::{
     detect_language, edge_sort_key, hash_text, line_count, manifest_hash, normalize_path,
@@ -106,7 +107,12 @@ impl ProjectIndexer {
         }
         symbols.sort_by(|left, right| left.id.cmp(&right.id));
         edges.sort_by_key(edge_sort_key);
-        let shards = build_shards(&files, &symbols, &self.root)?;
+        let shards = build_shards(
+            &files,
+            &symbols,
+            &self.root,
+            &ShardStrategy::RustSemanticWithLineFallback,
+        )?;
         let manifest_hash = manifest_hash(&files);
         Ok(ProjectManifest {
             version: 1,
@@ -132,7 +138,7 @@ impl ProjectIndexer {
     /// cannot be written.
     pub fn write_manifest(&self, manifest: &ProjectManifest) -> Result<PathBuf> {
         fs::create_dir_all(&self.model_dir).context("create model dir")?;
-        let path = self.model_dir.join("project_manifest.json");
+        let path = self.model_dir.join(LOCAL_PROJECT_MODEL_MANIFEST_FILE_NAME);
         let json = serde_json::to_string_pretty(manifest).context("serialize manifest")?;
         fs::write(&path, json).with_context(|| format!("write {}", path.display()))?;
         Ok(path)
@@ -144,7 +150,7 @@ impl ProjectIndexer {
     ///
     /// Returns an error when the manifest cannot be read or decoded.
     pub fn read_manifest(&self) -> Result<ProjectManifest> {
-        let path = self.model_dir.join("project_manifest.json");
+        let path = self.model_dir.join(LOCAL_PROJECT_MODEL_MANIFEST_FILE_NAME);
         let json = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         serde_json::from_str(&json).context("deserialize manifest")
     }
@@ -253,6 +259,7 @@ fn build_shards(
     files: &[SourceFile],
     symbols: &[SymbolNode],
     root: &Path,
+    strategy: &ShardStrategy,
 ) -> Result<Vec<ShardManifest>> {
     let mut shards = Vec::new();
     for file in files {
@@ -260,29 +267,18 @@ fn build_shards(
         let content = fs::read_to_string(&path)
             .with_context(|| format!("read shard source {}", path.display()))?;
         let lines = content.lines().collect::<Vec<_>>();
-        let chunk_size = 80usize;
-        for (index, chunk) in lines.chunks(chunk_size).enumerate() {
-            let start_index = index
-                .checked_mul(chunk_size)
-                .and_then(|value| value.checked_add(1))
-                .context("compute shard start line")?;
-            let end_index = index
-                .checked_mul(chunk_size)
-                .and_then(|value| value.checked_add(chunk.len()))
-                .context("compute shard end line")?;
-            let start_line = u32::try_from(start_index).context("shard start line exceeds u32")?;
-            let end_line = u32::try_from(end_index).context("shard end line exceeds u32")?;
-            let shard_text = chunk.join("\n");
+        let ranges = shard_ranges(file, symbols, strategy);
+        for (start_line, end_line) in ranges {
+            let start_index = usize::try_from(start_line.saturating_sub(1))
+                .context("compute shard start index")?;
+            let end_index = usize::try_from(end_line).context("compute shard end index")?;
+            let shard_text = lines
+                .get(start_index..end_index.min(lines.len()))
+                .unwrap_or_default()
+                .join("\n");
             let content_hash = hash_text(&shard_text);
             let id = format!("shard:{}:{}-{}", file.path, start_line, end_line);
-            let symbol_ids = symbols
-                .iter()
-                .filter(|symbol| {
-                    symbol.path == file.path
-                        && ranges_overlap(start_line, end_line, symbol.start_line, symbol.end_line)
-                })
-                .map(|symbol| symbol.id.clone())
-                .collect();
+            let symbol_ids = overlapping_symbol_ids(symbols, &file.path, start_line, end_line);
             shards.push(ShardManifest {
                 id: id.clone(),
                 path: file.path.clone(),
@@ -302,6 +298,67 @@ fn build_shards(
     }
     shards.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(shards)
+}
+
+fn shard_ranges(
+    file: &SourceFile,
+    symbols: &[SymbolNode],
+    strategy: &ShardStrategy,
+) -> Vec<(u32, u32)> {
+    match strategy {
+        ShardStrategy::RustSemanticWithLineFallback if file.language == Language::Rust => {
+            let mut semantic_ranges = symbols
+                .iter()
+                .filter(|symbol| symbol.path == file.path)
+                .filter(|symbol| symbol.start_line > 0 && symbol.end_line >= symbol.start_line)
+                .map(|symbol| (symbol.start_line, symbol.end_line.min(file.lines)))
+                .collect::<Vec<_>>();
+            semantic_ranges.sort_unstable();
+            semantic_ranges.dedup();
+            if semantic_ranges.is_empty() {
+                fixed_line_ranges(file.lines, strategy.default_chunk_size())
+            } else {
+                semantic_ranges
+            }
+        }
+        ShardStrategy::RustSemanticWithLineFallback | ShardStrategy::FixedLineChunks { .. } => {
+            fixed_line_ranges(file.lines, strategy.default_chunk_size())
+        }
+    }
+}
+
+fn fixed_line_ranges(lines: u32, chunk_size: usize) -> Vec<(u32, u32)> {
+    let chunk_size = u32::try_from(chunk_size.max(1)).unwrap_or(u32::MAX);
+    let mut ranges = Vec::new();
+    let mut start_line = 1u32;
+    while start_line <= lines.max(1) {
+        let end_line = start_line
+            .saturating_add(chunk_size)
+            .saturating_sub(1)
+            .min(lines.max(1));
+        ranges.push((start_line, end_line));
+        let Some(next_start) = end_line.checked_add(1) else {
+            break;
+        };
+        start_line = next_start;
+    }
+    ranges
+}
+
+fn overlapping_symbol_ids(
+    symbols: &[SymbolNode],
+    file_path: &str,
+    start_line: u32,
+    end_line: u32,
+) -> Vec<String> {
+    symbols
+        .iter()
+        .filter(|symbol| {
+            symbol.path == file_path
+                && ranges_overlap(start_line, end_line, symbol.start_line, symbol.end_line)
+        })
+        .map(|symbol| symbol.id.clone())
+        .collect()
 }
 
 fn is_model_storage_path(path: &str) -> bool {
@@ -378,6 +435,12 @@ pub(crate) mod tests {
         );
         assert_eq!(
             actual.shards.iter().any(|shard| shard.path == "src/lib.rs"),
+            true
+        );
+        assert_eq!(
+            actual.shards.iter().any(|shard| shard.path == "src/lib.rs"
+                && shard.start_line == 6
+                && shard.end_line == 8),
             true
         );
         assert_eq!(actual.manifest_hash.len(), 64);
