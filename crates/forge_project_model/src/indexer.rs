@@ -201,8 +201,8 @@ impl ProjectIndexer {
         Ok(episodes)
     }
 
-    /// Computes freshness by comparing a previous manifest with the current
-    /// filesystem state.
+    /// Computes full freshness by comparing a previous manifest with a freshly
+    /// rebuilt filesystem manifest.
     ///
     /// # Arguments
     ///
@@ -213,6 +213,83 @@ impl ProjectIndexer {
     /// Returns an error when current indexing fails.
     pub fn freshness(&self, previous: &ProjectManifest) -> Result<FreshnessState> {
         Ok(compare_freshness(previous, &self.index()?))
+    }
+
+    /// Returns true when an indexed source path has a filesystem modification
+    /// timestamp newer than the persisted manifest file.
+    ///
+    /// This is a hot-path guard for selected evidence. It avoids workspace
+    /// walking and content hashing while still preventing obviously stale
+    /// persisted evidence from being injected after a source edit.
+    ///
+    /// # Arguments
+    ///
+    /// * `relative_path` - Manifest-relative source path to compare.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when metadata for the manifest or selected source path
+    /// cannot be read.
+    pub fn source_modified_after_manifest(&self, relative_path: &str) -> Result<bool> {
+        let manifest_path = self.model_dir.join("project_manifest.json");
+        let manifest_modified = fs::metadata(&manifest_path)
+            .with_context(|| format!("stat {}", manifest_path.display()))?
+            .modified()
+            .with_context(|| format!("read modified time for {}", manifest_path.display()))?;
+        let source_path = self.root.join(relative_path);
+        let source_modified = fs::metadata(&source_path)
+            .with_context(|| format!("stat {}", source_path.display()))?
+            .modified()
+            .with_context(|| format!("read modified time for {}", source_path.display()))?;
+        Ok(source_modified > manifest_modified)
+    }
+
+    /// Computes hot-path freshness for files already listed in a manifest
+    /// without walking or rebuilding the workspace manifest.
+    ///
+    /// This check is intentionally bounded to persisted manifest evidence: it
+    /// detects changed and deleted indexed files by rehashing listed paths, but
+    /// it does not discover newly added files. Full added-file discovery remains
+    /// part of explicit indexing/sync through [`Self::freshness`].
+    ///
+    /// # Arguments
+    ///
+    /// * `previous` - Persisted manifest used as the hot-path evidence set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an indexed file exists but cannot be read or is no
+    /// longer valid UTF-8.
+    pub fn known_file_freshness(&self, previous: &ProjectManifest) -> Result<FreshnessState> {
+        let mut changed = Vec::new();
+        let mut deleted = Vec::new();
+        let mut unchanged = Vec::new();
+
+        for file in &previous.files {
+            let path = self.root.join(&file.path);
+            if !path.exists() {
+                deleted.push(file.path.clone());
+                continue;
+            }
+            let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+            let content = String::from_utf8(bytes).context("validated UTF-8 source content")?;
+            if hash_text(&content) == file.content_hash {
+                unchanged.push(file.path.clone());
+            } else {
+                changed.push(file.path.clone());
+            }
+        }
+
+        changed.sort();
+        deleted.sort();
+        unchanged.sort();
+        Ok(FreshnessState {
+            fresh: changed.is_empty() && deleted.is_empty(),
+            changed,
+            deleted,
+            added: Vec::new(),
+            unchanged,
+        })
     }
 }
 
@@ -461,6 +538,27 @@ pub(crate) mod tests {
             changed: vec!["src/lib.rs".to_string()],
             deleted: vec!["src/model.rs".to_string()],
             added: vec!["src/added.rs".to_string()],
+            unchanged: vec!["Cargo.toml".to_string()],
+            fresh: false,
+        };
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn known_file_freshness_checks_manifest_files_without_added_file_discovery() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let previous = setup.index()?;
+        fs::write(root.join("src").join("lib.rs"), "pub struct Changed;\n")?;
+        fs::remove_file(root.join("src").join("model.rs"))?;
+        fs::write(root.join("src").join("added.rs"), "pub fn added() {}\n")?;
+
+        let actual = setup.known_file_freshness(&previous)?;
+        let expected = FreshnessState {
+            changed: vec!["src/lib.rs".to_string()],
+            deleted: vec!["src/model.rs".to_string()],
+            added: Vec::new(),
             unchanged: vec!["Cargo.toml".to_string()],
             fresh: false,
         };
