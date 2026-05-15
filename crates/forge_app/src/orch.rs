@@ -392,6 +392,70 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
         )
     }
 
+    /// Returns the strongest safe canonical compaction for a context that could
+    /// not pass the provider context-window preflight.
+    ///
+    /// # Arguments
+    /// * `context` - Context that is already known or suspected to exceed the
+    ///   selected provider input budget.
+    ///
+    /// # Errors
+    /// Returns an error when model metadata cannot be represented or compaction
+    /// fails.
+    fn max_compacted_canonical_context(&self, context: Context) -> anyhow::Result<Context> {
+        let model = self.model_for_agent()?;
+        let context_window = model
+            .context_length
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Selected model '{}' for provider '{}' does not expose a configured context_length; context-window safety cannot be proven before provider dispatch. Add context_length to the model metadata or select a model with known context window.",
+                    self.agent.model,
+                    self.agent.provider
+                )
+            })?;
+        let canonical = context.model_context_length(context_window);
+        Compactor::new(self.agent.compact.clone(), self.services.get_environment())
+            .compact(canonical, true)
+    }
+
+    /// Persists a max-compacted canonical context after preflight proves the
+    /// provider request is still over budget.
+    ///
+    /// This is a forward-only repair path for already persisted oversized
+    /// sessions: it saves the safest locally reduced conversation state without
+    /// deleting/resetting the session and still returns the original guard error
+    /// so provider dispatch remains blocked.
+    ///
+    /// # Arguments
+    /// * `context` - The latest canonical context from the current loop.
+    /// * `error` - The original context-window guard error.
+    ///
+    /// # Errors
+    /// Returns the original guard error, optionally annotated when a repaired
+    /// canonical context was persisted.
+    async fn persist_preflight_repair_or_error(
+        &mut self,
+        context: Context,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        let Ok(repaired_context) = self.max_compacted_canonical_context(context.clone()) else {
+            return error;
+        };
+        if repaired_context.messages == context.messages {
+            return error;
+        }
+
+        self.conversation.context = Some(repaired_context);
+        match self.services.update(self.conversation.clone()).await {
+            Ok(()) => anyhow::anyhow!(
+                "{error:#}\nA max-compacted canonical context was saved locally for this persisted conversation before stopping. The provider call is still blocked because the repaired request remains over budget; run /compact again for diagnostics, reduce tool/context surface, lower max_tokens, or switch to a larger-context model."
+            ),
+            Err(save_error) => anyhow::anyhow!(
+                "{error:#}\nA max-compacted canonical context was computed but could not be saved locally: {save_error:#}. The provider call remains blocked."
+            ),
+        }
+    }
+
     // Returns if agent supports tool or not.
     fn is_tool_supported(&self) -> anyhow::Result<bool> {
         // Check if at agent level tool support is defined
@@ -558,7 +622,12 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
                 context = updated_context.clone();
             }
 
-            let preflight = self.preflight_context_window(context)?;
+            let preflight = match self.preflight_context_window(context.clone()) {
+                Ok(preflight) => preflight,
+                Err(error) => {
+                    return Err(self.persist_preflight_repair_or_error(context, error).await);
+                }
+            };
             context = preflight.canonical;
             let outbound_context = preflight.outbound;
             self.conversation.context = Some(context.clone());
@@ -762,6 +831,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
+    use tokio::sync::Mutex;
+
     use forge_domain::{
         Agent, AgentId, ChatCompletionMessage, Compact, Context, ContextMessage,
         DefaultTransformation, Environment, Image, ImageHandling, InputModality, MessageEntry,
@@ -799,6 +870,78 @@ mod tests {
 
         async fn update(&self, _conversation: forge_domain::Conversation) -> anyhow::Result<()> {
             unimplemented!()
+        }
+    }
+
+    struct PersistingFixtureServices {
+        updates: Mutex<Vec<forge_domain::Conversation>>,
+    }
+
+    impl PersistingFixtureServices {
+        fn new() -> Arc<Self> {
+            Arc::new(Self { updates: Mutex::new(Vec::new()) })
+        }
+
+        async fn updated_contexts(&self) -> Vec<Context> {
+            self.updates
+                .lock()
+                .await
+                .iter()
+                .filter_map(|conversation| conversation.context.clone())
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentService for PersistingFixtureServices {
+        async fn chat_agent(
+            &self,
+            _id: &ModelId,
+            _context: Context,
+            _provider_id: Option<ProviderId>,
+        ) -> ResultStream<ChatCompletionMessage, anyhow::Error> {
+            panic!("preflight should block before provider dispatch")
+        }
+
+        async fn call(
+            &self,
+            _agent: &Agent,
+            _context: &ToolCallContext,
+            _call: ToolCallFull,
+        ) -> ToolResult {
+            panic!("tool calls should not run when preflight blocks")
+        }
+
+        async fn update(&self, conversation: forge_domain::Conversation) -> anyhow::Result<()> {
+            self.updates.lock().await.push(conversation);
+            Ok(())
+        }
+    }
+
+    impl EnvironmentInfra for PersistingFixtureServices {
+        type Config = forge_config::ForgeConfig;
+
+        fn get_env_var(&self, _key: &str) -> Option<String> {
+            None
+        }
+
+        fn get_env_vars(&self) -> BTreeMap<String, String> {
+            BTreeMap::new()
+        }
+
+        fn get_environment(&self) -> Environment {
+            environment_fixture()
+        }
+
+        fn get_config(&self) -> anyhow::Result<Self::Config> {
+            Ok(forge_config::ForgeConfig::default())
+        }
+
+        async fn update_environment(
+            &self,
+            _ops: Vec<forge_domain::ConfigOperation>,
+        ) -> anyhow::Result<()> {
+            Ok(())
         }
     }
 
@@ -1288,6 +1431,54 @@ mod tests {
         assert_eq!(actual.contains("messages="), expected);
         assert_eq!(actual.contains("tools="), expected);
         assert_eq!(actual.contains("full serialized request="), expected);
+    }
+
+    #[tokio::test]
+    async fn test_run_persists_max_compacted_context_when_preflight_remains_over_budget() {
+        let services = PersistingFixtureServices::new();
+        let compact = Compact::new().retention_window(1_usize);
+        let agent = Agent::new(
+            AgentId::new("context_guard_agent"),
+            ProviderId::OPENAI,
+            ModelId::new("context-guard-model"),
+        )
+        .compact(compact);
+        let setup = Context::default()
+            .add_message(droppable_user_message(large_text(12_000)))
+            .add_message(ContextMessage::user("fresh user request", None))
+            .add_tool(
+                ToolDefinition::new("schema_heavy_tool")
+                    .description(large_text(5_000))
+                    .input_schema(schemars::schema_for!(())),
+            )
+            .max_tokens(512_usize);
+        let conversation = forge_domain::Conversation::generate().context(setup);
+        let mut fixture = Orchestrator::new(
+            services.clone(),
+            conversation,
+            agent,
+            forge_config::ForgeConfig::default(),
+        )
+        .models(vec![model_fixture(8_000)]);
+
+        let actual = fixture.run().await.unwrap_err().to_string();
+        let updates = services.updated_contexts().await;
+        let original_context = updates.first().expect("original context should be saved");
+        let repaired_context = updates.last().expect("repaired context should be saved");
+        let expected = true;
+
+        assert_eq!(
+            actual.contains("max-compacted canonical context was saved locally"),
+            expected
+        );
+        assert_eq!(
+            repaired_context.token_count_approx() < original_context.token_count_approx(),
+            expected
+        );
+        assert_eq!(
+            repaired_context.messages != original_context.messages,
+            expected
+        );
     }
 
     #[test]
