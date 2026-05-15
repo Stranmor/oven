@@ -403,7 +403,10 @@ impl TextMessage {
 
     /// Marks this message as a project-model context payload.
     pub fn project_model_context(role: Role, content: impl Into<String>) -> Self {
-        Self::new(role, content).kind(TextMessageKind::ProjectModelContext)
+        Self::new(role, content)
+            .kind(TextMessageKind::ProjectModelContext)
+            .droppable(true)
+            .cacheable(false)
     }
 
     /// Returns whether this message is eligible for provider prompt-cache
@@ -949,6 +952,22 @@ mod tests {
             .messages
             .get(index)
             .expect("expected message at index")
+    }
+
+    #[test]
+    fn test_project_model_context_constructor_sets_internal_transport_invariants() {
+        let fixture = TextMessage::project_model_context(
+            Role::User,
+            "<project_model_context>dynamic</project_model_context>",
+        );
+        let actual = (
+            fixture.is_project_model_context(),
+            fixture.is_internal_context(),
+            fixture.droppable,
+            fixture.is_cache_eligible(),
+        );
+        let expected = (true, true, true, false);
+        assert_eq!(actual, expected);
     }
 
     #[test]
