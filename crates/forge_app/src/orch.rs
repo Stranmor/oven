@@ -37,6 +37,20 @@ struct PreflightContexts {
     outbound: Context,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum PreflightContextWindowError {
+    #[error("{0}")]
+    OverBudget(String),
+    #[error(transparent)]
+    Other(anyhow::Error),
+}
+
+impl PreflightContextWindowError {
+    fn other(error: impl Into<anyhow::Error>) -> Self {
+        Self::Other(error.into())
+    }
+}
+
 impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orchestrator<S> {
     pub fn new(
         services: Arc<S>,
@@ -315,56 +329,71 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
     /// # Errors
     /// Returns an actionable local error when the request cannot fit inside the
     /// selected model window.
-    fn preflight_context_window(&self, context: Context) -> anyhow::Result<PreflightContexts> {
-        let model = self.model_for_agent()?;
+    fn preflight_context_window(
+        &self,
+        context: Context,
+    ) -> std::result::Result<PreflightContexts, PreflightContextWindowError> {
+        let model = self
+            .model_for_agent()
+            .map_err(PreflightContextWindowError::other)?;
         let context_window = model
             .context_length
             .and_then(|value| usize::try_from(value).ok())
             .ok_or_else(|| {
-                anyhow::anyhow!(
+                PreflightContextWindowError::other(anyhow::anyhow!(
                     "Selected model '{}' for provider '{}' does not expose a configured context_length; context-window safety cannot be proven before provider dispatch. Add context_length to the model metadata or select a model with known context window.",
                     self.agent.model,
                     self.agent.provider
-                )
+                ))
             })?;
 
-        let canonical = context.model_context_length(u64::try_from(context_window).map_err(|_| {
-            anyhow::anyhow!(
-                "Selected model '{}' context window {} tokens cannot be represented in provider safety metadata.",
-                self.agent.model,
-                context_window
-            )
-        })?);
+        let canonical = context.model_context_length(
+            u64::try_from(context_window).map_err(|_| {
+                PreflightContextWindowError::other(anyhow::anyhow!(
+                    "Selected model '{}' context window {} tokens cannot be represented in provider safety metadata.",
+                    self.agent.model,
+                    context_window
+                ))
+            })?,
+        );
         let reasoning_supported = canonical.is_reasoning_supported();
-        let outbound =
-            self.final_outbound_context(&self.agent.model, canonical.clone(), reasoning_supported)?;
+        let outbound = self
+            .final_outbound_context(&self.agent.model, canonical.clone(), reasoning_supported)
+            .map_err(PreflightContextWindowError::other)?;
 
         let output_reservation = Self::output_token_reservation(&outbound);
         let input_budget = Self::effective_input_budget(context_window, output_reservation)
             .ok_or_else(|| {
-                anyhow::anyhow!(
+                PreflightContextWindowError::OverBudget(format!(
                     "Selected model '{}' has a {} token context window, but the configured output reservation is {} tokens and leaves no safe prompt budget. Lower max_tokens or select a larger-context model.",
                     self.agent.model,
                     context_window,
                     output_reservation
-                )
+                ))
             })?;
 
-        let estimated_tokens = self.estimated_request_tokens(&outbound)?;
+        let estimated_tokens = self
+            .estimated_request_tokens(&outbound)
+            .map_err(PreflightContextWindowError::other)?;
         if estimated_tokens <= input_budget {
             return Ok(PreflightContexts { canonical, outbound });
         }
 
         let compacted_canonical =
             Compactor::new(self.agent.compact.clone(), self.services.get_environment())
-                .compact(canonical, true)?;
+                .compact(canonical, true)
+                .map_err(PreflightContextWindowError::other)?;
         let compacted_reasoning_supported = compacted_canonical.is_reasoning_supported();
-        let compacted_outbound = self.final_outbound_context(
-            &self.agent.model,
-            compacted_canonical.clone(),
-            compacted_reasoning_supported,
-        )?;
-        let compacted_estimate = self.estimated_request(&compacted_outbound)?;
+        let compacted_outbound = self
+            .final_outbound_context(
+                &self.agent.model,
+                compacted_canonical.clone(),
+                compacted_reasoning_supported,
+            )
+            .map_err(PreflightContextWindowError::other)?;
+        let compacted_estimate = self
+            .estimated_request(&compacted_outbound)
+            .map_err(PreflightContextWindowError::other)?;
         let compacted_estimated_tokens = compacted_estimate.estimated_input_tokens;
         if compacted_estimated_tokens <= input_budget {
             return Ok(PreflightContexts {
@@ -374,7 +403,7 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
         }
 
         let excess_tokens = compacted_estimated_tokens.saturating_sub(input_budget);
-        anyhow::bail!(
+        Err(PreflightContextWindowError::OverBudget(format!(
             "Local context-window guard blocked an oversized request before provider dispatch. Model '{}' has context window {} tokens; reserved output is {} tokens; safety margin is {} tokens; effective input budget is {} tokens; estimated request is {} tokens after compaction; excess is {} tokens. Major contributors after provider transformation: messages={} ({} serialized bytes), tools={} ({} serialized bytes), full serialized request={} bytes, media padding={} tokens. Reduce retained conversation/context, reduce tool surface, lower max_tokens, or select a larger-context model.",
             self.agent.model,
             context_window,
@@ -389,7 +418,7 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
             compacted_estimate.tools_bytes,
             compacted_estimate.serialized_request_bytes,
             compacted_estimate.media_token_padding
-        )
+        )))
     }
 
     /// Returns the strongest safe canonical compaction for a context that could
@@ -436,22 +465,25 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
     async fn persist_preflight_repair_or_error(
         &mut self,
         context: Context,
-        error: anyhow::Error,
+        error: PreflightContextWindowError,
     ) -> anyhow::Error {
+        let PreflightContextWindowError::OverBudget(message) = error else {
+            return error.into();
+        };
         let Ok(repaired_context) = self.max_compacted_canonical_context(context.clone()) else {
-            return error;
+            return PreflightContextWindowError::OverBudget(message).into();
         };
         if repaired_context.messages == context.messages {
-            return error;
+            return PreflightContextWindowError::OverBudget(message).into();
         }
 
         self.conversation.context = Some(repaired_context);
         match self.services.update(self.conversation.clone()).await {
             Ok(()) => anyhow::anyhow!(
-                "{error:#}\nA max-compacted canonical context was saved locally for this persisted conversation before stopping. The provider call is still blocked because the repaired request remains over budget; run /compact again for diagnostics, reduce tool/context surface, lower max_tokens, or switch to a larger-context model."
+                "{message}\nA max-compacted canonical context was saved locally for this persisted conversation before stopping. The provider call is still blocked because the repaired request remains over budget; run /compact again for diagnostics, reduce tool/context surface, lower max_tokens, or switch to a larger-context model."
             ),
             Err(save_error) => anyhow::anyhow!(
-                "{error:#}\nA max-compacted canonical context was computed but could not be saved locally: {save_error:#}. The provider call remains blocked."
+                "{message}\nA max-compacted canonical context was computed but could not be saved locally: {save_error:#}. The provider call remains blocked."
             ),
         }
     }
@@ -1479,6 +1511,44 @@ mod tests {
             repaired_context.messages != original_context.messages,
             expected
         );
+    }
+
+    #[tokio::test]
+    async fn test_run_does_not_persist_compaction_repair_for_non_budget_preflight_error() {
+        let services = PersistingFixtureServices::new();
+        let compact = Compact::new().retention_window(1_usize);
+        let agent = Agent::new(
+            AgentId::new("context_guard_agent"),
+            ProviderId::OPENAI,
+            ModelId::new("context-guard-model"),
+        )
+        .compact(compact);
+        let setup = Context::default()
+            .add_message(droppable_user_message(large_text(12_000)))
+            .add_tool_results(vec![ToolResult {
+                name: ToolName::new("invalid_image_tool"),
+                call_id: Some(ToolCallId::new("call_invalid_image")),
+                output: ToolOutput::image(Image::new_base64(
+                    "not valid base64".to_string(),
+                    "image/png",
+                )),
+            }])
+            .max_tokens(512_usize);
+        let conversation = forge_domain::Conversation::generate().context(setup);
+        let mut fixture = Orchestrator::new(
+            services.clone(),
+            conversation,
+            agent,
+            forge_config::ForgeConfig::default(),
+        )
+        .models(vec![model_fixture(128_000)]);
+
+        let actual = fixture.run().await.unwrap_err().to_string();
+        let updates = services.updated_contexts().await;
+        let expected = 1;
+
+        assert!(actual.contains("Invalid image base64 payload"));
+        assert_eq!(updates.len(), expected);
     }
 
     #[test]
