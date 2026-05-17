@@ -585,10 +585,12 @@ mod tests {
 
         let google = create_google(&fixture.url())?;
 
-        let context = Context::default().add_message(ContextMessage::user(
-            "Hi",
-            Some(ModelId::new(format!("models/{}", model_id))),
-        ));
+        let context = Context::default()
+            .add_message(ContextMessage::user(
+                "Hi",
+                Some(ModelId::new(format!("models/{}", model_id))),
+            ))
+            .model_context_length(128_000_u64);
 
         let mut stream = google
             .chat(&ModelId::new(format!("models/{}", model_id)), context)

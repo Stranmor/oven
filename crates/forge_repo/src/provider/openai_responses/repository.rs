@@ -1550,7 +1550,8 @@ mod tests {
             OpenAIResponsesProvider::new(provider, infra);
         let context = ChatContext::default()
             .add_message(ContextMessage::user("Hi", None))
-            .stream(true);
+            .stream(true)
+            .model_context_length(128_000_u64);
 
         let mut stream = provider_impl
             .chat(&ModelId::from("codex-mini-latest"), context)
@@ -1627,7 +1628,8 @@ mod tests {
         let provider_impl = OpenAIResponsesProvider::new(provider, infra);
         let context = ChatContext::default()
             .add_message(ContextMessage::user("Hi", None))
-            .stream(true);
+            .stream(true)
+            .model_context_length(128_000_u64);
 
         let mut stream = provider_impl
             .chat(&ModelId::from("gpt-5.1-codex-mini"), context)
@@ -1708,7 +1710,8 @@ mod tests {
         let provider_impl = OpenAIResponsesProvider::new(provider, infra);
         let context = ChatContext::default()
             .add_message(ContextMessage::user("Hi", None))
-            .stream(true);
+            .stream(true)
+            .model_context_length(128_000_u64);
 
         let mut stream = provider_impl
             .chat(&ModelId::from("gpt-5.1-codex-mini"), context)
@@ -1756,7 +1759,8 @@ mod tests {
         let provider_impl = OpenAIResponsesProvider::new(provider, infra);
         let context = ChatContext::default()
             .add_message(ContextMessage::user("Hi", None))
-            .stream(true);
+            .stream(true)
+            .model_context_length(128_000_u64);
 
         let actual = provider_impl
             .chat(&ModelId::from("gpt-5.1-codex"), context)
@@ -1785,7 +1789,8 @@ mod tests {
         let provider_impl = OpenAIResponsesProvider::new(provider, infra);
         let context = ChatContext::default()
             .add_message(ContextMessage::user("Hi", None))
-            .stream(true);
+            .stream(true)
+            .model_context_length(128_000_u64);
 
         let mut stream = provider_impl
             .chat(&ModelId::from("gpt-4o"), context)
@@ -1824,7 +1829,8 @@ mod tests {
         let provider_impl = OpenAIResponsesProvider::new(provider, infra);
         let context = ChatContext::default()
             .add_message(ContextMessage::user("Hi", None))
-            .stream(true);
+            .stream(true)
+            .model_context_length(128_000_u64);
 
         let mut stream = provider_impl
             .chat(&ModelId::from("gpt-4o"), context)
@@ -2059,7 +2065,8 @@ mod tests {
             .add_message(ContextMessage::system(
                 "Stable instructions stay top-level.",
             ))
-            .add_message(ContextMessage::user("First cacheable user message.", None));
+            .add_message(ContextMessage::user("First cacheable user message.", None))
+            .model_context_length(128_000_u64);
 
         let mut actual = provider_impl
             .chat(&ModelId::from("gpt-5.5"), context)
@@ -2101,7 +2108,8 @@ mod tests {
         let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
         let provider_impl = OpenAIResponsesProvider::new(provider, infra);
         let context = ChatContext::default()
-            .add_message(ContextMessage::system("Only instructions are present."));
+            .add_message(ContextMessage::system("Only instructions are present."))
+            .model_context_length(128_000_u64);
 
         let actual = responses_input_cache_eligibility(&context);
         let expected = Vec::<bool>::new();
@@ -2150,7 +2158,8 @@ mod tests {
         let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
         let provider_impl = OpenAIResponsesProvider::new(provider, infra);
         let context = ChatContext::default()
-            .add_message(ContextMessage::user("First cacheable user message.", None));
+            .add_message(ContextMessage::user("First cacheable user message.", None))
+            .model_context_length(128_000_u64);
 
         let mut actual = provider_impl
             .chat(&ModelId::from("gpt-5.5"), context)
@@ -2224,5 +2233,6 @@ mod tests {
             .add_message(ContextMessage::user("Second cacheable user message.", None))
             .add_tool(tool_definition)
             .tool_choice(forge_domain::ToolChoice::Auto)
+            .model_context_length(128_000_u64)
     }
 }

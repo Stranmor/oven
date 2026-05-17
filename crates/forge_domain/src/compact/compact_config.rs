@@ -14,18 +14,22 @@ pub struct Compact {
     /// These messages won't be considered for summarization. Works alongside
     /// eviction_window - the more conservative limit (fewer messages to
     /// compact) takes precedence.
-    #[merge(strategy = crate::merge::std::overwrite)]
-    #[serde(default)]
-    pub retention_window: usize,
+    #[merge(strategy = crate::merge::option)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_window: Option<usize>,
 
     /// Maximum percentage of the context that can be summarized during
     /// compaction. Valid values are between 0.0 and 1.0, where 0.0 means no
     /// compaction and 1.0 allows summarizing all messages. Works alongside
     /// retention_window - the more conservative limit (fewer messages to
     /// compact) takes precedence.
-    #[merge(strategy = crate::merge::std::overwrite)]
-    #[serde(default, deserialize_with = "deserialize_percentage")]
-    pub eviction_window: f64,
+    #[merge(strategy = crate::merge::option)]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_percentage"
+    )]
+    pub eviction_window: Option<f64>,
 
     /// Maximum number of tokens to keep after compaction
     #[merge(strategy = crate::merge::option)]
@@ -71,21 +75,6 @@ pub struct Compact {
     pub on_turn_end: Option<bool>,
 }
 
-fn deserialize_percentage<'de, D>(deserializer: D) -> Result<f64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-
-    let value = f64::deserialize(deserializer)?;
-    if !(0.0..=1.0).contains(&value) {
-        return Err(Error::custom(format!(
-            "percentage must be between 0.0 and 1.0, got {value}"
-        )));
-    }
-    Ok(value)
-}
-
 fn deserialize_optional_percentage<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -120,14 +109,36 @@ impl Compact {
             turn_threshold: None,
             message_threshold: None,
             model: None,
-            eviction_window: 0.2, // Default to 20% compaction
-            retention_window: 0,
+            eviction_window: None,
+            retention_window: None,
             on_turn_end: None,
         }
     }
 
-    /// Determines if compaction should be triggered based on the current
-    /// context
+    /// Returns the retention window used when no explicit compact setting is
+    /// present.
+    pub fn default_retention_window() -> usize {
+        0
+    }
+
+    /// Returns the eviction window used when no explicit compact setting is
+    /// present.
+    pub fn default_eviction_window() -> f64 {
+        0.2
+    }
+
+    /// Returns the effective retention window for compaction execution.
+    pub fn effective_retention_window(&self) -> usize {
+        self.retention_window
+            .unwrap_or_else(Self::default_retention_window)
+    }
+
+    /// Returns the effective eviction window for compaction execution.
+    pub fn effective_eviction_window(&self) -> f64 {
+        self.eviction_window
+            .unwrap_or_else(Self::default_eviction_window)
+    }
+
     pub fn should_compact(&self, context: &Context, token_count: usize) -> bool {
         self.should_compact_due_to_tokens(token_count)
             || self.should_compact_due_to_turns(context)

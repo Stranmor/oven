@@ -36,17 +36,58 @@ impl Compactor {
     }
 }
 
+/// Returns the minimum tail size normal auto-compaction must keep so the most
+/// recent assistant response and its adjacent tool-result chain remain exact.
+///
+/// # Arguments
+///
+/// * `context` - Conversation context inspected before compaction.
+fn latest_complete_turn_retention(context: &Context) -> usize {
+    let messages = &context.messages;
+    let Some(mut start) = messages
+        .iter()
+        .rposition(|message| message.has_role(forge_domain::Role::Assistant))
+    else {
+        return messages
+            .iter()
+            .rposition(|message| !message.has_role(forge_domain::Role::System))
+            .map(|index| messages.len().saturating_sub(index))
+            .unwrap_or_default();
+    };
+
+    loop {
+        while start > 0 && messages[start - 1].has_tool_result() {
+            start -= 1;
+        }
+
+        if start > 0 && messages[start - 1].has_tool_call() {
+            start -= 1;
+            continue;
+        }
+
+        break;
+    }
+
+    if start > 0 && messages[start - 1].has_role(forge_domain::Role::User) {
+        start -= 1;
+    }
+
+    messages.len().saturating_sub(start)
+}
+
 impl Compactor {
     /// Apply compaction to the context if requested.
     pub fn compact(&self, context: Context, max: bool) -> anyhow::Result<Context> {
-        let eviction = CompactionStrategy::evict(self.compact.eviction_window);
-        let retention = CompactionStrategy::retain(self.compact.retention_window);
+        let eviction = CompactionStrategy::evict(self.compact.effective_eviction_window());
+        let retention = CompactionStrategy::retain(self.compact.effective_retention_window());
 
         let strategy = if max {
-            // TODO: Consider using `eviction.max(retention)`
+            // Manual/max compaction is intentionally allowed to follow the configured
+            // retention window exactly for preflight recovery.
             retention
         } else {
-            eviction.min(retention)
+            let latest_turn = CompactionStrategy::retain(latest_complete_turn_retention(&context));
+            eviction.max(retention).max(latest_turn)
         };
 
         match strategy.eviction_range(&context) {
@@ -435,6 +476,124 @@ mod tests {
         TemplateEngine::default()
             .render("forge-partial-summary-frame.md", data)
             .unwrap()
+    }
+
+    #[test]
+    fn test_normal_compaction_preserves_latest_assistant_turn() {
+        let environment = test_environment();
+        let compactor = Compactor::new(
+            Compact::new()
+                .retention_window(0_usize)
+                .eviction_window(1.0_f64),
+            environment,
+        );
+        let context = Context::default()
+            .add_message(ContextMessage::user("Old request", None))
+            .add_message(ContextMessage::assistant("Old response", None, None, None))
+            .add_message(ContextMessage::user("Fresh request", None))
+            .add_message(ContextMessage::assistant(
+                "Fresh response",
+                None,
+                None,
+                None,
+            ));
+
+        let actual = compactor.compact(context, false).unwrap();
+        let actual = actual
+            .messages
+            .iter()
+            .filter_map(|message| message.content().map(str::to_string))
+            .collect::<Vec<_>>();
+        let expected = vec![
+            actual[0].clone(),
+            "Fresh request".to_string(),
+            "Fresh response".to_string(),
+        ];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_normal_compaction_preserves_latest_todo_write_chain() {
+        use forge_domain::{TodoItem, TodoStatus, ToolCallId, ToolCatalog, ToolResult};
+
+        let environment = test_environment();
+        let compactor = Compactor::new(
+            Compact::new()
+                .retention_window(0_usize)
+                .eviction_window(1.0_f64),
+            environment,
+        );
+        let todo_call = ToolCatalog::tool_call_todo_write(vec![
+            TodoItem {
+                content: "Inspect compaction".to_string(),
+                status: TodoStatus::Completed,
+            },
+            TodoItem {
+                content: "Fix retention".to_string(),
+                status: TodoStatus::InProgress,
+            },
+            TodoItem {
+                content: "Run tests".to_string(),
+                status: TodoStatus::Pending,
+            },
+        ])
+        .call_id(ToolCallId::new("todo_call_1"));
+        let todo_result =
+            ToolResult::from(todo_call.clone()).success("<todos_updated changes=\"3\" />");
+        let context = Context::default()
+            .add_message(ContextMessage::user("Old request", None))
+            .add_message(ContextMessage::assistant("Old response", None, None, None))
+            .add_message(ContextMessage::assistant(
+                "",
+                None,
+                None,
+                Some(vec![todo_call.clone()]),
+            ))
+            .add_message(ContextMessage::tool_result(todo_result))
+            .add_message(ContextMessage::assistant(
+                "Continuing after todo update",
+                None,
+                None,
+                None,
+            ));
+
+        let actual = compactor.compact(context, false).unwrap();
+        let retained_tail = actual.messages.iter().skip(1).collect::<Vec<_>>();
+
+        assert_eq!(retained_tail.len(), 3);
+        assert!(retained_tail[0].has_tool_call());
+        assert!(retained_tail[1].has_tool_result());
+        assert_eq!(
+            retained_tail[2].content(),
+            Some("Continuing after todo update")
+        );
+    }
+
+    #[test]
+    fn test_manual_max_compaction_can_remain_aggressive() {
+        let environment = test_environment();
+        let compactor = Compactor::new(
+            Compact::new()
+                .retention_window(0_usize)
+                .eviction_window(1.0_f64),
+            environment,
+        );
+        let context = Context::default()
+            .add_message(ContextMessage::user("Old request", None))
+            .add_message(ContextMessage::assistant("Old response", None, None, None))
+            .add_message(ContextMessage::user("Fresh request", None))
+            .add_message(ContextMessage::assistant(
+                "Fresh response",
+                None,
+                None,
+                None,
+            ));
+
+        let actual = compactor.compact(context, true).unwrap();
+        let expected = 1;
+
+        assert_eq!(actual.messages.len(), expected);
     }
 
     #[test]

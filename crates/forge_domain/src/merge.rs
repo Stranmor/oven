@@ -1,12 +1,6 @@
 use ::std::collections::HashMap;
 use ::std::hash::Hash;
 
-pub mod std {
-    pub fn overwrite<T>(base: &mut T, other: T) {
-        *base = other;
-    }
-}
-
 pub mod vec {
 
     use std::collections::HashMap;

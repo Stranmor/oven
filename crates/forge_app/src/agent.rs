@@ -189,13 +189,13 @@ impl AgentExt for Agent {
             agent.max_requests_per_turn = Some(max_requests_per_turn);
         }
 
-        // Apply workflow compact configuration to agents
+        // Apply workflow compact configuration to agents. Workflow values fill
+        // the agent's compact defaults, and only explicitly configured agent
+        // compact fields override them.
         if let Some(ref workflow_compact) = config.compact {
-            // Convert forge_config::Compact to forge_domain::Compact, then merge.
-            // Agent settings take priority over workflow settings.
-            let mut merged_compact = Compact {
-                retention_window: workflow_compact.retention_window,
-                eviction_window: workflow_compact.eviction_window.value(),
+            let workflow_compact = Compact {
+                retention_window: Some(workflow_compact.retention_window),
+                eviction_window: Some(workflow_compact.eviction_window.value()),
                 max_tokens: workflow_compact.max_tokens,
                 token_threshold: workflow_compact.token_threshold,
                 token_threshold_percentage: workflow_compact
@@ -206,6 +206,7 @@ impl AgentExt for Agent {
                 model: workflow_compact.model.as_deref().map(ModelId::new),
                 on_turn_end: workflow_compact.on_turn_end,
             };
+            let mut merged_compact = workflow_compact;
             merged_compact.merge(agent.compact.clone());
             agent.compact = merged_compact;
         }
@@ -332,16 +333,8 @@ mod tests {
         assert_eq!(actual.as_ref().and_then(|r| r.enabled), Some(false));
     }
 
-    /// Tests the current behavior: agent compact settings take priority over
-    /// workflow config.
-    ///
-    /// CURRENT BEHAVIOR: When agent has compact settings, they override
-    /// workflow settings. This means user's .forge.toml compact settings
-    /// are ignored if agent has ANY compact config.
-    ///
-    /// Note: The apply_config comment says "Agent settings take priority over
-    /// workflow settings", which is implemented via the merge() call that
-    /// overwrites workflow values with agent values.
+    /// Tests compact merging where workflow config fills default agent compact
+    /// settings while explicit agent compact fields retain priority.
     #[test]
     fn test_compact_agent_settings_take_priority_over_workflow_config() {
         use forge_config::Percentage;
@@ -356,22 +349,15 @@ mod tests {
 
         let config = ForgeConfig::default().compact(workflow_compact);
 
-        // Agent with default compact config - retention_window=0 from Default
+        // Agent with default compact config - no explicit compact fields.
         let agent = fixture_agent();
 
         let actual = agent.apply_config(&config).compact;
 
-        // CURRENT BEHAVIOR: Due to merge order (workflow_compact merged with
-        // agent.compact), agent's retention_window=0 overwrites workflow's 10
-        // This is the documented behavior: "Agent settings take priority over workflow
-        // settings"
-
-        // Agent default has retention_window=0, which overwrites workflow's 10
         assert_eq!(
-            actual.retention_window, 0,
-            "Agent's retention_window (0) takes priority over workflow's (10). \
-             This is the CURRENT behavior per apply_config comment. \
-             If user wants workflow settings to apply, agent should have no compact config set."
+            actual.retention_window,
+            Some(10),
+            "Workflow retention_window applies because the agent has no explicit compact override"
         );
 
         // Agent default has token_threshold=None, workflow's 80000 should apply
@@ -387,12 +373,25 @@ mod tests {
         );
     }
 
-    /// Tests the current behavior when agent has partial compact config:
-    /// those agent values override workflow values.
-    ///
-    /// CURRENT BEHAVIOR: If agent sets ANY compact field, that value wins over
-    /// workflow config. Only fields where agent has None will get workflow
-    /// values.
+    #[test]
+    fn test_compact_explicit_agent_zero_overrides_workflow_retention() {
+        use forge_config::Percentage;
+        use forge_domain::Compact as DomainCompact;
+
+        let workflow_compact = forge_config::Compact::default()
+            .retention_window(15_usize)
+            .eviction_window(Percentage::new(0.25).unwrap());
+        let config = ForgeConfig::default().compact(workflow_compact);
+        let agent = fixture_agent().compact(DomainCompact::new().retention_window(0_usize));
+
+        let actual = agent.apply_config(&config).compact;
+        let expected = Some(0);
+
+        assert_eq!(actual.retention_window, expected);
+    }
+
+    /// Tests that explicit agent compact fields override workflow compact
+    /// values while unset fields are filled from workflow config.
     #[test]
     fn test_compact_partial_agent_settings_override_workflow_values() {
         use forge_config::Percentage;
@@ -409,7 +408,8 @@ mod tests {
 
         let config = ForgeConfig::default().compact(workflow_compact);
 
-        // Agent with PARTIAL compact config (only retention_window set to 5)
+        // Agent with PARTIAL compact config (only retention_window and
+        // token_threshold_percentage set).
         let agent = fixture_agent().compact(
             DomainCompact::new()
                 .retention_window(5_usize)
@@ -418,12 +418,10 @@ mod tests {
 
         let actual = agent.apply_config(&config).compact;
 
-        // CURRENT BEHAVIOR: Agent's retention_window=5 overwrites workflow's 15
         assert_eq!(
-            actual.retention_window, 5,
-            "Agent's retention_window (5) takes priority. \
-             This is CURRENT behavior: agent.compact.retention_window is Some(5), \
-             so merge() overwrites workflow's Some(15) with agent's Some(5)."
+            actual.retention_window,
+            Some(5),
+            "Explicit agent retention_window takes priority over workflow retention_window"
         );
 
         // Fields where agent had None get workflow values
