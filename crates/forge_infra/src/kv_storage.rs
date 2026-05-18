@@ -268,6 +268,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_clear_removes_regular_files_inside_cache_dir() {
+        let cache_dir = test_cache_dir();
+        let cache = CacacheStorage::new(cache_dir.clone(), None);
+
+        std::fs::write(cache_dir.join(".mcp.json"), "{}").unwrap();
+        let actual = cache.cache_clear().await;
+
+        assert!(actual.is_ok());
+        assert!(cache_dir.exists());
+        assert!(!cache_dir.join(".mcp.json").exists());
+    }
+
+    #[tokio::test]
     async fn test_ttl_not_expired() {
         let cache_dir = test_cache_dir();
         let cache = CacacheStorage::new(cache_dir, Some(std::time::Duration::from_secs(60))); // 60 seconds TTL
