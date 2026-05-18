@@ -18,8 +18,16 @@ enum CacheStorageError {
     EntrySerialization { source: serde_json::Error },
     #[error("Failed to write to cache")]
     Write { source: cacache::Error },
-    #[error("Failed to clear cache")]
-    Clear { source: cacache::Error },
+    #[error("Failed to clear cache directory {path}")]
+    ClearDirectory {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("Failed to recreate cache directory {path}")]
+    RecreateDirectory {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 /// Wrapper for cached values with timestamp for TTL validation
@@ -171,9 +179,21 @@ impl forge_app::KVStore for CacacheStorage {
         if !self.cache_dir.exists() {
             return Ok(());
         }
-        cacache::clear(&self.cache_dir)
+        // Use remove_dir_all + create_dir_all instead of cacache::clear because
+        // cacache::clear calls remove_dir_all on every directory entry, which
+        // fails with ENOTDIR when regular files (e.g. .mcp.json) are present.
+        tokio::fs::remove_dir_all(&self.cache_dir)
             .await
-            .map_err(|source| CacheStorageError::Clear { source })?;
+            .map_err(|source| CacheStorageError::ClearDirectory {
+                path: self.cache_dir.clone(),
+                source,
+            })?;
+        tokio::fs::create_dir_all(&self.cache_dir)
+            .await
+            .map_err(|source| CacheStorageError::RecreateDirectory {
+                path: self.cache_dir.clone(),
+                source,
+            })?;
         Ok(())
     }
 }
