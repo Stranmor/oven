@@ -398,6 +398,7 @@ fn tool_activity_title(detail: &UiToolDetail) -> String {
         None => detail.name.clone(),
     }
 }
+/// A typed render block that preserves the semantics of a chat response.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UiBlock {
     /// Submitted user message for a turn that has been accepted by the UI.
