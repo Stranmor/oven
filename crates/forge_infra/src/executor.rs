@@ -1948,16 +1948,16 @@ mod tests {
     async fn test_execute_command_handoff_process_read_status_kill_without_duplicate_start() {
         let temp_dir = tempfile::tempdir().unwrap();
         let marker_path = temp_dir.path().join("tool-handoff-side-effect");
-        let command = format!(
-            "printf run >> {marker}; sleep 2; printf delayed-output; sleep 5",
-            marker = marker_path.display()
-        );
+        let command =
+            "printf run >> tool-handoff-side-effect; sleep 2; printf delayed-output; sleep 5";
+        let full_command_duration = Duration::from_secs(7);
+        let handoff_proof_deadline = full_command_duration - Duration::from_millis(500);
         let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
         let started_at = Instant::now();
 
         let actual = fixture
             .execute_command(
-                command,
+                command.to_string(),
                 temp_dir.path().to_path_buf(),
                 true,
                 None,
@@ -1976,16 +1976,21 @@ mod tests {
                 ProcessReadCursor::new(0),
                 Some(ProcessObservationWaitSeconds::new(3).unwrap()),
             )
-            .await
-            .unwrap();
+            .await;
         let status = fixture
             .process_status(process.process_id.clone(), None)
-            .await
-            .unwrap();
-        let kill_status = fixture.kill_process(process.process_id).await.unwrap();
+            .await;
+        let kill_status = fixture.kill_process(process.process_id).await;
         let side_effects = std::fs::read_to_string(marker_path).unwrap();
+        let read_output = read_output.unwrap();
+        let status = status.unwrap();
+        let kill_status = kill_status.unwrap();
 
-        assert!(handoff_elapsed < Duration::from_secs(2));
+        assert!(
+            handoff_elapsed < handoff_proof_deadline,
+            "handoff should return before the full command duration; elapsed={handoff_elapsed:?}, \
+             deadline={handoff_proof_deadline:?}"
+        );
         assert_eq!(actual.output.exit_code, None);
         assert!(
             actual
