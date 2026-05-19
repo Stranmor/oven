@@ -1,6 +1,6 @@
 //! Ignore-aware project indexing, persistence, sharding, and episodes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -10,7 +10,8 @@ use ignore::WalkBuilder;
 
 use crate::durable_vector_index::{VectorIndexArtifact, VectorIndexArtifactId};
 use crate::extraction::{
-    extract_cargo_dependency_edges, extract_rust_import_edges, extract_rust_symbols,
+    CargoManifestInput, extract_cargo_dependency_edges, extract_rust_import_edges,
+    extract_rust_symbols, extract_static_cargo_metadata,
 };
 use crate::freshness::compare_freshness;
 use crate::policy::LOCAL_PROJECT_MODEL_MANIFEST_FILE_NAME;
@@ -89,7 +90,7 @@ impl ProjectIndexer {
             if language == Language::Rust {
                 rust_sources.insert(relative.clone(), content);
             } else if relative.ends_with("Cargo.toml") {
-                cargo_tomls.push((relative.clone(), content));
+                cargo_tomls.push(CargoManifestInput { path: relative.clone(), content });
             }
             files.push(source);
         }
@@ -98,14 +99,22 @@ impl ProjectIndexer {
         let file_nodes = build_file_nodes(&files);
         let mut symbols = Vec::new();
         let mut edges = Vec::new();
+        let known_files = files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<BTreeSet<_>>();
+        let cargo_metadata = extract_static_cargo_metadata(&cargo_tomls, &known_files)?;
         for (path, content) in &rust_sources {
             let extracted = extract_rust_symbols(path, content)?;
             symbols.extend(extracted.symbols);
             edges.extend(extracted.edges);
             edges.extend(extract_rust_import_edges(path, content)?);
         }
-        for (path, content) in &cargo_tomls {
-            edges.extend(extract_cargo_dependency_edges(path, content)?);
+        for cargo_manifest in &cargo_tomls {
+            edges.extend(extract_cargo_dependency_edges(
+                &cargo_manifest.path,
+                &cargo_manifest.content,
+            )?);
         }
         symbols.sort_by(|left, right| left.id.cmp(&right.id));
         edges.sort_by_key(edge_sort_key);
@@ -126,6 +135,9 @@ impl ProjectIndexer {
             files,
             file_nodes,
             symbols,
+            cargo_workspace: cargo_metadata.workspace,
+            cargo_packages: cargo_metadata.packages,
+            cargo_package_dependencies: cargo_metadata.dependencies,
             edges,
             external_fact_batches,
             external_facts_fingerprint,
@@ -782,9 +794,10 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::{
-        ContextPackSelection, GraphEdgeKind, RetrievalQuery, StaleEvidencePolicy, SymbolKind,
-        VectorIndexArtifact, compare_freshness, fingerprint, retrieve,
-        vector_entries_from_manifest_embeddings,
+        CargoDependencyDeclaration, CargoDependencyKind, CargoPackageDependency,
+        CargoTargetDeclaration, CargoTargetKind, ContextPackSelection, GraphEdgeKind,
+        RetrievalQuery, StaleEvidencePolicy, SymbolKind, VectorIndexArtifact, compare_freshness,
+        fingerprint, retrieve, vector_entries_from_manifest_embeddings,
     };
 
     pub(crate) fn fixture_project() -> Result<(TempDir, PathBuf)> {
@@ -849,6 +862,244 @@ pub(crate) mod tests {
         );
         assert_eq!(actual.manifest_hash.len(), 64);
         Ok(())
+    }
+
+    #[test]
+    fn cargo_single_package_indexes_static_package_targets_and_dependency_declarations()
+    -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let actual = setup.index()?;
+        let actual_package = actual
+            .cargo_packages
+            .iter()
+            .find(|package| package.name == "fixture")
+            .expect("fixture package should be indexed");
+        let actual_dependency = actual
+            .cargo_package_dependencies
+            .iter()
+            .find(|dependency| dependency.dependency_key == "serde")
+            .expect("serde dependency should be indexed");
+
+        assert_eq!(actual_package.manifest_path, "Cargo.toml");
+        assert_eq!(actual_package.package_root, "");
+        assert_eq!(actual_package.version.as_deref(), Some("0.1.0"));
+        assert_eq!(actual_package.edition, None);
+        assert_eq!(actual_package.provenance.is_complete(), true);
+        assert_eq!(
+            actual_package
+                .targets
+                .iter()
+                .any(|target| target.kind == CargoTargetKind::Lib
+                    && target.path == "src/lib.rs"
+                    && target.declaration == CargoTargetDeclaration::ConventionInferred),
+            true
+        );
+        assert_eq!(
+            actual_dependency.declaring_package.as_deref(),
+            Some("fixture")
+        );
+        assert_eq!(actual_dependency.kind, CargoDependencyKind::Normal);
+        assert_eq!(
+            actual_dependency.declaration,
+            CargoDependencyDeclaration::DeclaredExternal
+        );
+        assert_eq!(actual_dependency.version.as_deref(), Some("1"));
+        assert_eq!(actual_dependency.provenance.is_complete(), true);
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_workspace_indexes_members_and_member_packages_deterministically() -> Result<()> {
+        let (left_fixture, left_root) = cargo_workspace_fixture(false)?;
+        let (right_fixture, right_root) = cargo_workspace_fixture(true)?;
+        let left = ProjectIndexer::new(&left_root, left_fixture.path().join("model")).index()?;
+        let right = ProjectIndexer::new(&right_root, right_fixture.path().join("model")).index()?;
+        let left_workspace = left
+            .cargo_workspace
+            .as_ref()
+            .expect("workspace metadata should be indexed");
+        let right_workspace = right
+            .cargo_workspace
+            .as_ref()
+            .expect("workspace metadata should be indexed");
+
+        assert_eq!(right_workspace.provenance.is_complete(), true);
+        assert_eq!(
+            left_workspace.members,
+            vec!["crates/app".to_string(), "crates/util".to_string()]
+        );
+        assert_eq!(
+            left_workspace.package_manifest_paths,
+            vec![
+                "crates/app/Cargo.toml".to_string(),
+                "crates/util/Cargo.toml".to_string()
+            ]
+        );
+        assert_eq!(
+            serde_json::to_string(&left.cargo_workspace)?,
+            serde_json::to_string(&right.cargo_workspace)?
+        );
+        assert_eq!(
+            serde_json::to_string(&left.cargo_packages)?,
+            serde_json::to_string(&right.cargo_packages)?
+        );
+        assert_eq!(
+            serde_json::to_string(&left.cargo_package_dependencies)?,
+            serde_json::to_string(&right.cargo_package_dependencies)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_dependencies_model_static_kinds_paths_workspace_target_renames_and_features()
+    -> Result<()> {
+        let (fixture, root) = cargo_workspace_fixture(false)?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let actual = setup.index()?;
+        let path_dependency = dependency(&actual, "app", "util");
+        let workspace_declaration = actual
+            .cargo_package_dependencies
+            .iter()
+            .find(|dependency| {
+                dependency.declaring_package.is_none() && dependency.dependency_key == "serde"
+            })
+            .expect("workspace serde declaration should be indexed");
+        let inherited_dependency = dependency(&actual, "app", "serde");
+        let renamed_dependency = dependency(&actual, "app", "anyhow_renamed");
+        let optional_dependency = dependency(&actual, "app", "optional_dep");
+        let dev_dependency = dependency(&actual, "app", "pretty_assertions");
+        let build_dependency = dependency(&actual, "app", "cc");
+        let target_dependency = dependency(&actual, "app", "cfg-if");
+        let app_package = actual
+            .cargo_packages
+            .iter()
+            .find(|package| package.name == "app")
+            .expect("app package should be indexed");
+
+        assert_eq!(
+            path_dependency.declaration,
+            CargoDependencyDeclaration::DeclaredPath
+        );
+        assert_eq!(path_dependency.path.as_deref(), Some("../util"));
+        assert_eq!(
+            path_dependency.linked_package_manifest_path.as_deref(),
+            Some("crates/util/Cargo.toml")
+        );
+        assert_eq!(workspace_declaration.declaring_package, None);
+        assert_eq!(workspace_declaration.features, vec!["derive".to_string()]);
+        assert_eq!(
+            inherited_dependency.declaration,
+            CargoDependencyDeclaration::DeclaredWorkspaceInherited
+        );
+        assert_eq!(inherited_dependency.package_name, "serde");
+        assert_eq!(renamed_dependency.dependency_key, "anyhow_renamed");
+        assert_eq!(renamed_dependency.package_name, "anyhow");
+        assert_eq!(optional_dependency.optional, true);
+        assert_eq!(optional_dependency.features, vec!["feature-a".to_string()]);
+        assert_eq!(
+            app_package
+                .features
+                .iter()
+                .any(|feature| feature.name == "extras"
+                    && feature.members == vec!["optional_dep/feature-a".to_string()]),
+            true
+        );
+        assert_eq!(dev_dependency.kind, CargoDependencyKind::Dev);
+        assert_eq!(build_dependency.kind, CargoDependencyKind::Build);
+        assert_eq!(target_dependency.target.as_deref(), Some("cfg(unix)"));
+        assert_eq!(target_dependency.kind, CargoDependencyKind::Normal);
+        assert_eq!(
+            actual
+                .edges
+                .iter()
+                .any(|edge| edge.kind == GraphEdgeKind::CargoDependency && edge.to == "serde"),
+            true
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_manifest_hash_changes_when_static_declarations_change() -> Result<()> {
+        let (fixture, root) = cargo_workspace_fixture(false)?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let previous = setup.index()?;
+        fs::write(
+            root.join("crates").join("app").join("Cargo.toml"),
+            app_manifest("0.2"),
+        )?;
+        let current = setup.index()?;
+
+        assert_ne!(previous.manifest_hash, current.manifest_hash);
+        assert_eq!(
+            current
+                .files
+                .iter()
+                .any(|file| file.path == "crates/app/Cargo.toml"
+                    && !previous
+                        .files
+                        .iter()
+                        .any(|previous_file| previous_file.path == file.path
+                            && previous_file.content_hash == file.content_hash)),
+            true
+        );
+        Ok(())
+    }
+
+    fn dependency<'a>(
+        manifest: &'a ProjectManifest,
+        declaring_package: &str,
+        dependency_key: &str,
+    ) -> &'a CargoPackageDependency {
+        manifest
+            .cargo_package_dependencies
+            .iter()
+            .find(|dependency| {
+                dependency.declaring_package.as_deref() == Some(declaring_package)
+                    && dependency.dependency_key == dependency_key
+            })
+            .expect("dependency should be indexed")
+    }
+
+    fn cargo_workspace_fixture(reversed: bool) -> Result<(TempDir, PathBuf)> {
+        let temp = TempDir::new()?;
+        let root = temp.path().join("project");
+        fs::create_dir_all(root.join("crates").join("app").join("src"))?;
+        fs::create_dir_all(root.join("crates").join("util").join("src"))?;
+        let members = if reversed {
+            "members = [\"crates/util\", \"crates/app\"]"
+        } else {
+            "members = [\"crates/app\", \"crates/util\"]"
+        };
+        fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[workspace]\n{members}\n\n[workspace.dependencies]\nserde = {{ version = \"1\", features = [\"derive\"] }}\n"
+            ),
+        )?;
+        fs::write(
+            root.join("crates").join("app").join("Cargo.toml"),
+            app_manifest("0.1"),
+        )?;
+        fs::write(
+            root.join("crates").join("app").join("src").join("lib.rs"),
+            "pub fn app() {}\n",
+        )?;
+        fs::write(
+            root.join("crates").join("util").join("Cargo.toml"),
+            "[package]\nname = \"util\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(
+            root.join("crates").join("util").join("src").join("lib.rs"),
+            "pub fn util() {}\n",
+        )?;
+        Ok((temp, root))
+    }
+
+    fn app_manifest(version: &str) -> String {
+        format!(
+            "[package]\nname = \"app\"\nversion = \"{version}.0\"\nedition = \"2021\"\n\n[dependencies]\nserde = {{ workspace = true }}\nanyhow_renamed = {{ package = \"anyhow\", version = \"1\" }}\n\n[dependencies.util]\npath = \"../util\"\n\n[dependencies.optional_dep]\nversion = \"1\"\noptional = true\nfeatures = [\"feature-a\"]\n\n[dev-dependencies]\npretty_assertions = \"1\"\n\n[build-dependencies]\ncc = \"1\"\n\n[target.'cfg(unix)'.dependencies]\ncfg-if = \"1\"\n\n[features]\nextras = [\"optional_dep/feature-a\"]\n"
+        )
     }
 
     #[test]

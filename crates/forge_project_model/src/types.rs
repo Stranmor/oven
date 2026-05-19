@@ -21,6 +21,15 @@ pub struct ProjectManifest {
     pub file_nodes: Vec<FileNode>,
     /// Rust symbols extracted from source files.
     pub symbols: Vec<SymbolNode>,
+    /// Static Cargo workspace declaration metadata parsed from Cargo.toml files.
+    #[serde(default)]
+    pub cargo_workspace: Option<CargoWorkspaceMetadata>,
+    /// Static Cargo package declaration metadata parsed from Cargo.toml files.
+    #[serde(default)]
+    pub cargo_packages: Vec<CargoPackageMetadata>,
+    /// Static Cargo dependency declarations parsed without resolver semantics.
+    #[serde(default)]
+    pub cargo_package_dependencies: Vec<CargoPackageDependency>,
     /// Typed knowledge and dependency edges.
     pub edges: Vec<GraphEdge>,
     /// Accepted external exact fact batch provenance.
@@ -34,6 +43,149 @@ pub struct ProjectManifest {
     /// Manifest-level content hash over deterministic file hashes and accepted
     /// external fact fingerprints.
     pub manifest_hash: String,
+}
+
+/// Static Cargo workspace declaration metadata parsed without invoking Cargo.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CargoWorkspaceMetadata {
+    /// Workspace manifest path relative to the project root.
+    pub manifest_path: String,
+    /// Workspace root path relative to the project root.
+    pub root_path: String,
+    /// Declared workspace member patterns in deterministic order.
+    pub members: Vec<String>,
+    /// Statically confirmed workspace package manifest paths in deterministic order.
+    pub package_manifest_paths: Vec<String>,
+    /// Provenance for the workspace declaration.
+    pub provenance: Provenance,
+}
+
+/// Static Cargo package declaration metadata parsed without invoking Cargo.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CargoPackageMetadata {
+    /// Package manifest path relative to the project root.
+    pub manifest_path: String,
+    /// Package root path relative to the project root.
+    pub package_root: String,
+    /// Declared package name.
+    pub name: String,
+    /// Declared package version when present.
+    pub version: Option<String>,
+    /// Declared package edition when present.
+    pub edition: Option<String>,
+    /// Static target declarations and convention-inferred targets.
+    pub targets: Vec<CargoTargetMetadata>,
+    /// Static feature declarations without claiming activation.
+    pub features: Vec<CargoFeatureMetadata>,
+    /// Provenance for the package declaration.
+    pub provenance: Provenance,
+}
+
+/// Static Cargo target declaration or convention inference.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CargoTargetMetadata {
+    /// Target name.
+    pub name: String,
+    /// Target kind such as `lib` or `bin`.
+    pub kind: CargoTargetKind,
+    /// Target source path relative to the project root.
+    pub path: String,
+    /// Whether the target came from explicit TOML or Cargo's file convention.
+    pub declaration: CargoTargetDeclaration,
+    /// Provenance for the target declaration or inference.
+    pub provenance: Provenance,
+}
+
+/// Static Cargo feature declaration parsed without activation semantics.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CargoFeatureMetadata {
+    /// Feature key as declared in TOML.
+    pub name: String,
+    /// Feature entries as declared in TOML.
+    pub members: Vec<String>,
+    /// Provenance for the feature declaration.
+    pub provenance: Provenance,
+}
+
+/// Cargo target kind modeled for static declaration metadata.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum CargoTargetKind {
+    /// Library target.
+    Lib,
+    /// Binary target.
+    Bin,
+    /// Future or unsupported target kind.
+    #[default]
+    Other,
+}
+
+/// Source of a static Cargo target fact.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum CargoTargetDeclaration {
+    /// Explicitly declared in Cargo.toml.
+    Declared,
+    /// Inferred from standard Cargo target paths without resolver execution.
+    #[default]
+    ConventionInferred,
+}
+
+/// Static Cargo dependency declaration parsed without resolver semantics.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CargoPackageDependency {
+    /// Manifest path that declares this dependency.
+    pub manifest_path: String,
+    /// Declaring package name, or `None` for workspace-level dependency declarations.
+    pub declaring_package: Option<String>,
+    /// Dependency key as written in TOML.
+    pub dependency_key: String,
+    /// Actual package name from `package = "..."`, or the dependency key.
+    pub package_name: String,
+    /// Dependency kind declaration.
+    pub kind: CargoDependencyKind,
+    /// Optional target scope for `[target.*.dependencies]` declarations.
+    pub target: Option<String>,
+    /// Declared version requirement when present.
+    pub version: Option<String>,
+    /// Declared local path relative to the declaring package root when present.
+    pub path: Option<String>,
+    /// Whether this dependency was declared optional without claiming activation.
+    pub optional: bool,
+    /// Declared features without claiming activation.
+    pub features: Vec<String>,
+    /// Static declaration source/status.
+    pub declaration: CargoDependencyDeclaration,
+    /// Statically confirmed linked package manifest for path dependencies.
+    pub linked_package_manifest_path: Option<String>,
+    /// Provenance for the dependency declaration.
+    pub provenance: Provenance,
+}
+
+/// Cargo dependency section kind.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum CargoDependencyKind {
+    /// `[dependencies]` declaration.
+    #[default]
+    Normal,
+    /// `[dev-dependencies]` declaration.
+    Dev,
+    /// `[build-dependencies]` declaration.
+    Build,
+    /// Unsupported future dependency section.
+    Unsupported,
+}
+
+/// Static Cargo dependency declaration source/status.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum CargoDependencyDeclaration {
+    /// External dependency declaration.
+    #[default]
+    DeclaredExternal,
+    /// Local path dependency declaration.
+    DeclaredPath,
+    /// Package dependency inheriting a `[workspace.dependencies]` declaration.
+    DeclaredWorkspaceInherited,
+    /// Static parser recognized a dependency-like declaration it cannot model exactly.
+    UnresolvedStatic,
 }
 
 /// A source file known to the project model.

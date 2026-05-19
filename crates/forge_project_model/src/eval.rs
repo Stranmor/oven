@@ -495,6 +495,36 @@ fn manifest_provenance(manifest: &ProjectManifest) -> Vec<&crate::types::Provena
         .map(|file| &file.provenance)
         .chain(manifest.file_nodes.iter().map(|node| &node.provenance))
         .chain(manifest.symbols.iter().map(|symbol| &symbol.provenance))
+        .chain(
+            manifest
+                .cargo_workspace
+                .iter()
+                .map(|workspace| &workspace.provenance),
+        )
+        .chain(
+            manifest
+                .cargo_packages
+                .iter()
+                .map(|package| &package.provenance),
+        )
+        .chain(
+            manifest
+                .cargo_packages
+                .iter()
+                .flat_map(|package| package.targets.iter().map(|target| &target.provenance)),
+        )
+        .chain(
+            manifest
+                .cargo_packages
+                .iter()
+                .flat_map(|package| package.features.iter().map(|feature| &feature.provenance)),
+        )
+        .chain(
+            manifest
+                .cargo_package_dependencies
+                .iter()
+                .map(|dependency| &dependency.provenance),
+        )
         .chain(manifest.edges.iter().map(|edge| &edge.provenance))
         .chain(manifest.shards.iter().map(|shard| &shard.provenance))
         .collect()
@@ -885,6 +915,25 @@ mod tests {
             evaluate_provenance_completeness(&manifest).completeness,
             1.0
         );
+        Ok(())
+    }
+
+    #[test]
+    fn provenance_completeness_checks_static_cargo_metadata() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let mut manifest = setup.index()?;
+        manifest
+            .cargo_package_dependencies
+            .first_mut()
+            .expect("fixture should include Cargo dependency metadata")
+            .provenance
+            .fingerprint
+            .clear();
+
+        let actual = evaluate_provenance_completeness(&manifest).completeness < 1.0;
+        let expected = true;
+        assert_eq!(actual, expected);
         Ok(())
     }
 
