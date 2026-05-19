@@ -27,6 +27,14 @@ fn format_process_read_subtitle(input: &ProcessRead) -> String {
     parts.join(" · ")
 }
 
+fn format_task_subtitle(agent_id: &str, tasks: &[String]) -> String {
+    if tasks.is_empty() {
+        agent_id.to_string()
+    } else {
+        format!("{}\n{}", agent_id, tasks.join("\n"))
+    }
+}
+
 impl FormatContent for ToolCatalog {
     fn to_content(&self, env: &Environment) -> Option<ChatResponseContent> {
         let display_path_for = |path: &str| format_display_path(Path::new(path), env.cwd.as_path());
@@ -171,9 +179,11 @@ impl FormatContent for ToolCatalog {
                     .into(),
             ),
             ToolCatalog::TodoRead(_) => Some(TitleFormat::debug("Read Todos").into()),
-            ToolCatalog::Task(input) => {
-                Some(TitleFormat::debug("Task").sub_title(&input.agent_id).into())
-            }
+            ToolCatalog::Task(input) => Some(
+                TitleFormat::debug("Task")
+                    .sub_title(format_task_subtitle(&input.agent_id, &input.tasks))
+                    .into(),
+            ),
         }
     }
 }
@@ -183,8 +193,8 @@ mod tests {
     use std::path::PathBuf;
 
     use forge_domain::{
-        Category, ChatResponseContent, Environment, ProcessObservationWaitSeconds, TitleFormat,
-        ToolCatalog,
+        Category, ChatResponseContent, Environment, ProcessObservationWaitSeconds, TaskInput,
+        TitleFormat, ToolCatalog,
     };
     use pretty_assertions::assert_eq;
 
@@ -303,6 +313,31 @@ mod tests {
         assert_eq!(actual.title, expected_title);
         assert_eq!(actual.sub_title, expected_sub_title);
         assert_eq!(actual.category, expected_category);
+    }
+
+    #[test]
+    fn test_task_formats_multiline_tasks_for_live_display() {
+        let fixture = ToolCatalog::Task(TaskInput {
+            tasks: vec![
+                "first line\nsecond line".to_string(),
+                "another task".to_string(),
+            ],
+            agent_id: "agi-dev".to_string(),
+            session_id: None,
+        });
+
+        let actual = fixture.to_content(&fixture_environment()).unwrap();
+        let ChatResponseContent::ToolInput(actual) = actual else {
+            panic!("expected tool input content");
+        };
+        let expected = TitleFormat {
+            title: "Task".to_string(),
+            sub_title: Some("agi-dev\nfirst line\nsecond line\nanother task".to_string()),
+            category: Category::Debug,
+            timestamp: actual.timestamp,
+        };
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

@@ -83,11 +83,41 @@ impl<S: AS> TitleGenerator<S> {
         // Parse the response - try JSON first (structured output), fallback to plain
         // text
         match serde_json::from_str::<TitleResponse>(&content) {
-            Ok(response) => Ok(Some(response.title)),
+            Ok(response) => Ok(non_empty_title(response.title)),
             Err(_) => {
                 // Fallback: Some providers don't support structured output, treat as plain text
-                Ok(Some(content.trim().to_string()))
+                Ok(non_empty_title(content))
             }
         }
+    }
+}
+
+fn non_empty_title(title: impl AsRef<str>) -> Option<String> {
+    let title = title.as_ref().trim();
+    if title.is_empty() {
+        None
+    } else {
+        Some(title.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::non_empty_title;
+
+    #[test]
+    fn test_non_empty_title_trims_provider_title() {
+        let actual = non_empty_title("  Generated title  ");
+        let expected = Some("Generated title".to_string());
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_non_empty_title_rejects_blank_provider_title() {
+        let actual = non_empty_title(" \n\t ");
+        let expected = None;
+        assert_eq!(actual, expected);
     }
 }

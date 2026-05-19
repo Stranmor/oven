@@ -13,6 +13,7 @@ use crate::title_generator::TitleGenerator;
 
 /// Per-conversation title generation state.
 struct TitleGenerationState {
+    fallback_title: String,
     rx: oneshot::Receiver<Option<String>>,
     handle: JoinHandle<()>,
 }
@@ -42,6 +43,40 @@ impl<S> TitleGenerationHandler<S> {
             .and_then(|e| e.message.as_value())
             .and_then(|e| e.as_user_prompt())
     }
+
+    fn fallback_title(user_prompt: Option<&forge_domain::UserPrompt>) -> String {
+        let text = user_prompt
+            .map(|prompt| prompt.as_str())
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text = if text.is_empty() {
+            "New conversation".to_string()
+        } else if text.chars().count() > 60 {
+            format!("{}...", text.chars().take(60).collect::<String>())
+        } else {
+            text
+        };
+        Self::sanitize_title(text).expect("fallback title should always be non-empty")
+    }
+
+    fn sanitize_title(title: impl AsRef<str>) -> Option<String> {
+        let title = title.as_ref().trim();
+        if title.is_empty() {
+            None
+        } else {
+            Some(title.to_string())
+        }
+    }
+
+    fn is_explicit_user_title(conversation: &Conversation, fallback_title: &str) -> bool {
+        conversation
+            .title
+            .as_ref()
+            .and_then(Self::sanitize_title)
+            .is_some_and(|title| title != fallback_title)
+    }
 }
 
 #[async_trait]
@@ -51,11 +86,12 @@ impl<S: AgentService> EventHandle<EventData<StartPayload>> for TitleGenerationHa
         event: &EventData<StartPayload>,
         conversation: &mut Conversation,
     ) -> anyhow::Result<()> {
-        if conversation.title.is_some() {
+        let user_prompt = Self::first_user_prompt(conversation).cloned();
+        let fallback_title = Self::fallback_title(user_prompt.as_ref());
+        if Self::is_explicit_user_title(conversation, &fallback_title) {
             return Ok(());
         }
-
-        let user_prompt = Self::first_user_prompt(conversation);
+        conversation.title = Some(fallback_title.clone());
 
         let Some(user_prompt) = user_prompt else {
             return Ok(());
@@ -78,7 +114,7 @@ impl<S: AgentService> EventHandle<EventData<StartPayload>> for TitleGenerationHa
                 let title = generator.generate().await.ok().flatten();
                 let _ = tx.send(title);
             });
-            TitleGenerationState { rx, handle }
+            TitleGenerationState { fallback_title, rx, handle }
         });
 
         Ok(())
@@ -93,32 +129,25 @@ impl<S: AgentService> EventHandle<EventData<EndPayload>> for TitleGenerationHand
         conversation: &mut Conversation,
     ) -> anyhow::Result<()> {
         if let Some((_, entry)) = self.title_tasks.remove(&conversation.id) {
+            let fallback_title = entry.fallback_title;
             let handle = &entry.handle;
             let rx = entry.rx;
 
             let mut generated = None;
             if !rx.is_empty() {
-                generated = rx.await.unwrap_or(None);
+                generated = rx
+                    .await
+                    .unwrap_or(None)
+                    .and_then(|title| Self::sanitize_title(title));
             } else {
                 handle.abort();
             }
 
-            if let Some(title) = generated {
-                conversation.title = Some(title);
-            } else {
-                let fallback = Self::first_user_prompt(conversation).map(|prompt| {
-                    let text = prompt.replace('\n', " ");
-                    if text.chars().count() > 60 {
-                        format!("{}...", text.chars().take(60).collect::<String>())
-                    } else {
-                        text
-                    }
-                });
-
-                if let Some(title) = fallback {
-                    conversation.title = Some(title);
-                }
+            if Self::is_explicit_user_title(conversation, &fallback_title) {
+                return Ok(());
             }
+
+            conversation.title = Some(generated.unwrap_or(fallback_title));
         }
 
         Ok(())
@@ -217,9 +246,10 @@ mod tests {
         tx.send(Some("original".to_string())).unwrap();
         let handle = tokio::spawn(async {});
         handle.abort();
-        handler
-            .title_tasks
-            .insert(conversation.id, TitleGenerationState { rx, handle });
+        handler.title_tasks.insert(
+            conversation.id,
+            TitleGenerationState { fallback_title: "test message".to_string(), rx, handle },
+        );
 
         handler
             .handle(&event(StartPayload), &mut conversation)
@@ -237,9 +267,10 @@ mod tests {
         tx.send(Some("generated".to_string())).unwrap();
         let handle = tokio::spawn(async {});
         handle.abort();
-        handler
-            .title_tasks
-            .insert(conversation.id, TitleGenerationState { rx, handle });
+        handler.title_tasks.insert(
+            conversation.id,
+            TitleGenerationState { fallback_title: "test message".to_string(), rx, handle },
+        );
 
         handler
             .handle(&event(EndPayload), &mut conversation)
@@ -259,9 +290,10 @@ mod tests {
         drop(tx);
         let handle = tokio::spawn(async {});
         handle.abort();
-        handler
-            .title_tasks
-            .insert(conversation.id, TitleGenerationState { rx, handle });
+        handler.title_tasks.insert(
+            conversation.id,
+            TitleGenerationState { fallback_title: "test message".to_string(), rx, handle },
+        );
 
         handler
             .handle(&event(EndPayload), &mut conversation)
@@ -279,16 +311,17 @@ mod tests {
         let (tx, rx) = oneshot::channel::<Option<String>>();
         let handle = tokio::spawn(async {});
         tx.send(None).unwrap();
-        handler
-            .title_tasks
-            .insert(conversation.id, TitleGenerationState { rx, handle });
+        let expected_fallback = "This is a very long message that spans multiple lines. It sh...";
+        handler.title_tasks.insert(
+            conversation.id,
+            TitleGenerationState { fallback_title: expected_fallback.to_string(), rx, handle },
+        );
 
         handler
             .handle(&event(EndPayload), &mut conversation)
             .await
             .unwrap();
 
-        let expected_fallback = "This is a very long message that spans multiple lines. It sh...";
         assert_eq!(conversation.title, Some(expected_fallback.into()));
         assert!(!handler.title_tasks.contains_key(&conversation.id));
     }
@@ -305,9 +338,10 @@ mod tests {
             let _ = tx.send(None);
         });
 
-        handler
-            .title_tasks
-            .insert(conversation.id, TitleGenerationState { rx, handle });
+        handler.title_tasks.insert(
+            conversation.id,
+            TitleGenerationState { fallback_title: "test message".to_string(), rx, handle },
+        );
 
         handler
             .handle(&event(EndPayload), &mut conversation)
@@ -320,6 +354,104 @@ mod tests {
         // Verify the task is no longer running by checking that the
         // EndPayload handler didn't hang (it completed immediately).
         assert_eq!(conversation.title, Some("test message".into()));
+    }
+
+    #[tokio::test]
+    async fn test_start_sets_non_empty_fallback_title_synchronously() {
+        let (handler, mut conversation) = setup("  first line\nsecond line  ");
+
+        handler
+            .handle(&event(StartPayload), &mut conversation)
+            .await
+            .unwrap();
+
+        let actual = conversation.title;
+        let expected = Some("first line second line".to_string());
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_start_replaces_blank_title_with_fallback() {
+        let (handler, mut conversation) = setup("test message");
+        conversation.title = Some("   ".to_string());
+
+        handler
+            .handle(&event(StartPayload), &mut conversation)
+            .await
+            .unwrap();
+
+        let actual = conversation.title;
+        let expected = Some("test message".to_string());
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_end_trims_generated_title() {
+        let (handler, mut conversation) = setup("test message");
+        conversation.title = Some("test message".to_string());
+        let (tx, rx) = oneshot::channel();
+        tx.send(Some("  generated title  ".to_string())).unwrap();
+        let handle = tokio::spawn(async {});
+        handle.abort();
+        handler.title_tasks.insert(
+            conversation.id,
+            TitleGenerationState { fallback_title: "test message".to_string(), rx, handle },
+        );
+
+        handler
+            .handle(&event(EndPayload), &mut conversation)
+            .await
+            .unwrap();
+
+        let actual = conversation.title;
+        let expected = Some("generated title".to_string());
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_end_keeps_fallback_when_generated_title_is_blank() {
+        let (handler, mut conversation) = setup("test message");
+        conversation.title = Some("test message".to_string());
+        let (tx, rx) = oneshot::channel();
+        tx.send(Some("  \n ".to_string())).unwrap();
+        let handle = tokio::spawn(async {});
+        handle.abort();
+        handler.title_tasks.insert(
+            conversation.id,
+            TitleGenerationState { fallback_title: "test message".to_string(), rx, handle },
+        );
+
+        handler
+            .handle(&event(EndPayload), &mut conversation)
+            .await
+            .unwrap();
+
+        let actual = conversation.title;
+        let expected = Some("test message".to_string());
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_end_does_not_overwrite_explicit_user_renamed_title() {
+        let (handler, mut conversation) = setup("test message");
+        conversation.title = Some("Manual title".to_string());
+        let (tx, rx) = oneshot::channel();
+        tx.send(Some("generated title".to_string())).unwrap();
+        let handle = tokio::spawn(async {});
+        handle.abort();
+        handler.title_tasks.insert(
+            conversation.id,
+            TitleGenerationState { fallback_title: "test message".to_string(), rx, handle },
+        );
+
+        handler
+            .handle(&event(EndPayload), &mut conversation)
+            .await
+            .unwrap();
+
+        let actual = conversation.title;
+        let expected = Some("Manual title".to_string());
+        assert_eq!(actual, expected);
     }
 
     /// Many concurrent StartPayload calls for the same conversation id must

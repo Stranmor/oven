@@ -399,6 +399,10 @@ impl From<Info> for Porcelain {
 }
 
 /// Converts Info reference to Porcelain representation
+fn normalize_porcelain_cell(value: &str) -> String {
+    value.replace('\r', "\\r").replace('\n', "\\n")
+}
+
 impl From<&Info> for Porcelain {
     fn from(info: &Info) -> Self {
         let mut rows = Vec::new();
@@ -461,7 +465,13 @@ impl From<&Info> for Porcelain {
                         if value.is_empty() {
                             None
                         } else {
-                            Some(value.join(", "))
+                            Some(
+                                value
+                                    .iter()
+                                    .map(|cell| normalize_porcelain_cell(cell))
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                            )
                         }
                     })
                 })
@@ -519,6 +529,21 @@ mod tests {
             ],
             vec![Some("user2".into()), Some("Bob".into()), Some("25".into())],
         ];
+
+        assert_eq!(actual, expected)
+    }
+
+    #[test]
+    fn test_from_info_escapes_multiline_cells_for_machine_output() {
+        let fixture = Info::new()
+            .add_title("task")
+            .add_key_value("task", "first line\nsecond line\rthird line");
+
+        let actual = Porcelain::from(fixture).into_body();
+        let expected = vec![vec![
+            Some("task".into()),
+            Some("first line\\nsecond line\\rthird line".into()),
+        ]];
 
         assert_eq!(actual, expected)
     }

@@ -508,6 +508,21 @@ fn calculate_cache_percentage(usage: &Usage) -> u8 {
         .unwrap_or(0)
 }
 
+fn write_multiline_item(
+    f: &mut fmt::Formatter<'_>,
+    prefix: String,
+    continuation_prefix: String,
+    value: &str,
+) -> fmt::Result {
+    let mut lines = value.lines();
+    let first = lines.next().unwrap_or_default();
+    writeln!(f, "{prefix}{first}")?;
+    for line in lines {
+        writeln!(f, "{continuation_prefix}{line}")?;
+    }
+    Ok(())
+}
+
 impl fmt::Display for Info {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut width: Option<usize> = None;
@@ -530,13 +545,28 @@ impl fmt::Display for Info {
                 }
                 Section::Items(key, value) => match (key.as_ref(), width) {
                     (Some(k), Some(w)) => {
-                        writeln!(f, "  {} {}", format!("{k:<w$}").green().bold(), value)?;
+                        write_multiline_item(
+                            f,
+                            format!("  {} ", format!("{k:<w$}").green().bold()),
+                            format!("  {} ", " ".repeat(w)),
+                            value,
+                        )?;
                     }
                     (Some(k), None) => {
-                        writeln!(f, "  {} {}", k.green().bold(), value)?;
+                        write_multiline_item(
+                            f,
+                            format!("  {} ", k.green().bold()),
+                            format!("  {} ", " ".repeat(k.len())),
+                            value,
+                        )?;
                     }
                     (None, _) => {
-                        writeln!(f, "    {} {}", "⦿".green(), value)?;
+                        write_multiline_item(
+                            f,
+                            format!("    {} ", "⦿".green()),
+                            "      ".to_string(),
+                            value,
+                        )?;
                     }
                 },
             }
@@ -708,14 +738,13 @@ pub fn format_reset_time(seconds: u64) -> String {
     humantime::format_duration(Duration::from_secs(seconds)).to_string()
 }
 
-/// Extracts the first line of raw content from a context message.
+/// Extracts raw user content from a context message while preserving multiline tasks.
 fn format_user_message(msg: &forge_api::ContextMessage) -> Option<String> {
     let content = msg
         .as_value()
         .and_then(|v| v.as_user_prompt())
         .map(|p| p.as_str())?;
-    let trimmed = content.lines().next().unwrap_or(content);
-    Some(trimmed.to_string())
+    Some(content.trim().to_string())
 }
 
 impl From<&Conversation> for Info {
@@ -1077,6 +1106,55 @@ mod tests {
         assert!(expected_display.contains("Task"));
         assert!(expected_display.contains("Create a new feature"));
         assert!(expected_display.contains(&conversation_id.to_string()));
+    }
+
+    #[test]
+    fn test_conversation_info_display_with_multiline_task() {
+        use chrono::Utc;
+        use forge_api::{Context, ContextMessage, ConversationId, Role};
+
+        use super::{Conversation, Metrics};
+
+        let conversation_id = ConversationId::generate();
+        let metrics = Metrics::default().started_at(Utc::now());
+        let context = Context::default().add_message(ContextMessage::Text(
+            forge_domain::TextMessage::new(Role::User, "First line\nSecond line")
+                .raw_content(EventValue::text("First line\nSecond line")),
+        ));
+        let fixture = Conversation {
+            id: conversation_id,
+            parent_id: None,
+            title: Some("Test Task".to_string()),
+            initiator: forge_domain::Initiator::User,
+            context: Some(context),
+            metrics,
+            metadata: forge_domain::MetaData::new(Utc::now()),
+        };
+
+        let actual = super::Info::from(&fixture).to_string();
+        let stripped = strip_ansi_escapes::strip(&actual);
+        let actual =
+            String::from_utf8(stripped).expect("stripped ANSI output should remain valid UTF-8");
+        let expected = "tasks First line\n        Second line";
+
+        assert!(actual.contains(expected));
+    }
+
+    #[test]
+    fn test_info_display_preserves_multiline_value_with_padding() {
+        use super::Info;
+
+        let fixture = Info::new()
+            .add_title("TASK")
+            .add_key_value("Task", "First line\nSecond line");
+
+        let actual = fixture.to_string();
+        let stripped = strip_ansi_escapes::strip(&actual);
+        let actual =
+            String::from_utf8(stripped).expect("stripped ANSI output should remain valid UTF-8");
+        let expected = "  task First line\n       Second line";
+
+        assert!(actual.contains(expected));
     }
 
     #[test]

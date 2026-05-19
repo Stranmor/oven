@@ -20,6 +20,27 @@ impl TitleDisplay {
         self
     }
 
+    fn format_multiline_sub_title(&self, sub_title: &str) -> String {
+        let mut lines = sub_title.lines();
+        let Some(first) = lines.next() else {
+            return String::new();
+        };
+        let mut output = String::new();
+        if self.with_colors {
+            output.push_str(&format!(" {}", first.dimmed()));
+        } else {
+            output.push_str(&format!(" {first}"));
+        }
+        for line in lines {
+            if self.with_colors {
+                output.push_str(&format!("\n  {}", line.dimmed()));
+            } else {
+                output.push_str(&format!("\n  {line}"));
+            }
+        }
+        output
+    }
+
     fn format_with_colors(&self) -> String {
         let mut buf = String::new();
 
@@ -52,7 +73,7 @@ impl TitleDisplay {
         buf.push_str(title.to_string().as_str());
 
         if let Some(ref sub_title) = self.inner.sub_title {
-            buf.push_str(&format!(" {}", sub_title.dimmed()).to_string());
+            buf.push_str(&self.format_multiline_sub_title(sub_title));
         }
 
         buf
@@ -70,7 +91,7 @@ impl TitleDisplay {
         buf.push_str(&self.inner.title);
 
         if let Some(ref sub_title) = self.inner.sub_title {
-            buf.push_str(&format!(" {sub_title}"));
+            buf.push_str(&self.format_multiline_sub_title(sub_title));
         }
 
         buf
@@ -100,5 +121,28 @@ impl TitleDisplayExt for TitleFormat {
 
     fn display_with_colors(self, with_colors: bool) -> TitleDisplay {
         TitleDisplay::new(self).with_colors(with_colors)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_title_display_preserves_multiline_subtitle_plain() {
+        let fixture = TitleFormat::debug("Task").sub_title("first line\nsecond line");
+
+        let actual = fixture.display_with_colors(false).to_string();
+        let expected_suffix = "Task first line\n  second line";
+        assert!(actual.ends_with(expected_suffix));
+    }
+
+    #[test]
+    fn test_title_display_preserves_single_line_subtitle_plain() {
+        let fixture = TitleFormat::debug("Task").sub_title("single line");
+
+        let actual = fixture.display_with_colors(false).to_string();
+        let expected_suffix = "Task single line";
+        assert!(actual.ends_with(expected_suffix));
     }
 }
