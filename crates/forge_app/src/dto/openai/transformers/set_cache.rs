@@ -182,13 +182,11 @@ mod tests {
                 TextMessage::new(Role::User, "real user").model(ModelId::new("gpt-4")),
             ))
             .add_message(ContextMessage::Text(
-                TextMessage::new(
+                TextMessage::project_model_context(
                     Role::User,
                     "<project_model_context>dynamic</project_model_context>",
                 )
-                .model(ModelId::new("gpt-4"))
-                .droppable(true)
-                .cacheable(false),
+                .model(ModelId::new("gpt-4")),
             ));
         let mut transformer = SetCache;
 

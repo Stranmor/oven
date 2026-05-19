@@ -962,6 +962,8 @@ pub struct RetrievalQuery {
     pub text: Option<String>,
     /// Exact path filter.
     pub path: Option<String>,
+    /// Directory or path prefix scope applied before scoring and truncation.
+    pub path_prefix: Option<String>,
     /// Exact symbol name or identifier filter.
     pub symbol: Option<String>,
     /// Maximum number of results.
@@ -1001,6 +1003,32 @@ pub struct FreshnessState {
     pub unchanged: Vec<String>,
     /// True when no indexed content changed.
     pub fresh: bool,
+}
+
+/// Freshness proof strength for a manifest compared against the current filesystem.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum FreshnessProofLevel {
+    /// All ignore-aware filesystem inputs were scanned, including added files.
+    FullFilesystem,
+    /// Only files already persisted in the manifest were checked.
+    #[default]
+    IndexedFilesOnly,
+}
+
+/// Freshness evaluation for a persisted manifest against the current filesystem.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestFreshnessEvaluation {
+    /// Deterministic freshness state.
+    pub state: FreshnessState,
+    /// Proof strength used to produce the freshness state.
+    pub proof_level: FreshnessProofLevel,
+}
+
+impl ManifestFreshnessEvaluation {
+    /// Returns true only when the manifest is proven fresh against the full filesystem.
+    pub fn can_inject(&self) -> bool {
+        self.state.fresh && self.proof_level == FreshnessProofLevel::FullFilesystem
+    }
 }
 
 /// Provenance carried by every project-model observation.
@@ -1598,6 +1626,7 @@ mod tests {
             &RetrievalQuery {
                 text: Some("Root".to_string()),
                 path: None,
+                path_prefix: None,
                 symbol: None,
                 limit: 2,
                 include_graph_expansion: false,

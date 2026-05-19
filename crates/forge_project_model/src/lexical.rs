@@ -1,6 +1,7 @@
 //! Deterministic lexical retrieval index with BM25-like scoring.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 
 use crate::types::{LexicalDocument, LexicalDocumentKind, LexicalSearchHit, ProjectManifest};
 
@@ -173,12 +174,31 @@ pub fn documents_from_manifest(manifest: &ProjectManifest) -> Vec<LexicalDocumen
             path: shard.path.clone(),
             symbol: None,
             kind: LexicalDocumentKind::Shard,
-            text: format!("{} {}", shard.path, shard.symbol_ids.join(" ")),
+            text: shard_search_text(manifest, shard),
             provenance: shard.provenance.clone(),
         });
     }
     documents.sort_by(|left, right| left.id.cmp(&right.id));
     documents
+}
+
+fn shard_search_text(manifest: &ProjectManifest, shard: &crate::types::ShardManifest) -> String {
+    let mut surfaces = vec![shard.path.clone(), shard.symbol_ids.join(" ")];
+    if let Ok(content) = fs::read_to_string(manifest.root.join(&shard.path)) {
+        let selected = content
+            .lines()
+            .skip(shard.start_line.saturating_sub(1) as usize)
+            .take(
+                shard
+                    .end_line
+                    .saturating_sub(shard.start_line)
+                    .saturating_add(1) as usize,
+            )
+            .collect::<Vec<_>>()
+            .join("\n");
+        surfaces.push(selected);
+    }
+    surfaces.join(" ")
 }
 
 pub(crate) fn tokenize(text: &str) -> Vec<String> {

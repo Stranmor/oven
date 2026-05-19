@@ -339,6 +339,7 @@ mod tests {
         let query = RetrievalQuery {
             text: Some("Root".to_string()),
             path: None,
+            path_prefix: None,
             symbol: Some("Root".to_string()),
             limit: 1,
             include_graph_expansion: false,

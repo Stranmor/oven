@@ -100,12 +100,16 @@ where
     } else {
         BTreeMap::new()
     };
+    retain_path_scope(&mut results, query);
 
     if plan.lexical
         && let Some(text) = &query.text
     {
         let lexical_index = LexicalIndex::from_manifest(manifest);
         for hit in lexical_index.search(text) {
+            if !matches_path_scope(&hit.path, query) {
+                continue;
+            }
             merge_part(
                 &mut results,
                 hit.id,
@@ -123,6 +127,9 @@ where
     {
         for hit in vector_index.search(vector_query) {
             if let Some((path, symbol, provenance)) = manifest_result_surface(manifest, &hit.id) {
+                if !matches_path_scope(&path, query) {
+                    continue;
+                }
                 merge_part(
                     &mut results,
                     hit.id,
@@ -137,7 +144,7 @@ where
     }
 
     if plan.graph {
-        expand_graph(manifest, &mut results, weights);
+        expand_graph(manifest, query, &mut results, weights);
     }
 
     if plan.rerank
@@ -163,6 +170,17 @@ where
     });
     values.truncate(limit);
     values
+}
+
+fn retain_path_scope(results: &mut BTreeMap<String, RetrievalResult>, query: &RetrievalQuery) {
+    results.retain(|_, result| matches_path_scope(&result.path, query));
+}
+
+fn matches_path_scope(path: &str, query: &RetrievalQuery) -> bool {
+    query
+        .path_prefix
+        .as_deref()
+        .is_none_or(|prefix| path.starts_with(prefix))
 }
 
 fn exact_results(
@@ -227,6 +245,7 @@ fn merge_part(
 
 fn expand_graph(
     manifest: &ProjectManifest,
+    query: &RetrievalQuery,
     results: &mut BTreeMap<String, RetrievalResult>,
     weights: &RetrievalScoringWeights,
 ) {
@@ -239,6 +258,9 @@ fn expand_graph(
                 graph_edge.from.clone()
             };
             if let Some((path, symbol, provenance)) = manifest_result_surface(manifest, &id) {
+                if !matches_path_scope(&path, query) {
+                    continue;
+                }
                 merge_part(
                     results,
                     id,
@@ -312,6 +334,101 @@ mod tests {
     use crate::vector::{DeterministicReranker, DeterministicVectorIndex};
 
     #[test]
+    fn content_only_query_returns_source_body_shard() -> Result<()> {
+        let fixture = tempfile::TempDir::new()?;
+        let root = fixture.path().join("project");
+        std::fs::create_dir_all(root.join("src"))?;
+        std::fs::write(
+            root.join("src").join("only.rs"),
+            "pub fn ordinary_name() -> &'static str {\n    \"bodyonlyneedle\"\n}\n",
+        )?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let query = RetrievalQuery {
+            text: Some("bodyonlyneedle".to_string()),
+            path: None,
+            path_prefix: None,
+            symbol: None,
+            limit: 3,
+            include_graph_expansion: false,
+        };
+
+        let actual = retrieve(&manifest, &query);
+        let expected = Some(("src/only.rs".to_string(), Some(1), Some(3)));
+        assert_eq!(
+            actual.first().map(|result| {
+                (
+                    result.path.clone(),
+                    result.provenance.start_line,
+                    result.provenance.end_line,
+                )
+            }),
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn path_prefix_scope_is_applied_before_truncation() -> Result<()> {
+        let fixture = tempfile::TempDir::new()?;
+        let root = fixture.path().join("project");
+        std::fs::create_dir_all(root.join("src").join("in"))?;
+        std::fs::create_dir_all(root.join("src").join("out"))?;
+        std::fs::write(
+            root.join("src").join("in").join("target.rs"),
+            "pub fn target() {\n    let _ = \"scopedneedle\";\n}\n",
+        )?;
+        std::fs::write(
+            root.join("src").join("out").join("loud.rs"),
+            "pub fn loud() {\n    let _ = \"scopedneedle scopedneedle scopedneedle scopedneedle scopedneedle\";\n}\n",
+        )?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let query = RetrievalQuery {
+            text: Some("scopedneedle".to_string()),
+            path: None,
+            path_prefix: Some("src/in/".to_string()),
+            symbol: None,
+            limit: 1,
+            include_graph_expansion: true,
+        };
+
+        let actual = retrieve(&manifest, &query);
+        let expected = vec!["src/in/target.rs".to_string()];
+        assert_eq!(
+            actual
+                .into_iter()
+                .map(|result| result.path)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_symbol_query_stays_above_body_content_hits() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let query = RetrievalQuery {
+            text: Some("Root".to_string()),
+            path: None,
+            path_prefix: None,
+            symbol: Some("Root".to_string()),
+            limit: 1,
+            include_graph_expansion: true,
+        };
+
+        let actual = retrieve(&manifest, &query);
+        let expected = Some("Root".to_string());
+        assert_eq!(
+            actual.first().and_then(|result| result.symbol.clone()),
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
     fn retrieves_exact_symbol_lexical_and_graph_expansion() -> Result<()> {
         let (fixture, root) = fixture_project()?;
         let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
@@ -319,6 +436,7 @@ mod tests {
         let query = RetrievalQuery {
             text: Some("Root".to_string()),
             path: None,
+            path_prefix: None,
             symbol: Some("Root".to_string()),
             limit: 5,
             include_graph_expansion: true,
@@ -353,6 +471,7 @@ mod tests {
         let query = RetrievalQuery {
             text: Some("Root".to_string()),
             path: None,
+            path_prefix: None,
             symbol: None,
             limit: 1,
             include_graph_expansion: false,
@@ -385,6 +504,7 @@ mod tests {
         let setup = RetrievalQuery {
             text: Some("Root".to_string()),
             path: Some("src/lib.rs".to_string()),
+            path_prefix: None,
             symbol: None,
             limit: 5,
             include_graph_expansion: true,
@@ -413,6 +533,7 @@ mod tests {
         let query = RetrievalQuery {
             text: None,
             path: None,
+            path_prefix: None,
             symbol: Some("Root".to_string()),
             limit: 1,
             include_graph_expansion: false,

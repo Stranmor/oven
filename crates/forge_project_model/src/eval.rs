@@ -170,6 +170,7 @@ mod tests {
             query: RetrievalQuery {
                 text: Some("Root".to_string()),
                 path: None,
+                path_prefix: None,
                 symbol: None,
                 limit: 3,
                 include_graph_expansion: false,

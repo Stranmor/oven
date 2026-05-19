@@ -11,9 +11,8 @@ use forge_domain::{
     WorkspaceContextManifestDiagnostic, WorkspaceId, WorkspaceIndexRepository,
 };
 use forge_project_model::{
-    ContextPack, ContextPackSelection, FreshnessState, ProjectIndexer, RetrievalQuery,
-    StaleEvidencePolicy, evidence_line_range, local_project_model_dir,
-    local_project_model_manifest, retrieve,
+    ContextPack, ContextPackSelection, ProjectIndexer, RetrievalQuery, StaleEvidencePolicy,
+    evidence_line_range, local_project_model_dir, local_project_model_manifest, retrieve,
 };
 use forge_stream::MpscStream;
 use futures::future::join_all;
@@ -242,11 +241,20 @@ impl<
         })?;
         let retrieval_query = RetrievalQuery {
             text: Some(params.query.to_string()),
-            path: params.starts_with.clone(),
+            path: None,
+            path_prefix: params.starts_with.clone(),
             symbol: None,
             limit: params.limit.unwrap_or(10),
             include_graph_expansion: true,
         };
+        let freshness = indexer.evaluate_manifest_freshness(&manifest)?;
+        if !freshness.can_inject() {
+            anyhow::bail!(
+                "Workspace project model is not fresh at {}. Run `forge workspace sync {}` before using project-model context.",
+                manifest_path.display(),
+                root.display()
+            );
+        }
         let results = retrieve(&manifest, &retrieval_query);
         let pack = ContextPack::from_selection(
             &manifest,
@@ -254,7 +262,7 @@ impl<
                 retrieval_results: results,
                 shards: Vec::new(),
                 evidence: Vec::new(),
-                freshness: FreshnessState::default(),
+                freshness: freshness.state.clone(),
                 stale_policy: StaleEvidencePolicy::Reject,
             },
         )?;
@@ -266,17 +274,6 @@ impl<
             let Some((start_line, end_line)) = evidence_line_range(&manifest, &evidence.id) else {
                 continue;
             };
-            if indexer
-                .source_modified_after_manifest(&evidence.path)
-                .with_context(|| format!("compare freshness for {}", evidence.path))?
-            {
-                anyhow::bail!(
-                    "Workspace project model selected evidence is stale at {} for {}. Run `forge workspace sync {}` before using project-model context.",
-                    manifest_path.display(),
-                    evidence.path,
-                    root.display()
-                );
-            }
             let absolute_path = root.join(&evidence.path);
             let (content, _) = self
                 .infra
@@ -333,8 +330,20 @@ fn evaluate_project_model_context(path: &Path) -> WorkspaceContextManifestDiagno
         };
     }
 
-    let freshness = match ProjectIndexer::new(path, local_project_model_dir(path)).read_manifest() {
-        Ok(_) => WorkspaceContextFreshness::Fresh,
+    let indexer = ProjectIndexer::new(path, local_project_model_dir(path));
+    let freshness = match indexer
+        .read_manifest()
+        .and_then(|manifest| indexer.evaluate_manifest_freshness(&manifest))
+    {
+        Ok(evaluation) if evaluation.can_inject() => WorkspaceContextFreshness::Fresh,
+        Ok(evaluation) if evaluation.state.fresh => WorkspaceContextFreshness::Unknown {
+            reason: "project-model freshness checked only indexed files; added-file discovery not proven".to_string(),
+        },
+        Ok(evaluation) => WorkspaceContextFreshness::Stale {
+            changed: evaluation.state.changed,
+            deleted: evaluation.state.deleted,
+            added: evaluation.state.added,
+        },
         Err(error) => WorkspaceContextFreshness::Unknown { reason: error.to_string() },
     };
 
@@ -553,7 +562,6 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
 
     use anyhow::{Result, bail};
     use forge_app::{WalkedFile, WalkedFileStream, Walker};
@@ -912,7 +920,6 @@ mod tests {
     async fn query_workspace_rejects_stale_project_model_manifest() -> Result<()> {
         let (_fixture, root) = fixture_workspace()?;
         write_fixture_project_model(&root)?;
-        std::thread::sleep(Duration::from_millis(20));
         fs::write(
             root.join("src").join("lib.rs"),
             "pub struct RuntimeNeedle {\n    pub value: usize,\n}\n\npub fn build_runtime_needle() -> RuntimeNeedle {\n    RuntimeNeedle { value: 8 }\n}\n",
@@ -936,7 +943,7 @@ mod tests {
             }
             Err(error) => error.to_string(),
         };
-        let expected = "Workspace project model selected evidence is stale";
+        let expected = "Workspace project model is not fresh";
 
         assert!(actual_error.contains(expected));
         assert!(!range_read_called.load(Ordering::SeqCst));
@@ -944,8 +951,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_model_context_diagnostic_reports_manifest_availability_without_hot_path_reindexing()
-    -> Result<()> {
+    async fn project_model_context_diagnostic_reports_stale_manifest_for_changed_file() -> Result<()>
+    {
         let (_fixture, root) = fixture_workspace()?;
         write_fixture_project_model(&root)?;
         let setup = ForgeWorkspaceService::new(
@@ -959,24 +966,49 @@ mod tests {
             Arc::new(NoopDiscovery),
         );
         let fresh = WorkspaceService::project_model_context_diagnostic(&setup, &root).await?;
-        std::thread::sleep(Duration::from_millis(20));
         fs::write(
             root.join("src").join("lib.rs"),
             "pub struct RuntimeNeedle {\n    pub value: usize,\n}\n\npub fn build_runtime_needle() -> RuntimeNeedle {\n    RuntimeNeedle { value: 8 }\n}\n",
         )?;
-        let changed_after_manifest = ProjectIndexer::new(&root, local_project_model_dir(&root))
-            .source_modified_after_manifest("src/lib.rs")?;
         let stale = WorkspaceService::project_model_context_diagnostic(&setup, &root).await?;
         let actual = (
             fresh.manifest_found,
             fresh.freshness.label().to_string(),
-            changed_after_manifest,
             stale.manifest_found,
             stale.freshness.label().to_string(),
+            stale.can_inject(),
         );
-        let expected = (true, "fresh".to_string(), true, true, "fresh".to_string());
+        let expected = (true, "fresh".to_string(), true, "stale".to_string(), false);
 
         assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_model_context_diagnostic_reports_stale_manifest_for_deleted_file() -> Result<()>
+    {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        fs::remove_file(root.join("src").join("lib.rs"))?;
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::new(AtomicBool::new(false)),
+            }),
+            Arc::new(NoopDiscovery),
+        );
+
+        let actual = WorkspaceService::project_model_context_diagnostic(&setup, &root).await?;
+        let expected = WorkspaceContextFreshness::Stale {
+            changed: Vec::new(),
+            deleted: vec!["src/lib.rs".to_string()],
+            added: Vec::new(),
+        };
+        assert_eq!(actual.freshness, expected);
+        assert_eq!(actual.can_inject(), false);
         Ok(())
     }
 
@@ -1107,6 +1139,7 @@ mod tests {
         let query = RetrievalQuery {
             text: Some("build runtime needle".to_string()),
             path: None,
+            path_prefix: None,
             symbol: None,
             limit: 5,
             include_graph_expansion: true,

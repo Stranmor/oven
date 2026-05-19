@@ -14,8 +14,9 @@ use crate::extraction::{
 use crate::freshness::compare_freshness;
 use crate::policy::LOCAL_PROJECT_MODEL_MANIFEST_FILE_NAME;
 use crate::types::{
-    FileNode, FileNodeKind, FreshnessState, Language, ProjectManifest, ShardManifest,
-    ShardStrategy, SourceFile, SymbolNode, ToolEpisode,
+    FileNode, FileNodeKind, FreshnessProofLevel, FreshnessState, Language,
+    ManifestFreshnessEvaluation, ProjectManifest, ShardManifest, ShardStrategy, SourceFile,
+    SymbolNode, ToolEpisode,
 };
 use crate::util::{
     detect_language, edge_sort_key, hash_text, line_count, manifest_hash, normalize_path,
@@ -201,6 +202,25 @@ impl ProjectIndexer {
         Ok(episodes)
     }
 
+    /// Evaluates a persisted manifest against the current ignore-aware filesystem.
+    ///
+    /// # Arguments
+    ///
+    /// * `previous` - Persisted manifest used as the freshness baseline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when current indexing fails.
+    pub fn evaluate_manifest_freshness(
+        &self,
+        previous: &ProjectManifest,
+    ) -> Result<ManifestFreshnessEvaluation> {
+        Ok(ManifestFreshnessEvaluation {
+            state: compare_freshness(previous, &self.index()?),
+            proof_level: FreshnessProofLevel::FullFilesystem,
+        })
+    }
+
     /// Computes full freshness by comparing a previous manifest with a freshly
     /// rebuilt filesystem manifest.
     ///
@@ -212,36 +232,7 @@ impl ProjectIndexer {
     ///
     /// Returns an error when current indexing fails.
     pub fn freshness(&self, previous: &ProjectManifest) -> Result<FreshnessState> {
-        Ok(compare_freshness(previous, &self.index()?))
-    }
-
-    /// Returns true when an indexed source path has a filesystem modification
-    /// timestamp newer than the persisted manifest file.
-    ///
-    /// This is a hot-path guard for selected evidence. It avoids workspace
-    /// walking and content hashing while still preventing obviously stale
-    /// persisted evidence from being injected after a source edit.
-    ///
-    /// # Arguments
-    ///
-    /// * `relative_path` - Manifest-relative source path to compare.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when metadata for the manifest or selected source path
-    /// cannot be read.
-    pub fn source_modified_after_manifest(&self, relative_path: &str) -> Result<bool> {
-        let manifest_path = self.model_dir.join("project_manifest.json");
-        let manifest_modified = fs::metadata(&manifest_path)
-            .with_context(|| format!("stat {}", manifest_path.display()))?
-            .modified()
-            .with_context(|| format!("read modified time for {}", manifest_path.display()))?;
-        let source_path = self.root.join(relative_path);
-        let source_modified = fs::metadata(&source_path)
-            .with_context(|| format!("stat {}", source_path.display()))?
-            .modified()
-            .with_context(|| format!("read modified time for {}", source_path.display()))?;
-        Ok(source_modified > manifest_modified)
+        Ok(self.evaluate_manifest_freshness(previous)?.state)
     }
 
     /// Computes hot-path freshness for files already listed in a manifest
@@ -289,6 +280,24 @@ impl ProjectIndexer {
             deleted,
             added: Vec::new(),
             unchanged,
+        })
+    }
+    /// Evaluates known manifest files without added-file discovery.
+    ///
+    /// # Arguments
+    ///
+    /// * `previous` - Persisted manifest used as the freshness baseline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when known-file hashing fails.
+    pub fn evaluate_known_file_freshness(
+        &self,
+        previous: &ProjectManifest,
+    ) -> Result<ManifestFreshnessEvaluation> {
+        Ok(ManifestFreshnessEvaluation {
+            state: self.known_file_freshness(previous)?,
+            proof_level: FreshnessProofLevel::IndexedFilesOnly,
         })
     }
 }
@@ -525,6 +534,58 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn manifest_freshness_evaluation_detects_changed_deleted_and_added_files() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let previous = setup.index()?;
+        fs::write(root.join("src").join("lib.rs"), "pub struct Changed;\n")?;
+        fs::remove_file(root.join("src").join("model.rs"))?;
+        fs::write(root.join("src").join("added.rs"), "pub fn added() {}\n")?;
+
+        let actual = setup.evaluate_manifest_freshness(&previous)?;
+        let expected = ManifestFreshnessEvaluation {
+            state: FreshnessState {
+                changed: vec!["src/lib.rs".to_string()],
+                deleted: vec!["src/model.rs".to_string()],
+                added: vec!["src/added.rs".to_string()],
+                unchanged: vec!["Cargo.toml".to_string()],
+                fresh: false,
+            },
+            proof_level: FreshnessProofLevel::FullFilesystem,
+        };
+        assert_eq!(actual, expected);
+        assert_eq!(actual.can_inject(), false);
+        Ok(())
+    }
+
+    #[test]
+    fn known_file_freshness_evaluation_does_not_overclaim_full_freshness() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let previous = setup.index()?;
+        fs::write(root.join("src").join("added.rs"), "pub fn added() {}\n")?;
+
+        let actual = setup.evaluate_known_file_freshness(&previous)?;
+        let expected = ManifestFreshnessEvaluation {
+            state: FreshnessState {
+                changed: Vec::new(),
+                deleted: Vec::new(),
+                added: Vec::new(),
+                unchanged: vec![
+                    "Cargo.toml".to_string(),
+                    "src/lib.rs".to_string(),
+                    "src/model.rs".to_string(),
+                ],
+                fresh: true,
+            },
+            proof_level: FreshnessProofLevel::IndexedFilesOnly,
+        };
+        assert_eq!(actual, expected);
+        assert_eq!(actual.can_inject(), false);
+        Ok(())
+    }
+
+    #[test]
     fn detects_changed_deleted_and_added_freshness() -> Result<()> {
         let (fixture, root) = fixture_project()?;
         let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
@@ -606,6 +667,7 @@ pub(crate) mod tests {
         let query = RetrievalQuery {
             text: Some("Root".to_string()),
             path: None,
+            path_prefix: None,
             symbol: Some("Root".to_string()),
             limit: 5,
             include_graph_expansion: true,
