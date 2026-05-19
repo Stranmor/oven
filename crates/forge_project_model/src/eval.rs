@@ -288,19 +288,19 @@ pub fn evaluate_episode_artifact_links(
 /// # Arguments
 ///
 /// * `episodes` - Tool episodes to represent as graph nodes.
-/// * `artifact_ids` - Context-pack artifact identifiers to represent as evidence nodes.
+/// * `artifacts` - Context-pack artifacts to represent as evidence nodes.
 ///
 /// # Errors
 ///
 /// Returns an error when graph validation finds duplicate nodes or invalid edge endpoints.
 pub fn tool_episodes_to_graph(
     episodes: &[ToolEpisode],
-    artifact_ids: &[ContextPackArtifactId],
+    artifacts: &[(ContextPackArtifactId, ContextPack)],
 ) -> anyhow::Result<KnowledgeGraph> {
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
     let mut artifact_nodes = BTreeMap::new();
-    for artifact_id in artifact_ids {
+    for (artifact_id, pack) in artifacts {
         let node_id = KnowledgeGraphNodeId::RetrievedEvidence(context_pack_graph_id(artifact_id));
         let provenance = context_pack_artifact_provenance(artifact_id);
         artifact_nodes.insert(artifact_id.as_str().to_string(), node_id.clone());
@@ -309,7 +309,7 @@ pub fn tool_episodes_to_graph(
                 id: node_id,
                 evidence_id: artifact_id.as_str().to_string(),
                 path: format!("context_packs/{}.json", artifact_id.as_str()),
-                freshness: EvidenceFreshness::Fresh,
+                freshness: context_pack_worst_case_freshness(pack),
                 provenance,
             },
         ));
@@ -338,6 +338,19 @@ pub fn tool_episodes_to_graph(
     KnowledgeGraph::new(nodes, edges)
 }
 
+/// Aggregates context-pack evidence freshness using the worst-case state.
+///
+/// # Arguments
+///
+/// * `pack` - Context pack whose evidence freshness is aggregated.
+pub fn context_pack_worst_case_freshness(pack: &ContextPack) -> EvidenceFreshness {
+    pack.evidence
+        .iter()
+        .map(|evidence| evidence.freshness.clone())
+        .max_by_key(freshness_rank)
+        .unwrap_or(EvidenceFreshness::Fresh)
+}
+
 /// Returns the deterministic graph identifier for a tool episode.
 ///
 /// # Arguments
@@ -352,6 +365,15 @@ pub fn tool_episode_graph_id(episode: &ToolEpisode) -> String {
         episode.provenance.fingerprint.as_str(),
     ];
     fingerprint(&length_prefixed_fields(&identity))
+}
+
+fn freshness_rank(freshness: &EvidenceFreshness) -> u8 {
+    match freshness {
+        EvidenceFreshness::Fresh => 0,
+        EvidenceFreshness::Added => 1,
+        EvidenceFreshness::Changed => 2,
+        EvidenceFreshness::Deleted => 3,
+    }
 }
 
 fn length_prefixed_fields(fields: &[&str]) -> String {
@@ -561,7 +583,8 @@ mod tests {
         let (fixture, root) = fixture_project()?;
         let indexer = ProjectIndexer::new(&root, fixture.path().join("model"));
         let manifest = indexer.index()?;
-        let (artifact_id, _pack) = write_fixture_context_pack(&indexer, &manifest)?;
+        let (artifact_id, pack) = write_fixture_context_pack(&indexer, &manifest)?;
+        let artifacts = vec![(artifact_id.clone(), pack)];
         let episode = fixture_episode(&artifact_id);
 
         let artifact_report = evaluate_context_pack_artifacts(&indexer)?;
@@ -570,14 +593,8 @@ mod tests {
             std::slice::from_ref(&episode),
             std::slice::from_ref(&artifact_id),
         );
-        let graph = tool_episodes_to_graph(
-            std::slice::from_ref(&episode),
-            std::slice::from_ref(&artifact_id),
-        )?;
-        let graph_again = tool_episodes_to_graph(
-            std::slice::from_ref(&episode),
-            std::slice::from_ref(&artifact_id),
-        )?;
+        let graph = tool_episodes_to_graph(std::slice::from_ref(&episode), &artifacts)?;
+        let graph_again = tool_episodes_to_graph(std::slice::from_ref(&episode), &artifacts)?;
 
         assert_eq!(artifact_report.checked, 1usize);
         assert_eq!(artifact_report.valid, true);
@@ -588,6 +605,15 @@ mod tests {
         assert_eq!(graph, graph_again);
         assert_eq!(graph.nodes.len(), 2usize);
         assert_eq!(graph.edges.len(), 1usize);
+        let actual_freshness = graph
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                KnowledgeGraphNode::RetrievedEvidence(evidence) => Some(evidence.freshness.clone()),
+                _ => None,
+            })
+            .expect("graph should include artifact evidence node");
+        assert_eq!(actual_freshness, EvidenceFreshness::Fresh);
         assert_eq!(graph.edges[0].kind, GraphEdgeKind::ToolEpisodeRelates);
         assert_eq!(
             graph.edges[0].confidence_kind,
@@ -729,16 +755,75 @@ mod tests {
             EvidenceLedgerEvalIssueCode::MissingLinkedArtifact,
         ]);
         let duplicate = fixture_episode(&artifact_id);
-        let graph_error = tool_episodes_to_graph(
-            &[duplicate.clone(), duplicate],
-            std::slice::from_ref(&artifact_id),
-        )
-        .expect_err("duplicate episode graph nodes should fail validation")
-        .to_string();
+        let pack = ContextPack {
+            version: 1,
+            manifest_hash: "test".to_string(),
+            evidence: Vec::new(),
+            provenance: vec![context_pack_artifact_provenance(&artifact_id)],
+        };
+        let artifacts = vec![(artifact_id.clone(), pack)];
+        let graph_error = tool_episodes_to_graph(&[duplicate.clone(), duplicate], &artifacts)
+            .expect_err("duplicate episode graph nodes should fail validation")
+            .to_string();
 
         assert_eq!(linkage.linked_count, 0usize);
         assert_eq!(actual_codes, expected);
         assert!(graph_error.contains("duplicated"));
+        Ok(())
+    }
+
+    #[test]
+    fn graph_helper_does_not_mark_stale_artifact_as_fresh() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let indexer = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = indexer.index()?;
+        let (_id, mut pack) = write_fixture_context_pack(&indexer, &manifest)?;
+        pack.evidence[0].freshness = EvidenceFreshness::Changed;
+        let stale_id = indexer.context_pack_artifact_id(&pack)?;
+        fs::write(
+            artifact_path(fixture.path(), &stale_id),
+            pack.to_stable_json()?,
+        )?;
+        let episode = fixture_episode(&stale_id);
+        let artifacts = vec![(stale_id.clone(), pack)];
+
+        let graph = tool_episodes_to_graph(&[episode], &artifacts)?;
+        let actual = graph
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                KnowledgeGraphNode::RetrievedEvidence(evidence) => Some(evidence.freshness.clone()),
+                _ => None,
+            })
+            .expect("graph should include artifact evidence node");
+        let expected = EvidenceFreshness::Changed;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn context_pack_worst_case_freshness_prefers_deleted_over_changed_added_fresh() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let indexer = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = indexer.index()?;
+        let (_id, mut pack) = write_fixture_context_pack(&indexer, &manifest)?;
+        let mut added = pack.evidence[0].clone();
+        added.id = "added".to_string();
+        added.freshness = EvidenceFreshness::Added;
+        let mut changed = pack.evidence[0].clone();
+        changed.id = "changed".to_string();
+        changed.freshness = EvidenceFreshness::Changed;
+        let mut deleted = pack.evidence[0].clone();
+        deleted.id = "deleted".to_string();
+        deleted.freshness = EvidenceFreshness::Deleted;
+        pack.evidence[0].freshness = EvidenceFreshness::Fresh;
+        pack.evidence.extend([added, changed, deleted]);
+
+        let actual = context_pack_worst_case_freshness(&pack);
+        let expected = EvidenceFreshness::Deleted;
+
+        assert_eq!(actual, expected);
         Ok(())
     }
 

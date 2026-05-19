@@ -649,8 +649,9 @@ impl ConversationRepository for ConversationRepositoryImpl {
 mod tests {
     use chrono::Utc;
     use forge_domain::{
-        Context, ContextMessage, Effort, FileOperation, Metrics, Role, ToolCallFull, ToolCallId,
-        ToolChoice, ToolDefinition, ToolKind, ToolName, ToolOutput, ToolResult, ToolValue, Usage,
+        Context, ContextMessage, Effort, FileOperation, MessagePhase, Metrics, Role, ToolCallFull,
+        ToolCallId, ToolChoice, ToolDefinition, ToolKind, ToolName, ToolOutput, ToolResult,
+        ToolValue, Usage,
     };
     use pretty_assertions::assert_eq;
 
@@ -829,7 +830,11 @@ mod tests {
                 .conversation_id(conversation_id)
                 .messages(vec![
                     ContextMessage::user("first", None).into(),
-                    ContextMessage::assistant("second", None, None, None).into(),
+                    ContextMessage::Text(
+                        forge_domain::TextMessage::new(Role::Assistant, "second")
+                            .phase(MessagePhase::FinalAnswer),
+                    )
+                    .into(),
                 ]),
         ));
 
@@ -849,6 +854,16 @@ mod tests {
             .get_conversation(&conversation_id)
             .await?
             .expect("normalized conversation should be persisted");
+        let actual_phase = second_read
+            .context
+            .as_ref()
+            .expect("normalized context should be persisted")
+            .messages
+            .get(1)
+            .and_then(|entry| match &entry.message {
+                ContextMessage::Text(text_message) => text_message.phase,
+                _ => None,
+            });
         let actual = second_read
             .context
             .expect("normalized context should be persisted")
@@ -863,6 +878,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(changed);
+        assert_eq!(actual_phase, Some(MessagePhase::FinalAnswer));
         assert_eq!(actual, expected);
         Ok(())
     }

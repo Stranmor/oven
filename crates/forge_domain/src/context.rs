@@ -60,6 +60,13 @@ impl MessageId {
         self.0.to_string()
     }
 
+    /// Materializes a deterministic legacy message ID from conversation, ordinal,
+    /// and stable message content.
+    ///
+    /// # Arguments
+    /// * `conversation_id` - Conversation namespace for the legacy message, when known.
+    /// * `ordinal` - Zero-based message position in the persisted context.
+    /// * `message` - Message payload used as deterministic identity material.
     pub fn materialized(
         conversation_id: Option<ConversationId>,
         ordinal: usize,

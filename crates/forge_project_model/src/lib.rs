@@ -20,10 +20,10 @@ pub use context_adapter::{
     render_source_from_evidence, render_sources_from_context_pack, render_sources_from_nodes,
 };
 pub use eval::{
-    evaluate_context_pack_artifacts, evaluate_context_pack_artifacts_by_id,
-    evaluate_episode_artifact_links, evaluate_freshness, evaluate_graph_coverage,
-    evaluate_provenance_completeness, evaluate_retrieval, evaluate_tool_episodes,
-    tool_episode_graph_id, tool_episodes_to_graph,
+    context_pack_worst_case_freshness, evaluate_context_pack_artifacts,
+    evaluate_context_pack_artifacts_by_id, evaluate_episode_artifact_links, evaluate_freshness,
+    evaluate_graph_coverage, evaluate_provenance_completeness, evaluate_retrieval,
+    evaluate_tool_episodes, tool_episode_graph_id, tool_episodes_to_graph,
 };
 pub use extraction::{
     RustExtraction, extract_cargo_dependency_edges, extract_rust_call_edges,
