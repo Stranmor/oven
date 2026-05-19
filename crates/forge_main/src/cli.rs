@@ -8,7 +8,9 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use forge_domain::{AgentId, ConversationId, Effort, ModelId, ProviderId, SubagentTaskId};
+use forge_domain::{
+    AgentId, ConversationId, Effort, MessageId, ModelId, ProviderId, SubagentTaskId,
+};
 
 use crate::version::VERSION_WITH_LAST_UPDATED;
 
@@ -66,6 +68,14 @@ pub struct Cli {
     /// Agent ID to use for this session.
     #[arg(long, alias = "aid")]
     pub agent: Option<AgentId>,
+
+    /// Mark a new headless/piped conversation as internal agent work.
+    ///
+    /// This is for trusted internal orchestrators that launch Forge as a
+    /// headless agent worker. Ordinary `forge --agent ...` runs remain visible
+    /// user conversations unless this explicit flag is present.
+    #[arg(long, default_value_t = false)]
+    pub internal_agent_session: bool,
 
     /// Top-level subcommands.
     #[command(subcommand)]
@@ -492,7 +502,11 @@ pub enum ListCommand {
 
     /// List conversation history.
     #[command(alias = "session")]
-    Conversation,
+    Conversation {
+        /// Include internal agent conversations in the diagnostic list.
+        #[arg(long)]
+        include_agent: bool,
+    },
 
     /// List custom commands.
     #[command(alias = "cmds")]
@@ -776,6 +790,23 @@ pub struct ConversationCommandGroup {
     pub command: ConversationCommand,
 }
 
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
+pub enum ConversationInitiatorFilter {
+    /// Human/user-started conversations.
+    User,
+    /// Internal or delegated agent-started conversations.
+    Agent,
+}
+
+impl From<ConversationInitiatorFilter> for forge_domain::Initiator {
+    fn from(value: ConversationInitiatorFilter) -> Self {
+        match value {
+            ConversationInitiatorFilter::User => forge_domain::Initiator::User,
+            ConversationInitiatorFilter::Agent => forge_domain::Initiator::Agent,
+        }
+    }
+}
+
 #[derive(Subcommand, Debug, Clone)]
 pub enum ConversationCommand {
     /// List conversation history.
@@ -783,6 +814,14 @@ pub enum ConversationCommand {
         /// Output in machine-readable format.
         #[arg(long)]
         porcelain: bool,
+
+        /// Include internal agent conversations in the diagnostic list.
+        #[arg(long)]
+        include_agent: bool,
+
+        /// Filter the diagnostic list by initiator.
+        #[arg(long)]
+        initiator: Option<ConversationInitiatorFilter>,
     },
 
     /// Create a new conversation.
@@ -846,6 +885,33 @@ pub enum ConversationCommand {
     Clone {
         /// Conversation ID to clone.
         id: ConversationId,
+
+        /// Output in machine-readable format.
+        #[arg(long)]
+        porcelain: bool,
+    },
+
+    /// Create a branch-only conversation from a selected prior message.
+    Branch {
+        /// Source conversation ID.
+        id: ConversationId,
+
+        /// Stable message ID to branch before.
+        message_id: MessageId,
+
+        /// Output in machine-readable format.
+        #[arg(long)]
+        porcelain: bool,
+    },
+
+    /// User-facing alias for branch-only conversation creation; never truncates the source.
+    #[command(alias = "undo")]
+    Revert {
+        /// Source conversation ID.
+        id: ConversationId,
+
+        /// Stable message ID to branch before.
+        message_id: MessageId,
 
         /// Output in machine-readable format.
         #[arg(long)]
@@ -1392,7 +1458,9 @@ mod tests {
     fn test_list_conversation_command() {
         let fixture = Cli::parse_from(["forge", "list", "conversation"]);
         let is_conversation_list = match fixture.subcommands {
-            Some(TopLevelCommand::List(list)) => matches!(list.command, ListCommand::Conversation),
+            Some(TopLevelCommand::List(list)) => {
+                matches!(list.command, ListCommand::Conversation { .. })
+            }
             _ => false,
         };
         assert_eq!(is_conversation_list, true);
@@ -1402,7 +1470,9 @@ mod tests {
     fn test_list_session_alias_command() {
         let fixture = Cli::parse_from(["forge", "list", "session"]);
         let is_conversation_list = match fixture.subcommands {
-            Some(TopLevelCommand::List(list)) => matches!(list.command, ListCommand::Conversation),
+            Some(TopLevelCommand::List(list)) => {
+                matches!(list.command, ListCommand::Conversation { .. })
+            }
             _ => false,
         };
         assert_eq!(is_conversation_list, true);
@@ -1574,11 +1644,141 @@ mod tests {
     }
 
     #[test]
+    fn test_internal_agent_session_flag_is_explicit() {
+        let fixture = Cli::parse_from([
+            "forge",
+            "--agent",
+            "hermes-smm-editor",
+            "--internal-agent-session",
+        ]);
+        assert_eq!(fixture.agent, Some(AgentId::new("hermes-smm-editor")));
+        assert!(fixture.internal_agent_session);
+    }
+
+    #[test]
+    fn test_agent_id_without_internal_flag_remains_user_visible_default() {
+        let fixture = Cli::parse_from(["forge", "--agent", "hermes-smm-editor"]);
+        assert_eq!(fixture.agent, Some(AgentId::new("hermes-smm-editor")));
+        assert!(!fixture.internal_agent_session);
+    }
+
+    #[test]
+    fn test_conversation_list_include_agent_flag() {
+        let fixture = Cli::parse_from(["forge", "conversation", "list", "--include-agent"]);
+        let actual = match fixture.subcommands {
+            Some(TopLevelCommand::Conversation(conversation)) => match conversation.command {
+                ConversationCommand::List { include_agent, initiator, .. } => {
+                    (include_agent, initiator)
+                }
+                _ => (false, None),
+            },
+            _ => (false, None),
+        };
+        assert_eq!(actual, (true, None));
+    }
+
+    #[test]
+    fn test_conversation_list_initiator_agent_filter() {
+        let fixture = Cli::parse_from(["forge", "conversation", "list", "--initiator", "agent"]);
+        let actual = match fixture.subcommands {
+            Some(TopLevelCommand::Conversation(conversation)) => match conversation.command {
+                ConversationCommand::List { include_agent, initiator, .. } => {
+                    (include_agent, initiator)
+                }
+                _ => (true, None),
+            },
+            _ => (true, None),
+        };
+        assert_eq!(actual, (false, Some(ConversationInitiatorFilter::Agent)));
+    }
+
+    #[test]
+    fn test_list_conversation_include_agent_flag() {
+        let fixture = Cli::parse_from(["forge", "list", "conversation", "--include-agent"]);
+        let actual = match fixture.subcommands {
+            Some(TopLevelCommand::List(list)) => match list.command {
+                ListCommand::Conversation { include_agent } => include_agent,
+                _ => false,
+            },
+            _ => false,
+        };
+        assert!(actual);
+    }
+
+    #[test]
+    fn test_conversation_branch_parse() {
+        let conversation_id = ConversationId::generate();
+        let message_id = MessageId::parse("00000000-0000-5000-8000-000000000001").unwrap();
+        let fixture = Cli::parse_from([
+            "forge",
+            "conversation",
+            "branch",
+            &conversation_id.to_string(),
+            &message_id.to_string(),
+            "--porcelain",
+        ]);
+        let actual = match fixture.subcommands {
+            Some(TopLevelCommand::Conversation(conversation)) => match conversation.command {
+                ConversationCommand::Branch { id, message_id, porcelain } => {
+                    (id, message_id, porcelain)
+                }
+                _ => (
+                    ConversationId::default(),
+                    MessageId::parse("00000000-0000-5000-8000-000000000000").unwrap(),
+                    false,
+                ),
+            },
+            _ => (
+                ConversationId::default(),
+                MessageId::parse("00000000-0000-5000-8000-000000000000").unwrap(),
+                false,
+            ),
+        };
+        let expected = (conversation_id, message_id, true);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_conversation_revert_parse_as_branch_only_alias() {
+        let conversation_id = ConversationId::generate();
+        let message_id = MessageId::parse("00000000-0000-5000-8000-000000000002").unwrap();
+        let fixture = Cli::parse_from([
+            "forge",
+            "conversation",
+            "revert",
+            &conversation_id.to_string(),
+            &message_id.to_string(),
+            "--porcelain",
+        ]);
+        let actual = match fixture.subcommands {
+            Some(TopLevelCommand::Conversation(conversation)) => match conversation.command {
+                ConversationCommand::Revert { id, message_id, porcelain } => {
+                    (id, message_id, porcelain)
+                }
+                _ => (
+                    ConversationId::default(),
+                    MessageId::parse("00000000-0000-5000-8000-000000000000").unwrap(),
+                    false,
+                ),
+            },
+            _ => (
+                ConversationId::default(),
+                MessageId::parse("00000000-0000-5000-8000-000000000000").unwrap(),
+                false,
+            ),
+        };
+        let expected = (conversation_id, message_id, true);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn test_conversation_list_with_porcelain() {
         let fixture = Cli::parse_from(["forge", "conversation", "list", "--porcelain"]);
         let actual = match fixture.subcommands {
             Some(TopLevelCommand::Conversation(conversation)) => match conversation.command {
-                ConversationCommand::List { porcelain } => porcelain,
+                ConversationCommand::List { porcelain, .. } => porcelain,
                 _ => false,
             },
             _ => false,

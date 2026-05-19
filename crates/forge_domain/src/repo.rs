@@ -87,11 +87,18 @@ pub trait ConversationRepository: Send + Sync {
         conversation_id: &ConversationId,
     ) -> Result<Option<Conversation>>;
 
-    /// Retrieves all conversations
+    /// Retrieves all primary user conversations
     ///
     /// # Errors
     /// Returns an error if the operation fails
     async fn get_all_conversations(&self) -> Result<Vec<Conversation>>;
+
+    /// Retrieves all root conversations with context, including internal agent
+    /// conversations for diagnostic surfaces.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails
+    async fn get_all_conversations_including_agent(&self) -> Result<Vec<Conversation>>;
 
     /// Retrieves sub-conversations for a parent conversation.
     ///

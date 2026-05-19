@@ -1,11 +1,14 @@
 use std::fmt::Display;
 use std::ops::Deref;
+use std::str::FromStr;
 
 use derive_more::derive::{Display, From};
 use derive_setters::Setters;
 use forge_template::Element;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::debug;
+use uuid::Uuid;
 
 use super::{ToolCallFull, ToolResult};
 
@@ -18,8 +21,8 @@ use crate::temperature::Temperature;
 use crate::top_k::TopK;
 use crate::top_p::TopP;
 use crate::{
-    Attachment, AttachmentContent, ConversationId, EventValue, Image, Initiator, MessagePhase,
-    ModelId, ReasoningFull, ToolChoice, ToolDefinition, ToolOutput, ToolValue, Usage,
+    Attachment, AttachmentContent, ConversationId, Error, EventValue, Image, Initiator,
+    MessagePhase, ModelId, ReasoningFull, ToolChoice, ToolDefinition, ToolOutput, ToolValue, Usage,
 };
 
 /// Response format for structured output
@@ -31,6 +34,109 @@ pub enum ResponseFormat {
     Text,
     /// JSON response with schema
     JsonSchema(Box<schemars::Schema>),
+}
+
+/// Stable persisted identity for a conversation context message.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Hash, Serialize, Display)]
+#[serde(transparent)]
+pub struct MessageId(Uuid);
+
+impl MessageId {
+    /// Creates a stable message identifier from persisted UUID text.
+    ///
+    /// # Arguments
+    /// * `value` - UUID text read from storage or a user selector.
+    ///
+    /// # Errors
+    /// Returns an error when the supplied value is not a valid UUID.
+    pub fn parse(value: impl ToString) -> crate::Result<Self> {
+        Ok(Self(
+            Uuid::parse_str(&value.to_string()).map_err(Error::ConversationId)?,
+        ))
+    }
+
+    /// Returns the message identifier as UUID text.
+    pub fn into_string(&self) -> String {
+        self.0.to_string()
+    }
+
+    pub fn materialized(
+        conversation_id: Option<ConversationId>,
+        ordinal: usize,
+        message: &ContextMessage,
+    ) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"forge-message-id-v1");
+        if let Some(conversation_id) = conversation_id {
+            hasher.update(conversation_id.into_string().as_bytes());
+        }
+        hasher.update((ordinal as u64).to_be_bytes());
+        hasher.update(message.stable_identity_bytes().as_bytes());
+        let digest = hasher.finalize();
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(
+            digest
+                .get(..16)
+                .expect("sha256 digest must contain at least 16 bytes"),
+        );
+        bytes[6] = (bytes[6] & 0x0f) | 0x50;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        Self(Uuid::from_bytes(bytes))
+    }
+}
+
+impl FromStr for MessageId {
+    type Err = Error;
+
+    fn from_str(s: &str) -> crate::Result<Self> {
+        Self::parse(s)
+    }
+}
+
+/// Role-aware selectable message reference for conversation branching.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectableMessageTarget {
+    /// Stable target message identifier.
+    pub id: MessageId,
+    /// Zero-based ordinal in the source context; display-only outside boundary logic.
+    pub ordinal: usize,
+    /// Message role accepted for branch selection.
+    pub role: Role,
+}
+
+/// Boundary used when creating a branch from a selected message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConversationBranchBoundary {
+    retain_messages_before: usize,
+}
+
+impl ConversationBranchBoundary {
+    /// Creates a boundary that excludes the selected message and everything
+    /// after it.
+    ///
+    /// # Arguments
+    /// * `target` - Selectable user or assistant message target.
+    pub fn before_selected(target: SelectableMessageTarget) -> Self {
+        Self { retain_messages_before: target.ordinal }
+    }
+
+    /// Applies the boundary to a context and returns the branch context.
+    ///
+    /// # Arguments
+    /// * `context` - Source context to truncate for a new branch.
+    pub fn branch_context(self, context: &Context) -> Context {
+        let mut branch = context.clone();
+        branch.messages.truncate(self.retain_messages_before);
+        branch
+    }
+}
+
+/// Error returned when a message selector cannot be resolved safely.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum MessageTargetError {
+    /// The ID does not point at a selectable user or assistant message.
+    #[error("message target '{0}' is not selectable")]
+    NotSelectable(MessageId),
 }
 
 /// Represents a message being sent to the LLM provider
@@ -67,6 +173,46 @@ fn filter_base64_images_from_tool_output(output: &ToolOutput) -> ToolOutput {
 }
 
 impl ContextMessage {
+    fn stable_identity_bytes(&self) -> String {
+        match self {
+            ContextMessage::Text(text_message) => {
+                format!(
+                    "text\n{}\n{}\n{}\n{}\n{}",
+                    text_message.role,
+                    text_message.content,
+                    text_message.droppable,
+                    text_message
+                        .kind
+                        .as_ref()
+                        .map(|kind| format!("{kind:?}"))
+                        .unwrap_or_default(),
+                    text_message.tool_calls.as_ref().map_or(0, Vec::len),
+                )
+            }
+            ContextMessage::Tool(result) => {
+                format!("tool\n{}\n{}", result.name, result.output.is_error)
+            }
+            ContextMessage::Image(image) => {
+                format!("image\n{}\n{}", image.mime_type(), image.url())
+            }
+        }
+    }
+
+    /// Returns whether this message can be selected as a branch boundary.
+    pub fn selectable_branch_role(&self) -> Option<Role> {
+        match self {
+            ContextMessage::Text(text_message)
+                if matches!(text_message.role, Role::User | Role::Assistant)
+                    && !text_message.droppable
+                    && !text_message.is_internal_context()
+                    && text_message.tool_calls.is_none() =>
+            {
+                Some(text_message.role)
+            }
+            ContextMessage::Text(_) | ContextMessage::Tool(_) | ContextMessage::Image(_) => None,
+        }
+    }
+
     pub fn content(&self) -> Option<&str> {
         match self {
             ContextMessage::Text(text_message) => Some(&text_message.content),
@@ -461,7 +607,7 @@ impl TextMessage {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize, Display)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, Display)]
 pub enum Role {
     System,
     User,
@@ -470,6 +616,9 @@ pub enum Role {
 #[derive(Clone, Debug, Serialize, Deserialize, Setters, PartialEq)]
 #[setters(into, strip_option)]
 pub struct MessageEntry {
+    /// Stable persisted message identity; legacy entries are materialized deterministically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<MessageId>,
     #[serde(flatten)]
     pub message: ContextMessage,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -478,7 +627,7 @@ pub struct MessageEntry {
 
 impl From<ContextMessage> for MessageEntry {
     fn from(value: ContextMessage) -> Self {
-        MessageEntry { message: value, usage: Default::default() }
+        MessageEntry { id: None, message: value, usage: Default::default() }
     }
 }
 
@@ -570,6 +719,60 @@ pub struct Context {
 }
 
 impl Context {
+    /// Materializes stable IDs for legacy entries and returns whether any entry
+    /// changed.
+    pub fn normalize_message_ids(&mut self) -> bool {
+        let conversation_id = self.conversation_id;
+        let mut changed = false;
+        for (ordinal, entry) in self.messages.iter_mut().enumerate() {
+            if entry.id.is_none() {
+                entry.id = Some(MessageId::materialized(
+                    conversation_id,
+                    ordinal,
+                    &entry.message,
+                ));
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Returns stable selectable user and assistant targets for branch creation.
+    pub fn selectable_branch_targets(&self) -> Vec<SelectableMessageTarget> {
+        self.messages
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, entry)| {
+                let role = entry.message.selectable_branch_role()?;
+                Some(SelectableMessageTarget {
+                    id: entry.id.unwrap_or_else(|| {
+                        MessageId::materialized(self.conversation_id, ordinal, &entry.message)
+                    }),
+                    ordinal,
+                    role,
+                })
+            })
+            .collect()
+    }
+
+    /// Resolves a message ID to a safe branch boundary.
+    ///
+    /// # Arguments
+    /// * `target_id` - Stable selectable message ID.
+    ///
+    /// # Errors
+    /// Returns an error when the message is absent or excluded from selection.
+    pub fn branch_boundary_for(
+        &self,
+        target_id: MessageId,
+    ) -> std::result::Result<ConversationBranchBoundary, MessageTargetError> {
+        self.selectable_branch_targets()
+            .into_iter()
+            .find(|target| target.id == target_id)
+            .map(ConversationBranchBoundary::before_selected)
+            .ok_or(MessageTargetError::NotSelectable(target_id))
+    }
+
     pub fn accumulate_usage(&self) -> Option<Usage> {
         self.messages
             .iter()
@@ -971,6 +1174,138 @@ mod tests {
             .messages
             .get(index)
             .expect("expected message at index")
+    }
+
+    fn user_message(content: impl Into<String>) -> MessageEntry {
+        ContextMessage::user(content.into(), None).into()
+    }
+
+    fn assistant_message(content: impl Into<String>) -> MessageEntry {
+        ContextMessage::assistant(content.into(), None, None, None).into()
+    }
+
+    #[test]
+    fn test_message_id_normalization_is_deterministic_for_legacy_entries() {
+        let conversation_id =
+            ConversationId::parse("00000000-0000-4000-8000-000000000001").unwrap();
+        let mut fixture = Context::default()
+            .conversation_id(conversation_id)
+            .messages(vec![user_message("hello"), assistant_message("world")]);
+        let mut repeat = fixture.clone();
+
+        let actual_changed = fixture.normalize_message_ids();
+        let repeat_changed = repeat.normalize_message_ids();
+        let actual = fixture
+            .messages
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        let expected = repeat
+            .messages
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+
+        assert!(actual_changed);
+        assert!(repeat_changed);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_message_id_normalization_preserves_existing_ids() {
+        let existing_id = MessageId::parse("00000000-0000-5000-8000-000000000099").unwrap();
+        let mut fixture = Context::default().messages(vec![MessageEntry {
+            id: Some(existing_id),
+            message: ContextMessage::user("hello", None),
+            usage: None,
+        }]);
+
+        let actual_changed = fixture.normalize_message_ids();
+        let actual = fixture.messages.first().and_then(|entry| entry.id);
+        let expected = Some(existing_id);
+
+        assert!(!actual_changed);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_selectable_branch_targets_exclude_internal_droppable_tool_and_tool_calls() {
+        let tool_call = ToolCallFull {
+            name: crate::ToolName::new("shell"),
+            call_id: Some(crate::ToolCallId::new("call_1")),
+            arguments: crate::ToolCallArguments::default(),
+            thought_signature: None,
+        };
+        let fixture = Context::default().messages(vec![
+            ContextMessage::system("system").into(),
+            ContextMessage::Text(TextMessage::project_model_context(Role::User, "project")).into(),
+            ContextMessage::Text(TextMessage::learning_context(Role::User, "learning")).into(),
+            ContextMessage::Text(TextMessage::new(Role::User, "droppable").droppable(true)).into(),
+            user_message("real user"),
+            ContextMessage::assistant("tooling", None, None, Some(vec![tool_call])).into(),
+            ContextMessage::tool_result(
+                ToolResult::new(crate::ToolName::new("shell"))
+                    .call_id(crate::ToolCallId::new("call_1"))
+                    .output(Ok(ToolOutput::text("ok"))),
+            )
+            .into(),
+            assistant_message("real assistant"),
+        ]);
+
+        let actual = fixture
+            .selectable_branch_targets()
+            .into_iter()
+            .map(|target| (target.ordinal, target.role))
+            .collect::<Vec<_>>();
+        let expected = vec![(4, Role::User), (7, Role::Assistant)];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_branch_boundary_excludes_selected_user_message_and_after() {
+        let mut fixture = Context::default().messages(vec![
+            user_message("good"),
+            user_message("bad"),
+            assistant_message("after"),
+        ]);
+        fixture.normalize_message_ids();
+        let target_id = fixture.messages.get(1).and_then(|entry| entry.id).unwrap();
+
+        let actual = fixture
+            .branch_boundary_for(target_id)
+            .unwrap()
+            .branch_context(&fixture)
+            .messages
+            .into_iter()
+            .map(|entry| entry.message.content().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        let expected = vec!["good".to_string()];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_branch_boundary_excludes_selected_assistant_message_and_after() {
+        let mut fixture = Context::default().messages(vec![
+            user_message("prompt"),
+            assistant_message("bad answer"),
+            user_message("after"),
+        ]);
+        fixture.normalize_message_ids();
+        let target_id = fixture.messages.get(1).and_then(|entry| entry.id).unwrap();
+
+        let actual = fixture
+            .branch_boundary_for(target_id)
+            .unwrap()
+            .branch_context(&fixture)
+            .messages
+            .into_iter()
+            .map(|entry| entry.message.content().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        let expected = vec!["prompt".to_string()];
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

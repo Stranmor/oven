@@ -183,8 +183,20 @@ mod tests {
             Ok(f(conversation))
         }
 
+        async fn branch_conversation(
+            &self,
+            _conversation_id: &ConversationId,
+            _target_id: forge_domain::MessageId,
+        ) -> anyhow::Result<Conversation> {
+            anyhow::bail!("branch conversation is not implemented for steer fixture service")
+        }
+
         async fn get_conversations(&self) -> anyhow::Result<Vec<Conversation>> {
             Ok(self.conversations.lock().await.values().cloned().collect())
+        }
+
+        async fn get_conversations_including_agent(&self) -> anyhow::Result<Vec<Conversation>> {
+            self.get_conversations().await
         }
 
         async fn get_sub_conversations(

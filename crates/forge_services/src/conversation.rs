@@ -4,7 +4,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use forge_app::ConversationService;
 use forge_app::domain::{
-    Conversation, ConversationId, SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter,
+    Conversation, ConversationId, MessageId, SubagentTaskId, SubagentTaskSession,
+    SubagentTaskSessionFilter,
 };
 use forge_domain::ConversationRepository;
 
@@ -90,8 +91,56 @@ impl<S: ConversationRepository> ConversationService for ForgeConversationService
         Ok(Some(root_id))
     }
 
+    async fn branch_conversation(
+        &self,
+        conversation_id: &ConversationId,
+        target_id: MessageId,
+    ) -> Result<Conversation> {
+        let mut source = self
+            .conversation_repository
+            .get_conversation(conversation_id)
+            .await?
+            .ok_or_else(|| forge_app::domain::Error::ConversationNotFound(*conversation_id))?;
+        let mut context = source
+            .context
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Conversation {conversation_id} has no context"))?;
+        context.conversation_id = Some(source.id);
+        let source_normalized = context.normalize_message_ids();
+        if source_normalized {
+            source.context = Some(context.clone());
+            self.conversation_repository
+                .upsert_conversation(source.clone())
+                .await?;
+        }
+        let boundary = context.branch_boundary_for(target_id)?;
+        let new_id = ConversationId::generate();
+        let mut branch_context = boundary.branch_context(&context);
+        branch_context.conversation_id = Some(new_id);
+        branch_context.normalize_message_ids();
+        let branch = Conversation::new(new_id)
+            .title(
+                source
+                    .title
+                    .clone()
+                    .map(|title| format!("{title} (branch)")),
+            )
+            .context(Some(branch_context))
+            .initiator(source.initiator);
+        self.conversation_repository
+            .upsert_conversation(branch.clone())
+            .await?;
+        Ok(branch)
+    }
+
     async fn get_conversations(&self) -> Result<Vec<Conversation>> {
         self.conversation_repository.get_all_conversations().await
+    }
+
+    async fn get_conversations_including_agent(&self) -> Result<Vec<Conversation>> {
+        self.conversation_repository
+            .get_all_conversations_including_agent()
+            .await
     }
 
     async fn get_sub_conversations(&self, parent_id: &ConversationId) -> Result<Vec<Conversation>> {
@@ -150,7 +199,7 @@ mod tests {
     use std::sync::Mutex;
 
     use forge_app::ConversationService;
-    use forge_app::domain::{Context, ContextMessage, ConversationId, Initiator};
+    use forge_app::domain::{Context, ContextMessage, ConversationId, Initiator, MessageEntry};
     use pretty_assertions::assert_eq;
 
     use super::*;
@@ -160,6 +209,7 @@ mod tests {
         conversations: Mutex<HashMap<ConversationId, Conversation>>,
         subagent_task_sessions: Mutex<HashMap<ConversationId, SubagentTaskSession>>,
         ledger_insert_after_lookup: Mutex<Option<SubagentTaskSession>>,
+        delete_count: Mutex<usize>,
     }
 
     #[async_trait::async_trait]
@@ -228,6 +278,10 @@ mod tests {
                 .collect())
         }
 
+        async fn get_all_conversations_including_agent(&self) -> anyhow::Result<Vec<Conversation>> {
+            self.get_all_conversations().await
+        }
+
         async fn get_sub_conversations(
             &self,
             parent_id: &ConversationId,
@@ -294,9 +348,94 @@ mod tests {
             &self,
             conversation_id: &ConversationId,
         ) -> anyhow::Result<()> {
+            *self.delete_count.lock().unwrap() += 1;
             self.conversations.lock().unwrap().remove(conversation_id);
             Ok(())
         }
+    }
+
+    fn text_contents(conversation: &Conversation) -> Vec<String> {
+        conversation
+            .context
+            .as_ref()
+            .map(|context| {
+                context
+                    .messages
+                    .iter()
+                    .filter_map(|entry| entry.message.content().map(ToString::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn user_message(content: impl Into<String>) -> MessageEntry {
+        ContextMessage::user(content.into(), None).into()
+    }
+
+    fn assistant_message(content: impl Into<String>) -> MessageEntry {
+        ContextMessage::assistant(content.into(), None, None, None).into()
+    }
+
+    #[tokio::test]
+    async fn test_branch_conversation_persists_new_branch_and_preserves_source_history()
+    -> anyhow::Result<()> {
+        let repository = Arc::new(FixtureRepository::default());
+        let service = ForgeConversationService::new(repository.clone());
+        let source_id = ConversationId::generate();
+        let source = Conversation::new(source_id)
+            .title(Some("Source".to_string()))
+            .context(Some(
+                Context::default().conversation_id(source_id).messages(vec![
+                    user_message("keep"),
+                    user_message("bad"),
+                    assistant_message("after"),
+                ]),
+            ));
+        let target_id = source
+            .context
+            .as_ref()
+            .map(|context| {
+                forge_domain::MessageId::materialized(
+                    Some(source_id),
+                    1,
+                    &context
+                        .messages
+                        .get(1)
+                        .expect("target message exists")
+                        .message,
+                )
+            })
+            .expect("source context exists");
+
+        repository.upsert_conversation(source.clone()).await?;
+        let actual = service.branch_conversation(&source_id, target_id).await?;
+        let persisted_source = repository
+            .get_conversation(&source_id)
+            .await?
+            .expect("source conversation should remain persisted");
+        let persisted_branch = repository
+            .get_conversation(&actual.id)
+            .await?
+            .expect("branch conversation should be persisted");
+        let expected_source_messages =
+            vec!["keep".to_string(), "bad".to_string(), "after".to_string()];
+        let expected_branch_messages = vec!["keep".to_string()];
+
+        assert_ne!(actual.id, source_id);
+        assert_eq!(text_contents(&persisted_source), expected_source_messages);
+        assert_eq!(text_contents(&persisted_branch), expected_branch_messages);
+        assert_eq!(persisted_branch.parent_id, None);
+        assert_eq!(*repository.delete_count.lock().unwrap(), 0);
+        assert!(
+            persisted_source
+                .context
+                .as_ref()
+                .expect("source context should exist")
+                .messages
+                .iter()
+                .all(|entry| entry.id.is_some())
+        );
+        Ok(())
     }
 
     #[tokio::test]

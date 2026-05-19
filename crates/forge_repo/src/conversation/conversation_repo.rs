@@ -426,6 +426,24 @@ impl ConversationRepository for ConversationRepositoryImpl {
         .await
     }
 
+    async fn get_all_conversations_including_agent(&self) -> anyhow::Result<Vec<Conversation>> {
+        self.run_with_connection(move |connection, wid| {
+            let workspace_id = workspace_db_id(wid);
+            let records: Vec<ConversationRecord> = conversations::table
+                .filter(conversations::workspace_id.eq(&workspace_id))
+                .filter(conversations::context.is_not_null())
+                .filter(conversations::parent_id.is_null())
+                .order(conversations::updated_at.desc())
+                .load(connection)?;
+
+            records
+                .into_iter()
+                .map(Conversation::try_from)
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .await
+    }
+
     async fn get_sub_conversations(
         &self,
         parent_id: &ConversationId,
@@ -803,6 +821,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_message_id_normalization_round_trips_stably() -> anyhow::Result<()> {
+        let repo = repository()?;
+        let conversation_id = ConversationId::generate();
+        let conversation = Conversation::new(conversation_id).context(Some(
+            Context::default()
+                .conversation_id(conversation_id)
+                .messages(vec![
+                    ContextMessage::user("first", None).into(),
+                    ContextMessage::assistant("second", None, None, None).into(),
+                ]),
+        ));
+
+        repo.upsert_conversation(conversation).await?;
+        let mut first_read = repo
+            .get_conversation(&conversation_id)
+            .await?
+            .expect("conversation should be persisted");
+        let mut normalized_context = first_read
+            .context
+            .take()
+            .expect("context should be persisted");
+        let changed = normalized_context.normalize_message_ids();
+        first_read.context = Some(normalized_context.clone());
+        repo.upsert_conversation(first_read).await?;
+        let second_read = repo
+            .get_conversation(&conversation_id)
+            .await?
+            .expect("normalized conversation should be persisted");
+        let actual = second_read
+            .context
+            .expect("normalized context should be persisted")
+            .messages
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        let expected = normalized_context
+            .messages
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+
+        assert!(changed);
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_find_all_conversations() -> anyhow::Result<()> {
         let context1 =
             Context::default().messages(vec![ContextMessage::user("Hello", None).into()]);
@@ -850,6 +915,32 @@ mod tests {
             actual.iter().map(|conv| conv.id).collect::<Vec<_>>(),
             expected
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_find_all_conversations_including_agent_for_diagnostics() -> anyhow::Result<()> {
+        let user_context =
+            Context::default().messages(vec![ContextMessage::user("User task", None).into()]);
+        let agent_context =
+            Context::default().messages(vec![ContextMessage::user("Agent task", None).into()]);
+        let user_conversation = Conversation::new(ConversationId::generate())
+            .title(Some("User Conversation".to_string()))
+            .context(Some(user_context));
+        let agent_conversation = Conversation::new(ConversationId::generate())
+            .initiator(forge_domain::Initiator::Agent)
+            .title(Some("Agent Conversation".to_string()))
+            .context(Some(agent_context));
+        let repo = repository()?;
+
+        repo.upsert_conversation(agent_conversation.clone()).await?;
+        repo.upsert_conversation(user_conversation.clone()).await?;
+
+        let actual = repo.get_all_conversations_including_agent().await?;
+        let actual_ids = actual.iter().map(|conv| conv.id).collect::<Vec<_>>();
+        let expected = vec![user_conversation.id, agent_conversation.id];
+
+        assert_eq!(actual_ids, expected);
         Ok(())
     }
 
@@ -1670,6 +1761,7 @@ mod tests {
             })
             .into(),
             forge_domain::MessageEntry {
+                id: None,
                 message: ContextMessage::Text(forge_domain::TextMessage {
                     role: Role::Assistant,
                     content: "Assistant response".to_string(),

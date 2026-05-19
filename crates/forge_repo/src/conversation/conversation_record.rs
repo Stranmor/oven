@@ -541,6 +541,8 @@ impl TryFrom<ContextMessageValueRecord> for forge_domain::ContextMessage {
 /// Repository-specific representation of ContextMessage
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct ContextMessageRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<forge_domain::MessageId>,
     message: ContextMessageValueRecord,
     #[serde(skip_serializing_if = "Option::is_none")]
     usage: Option<UsageRecord>,
@@ -557,6 +559,7 @@ impl<'de> Deserialize<'de> for ContextMessageRecord {
         enum ContextMessageParser {
             // Try new format first (with message field)
             Wrapper {
+                id: Option<forge_domain::MessageId>,
                 message: ContextMessageValueRecord,
                 usage: Option<UsageRecord>,
             },
@@ -565,11 +568,11 @@ impl<'de> Deserialize<'de> for ContextMessageRecord {
         }
 
         match ContextMessageParser::deserialize(deserializer)? {
-            ContextMessageParser::Wrapper { message, usage } => {
-                Ok(ContextMessageRecord { message, usage })
+            ContextMessageParser::Wrapper { id, message, usage } => {
+                Ok(ContextMessageRecord { id, message, usage })
             }
             ContextMessageParser::Direct(message) => {
-                Ok(ContextMessageRecord { message, usage: None })
+                Ok(ContextMessageRecord { id: None, message, usage: None })
             }
         }
     }
@@ -578,6 +581,7 @@ impl<'de> Deserialize<'de> for ContextMessageRecord {
 impl From<&forge_domain::MessageEntry> for ContextMessageRecord {
     fn from(msg: &forge_domain::MessageEntry) -> Self {
         Self {
+            id: msg.id,
             message: ContextMessageValueRecord::from(&msg.message),
             usage: msg.usage.as_ref().map(UsageRecord::from),
         }
@@ -589,6 +593,7 @@ impl TryFrom<ContextMessageRecord> for forge_domain::MessageEntry {
 
     fn try_from(record: ContextMessageRecord) -> anyhow::Result<Self> {
         Ok(forge_domain::MessageEntry {
+            id: record.id,
             message: record.message.try_into()?,
             usage: record.usage.map(Into::into),
         })

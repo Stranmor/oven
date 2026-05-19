@@ -32,8 +32,8 @@ use tokio_stream::StreamExt;
 use url::Url;
 
 use crate::cli::{
-    Cli, CommitCommandGroup, ConversationCommand, ListCommand, McpCommand, SelectCommand,
-    TaskCommand, TopLevelCommand,
+    Cli, CommitCommandGroup, ConversationCommand, ConversationInitiatorFilter, ListCommand,
+    McpCommand, SelectCommand, TaskCommand, TopLevelCommand,
 };
 use crate::completion_notification::{
     CompletionNotificationContext, play_completion_notification, project_label,
@@ -56,6 +56,15 @@ use crate::update::on_update;
 use crate::utils::humanize_time;
 use crate::zsh::ZshRPrompt;
 use crate::{TRACKER, banner, tracker};
+
+fn mark_internal_agent_session_if_requested(
+    conversation: &mut Conversation,
+    internal_agent_session: bool,
+) {
+    if internal_agent_session {
+        conversation.ensure_delegated(None);
+    }
+}
 
 // File-specific constants
 const MISSING_AGENT_TITLE: &str = "<missing agent.title>";
@@ -550,8 +559,17 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                     ListCommand::Mcp => {
                         self.on_show_mcp_servers(porcelain).await?;
                     }
-                    ListCommand::Conversation => {
-                        self.on_show_conversations(porcelain).await?;
+                    ListCommand::Conversation { include_agent } => {
+                        self.on_show_conversations(
+                            porcelain,
+                            include_agent,
+                            if include_agent {
+                                None
+                            } else {
+                                Some(ConversationInitiatorFilter::User)
+                            },
+                        )
+                        .await?;
                     }
                     ListCommand::Cmd => {
                         self.on_show_custom_commands(porcelain).await?;
@@ -935,8 +953,9 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         conversation_group: crate::cli::ConversationCommandGroup,
     ) -> anyhow::Result<()> {
         match conversation_group.command {
-            ConversationCommand::List { porcelain } => {
-                self.on_show_conversations(porcelain).await?;
+            ConversationCommand::List { porcelain, include_agent, initiator } => {
+                self.on_show_conversations(porcelain, include_agent, initiator)
+                    .await?;
             }
             ConversationCommand::New => {
                 self.handle_generate_conversation_id().await?;
@@ -1009,6 +1028,14 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
 
                 self.spinner.start(Some("Cloning"))?;
                 self.on_clone_conversation(conversation, porcelain).await?;
+                self.spinner.stop(None)?;
+            }
+            ConversationCommand::Branch { id, message_id, porcelain }
+            | ConversationCommand::Revert { id, message_id, porcelain } => {
+                self.validate_conversation_exists(&id).await?;
+                self.spinner.start(Some("Branching"))?;
+                self.on_branch_conversation(id, message_id, porcelain)
+                    .await?;
                 self.spinner.stop(None)?;
             }
             ConversationCommand::Rename { id, name } => {
@@ -2235,17 +2262,34 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         Ok(())
     }
 
-    async fn on_show_conversations(&mut self, porcelain: bool) -> anyhow::Result<()> {
-        let conversations = self.api.get_conversations().await?;
+    async fn on_show_conversations(
+        &mut self,
+        porcelain: bool,
+        include_agent: bool,
+        initiator: Option<ConversationInitiatorFilter>,
+    ) -> anyhow::Result<()> {
+        let conversations = if include_agent || initiator.is_some() {
+            self.api.get_conversations_including_agent().await?
+        } else {
+            self.api.get_conversations().await?
+        };
 
         if conversations.is_empty() {
             return Ok(());
         }
 
         let mut info = Info::new();
+        let initiator_filter = initiator.map(forge_domain::Initiator::from);
 
         for conv in conversations.into_iter() {
             if conv.context.is_none() {
+                continue;
+            }
+            if let Some(expected) = initiator_filter {
+                if conv.initiator != expected {
+                    continue;
+                }
+            } else if !include_agent && conv.is_agent_initiated() {
                 continue;
             }
 
@@ -3937,7 +3981,11 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
 
             // Check if conversation exists, if not create it
             if self.api.conversation(&id).await?.is_none() {
-                let conversation = Conversation::new(id);
+                let mut conversation = Conversation::new(id);
+                mark_internal_agent_session_if_requested(
+                    &mut conversation,
+                    self.cli.internal_agent_session,
+                );
                 self.api.upsert_conversation(conversation).await?;
                 is_new = true;
             }
@@ -3960,7 +4008,11 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             self.api.upsert_conversation(conversation).await?;
             id
         } else {
-            let conversation = Conversation::generate();
+            let mut conversation = Conversation::generate();
+            mark_internal_agent_session_if_requested(
+                &mut conversation,
+                self.cli.internal_agent_session,
+            );
             let id = conversation.id;
             is_new = true;
             self.api.upsert_conversation(conversation).await?;
@@ -4216,7 +4268,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
 
         while let Some(message) = stream.next().await {
             match message {
-                Ok(message) => self.handle_tui_chat_response(message, session).await?,
+                Ok(message) => Box::pin(self.handle_tui_chat_response(message, session)).await?,
                 Err(err) => {
                     self.spinner.stop(None)?;
                     self.spinner.reset();
@@ -4263,26 +4315,38 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                 self.handle_task_complete_side_effects(false).await?;
             }
             ChatResponse::Interrupt { reason } => {
-                let title = match reason {
-                    InterruptionReason::MaxRequestPerTurnLimitReached { limit } => {
-                        format!("Maximum request ({limit}) per turn achieved")
-                    }
-                    InterruptionReason::MaxToolFailurePerTurnLimitReached { limit, .. } => {
-                        format!("Maximum tool failure limit ({limit}) reached for this turn")
-                    }
-                };
-
-                self.writeln_title(TitleFormat::action(title))?;
-                let continued = self.should_continue().await?;
-                if !continued && let Some(conversation_id) = self.state.conversation_id {
-                    self.writeln_title(
-                        TitleFormat::debug("Finished").sub_title(conversation_id.into_string()),
-                    )?;
-                }
+                self.handle_tui_interrupt(reason, session).await?;
             }
             ChatResponse::TaskMessage { .. }
             | ChatResponse::TaskReasoning { .. }
             | ChatResponse::RetryAttempt { .. } => {}
+        }
+
+        Ok(())
+    }
+
+    async fn handle_tui_interrupt(
+        &mut self,
+        reason: InterruptionReason,
+        session: &mut impl forge_tui::TuiRenderer,
+    ) -> Result<()> {
+        let title = interruption_title(&reason);
+        let continued = run_tui_suspended_stdout_value(session, async {
+            self.writeln_title(TitleFormat::action(title))?;
+            let should_continue = ForgeWidget::confirm("Do you want to continue anyway?")
+                .with_default(true)
+                .prompt()?;
+            Ok(should_continue.unwrap_or(false))
+        })
+        .await?;
+
+        if continued {
+            let chat = self.build_chat_request(None).await?;
+            Box::pin(self.on_tui_chat_with_session(chat, session)).await?;
+        } else {
+            session.queue_and_render(forge_ui_model::UiModel::new(vec![
+                forge_ui_model::UiBlock::Completion,
+            ]))?;
         }
 
         Ok(())
@@ -4500,14 +4564,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                 writer.finish()?;
                 self.spinner.stop(None)?;
 
-                let title = match reason {
-                    InterruptionReason::MaxRequestPerTurnLimitReached { limit } => {
-                        format!("Maximum request ({limit}) per turn achieved")
-                    }
-                    InterruptionReason::MaxToolFailurePerTurnLimitReached { limit, .. } => {
-                        format!("Maximum tool failure limit ({limit}) reached for this turn")
-                    }
-                };
+                let title = interruption_title(&reason);
 
                 self.writeln_title(TitleFormat::action(title))?;
                 let continued = self.should_continue().await?;
@@ -4650,6 +4707,23 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             )?;
         }
 
+        Ok(())
+    }
+
+    async fn on_branch_conversation(
+        &mut self,
+        source_id: ConversationId,
+        target_id: forge_domain::MessageId,
+        porcelain: bool,
+    ) -> anyhow::Result<()> {
+        let branch = self.api.branch_conversation(&source_id, target_id).await?;
+        if porcelain {
+            println!("{}", branch.id);
+        } else {
+            self.writeln_title(
+                TitleFormat::info("Branched").sub_title(format!("[{} → {}]", source_id, branch.id)),
+            )?;
+        }
         Ok(())
     }
 
@@ -5588,6 +5662,17 @@ fn queue_tui_response_and_notify(
     Ok(())
 }
 
+fn interruption_title(reason: &InterruptionReason) -> String {
+    match reason {
+        InterruptionReason::MaxRequestPerTurnLimitReached { limit } => {
+            format!("Maximum request ({limit}) per turn achieved")
+        }
+        InterruptionReason::MaxToolFailurePerTurnLimitReached { limit, .. } => {
+            format!("Maximum tool failure limit ({limit}) reached for this turn")
+        }
+    }
+}
+
 async fn run_tui_command_with_suspended_stdout<
     A: API + ConsoleWriter + 'static,
     F: Fn(ForgeConfig) -> A + Send + Sync,
@@ -5599,18 +5684,29 @@ async fn run_tui_command_with_suspended_stdout<
     run_tui_suspended_stdout_boundary(session, ui.on_command(command)).await
 }
 
+async fn run_tui_suspended_stdout_value<T>(
+    session: &mut impl forge_tui::TuiRenderer,
+    operation: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    session.suspend_for_stdout()?;
+    let operation_result = operation.await;
+    let resume_result = session.resume_after_stdout();
+    let redraw_result = if resume_result.is_ok() {
+        session.render_current()
+    } else {
+        Ok(())
+    };
+    let value = operation_result?;
+    resume_result?;
+    redraw_result?;
+    Ok(value)
+}
+
 async fn run_tui_suspended_stdout_boundary(
     session: &mut impl forge_tui::TuiRenderer,
     operation: impl std::future::Future<Output = Result<bool>>,
 ) -> Result<bool> {
-    session.suspend_for_stdout()?;
-    let command_result = operation.await;
-    let resume_result = session.resume_after_stdout();
-    let redraw_result = session.render_current();
-    let should_exit = command_result?;
-    resume_result?;
-    redraw_result?;
-    Ok(should_exit)
+    run_tui_suspended_stdout_value(session, operation).await
 }
 
 #[cfg(test)]
@@ -5627,6 +5723,26 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
+
+    #[test]
+    fn internal_agent_session_marks_new_conversation_as_agent_initiated() {
+        let mut conversation = Conversation::new(ConversationId::generate());
+
+        mark_internal_agent_session_if_requested(&mut conversation, true);
+
+        assert_eq!(conversation.initiator, forge_domain::Initiator::Agent);
+        assert_eq!(conversation.parent_id, None);
+    }
+
+    #[test]
+    fn ordinary_agent_flag_does_not_hide_new_conversation() {
+        let mut conversation = Conversation::new(ConversationId::generate());
+
+        mark_internal_agent_session_if_requested(&mut conversation, false);
+
+        assert_eq!(conversation.initiator, forge_domain::Initiator::User);
+        assert_eq!(conversation.parent_id, None);
+    }
 
     #[test]
     fn test_compaction_provider_estimate_format_includes_before_after_and_fit_status() {
@@ -5692,6 +5808,7 @@ mod tests {
         saw_resume_before_render: bool,
         fail_render: bool,
         fail_suspend: bool,
+        fail_resume: bool,
         render_count: usize,
         render_current_count: usize,
         suspend_count: usize,
@@ -5708,6 +5825,7 @@ mod tests {
                 saw_resume_before_render: false,
                 fail_render: false,
                 fail_suspend: false,
+                fail_resume: false,
                 render_count: 0,
                 render_current_count: 0,
                 suspend_count: 0,
@@ -5722,6 +5840,10 @@ mod tests {
 
         fn failing_suspend(notifier: Arc<Notify>) -> Self {
             Self { fail_suspend: true, ..Self::new(notifier) }
+        }
+
+        fn failing_resume(notifier: Arc<Notify>) -> Self {
+            Self { fail_resume: true, ..Self::new(notifier) }
         }
     }
 
@@ -5757,6 +5879,9 @@ mod tests {
                 .checked_add(1)
                 .expect("fixture resume count should not overflow");
             self.saw_notify_before_resume = self.notifier.notified().now_or_never().is_some();
+            if self.fail_resume {
+                return Err(io::Error::other("resume failed"));
+            }
             Ok(())
         }
 
@@ -5911,6 +6036,90 @@ mod tests {
             notifier.notified().now_or_never().is_some(),
         );
         let expected = (false, 1, 1, 0, 1, false, false);
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_tui_suspended_value_boundary_returns_operation_value_after_safe_redraw() {
+        let notifier = Arc::new(Notify::new());
+        let mut setup = ObservingRenderer::new(notifier.clone());
+
+        let value = run_tui_suspended_stdout_value(&mut setup, async { Ok("continued") })
+            .await
+            .expect("fixture TUI value boundary should complete successfully");
+        let actual = (
+            value,
+            setup.suspend_count,
+            setup.resume_count,
+            setup.render_current_count,
+            setup.saw_notify_before_resume,
+            notifier.notified().now_or_never().is_some(),
+        );
+        let expected = ("continued", 1, 1, 1, false, false);
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_tui_suspended_value_boundary_resumes_and_redraws_after_operation_error() {
+        let notifier = Arc::new(Notify::new());
+        let mut setup = ObservingRenderer::new(notifier.clone());
+
+        let actual = (
+            run_tui_suspended_stdout_value::<()>(&mut setup, async {
+                Err(anyhow::anyhow!("operation failed"))
+            })
+            .await
+            .is_err(),
+            setup.suspend_count,
+            setup.resume_count,
+            setup.render_current_count,
+            setup.saw_notify_before_resume,
+            notifier.notified().now_or_never().is_some(),
+        );
+        let expected = (true, 1, 1, 1, false, false);
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_tui_suspended_value_boundary_does_not_run_operation_when_suspend_fails() {
+        let notifier = Arc::new(Notify::new());
+        let mut setup = ObservingRenderer::failing_suspend(notifier.clone());
+        let operation_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let operation_flag = operation_ran.clone();
+
+        let actual = (
+            run_tui_suspended_stdout_value::<()>(&mut setup, async move {
+                operation_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .is_err(),
+            operation_ran.load(std::sync::atomic::Ordering::SeqCst),
+            setup.suspend_count,
+            setup.resume_count,
+            setup.render_current_count,
+            notifier.notified().now_or_never().is_some(),
+        );
+        let expected = (true, false, 1, 0, 0, false);
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_tui_suspended_value_boundary_reports_resume_error_after_operation() {
+        let notifier = Arc::new(Notify::new());
+        let mut setup = ObservingRenderer::failing_resume(notifier.clone());
+
+        let actual = (
+            run_tui_suspended_stdout_value(&mut setup, async { Ok(true) })
+                .await
+                .is_err(),
+            setup.suspend_count,
+            setup.resume_count,
+            setup.render_current_count,
+            setup.saw_notify_before_resume,
+            notifier.notified().now_or_never().is_some(),
+        );
+        let expected = (true, 1, 1, 0, false, false);
         assert_eq!(actual, expected);
     }
 

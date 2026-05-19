@@ -153,6 +153,12 @@ impl<F: Send + Sync> ConversationRepository for ForgeRepo<F> {
         self.conversation_repository.get_all_conversations().await
     }
 
+    async fn get_all_conversations_including_agent(&self) -> anyhow::Result<Vec<Conversation>> {
+        self.conversation_repository
+            .get_all_conversations_including_agent()
+            .await
+    }
+
     async fn get_sub_conversations(
         &self,
         parent_id: &ConversationId,

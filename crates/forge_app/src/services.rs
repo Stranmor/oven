@@ -320,11 +320,34 @@ pub trait ConversationService: Send + Sync {
         F: FnOnce(&mut Conversation) -> T + Send,
         T: Send;
 
-    /// Find conversations.
+    /// Creates a branch-only conversation by excluding the selected message and
+    /// everything after it. The source conversation is normalized and preserved.
+    ///
+    /// # Arguments
+    /// * `conversation_id` - Source conversation ID.
+    /// * `target_id` - Stable selectable message ID that defines the branch boundary.
+    ///
+    /// # Errors
+    /// Returns an error when the source conversation or target message is missing,
+    /// not selectable, or persistence fails.
+    async fn branch_conversation(
+        &self,
+        conversation_id: &ConversationId,
+        target_id: forge_domain::MessageId,
+    ) -> anyhow::Result<Conversation>;
+
+    /// Find primary user conversations.
     ///
     /// # Errors
     /// Returns an error if listing conversations fails.
     async fn get_conversations(&self) -> anyhow::Result<Vec<Conversation>>;
+
+    /// Find root conversations including internal agent sessions for diagnostic
+    /// list surfaces.
+    ///
+    /// # Errors
+    /// Returns an error if listing conversations fails.
+    async fn get_conversations_including_agent(&self) -> anyhow::Result<Vec<Conversation>>;
 
     /// Find sub-conversations (subagent chats) for a parent conversation.
     ///
@@ -930,8 +953,24 @@ impl<I: Services> ConversationService for I {
         self.conversation_service().modify_conversation(id, f).await
     }
 
+    async fn branch_conversation(
+        &self,
+        conversation_id: &ConversationId,
+        target_id: forge_domain::MessageId,
+    ) -> anyhow::Result<Conversation> {
+        self.conversation_service()
+            .branch_conversation(conversation_id, target_id)
+            .await
+    }
+
     async fn get_conversations(&self) -> anyhow::Result<Vec<Conversation>> {
         self.conversation_service().get_conversations().await
+    }
+
+    async fn get_conversations_including_agent(&self) -> anyhow::Result<Vec<Conversation>> {
+        self.conversation_service()
+            .get_conversations_including_agent()
+            .await
     }
 
     async fn get_sub_conversations(
@@ -1617,8 +1656,20 @@ mod tests {
             Ok(f(conversation))
         }
 
+        async fn branch_conversation(
+            &self,
+            _conversation_id: &ConversationId,
+            _target_id: forge_domain::MessageId,
+        ) -> anyhow::Result<Conversation> {
+            anyhow::bail!("branch conversation is not implemented for raw fixture service")
+        }
+
         async fn get_conversations(&self) -> anyhow::Result<Vec<Conversation>> {
             Ok(self.conversations.lock().await.values().cloned().collect())
+        }
+
+        async fn get_conversations_including_agent(&self) -> anyhow::Result<Vec<Conversation>> {
+            self.get_conversations().await
         }
 
         async fn get_sub_conversations(

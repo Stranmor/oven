@@ -70,8 +70,19 @@ pub trait API: Sync + Send {
     /// Returns the conversation with the given ID
     async fn conversation(&self, conversation_id: &ConversationId) -> Result<Option<Conversation>>;
 
-    /// Lists all conversations for the active workspace
+    /// Creates a branch-only conversation from a selected prior message.
+    async fn branch_conversation(
+        &self,
+        conversation_id: &ConversationId,
+        target_id: forge_domain::MessageId,
+    ) -> Result<Conversation>;
+
+    /// Lists all primary user conversations for the active workspace
     async fn get_conversations(&self) -> Result<Vec<Conversation>>;
+
+    /// Lists all root conversations for the active workspace, including
+    /// internal agent sessions for diagnostic surfaces.
+    async fn get_conversations_including_agent(&self) -> Result<Vec<Conversation>>;
 
     /// Lists sub-conversations (subagent chats) for a parent conversation
     async fn get_sub_conversations(&self, parent_id: &ConversationId) -> Result<Vec<Conversation>>;

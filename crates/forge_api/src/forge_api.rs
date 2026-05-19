@@ -181,10 +181,24 @@ impl<
         self.services.find_conversation(conversation_id).await
     }
 
+    async fn branch_conversation(
+        &self,
+        conversation_id: &ConversationId,
+        target_id: forge_domain::MessageId,
+    ) -> anyhow::Result<Conversation> {
+        self.services
+            .branch_conversation(conversation_id, target_id)
+            .await
+    }
+
     async fn get_conversations(&self) -> anyhow::Result<Vec<Conversation>> {
         let mut conversations = self.services.get_conversations().await?;
         conversations.truncate(self.services.get_config()?.max_conversations);
         Ok(conversations)
+    }
+
+    async fn get_conversations_including_agent(&self) -> anyhow::Result<Vec<Conversation>> {
+        self.services.get_conversations_including_agent().await
     }
 
     async fn get_sub_conversations(
