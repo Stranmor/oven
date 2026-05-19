@@ -14,11 +14,12 @@ use crate::extraction::{
     extract_rust_symbols, extract_static_cargo_metadata,
 };
 use crate::freshness::compare_freshness;
+use crate::ingestion::ingest_external_fact_artifacts;
 use crate::policy::LOCAL_PROJECT_MODEL_MANIFEST_FILE_NAME;
 use crate::types::{
-    ContextPack, ContextPackArtifactId, FileNode, FileNodeKind, FreshnessProofLevel,
-    FreshnessState, Language, ManifestFreshnessEvaluation, ProjectManifest, ShardManifest,
-    ShardStrategy, SourceFile, SymbolNode, ToolEpisode,
+    ContextPack, ContextPackArtifactId, ExternalFactArtifactIngestionReport, FileNode,
+    FileNodeKind, FreshnessProofLevel, FreshnessState, Language, ManifestFreshnessEvaluation,
+    ProjectManifest, ShardManifest, ShardStrategy, SourceFile, SymbolNode, ToolEpisode,
 };
 use crate::util::{
     detect_language, edge_sort_key, hash_text, line_count, manifest_hash, normalize_path,
@@ -50,6 +51,25 @@ impl ProjectIndexer {
     /// Returns an error when walking, reading, parsing, or hashing project
     /// files fails.
     pub fn index(&self) -> Result<ProjectManifest> {
+        Ok(self.index_with_external_fact_report()?.0)
+    }
+
+    /// Builds a deterministic project manifest and returns the external fact
+    /// artifact ingestion report produced while indexing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when base indexing fails or the model-dir external fact
+    /// store cannot be listed.
+    pub fn index_with_external_fact_report(
+        &self,
+    ) -> Result<(ProjectManifest, ExternalFactArtifactIngestionReport)> {
+        let mut manifest = self.index_base_manifest()?;
+        let report = ingest_external_fact_artifacts(&mut manifest, &self.external_facts_dir())?;
+        Ok((manifest, report))
+    }
+
+    fn index_base_manifest(&self) -> Result<ProjectManifest> {
         let mut files = Vec::new();
         let mut rust_sources = BTreeMap::new();
         let mut cargo_tomls = Vec::new();
@@ -61,6 +81,9 @@ impl ProjectIndexer {
         {
             let entry = result.context("walk project tree")?;
             let path = entry.path();
+            if path.starts_with(&self.model_dir) {
+                continue;
+            }
             if !path.is_file() {
                 continue;
             }
@@ -394,6 +417,10 @@ impl ProjectIndexer {
         }
         ids.sort();
         Ok(ids)
+    }
+
+    fn external_facts_dir(&self) -> PathBuf {
+        self.model_dir.join("external_facts")
     }
 
     fn vector_index_dir(&self) -> PathBuf {
@@ -795,8 +822,11 @@ pub(crate) mod tests {
     use super::*;
     use crate::{
         CargoDependencyDeclaration, CargoDependencyKind, CargoPackageDependency,
-        CargoTargetDeclaration, CargoTargetKind, ContextPackSelection, GraphEdgeKind,
-        RetrievalQuery, StaleEvidencePolicy, SymbolKind, VectorIndexArtifact, compare_freshness,
+        CargoTargetDeclaration, CargoTargetKind, ContextPackSelection, EdgeConfidence,
+        ExternalFactBatch, ExternalFactBatchMetadata, ExternalFactSource, GraphEdgeKind,
+        RetrievalQuery, StaleEvidencePolicy, SymbolKind, TypedExternalFacts,
+        TypedExternalReferenceFact, TypedExternalSymbolFact, VectorIndexArtifact,
+        compare_freshness, external_fact_artifact_fingerprint, external_fact_batch_fingerprint,
         fingerprint, retrieve, vector_entries_from_manifest_embeddings,
     };
 
@@ -819,6 +849,279 @@ pub(crate) mod tests {
             "pub enum Widget {\n    One,\n}\n\npub trait Named {\n    fn name(&self) -> &str;\n}\n\nimpl Named for Widget {\n    fn name(&self) -> &str {\n        \"widget\"\n    }\n}\n",
         )?;
         Ok((temp, root))
+    }
+
+    fn external_artifact_batch(
+        manifest: &ProjectManifest,
+        source_label: &str,
+        external_symbol_id: &str,
+    ) -> ExternalFactBatch {
+        let facts = TypedExternalFacts {
+            symbols: vec![TypedExternalSymbolFact {
+                id: external_symbol_id.to_string(),
+                name: "external_new".to_string(),
+                kind: SymbolKind::Method,
+                path: "src/lib.rs".to_string(),
+                start_line: 10,
+                end_line: 12,
+                source: ExternalFactSource::Lsp,
+            }],
+            references: vec![TypedExternalReferenceFact {
+                from: external_symbol_id.to_string(),
+                to: "symbol:src/lib.rs:Struct:Root".to_string(),
+                kind: GraphEdgeKind::References,
+                path: "src/lib.rs".to_string(),
+                start_line: Some(10),
+                end_line: Some(10),
+                source: ExternalFactSource::Lsp,
+            }],
+        };
+        let mut batch = ExternalFactBatch {
+            metadata: ExternalFactBatchMetadata {
+                source: ExternalFactSource::Lsp,
+                source_label: source_label.to_string(),
+                tool_version: Some("fixture-1".to_string()),
+                workspace_root: manifest.root.to_string_lossy().to_string(),
+                source_artifact_fingerprint: String::new(),
+                manifest_hash_input: manifest.manifest_hash.clone(),
+                batch_fingerprint: String::new(),
+            },
+            facts,
+        };
+        batch.metadata.source_artifact_fingerprint = external_fact_artifact_fingerprint(&batch);
+        batch.metadata.batch_fingerprint =
+            external_fact_batch_fingerprint(&batch.metadata, &batch.facts);
+        batch
+    }
+
+    fn write_external_artifact(
+        setup: &ProjectIndexer,
+        name: &str,
+        batch: &ExternalFactBatch,
+    ) -> Result<PathBuf> {
+        let directory = setup.model_dir.join("external_facts");
+        fs::create_dir_all(&directory)?;
+        let path = directory.join(name);
+        fs::write(&path, serde_json::to_string_pretty(batch)?)?;
+        Ok(path)
+    }
+
+    #[test]
+    fn external_artifact_batch_is_accepted_and_produces_exact_edges_and_metadata() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let base = setup.index()?;
+        let batch =
+            external_artifact_batch(&base, "rust-analyzer", "lsp:src/lib.rs:Root::external_new");
+        write_external_artifact(&setup, "accepted.json", &batch)?;
+
+        let (actual, report) = setup.index_with_external_fact_report()?;
+
+        assert_eq!(report.accepted_artifacts, 1usize);
+        assert_eq!(actual.external_fact_batches, vec![batch.metadata.clone()]);
+        assert_eq!(
+            actual.edges.iter().any(|edge| {
+                edge.from == "lsp:src/lib.rs:Root::external_new"
+                    && edge.to == "symbol:src/lib.rs:Struct:Root"
+                    && edge.confidence_kind == EdgeConfidence::ExactCompiler
+            }),
+            true
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn external_artifact_two_valid_same_base_batches_are_both_accepted() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let base = setup.index()?;
+        let first = external_artifact_batch(&base, "rust-analyzer", "lsp:src/lib.rs:first");
+        let second = external_artifact_batch(&base, "rust-analyzer-alt", "lsp:src/lib.rs:second");
+        write_external_artifact(&setup, "b.json", &second)?;
+        write_external_artifact(&setup, "a.json", &first)?;
+
+        let (actual, report) = setup.index_with_external_fact_report()?;
+
+        assert_eq!(report.accepted_artifacts, 2usize);
+        assert_eq!(actual.external_fact_batches.len(), 2usize);
+        assert_eq!(
+            actual
+                .external_fact_batches
+                .iter()
+                .map(|metadata| metadata.manifest_hash_input.clone())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([base.manifest_hash])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn external_artifact_stale_base_hash_is_rejected_without_manifest_mutation() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let base = setup.index()?;
+        let mut stale = external_artifact_batch(&base, "rust-analyzer", "lsp:src/lib.rs:stale");
+        stale.metadata.manifest_hash_input = fingerprint("stale");
+        stale.metadata.source_artifact_fingerprint = external_fact_artifact_fingerprint(&stale);
+        stale.metadata.batch_fingerprint =
+            external_fact_batch_fingerprint(&stale.metadata, &stale.facts);
+        write_external_artifact(&setup, "stale.json", &stale)?;
+
+        let (actual, report) = setup.index_with_external_fact_report()?;
+
+        assert_eq!(report.accepted_artifacts, 0usize);
+        assert_eq!(actual, base);
+        Ok(())
+    }
+
+    #[test]
+    fn external_artifact_fingerprint_mismatch_is_rejected_without_manifest_mutation() -> Result<()>
+    {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let base = setup.index()?;
+        let mut batch =
+            external_artifact_batch(&base, "rust-analyzer", "lsp:src/lib.rs:fingerprint");
+        batch.metadata.source_artifact_fingerprint = fingerprint("wrong-artifact");
+        batch.metadata.batch_fingerprint =
+            external_fact_batch_fingerprint(&batch.metadata, &batch.facts);
+        write_external_artifact(&setup, "fingerprint.json", &batch)?;
+
+        let (actual, report) = setup.index_with_external_fact_report()?;
+
+        assert_eq!(report.accepted_artifacts, 0usize);
+        assert_eq!(actual, base);
+        Ok(())
+    }
+
+    #[test]
+    fn external_artifact_endpoint_mismatch_is_rejected_without_manifest_mutation() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let base = setup.index()?;
+        let mut batch = external_artifact_batch(&base, "rust-analyzer", "lsp:src/lib.rs:endpoint");
+        batch
+            .facts
+            .references
+            .first_mut()
+            .expect("fixture should include reference")
+            .to = "symbol:missing".to_string();
+        batch.metadata.source_artifact_fingerprint = external_fact_artifact_fingerprint(&batch);
+        batch.metadata.batch_fingerprint =
+            external_fact_batch_fingerprint(&batch.metadata, &batch.facts);
+        write_external_artifact(&setup, "endpoint.json", &batch)?;
+
+        let (actual, report) = setup.index_with_external_fact_report()?;
+
+        assert_eq!(report.accepted_artifacts, 0usize);
+        assert_eq!(actual, base);
+        Ok(())
+    }
+
+    #[test]
+    fn external_artifact_directory_order_does_not_change_final_manifest_hash() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let left_setup = ProjectIndexer::new(&root, fixture.path().join("model-left"));
+        let right_setup = ProjectIndexer::new(&root, fixture.path().join("model-right"));
+        let base = left_setup.index()?;
+        let left_first = external_artifact_batch(&base, "rust-analyzer", "lsp:src/lib.rs:first");
+        let left_second =
+            external_artifact_batch(&base, "rust-analyzer-alt", "lsp:src/lib.rs:second");
+        let right_first = external_artifact_batch(&base, "rust-analyzer", "lsp:src/lib.rs:first");
+        let right_second =
+            external_artifact_batch(&base, "rust-analyzer-alt", "lsp:src/lib.rs:second");
+        write_external_artifact(&left_setup, "a.json", &left_first)?;
+        write_external_artifact(&left_setup, "b.json", &left_second)?;
+        write_external_artifact(&right_setup, "b.json", &right_second)?;
+        write_external_artifact(&right_setup, "a.json", &right_first)?;
+
+        let left = left_setup.index()?;
+        let right = right_setup.index()?;
+
+        assert_eq!(left.manifest_hash, right.manifest_hash);
+        assert_eq!(left.external_fact_batches, right.external_fact_batches);
+        Ok(())
+    }
+
+    #[test]
+    fn external_artifacts_under_model_storage_are_not_indexed_as_source_files() -> Result<()> {
+        let (_fixture, root) = fixture_project()?;
+        let model_dir = root.join(".forge_project_model");
+        let setup = ProjectIndexer::new(&root, &model_dir);
+        let base = setup.index()?;
+        let batch = external_artifact_batch(&base, "rust-analyzer", "lsp:src/lib.rs:model_storage");
+        write_external_artifact(&setup, "accepted.json", &batch)?;
+
+        let actual = setup.index()?;
+
+        assert_eq!(
+            actual
+                .files
+                .iter()
+                .any(|file| file.path.contains("external_facts")),
+            false
+        );
+        assert_eq!(actual.external_fact_batches.len(), 1usize);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_artifact_store_reports_non_json_directory_and_symlink_without_accepting()
+    -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let base = setup.index()?;
+        let directory = setup.model_dir.join("external_facts");
+        fs::create_dir_all(directory.join("nested"))?;
+        fs::write(directory.join("ignored.txt"), "not json")?;
+        std::os::unix::fs::symlink(root.join("src").join("lib.rs"), directory.join("link.json"))?;
+
+        let (actual, report) = setup.index_with_external_fact_report()?;
+        let codes = report
+            .artifacts
+            .iter()
+            .flat_map(|artifact| artifact.issues.iter().map(|issue| issue.code.clone()))
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(actual, base);
+        assert_eq!(report.accepted_artifacts, 0usize);
+        assert_eq!(
+            codes,
+            BTreeSet::from([
+                crate::ExternalFactIngestionIssueCode::NonFileArtifact,
+                crate::ExternalFactIngestionIssueCode::NonJsonArtifact,
+                crate::ExternalFactIngestionIssueCode::SymlinkArtifact,
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn external_artifact_exact_edge_participates_in_retrieval_graph_expansion() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let base = setup.index()?;
+        let batch =
+            external_artifact_batch(&base, "rust-analyzer", "lsp:src/lib.rs:graph_neighbor");
+        write_external_artifact(&setup, "graph.json", &batch)?;
+        let manifest = setup.index()?;
+        let query = RetrievalQuery {
+            text: None,
+            path: None,
+            path_prefix: None,
+            symbol: Some("external_new".to_string()),
+            limit: 5,
+            include_graph_expansion: true,
+        };
+
+        let actual = retrieve(&manifest, &query)
+            .into_iter()
+            .map(|result| result.id)
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(actual.contains("symbol:src/lib.rs:Struct:Root"), true);
+        Ok(())
     }
 
     #[test]

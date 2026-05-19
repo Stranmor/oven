@@ -1,12 +1,15 @@
 //! Typed ingestion boundary for validated external exact facts.
 
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 
 use crate::types::{
-    EdgeConfidence, ExternalFactBatch, ExternalFactBatchMetadata, ExternalFactIngestionIssue,
+    EdgeConfidence, ExternalFactArtifactIngestionReport, ExternalFactArtifactReport,
+    ExternalFactBatch, ExternalFactBatchMetadata, ExternalFactIngestionIssue,
     ExternalFactIngestionIssueCode, ExternalFactIngestionReport, ExternalFactSource, ExternalFacts,
     GraphEdge, ProjectManifest, Provenance, SymbolNode, TypedExternalFacts,
     TypedExternalReferenceFact, TypedExternalSymbolFact,
@@ -14,6 +17,146 @@ use crate::types::{
 use crate::util::{
     edge, edge_sort_key, external_facts_fingerprint, fingerprint, manifest_hash, provenance,
 };
+
+const MAX_EXTERNAL_FACT_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Loads and applies durable precomputed external exact-fact artifacts from a
+/// model-dir scoped store.
+///
+/// The loader is intentionally a consumer only: it never spawns language
+/// servers, SCIP, Cargo, rustc, or any other producer. All candidates are parsed
+/// and validated against the frozen base manifest before any accepted batch is
+/// applied, preventing mutable-baseline acceptance bugs.
+///
+/// # Arguments
+///
+/// * `manifest` - Frozen-base manifest that accepted artifacts may extend.
+/// * `external_facts_dir` - Model-dir scoped `external_facts` storage path.
+///
+/// # Errors
+///
+/// Returns an error only when the artifact store itself cannot be listed or a
+/// previously accepted batch fails to apply after successful dry-run validation.
+pub fn ingest_external_fact_artifacts(
+    manifest: &mut ProjectManifest,
+    external_facts_dir: &Path,
+) -> Result<ExternalFactArtifactIngestionReport> {
+    if !external_facts_dir.exists() {
+        return Ok(ExternalFactArtifactIngestionReport {
+            store_path: "external_facts".to_string(),
+            inspected_artifacts: 0,
+            accepted_artifacts: 0,
+            artifacts: Vec::new(),
+            accepted_batches: Vec::new(),
+        });
+    }
+
+    let frozen_base = manifest.clone();
+    let mut candidates = list_artifact_candidates(external_facts_dir)?;
+    let mut accepted = Vec::<AcceptedArtifact>::new();
+    let mut reports = Vec::<ExternalFactArtifactReport>::new();
+
+    for candidate in &mut candidates {
+        let report = parse_artifact_candidate(candidate, &frozen_base);
+        if let Some(batch) = report.batch {
+            accepted
+                .push(AcceptedArtifact { artifact_path: candidate.relative_path.clone(), batch });
+        }
+        reports.push(ExternalFactArtifactReport {
+            artifact_path: candidate.relative_path.clone(),
+            artifact_fingerprint: report.artifact_fingerprint,
+            accepted_batch: None,
+            issues: report.issues,
+        });
+    }
+
+    let duplicate_issues = duplicate_batch_issues(&accepted);
+    for (artifact_path, issue) in duplicate_issues {
+        if let Some(report) = reports
+            .iter_mut()
+            .find(|report| report.artifact_path == artifact_path)
+        {
+            report.issues.push(issue);
+        }
+    }
+
+    let mut seen_batch_fingerprints = BTreeSet::new();
+    let mut seen_symbol_ids = BTreeSet::new();
+    let mut accepted_filtered = Vec::new();
+    for artifact in accepted {
+        let has_report_issues = reports
+            .iter()
+            .find(|report| report.artifact_path == artifact.artifact_path)
+            .is_some_and(|report| !report.issues.is_empty());
+        if has_report_issues {
+            continue;
+        }
+        if !seen_batch_fingerprints.insert(artifact.batch.metadata.batch_fingerprint.clone()) {
+            continue;
+        }
+        let mut symbol_duplicate = false;
+        for symbol in &artifact.batch.facts.symbols {
+            if !seen_symbol_ids.insert(symbol.id.clone()) {
+                symbol_duplicate = true;
+                if let Some(report) = reports
+                    .iter_mut()
+                    .find(|report| report.artifact_path == artifact.artifact_path)
+                {
+                    report.issues.push(issue(
+                        ExternalFactIngestionIssueCode::DuplicateAcceptedSymbolId,
+                        Some(symbol.id.clone()),
+                        format!("duplicate_accepted_symbol_id:{}", symbol.id),
+                    ));
+                }
+            }
+        }
+        if !symbol_duplicate {
+            accepted_filtered.push(artifact);
+        }
+    }
+
+    accepted_filtered.sort_by(|left, right| {
+        left.batch
+            .metadata
+            .batch_fingerprint
+            .cmp(&right.batch.metadata.batch_fingerprint)
+            .then_with(|| {
+                left.batch
+                    .metadata
+                    .source_label
+                    .cmp(&right.batch.metadata.source_label)
+            })
+            .then_with(|| {
+                left.batch
+                    .metadata
+                    .source_artifact_fingerprint
+                    .cmp(&right.batch.metadata.source_artifact_fingerprint)
+            })
+            .then_with(|| left.artifact_path.cmp(&right.artifact_path))
+    });
+
+    let mut accepted_batches = Vec::new();
+    for artifact in accepted_filtered {
+        let metadata = artifact.batch.metadata.clone();
+        let ingestion = apply_external_fact_batch(manifest, artifact.batch);
+        if let Some(report) = reports
+            .iter_mut()
+            .find(|report| report.artifact_path == artifact.artifact_path)
+        {
+            report.accepted_batch = Some(metadata);
+        }
+        accepted_batches.push(ingestion);
+    }
+
+    reports.sort_by(|left, right| left.artifact_path.cmp(&right.artifact_path));
+    Ok(ExternalFactArtifactIngestionReport {
+        store_path: "external_facts".to_string(),
+        inspected_artifacts: reports.len(),
+        accepted_artifacts: accepted_batches.len(),
+        artifacts: reports,
+        accepted_batches,
+    })
+}
 
 /// Imports legacy external facts through a validated synthetic batch.
 ///
@@ -87,6 +230,13 @@ pub fn ingest_external_fact_batch(
         bail!("external fact batch rejected: {}", issue_summary(&issues));
     }
 
+    Ok(apply_external_fact_batch(manifest, batch))
+}
+
+fn apply_external_fact_batch(
+    manifest: &mut ProjectManifest,
+    batch: ExternalFactBatch,
+) -> ExternalFactIngestionReport {
     let ExternalFactBatch { metadata, facts } = batch;
     let accepted_symbols = facts.symbols.len();
     let accepted_edges = facts.references.len();
@@ -131,12 +281,12 @@ pub fn ingest_external_fact_batch(
         &manifest.external_facts_fingerprint,
     );
 
-    Ok(ExternalFactIngestionReport {
+    ExternalFactIngestionReport {
         accepted_symbols,
         accepted_edges,
         deduplicated_edges: removed_edges,
         batch_metadata: metadata,
-    })
+    }
 }
 
 /// Validates one external exact fact batch against the current manifest graph
@@ -229,6 +379,24 @@ impl ExternalFactBatch {
         metadata.batch_fingerprint = external_fact_batch_fingerprint(&metadata, &facts);
         Self { metadata, facts }
     }
+}
+
+/// Computes the deterministic source-artifact fingerprint for one external fact artifact.
+///
+/// The fingerprint intentionally excludes both stored fingerprint fields so a
+/// producer can write placeholder values first and callers can recompute the
+/// authoritative identifiers from the decoded artifact payload.
+///
+/// # Arguments
+///
+/// * `batch` - Decoded artifact batch payload.
+pub fn external_fact_artifact_fingerprint(batch: &ExternalFactBatch) -> String {
+    let mut metadata = batch.metadata.clone();
+    metadata.source_artifact_fingerprint.clear();
+    metadata.batch_fingerprint.clear();
+    let canonical = serde_json::to_string(&(&metadata, &batch.facts))
+        .expect("external fact artifact fingerprint serialization should be infallible");
+    fingerprint(&canonical)
 }
 
 /// Computes the deterministic fingerprint for one external exact fact batch.
@@ -510,6 +678,226 @@ fn issue_summary(issues: &[ExternalFactIngestionIssue]) -> String {
         .map(|issue| format!("{:?}:{}", issue.code, issue.detail))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+#[derive(Clone, Debug)]
+struct ArtifactCandidate {
+    relative_path: String,
+    absolute_path: PathBuf,
+    file_type: fs::FileType,
+}
+
+#[derive(Clone, Debug)]
+struct ArtifactParseReport {
+    artifact_fingerprint: Option<String>,
+    batch: Option<ExternalFactBatch>,
+    issues: Vec<ExternalFactIngestionIssue>,
+}
+
+#[derive(Clone, Debug)]
+struct AcceptedArtifact {
+    artifact_path: String,
+    batch: ExternalFactBatch,
+}
+
+fn list_artifact_candidates(external_facts_dir: &Path) -> Result<Vec<ArtifactCandidate>> {
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(external_facts_dir)? {
+        let entry = entry?;
+        let absolute_path = entry.path();
+        let file_type = entry.file_type()?;
+        let relative_path = absolute_path
+            .strip_prefix(external_facts_dir)
+            .map(normalized_artifact_path)
+            .unwrap_or_else(|_| normalized_artifact_path(&absolute_path));
+        candidates.push(ArtifactCandidate { relative_path, absolute_path, file_type });
+    }
+    candidates.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(candidates)
+}
+
+fn parse_artifact_candidate(
+    candidate: &ArtifactCandidate,
+    frozen_base: &ProjectManifest,
+) -> ArtifactParseReport {
+    let mut issues = artifact_file_issues(candidate);
+    if !issues.is_empty() {
+        sort_issues(&mut issues);
+        return ArtifactParseReport { artifact_fingerprint: None, batch: None, issues };
+    }
+
+    let metadata = match fs::symlink_metadata(&candidate.absolute_path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            issues.push(issue(
+                ExternalFactIngestionIssueCode::ArtifactReadFailed,
+                Some(candidate.relative_path.clone()),
+                format!("artifact_metadata_failed:{}", redacted_io_error(&error)),
+            ));
+            sort_issues(&mut issues);
+            return ArtifactParseReport { artifact_fingerprint: None, batch: None, issues };
+        }
+    };
+    if metadata.len() > MAX_EXTERNAL_FACT_ARTIFACT_BYTES {
+        issues.push(issue(
+            ExternalFactIngestionIssueCode::ArtifactTooLarge,
+            Some(candidate.relative_path.clone()),
+            format!(
+                "artifact_too_large:{}>{}",
+                metadata.len(),
+                MAX_EXTERNAL_FACT_ARTIFACT_BYTES
+            ),
+        ));
+        sort_issues(&mut issues);
+        return ArtifactParseReport { artifact_fingerprint: None, batch: None, issues };
+    }
+
+    let bytes = match fs::read(&candidate.absolute_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            issues.push(issue(
+                ExternalFactIngestionIssueCode::ArtifactReadFailed,
+                Some(candidate.relative_path.clone()),
+                format!("artifact_read_failed:{}", redacted_io_error(&error)),
+            ));
+            sort_issues(&mut issues);
+            return ArtifactParseReport { artifact_fingerprint: None, batch: None, issues };
+        }
+    };
+    let json = match String::from_utf8(bytes) {
+        Ok(json) => json,
+        Err(error) => {
+            issues.push(issue(
+                ExternalFactIngestionIssueCode::ArtifactParseFailed,
+                Some(candidate.relative_path.clone()),
+                format!("artifact_utf8_failed:{}", error.utf8_error()),
+            ));
+            sort_issues(&mut issues);
+            return ArtifactParseReport { artifact_fingerprint: None, batch: None, issues };
+        }
+    };
+    let mut batch = match serde_json::from_str::<ExternalFactBatch>(&json) {
+        Ok(batch) => batch,
+        Err(error) => {
+            let artifact_fingerprint = fingerprint(&json);
+            issues.push(issue(
+                ExternalFactIngestionIssueCode::ArtifactParseFailed,
+                Some(candidate.relative_path.clone()),
+                format!("artifact_json_failed:{error}"),
+            ));
+            sort_issues(&mut issues);
+            return ArtifactParseReport {
+                artifact_fingerprint: Some(artifact_fingerprint),
+                batch: None,
+                issues,
+            };
+        }
+    };
+    let artifact_fingerprint = external_fact_artifact_fingerprint(&batch);
+    if batch.metadata.source_artifact_fingerprint != artifact_fingerprint {
+        issues.push(issue(
+            ExternalFactIngestionIssueCode::SourceArtifactFingerprintMismatch,
+            Some(batch.metadata.source_artifact_fingerprint.clone()),
+            format!("source_artifact_fingerprint_expected:{artifact_fingerprint}"),
+        ));
+    }
+    batch.metadata.source_artifact_fingerprint = artifact_fingerprint.clone();
+    let expected_batch_fingerprint = external_fact_batch_fingerprint(&batch.metadata, &batch.facts);
+    if batch.metadata.batch_fingerprint != expected_batch_fingerprint {
+        issues.push(issue(
+            ExternalFactIngestionIssueCode::BatchFingerprintMismatch,
+            Some(batch.metadata.batch_fingerprint.clone()),
+            format!("batch_fingerprint_expected:{expected_batch_fingerprint}"),
+        ));
+    }
+    batch.metadata.batch_fingerprint = expected_batch_fingerprint;
+    issues.extend(validate_external_fact_batch(frozen_base, &batch));
+    sort_issues(&mut issues);
+    let accepted_batch = if issues.is_empty() { Some(batch) } else { None };
+    ArtifactParseReport {
+        artifact_fingerprint: Some(artifact_fingerprint),
+        batch: accepted_batch,
+        issues,
+    }
+}
+
+fn artifact_file_issues(candidate: &ArtifactCandidate) -> Vec<ExternalFactIngestionIssue> {
+    let mut issues = Vec::new();
+    if candidate.file_type.is_symlink() {
+        issues.push(issue(
+            ExternalFactIngestionIssueCode::SymlinkArtifact,
+            Some(candidate.relative_path.clone()),
+            "artifact_symlink_ignored".to_string(),
+        ));
+        return issues;
+    }
+    if !candidate.file_type.is_file() {
+        issues.push(issue(
+            ExternalFactIngestionIssueCode::NonFileArtifact,
+            Some(candidate.relative_path.clone()),
+            "artifact_non_file_ignored".to_string(),
+        ));
+        return issues;
+    }
+    if !candidate.relative_path.ends_with(".json") {
+        issues.push(issue(
+            ExternalFactIngestionIssueCode::NonJsonArtifact,
+            Some(candidate.relative_path.clone()),
+            "artifact_non_json_ignored".to_string(),
+        ));
+    }
+    issues
+}
+
+fn duplicate_batch_issues(
+    accepted: &[AcceptedArtifact],
+) -> BTreeMap<String, ExternalFactIngestionIssue> {
+    let mut by_fingerprint = BTreeMap::<String, Vec<String>>::new();
+    for artifact in accepted {
+        by_fingerprint
+            .entry(artifact.batch.metadata.batch_fingerprint.clone())
+            .or_default()
+            .push(artifact.artifact_path.clone());
+    }
+    let mut issues = BTreeMap::new();
+    for (fingerprint, mut paths) in by_fingerprint {
+        if paths.len() < 2 {
+            continue;
+        }
+        paths.sort();
+        for path in paths {
+            issues.insert(
+                path,
+                issue(
+                    ExternalFactIngestionIssueCode::DuplicateBatchFingerprint,
+                    Some(fingerprint.clone()),
+                    "duplicate_batch_fingerprint".to_string(),
+                ),
+            );
+        }
+    }
+    issues
+}
+
+fn normalized_artifact_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn redacted_io_error(error: &std::io::Error) -> String {
+    error.kind().to_string().replace(char::is_whitespace, "_")
+}
+
+fn sort_issues(issues: &mut Vec<ExternalFactIngestionIssue>) {
+    issues.sort_by(|left, right| {
+        left.code
+            .cmp(&right.code)
+            .then_with(|| left.endpoint.cmp(&right.endpoint))
+            .then_with(|| left.detail.cmp(&right.detail))
+    });
+    issues.dedup();
 }
 
 impl From<ExternalFacts> for TypedExternalFacts {

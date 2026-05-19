@@ -293,8 +293,8 @@ pub struct GraphEdge {
 /// Semantic confidence carried by graph edges.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum EdgeConfidence {
-    /// Exact fact accepted from a typed external batch whose source contract and
-    /// manifest baseline were validated before ingestion.
+    /// Exact fact accepted from a typed external producer artifact or batch whose
+    /// source contract and manifest baseline were validated before ingestion.
     ExactCompiler,
     /// High-confidence syntax heuristic produced without type resolution.
     #[default]
@@ -1384,6 +1384,24 @@ pub struct ExternalFactBatch {
 /// Stable issue code emitted by external exact fact ingestion.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ExternalFactIngestionIssueCode {
+    /// Candidate artifact is not a JSON file and was ignored.
+    NonJsonArtifact,
+    /// Candidate path is a directory or non-regular file and was ignored.
+    NonFileArtifact,
+    /// Candidate path is a symlink and was ignored without following it.
+    SymlinkArtifact,
+    /// Candidate artifact exceeds the bounded parse size limit.
+    ArtifactTooLarge,
+    /// Candidate artifact could not be read from storage.
+    ArtifactReadFailed,
+    /// Candidate artifact JSON could not be decoded as an external fact batch.
+    ArtifactParseFailed,
+    /// Candidate artifact fingerprint does not match deterministic recomputation.
+    SourceArtifactFingerprintMismatch,
+    /// Candidate batch duplicates another accepted batch fingerprint.
+    DuplicateBatchFingerprint,
+    /// Candidate batch duplicates an external symbol identifier accepted from an earlier artifact.
+    DuplicateAcceptedSymbolId,
     /// Batch metadata is missing source, artifact, workspace, or baseline data.
     IncompleteBatchMetadata,
     /// Batch workspace identity does not match the current manifest workspace.
@@ -1430,6 +1448,35 @@ pub struct ExternalFactIngestionReport {
     pub deduplicated_edges: usize,
     /// Batch metadata persisted into the manifest.
     pub batch_metadata: ExternalFactBatchMetadata,
+}
+
+/// Redaction-safe report for one external fact artifact candidate.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalFactArtifactReport {
+    /// Relative artifact label under the external facts store.
+    pub artifact_path: String,
+    /// Recomputed redaction-safe fingerprint for the decoded artifact payload or
+    /// readable rejected JSON content.
+    pub artifact_fingerprint: Option<String>,
+    /// Accepted batch metadata when the artifact was ingested.
+    pub accepted_batch: Option<ExternalFactBatchMetadata>,
+    /// Redaction-safe rejection and validation issues for this artifact.
+    pub issues: Vec<ExternalFactIngestionIssue>,
+}
+
+/// Redaction-safe report for durable external fact artifact ingestion.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalFactArtifactIngestionReport {
+    /// Model-dir relative store used for artifact discovery.
+    pub store_path: String,
+    /// Number of artifact candidates inspected.
+    pub inspected_artifacts: usize,
+    /// Number of artifacts accepted and applied.
+    pub accepted_artifacts: usize,
+    /// Per-artifact accepted or rejected report entries in deterministic order.
+    pub artifacts: Vec<ExternalFactArtifactReport>,
+    /// Per-batch ingestion reports for accepted artifacts in deterministic apply order.
+    pub accepted_batches: Vec<ExternalFactIngestionReport>,
 }
 
 /// Typed external fact source accepted at the exact fact ingestion boundary.
