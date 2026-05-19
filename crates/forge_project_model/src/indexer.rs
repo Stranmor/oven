@@ -41,7 +41,14 @@ impl ProjectIndexer {
     /// * `model_dir` - Directory where deterministic JSON and JSONL model files
     ///   are stored.
     pub fn new(root: impl Into<PathBuf>, model_dir: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), model_dir: model_dir.into() }
+        let root = root.into();
+        let model_dir = model_dir.into();
+        let model_dir = if model_dir.is_absolute() {
+            model_dir
+        } else {
+            root.join(model_dir)
+        };
+        Self { root, model_dir }
     }
 
     /// Builds a deterministic project manifest from the configured root.
@@ -1061,6 +1068,26 @@ pub(crate) mod tests {
                 .any(|file| file.path.contains("external_facts")),
             false
         );
+        assert_eq!(actual.external_fact_batches.len(), 1usize);
+        Ok(())
+    }
+
+    #[test]
+    fn external_artifacts_under_relative_model_storage_are_not_indexed_as_source_files()
+    -> Result<()> {
+        let (_fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, "relative-model");
+        let base = setup.index()?;
+        let batch = external_artifact_batch(
+            &base,
+            "rust-analyzer",
+            "lsp:src/lib.rs:relative_model_storage",
+        );
+        write_external_artifact(&setup, "accepted.json", &batch)?;
+
+        let actual = setup.index()?;
+
+        assert_eq!(actual.files, base.files);
         assert_eq!(actual.external_fact_batches.len(), 1usize);
         Ok(())
     }
