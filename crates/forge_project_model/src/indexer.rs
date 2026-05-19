@@ -87,6 +87,31 @@ impl ProjectIndexer {
         Ok((manifest, report))
     }
 
+    /// Applies durable external fact artifacts to a caller-provided frozen base manifest.
+    ///
+    /// This API is the no-second-walk ingestion path for future opt-in exact-fact
+    /// wiring: callers pass the already built filesystem baseline and this method
+    /// only reads the external fact artifact store before returning the final
+    /// manifest and ingestion report. It does not rebuild the base manifest,
+    /// discover newly added files, collect source text, or invoke producers.
+    ///
+    /// # Arguments
+    ///
+    /// * `frozen_manifest` - Base manifest previously produced by explicit indexing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the external fact artifact store cannot be listed or
+    /// accepted artifacts cannot be applied to the cloned frozen manifest.
+    pub fn ingest_external_fact_artifacts_from_manifest(
+        &self,
+        frozen_manifest: &ProjectManifest,
+    ) -> Result<(ProjectManifest, ExternalFactArtifactIngestionReport)> {
+        let mut manifest = frozen_manifest.clone();
+        let report = ingest_external_fact_artifacts(&mut manifest, &self.external_facts_dir())?;
+        Ok((manifest, report))
+    }
+
     /// Builds a base project manifest and transient manifest-owned Rust source texts.
     ///
     /// The returned manifest is the base filesystem manifest before external
@@ -1235,6 +1260,60 @@ pub(crate) mod tests {
         let expected = (Vec::new(), false, false, "{".to_string());
 
         assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn ingest_external_fact_artifacts_from_manifest_does_not_rewalk_filesystem() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model-no-second-walk"));
+        let base = setup.index()?;
+        let batch =
+            external_artifact_batch(&base, "rust-analyzer", "lsp:src/lib.rs:no_second_walk");
+        write_external_artifact(&setup, "accepted.json", &batch)?;
+        fs::write(
+            root.join("src").join("added_after_base.rs"),
+            "pub fn late() {}\n",
+        )?;
+
+        let (actual, report) = setup.ingest_external_fact_artifacts_from_manifest(&base)?;
+
+        assert_eq!(report.accepted_artifacts, 1usize);
+        assert_eq!(actual.files, base.files);
+        assert_eq!(
+            actual
+                .files
+                .iter()
+                .any(|file| file.path == "src/added_after_base.rs"),
+            false
+        );
+        assert_eq!(actual.external_fact_batches, vec![batch.metadata]);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_manifest_artifact_ingestion_is_idempotent_without_duplicate_edges_or_batches()
+    -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model-idempotent-ingest"));
+        let base = setup.index()?;
+        let batch = external_artifact_batch(&base, "rust-analyzer", "lsp:src/lib.rs:idempotent");
+        write_external_artifact(&setup, "accepted.json", &batch)?;
+
+        let (left, left_report) = setup.ingest_external_fact_artifacts_from_manifest(&base)?;
+        let (right, right_report) = setup.ingest_external_fact_artifacts_from_manifest(&base)?;
+
+        assert_eq!(left, right);
+        assert_eq!(left_report.accepted_artifacts, 1usize);
+        assert_eq!(right_report.accepted_artifacts, 1usize);
+        assert_eq!(left.external_fact_batches.len(), 1usize);
+        assert_eq!(
+            left.edges
+                .iter()
+                .filter(|edge| edge.from == "lsp:src/lib.rs:idempotent")
+                .count(),
+            1usize
+        );
         Ok(())
     }
 
