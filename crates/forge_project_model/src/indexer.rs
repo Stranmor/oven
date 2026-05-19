@@ -14,9 +14,9 @@ use crate::extraction::{
 use crate::freshness::compare_freshness;
 use crate::policy::LOCAL_PROJECT_MODEL_MANIFEST_FILE_NAME;
 use crate::types::{
-    FileNode, FileNodeKind, FreshnessProofLevel, FreshnessState, Language,
-    ManifestFreshnessEvaluation, ProjectManifest, ShardManifest, ShardStrategy, SourceFile,
-    SymbolNode, ToolEpisode,
+    ContextPack, ContextPackArtifactId, FileNode, FileNodeKind, FreshnessProofLevel,
+    FreshnessState, Language, ManifestFreshnessEvaluation, ProjectManifest, ShardManifest,
+    ShardStrategy, SourceFile, SymbolNode, ToolEpisode,
 };
 use crate::util::{
     detect_language, edge_sort_key, hash_text, line_count, manifest_hash, normalize_path,
@@ -156,7 +156,157 @@ impl ProjectIndexer {
         serde_json::from_str(&json).context("deserialize manifest")
     }
 
-    /// Appends a redaction-safe tool episode to `tool_episodes.jsonl`.
+    /// Computes the deterministic artifact identifier for a context pack.
+    ///
+    /// # Arguments
+    ///
+    /// * `pack` - Redaction-safe context pack to identify.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when stable JSON serialization fails.
+    pub fn context_pack_artifact_id(&self, pack: &ContextPack) -> Result<ContextPackArtifactId> {
+        ContextPackArtifactId::new(hash_text(&pack.to_stable_json()?))
+    }
+
+    /// Atomically writes a non-empty context pack artifact and validates readback.
+    ///
+    /// # Arguments
+    ///
+    /// * `pack` - Redaction-safe context pack artifact to persist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the pack has no evidence, storage cannot be
+    /// created, JSON cannot be written atomically, or readback differs from the
+    /// input pack.
+    pub fn write_context_pack(&self, pack: &ContextPack) -> Result<PathBuf> {
+        if pack.evidence.is_empty() {
+            anyhow::bail!("context pack artifact requires non-empty evidence");
+        }
+        let id = self.context_pack_artifact_id(pack)?;
+        let directory = self.context_pack_dir();
+        fs::create_dir_all(&directory).context("create context pack dir")?;
+        let path = self.context_pack_path(&id);
+        let json = pack.to_stable_json()?;
+        let temp_path = self.write_context_pack_temp(&directory, &id, &json)?;
+        fs::rename(&temp_path, &path)
+            .with_context(|| format!("rename {} to {}", temp_path.display(), path.display()))?;
+        sync_directory(&directory)?;
+        let actual = self.read_context_pack(&id)?;
+        if &actual != pack {
+            anyhow::bail!("context pack artifact readback mismatch: {}", id);
+        }
+        Ok(path)
+    }
+
+    /// Reads a persisted context pack artifact by deterministic identifier.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - Hash-only context pack artifact identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the artifact cannot be read, decoded, or its
+    /// content-derived identifier does not match `id`.
+    pub fn read_context_pack(&self, id: &ContextPackArtifactId) -> Result<ContextPack> {
+        let path = self.context_pack_path(id);
+        let json = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let pack =
+            serde_json::from_str::<ContextPack>(&json).context("deserialize context pack")?;
+        let actual_id = self.context_pack_artifact_id(&pack)?;
+        if &actual_id != id {
+            anyhow::bail!(
+                "context pack artifact id mismatch: expected {}, got {}",
+                id,
+                actual_id
+            );
+        }
+        Ok(pack)
+    }
+
+    /// Lists deterministic context pack artifact identifiers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the artifact directory cannot be listed or an
+    /// artifact filename is not a valid hash-only identifier.
+    pub fn list_context_pack_artifacts(&self) -> Result<Vec<ContextPackArtifactId>> {
+        let directory = self.context_pack_dir();
+        if !directory.exists() {
+            return Ok(Vec::new());
+        }
+        let mut ids = Vec::new();
+        for entry in
+            fs::read_dir(&directory).with_context(|| format!("read {}", directory.display()))?
+        {
+            let entry = entry.context("read context pack artifact entry")?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+                anyhow::bail!(
+                    "context pack artifact filename is not UTF-8: {}",
+                    path.display()
+                );
+            };
+            let Some(id) = file_name.strip_suffix(".json") else {
+                continue;
+            };
+            ids.push(ContextPackArtifactId::new(id.to_string())?);
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
+    fn context_pack_dir(&self) -> PathBuf {
+        self.model_dir.join("context_packs")
+    }
+
+    fn context_pack_path(&self, id: &ContextPackArtifactId) -> PathBuf {
+        self.context_pack_dir()
+            .join(format!("{}.json", id.as_str()))
+    }
+
+    fn write_context_pack_temp(
+        &self,
+        directory: &Path,
+        id: &ContextPackArtifactId,
+        json: &str,
+    ) -> Result<PathBuf> {
+        for attempt in 0..100u32 {
+            let temp_path = directory.join(format!(
+                ".{}.{}.{}.tmp",
+                id.as_str(),
+                std::process::id(),
+                attempt
+            ));
+            let mut file = match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("create {}", temp_path.display()));
+                }
+            };
+            file.write_all(json.as_bytes())
+                .with_context(|| format!("write {}", temp_path.display()))?;
+            file.write_all(b"\n")
+                .with_context(|| format!("write newline {}", temp_path.display()))?;
+            file.flush()
+                .with_context(|| format!("flush {}", temp_path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("sync {}", temp_path.display()))?;
+            return Ok(temp_path);
+        }
+        anyhow::bail!("could not create unique context pack temp file");
+    }
+
     ///
     /// # Arguments
     ///
@@ -300,6 +450,13 @@ impl ProjectIndexer {
             proof_level: FreshnessProofLevel::IndexedFilesOnly,
         })
     }
+}
+
+fn sync_directory(directory: &Path) -> Result<()> {
+    File::open(directory)
+        .with_context(|| format!("open {}", directory.display()))?
+        .sync_all()
+        .with_context(|| format!("sync {}", directory.display()))
 }
 
 fn build_file_nodes(files: &[SourceFile]) -> Vec<FileNode> {
@@ -466,7 +623,8 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::{
-        GraphEdgeKind, RetrievalQuery, SymbolKind, compare_freshness, fingerprint, retrieve,
+        ContextPackSelection, GraphEdgeKind, RetrievalQuery, StaleEvidencePolicy, SymbolKind,
+        compare_freshness, fingerprint, retrieve,
     };
 
     pub(crate) fn fixture_project() -> Result<(TempDir, PathBuf)> {
@@ -656,6 +814,108 @@ pub(crate) mod tests {
         let expected = manifest;
         assert_eq!(actual, expected);
         assert_eq!(path.ends_with("project_manifest.json"), true);
+        Ok(())
+    }
+
+    fn fixture_context_pack(
+        setup: &ProjectIndexer,
+        manifest: &ProjectManifest,
+    ) -> Result<ContextPack> {
+        let query = RetrievalQuery {
+            text: Some("Root".to_string()),
+            path: None,
+            path_prefix: None,
+            symbol: Some("Root".to_string()),
+            limit: 5,
+            include_graph_expansion: true,
+        };
+        ContextPack::from_selection(
+            manifest,
+            ContextPackSelection {
+                retrieval_results: retrieve(manifest, &query),
+                shards: Vec::new(),
+                evidence: Vec::new(),
+                freshness: setup.evaluate_manifest_freshness(manifest)?.state,
+                stale_policy: StaleEvidencePolicy::Reject,
+            },
+        )
+    }
+
+    #[test]
+    fn writes_context_pack_artifact_deterministically_and_round_trips() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let pack = fixture_context_pack(&setup, &manifest)?;
+
+        let first_path = setup.write_context_pack(&pack)?;
+        let first_bytes = fs::read(&first_path)?;
+        let second_path = setup.write_context_pack(&pack)?;
+        let second_bytes = fs::read(&second_path)?;
+        let id = setup.context_pack_artifact_id(&pack)?;
+        let actual = (
+            first_path.clone(),
+            second_path,
+            first_bytes,
+            second_bytes,
+            setup.read_context_pack(&id)?,
+            setup.list_context_pack_artifacts()?,
+        );
+        let expected = (
+            first_path.clone(),
+            first_path,
+            actual.2.clone(),
+            actual.2.clone(),
+            pack,
+            vec![id.clone()],
+        );
+
+        assert_eq!(actual, expected);
+        assert_eq!(id.as_str().len(), 64);
+        assert!(id.as_str().bytes().all(|byte| byte.is_ascii_hexdigit()));
+        Ok(())
+    }
+
+    #[test]
+    fn context_pack_artifact_rejects_empty_and_path_influenced_ids() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let empty = ContextPack::from_selection(
+            &manifest,
+            ContextPackSelection {
+                retrieval_results: Vec::new(),
+                shards: Vec::new(),
+                evidence: Vec::new(),
+                freshness: setup.evaluate_manifest_freshness(&manifest)?.state,
+                stale_policy: StaleEvidencePolicy::Reject,
+            },
+        )?;
+
+        let actual = setup.write_context_pack(&empty).is_err();
+        let expected = true;
+        assert_eq!(actual, expected);
+        assert!(setup.list_context_pack_artifacts()?.is_empty());
+        assert!(ContextPackArtifactId::new("../escape".to_string()).is_err());
+        assert!(ContextPackArtifactId::new("src/lib.rs".to_string()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn read_context_pack_rejects_corrupt_or_mismatched_artifacts() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let pack = fixture_context_pack(&setup, &manifest)?;
+        let id = setup.context_pack_artifact_id(&pack)?;
+        let path = setup.write_context_pack(&pack)?;
+        let mut mutated = pack.clone();
+        mutated.manifest_hash = "different".to_string();
+        fs::write(&path, mutated.to_stable_json()?)?;
+
+        let actual = setup.read_context_pack(&id).is_err();
+        let expected = true;
+        assert_eq!(actual, expected);
         Ok(())
     }
 

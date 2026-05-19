@@ -46,10 +46,10 @@ pub use render::{
 };
 pub use retrieval::{plan_retrieval, retrieve, retrieve_with_boundaries};
 pub use types::{
-    ContextPack, ContextPackEvidence, ContextPackEvidenceSource, ContextPackSelection,
-    DecisionGraphNode, EdgeConfidence, EvalCaseGraphNode, EvidenceFreshness, ExternalFactSource,
-    ExternalFacts, ExternalReferenceFact, ExternalSymbolFact, FileGraphNode, FileNode,
-    FileNodeKind, FreshnessEvalReport, FreshnessProofLevel, FreshnessState,
+    ContextPack, ContextPackArtifactId, ContextPackEvidence, ContextPackEvidenceSource,
+    ContextPackSelection, DecisionGraphNode, EdgeConfidence, EvalCaseGraphNode, EvidenceFreshness,
+    ExternalFactSource, ExternalFacts, ExternalReferenceFact, ExternalSymbolFact, FileGraphNode,
+    FileNode, FileNodeKind, FreshnessEvalReport, FreshnessProofLevel, FreshnessState,
     FutureVectorRetrievalScaffold, GraphCoverageReport, GraphEdge, GraphEdgeKind, KnowledgeGraph,
     KnowledgeGraphEdge, KnowledgeGraphNode, KnowledgeGraphNodeId, KnowledgeGraphNodeKind, Language,
     LexicalDocument, LexicalDocumentKind, LexicalSearchHit, ManifestFreshnessEvaluation,

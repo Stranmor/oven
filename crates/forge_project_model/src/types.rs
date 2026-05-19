@@ -2,6 +2,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
@@ -714,6 +715,39 @@ pub enum ContextPackEvidenceSource {
     Shard,
     /// Evidence supplied directly by a typed caller.
     DirectEvidence,
+}
+
+/// Hash-only deterministic identifier for a persisted context pack artifact.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ContextPackArtifactId(String);
+
+impl ContextPackArtifactId {
+    /// Builds a context pack artifact identifier from a 64-character hex hash.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - Candidate lowercase SHA-256 hex string.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value is not a hash-only artifact identifier.
+    pub fn new(value: String) -> Result<Self> {
+        if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("context pack artifact id must be a 64-character hex hash");
+        }
+        Ok(Self(value.to_ascii_lowercase()))
+    }
+
+    /// Returns the validated hash-only artifact identifier.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ContextPackArtifactId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
 }
 
 /// Deterministic context package consumed by model-context assembly layers.

@@ -255,7 +255,10 @@ impl<
                 root.display()
             );
         }
-        let results = retrieve(&manifest, &retrieval_query);
+        let results = retrieve(&manifest, &retrieval_query)
+            .into_iter()
+            .filter(|result| matches_path_filters(&result.path, &params))
+            .collect::<Vec<_>>();
         let pack = ContextPack::from_selection(
             &manifest,
             ContextPackSelection {
@@ -267,13 +270,9 @@ impl<
             },
         )?;
         let mut nodes = Vec::new();
-        for evidence in pack.evidence {
-            if !matches_path_filters(&evidence.path, &params) {
-                continue;
-            }
-            let Some((start_line, end_line)) = evidence_line_range(&manifest, &evidence.id) else {
-                continue;
-            };
+        for evidence in &pack.evidence {
+            let (start_line, end_line) = evidence_line_range(&manifest, &evidence.id)
+                .with_context(|| format!("resolve evidence line range {}", evidence.id))?;
             let absolute_path = root.join(&evidence.path);
             let (content, _) = self
                 .infra
@@ -281,9 +280,9 @@ impl<
                 .await
                 .with_context(|| format!("read {}", absolute_path.display()))?;
             nodes.push(Node {
-                node_id: NodeId::new(evidence.id),
+                node_id: NodeId::new(evidence.id.clone()),
                 node: NodeData::FileChunk(FileChunk {
-                    file_path: evidence.path,
+                    file_path: evidence.path.clone(),
                     content,
                     start_line,
                     end_line,
@@ -291,6 +290,9 @@ impl<
                 relevance: Some(evidence.score),
                 distance: None,
             });
+        }
+        if !nodes.is_empty() {
+            indexer.write_context_pack(&pack)?;
         }
         nodes.sort_by(|left, right| {
             right
@@ -582,6 +584,7 @@ mod tests {
         workspaces: Vec<WorkspaceInfo>,
         remote_search_called: Arc<AtomicBool>,
         range_read_called: Arc<AtomicBool>,
+        range_read_fails: bool,
     }
 
     struct NoopDiscovery;
@@ -759,6 +762,9 @@ mod tests {
             end_line: u64,
         ) -> Result<(String, forge_domain::FileInfo)> {
             self.range_read_called.store(true, Ordering::SeqCst);
+            if self.range_read_fails {
+                bail!("configured range read failure");
+            }
             let content = fs::read_to_string(path)?;
             let selected = content
                 .lines()
@@ -889,6 +895,7 @@ mod tests {
                 workspaces: Vec::new(),
                 remote_search_called: Arc::clone(&remote_search_called),
                 range_read_called: Arc::clone(&range_read_called),
+                range_read_fails: false,
             }),
             Arc::new(NoopDiscovery),
         );
@@ -917,6 +924,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_workspace_persists_deterministic_context_pack_after_node_readback() -> Result<()>
+    {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::new(AtomicBool::new(false)),
+                range_read_fails: false,
+            }),
+            Arc::new(NoopDiscovery),
+        );
+        let params = || {
+            SearchParams::new("build runtime needle", "runtime integration proof")
+                .limit(5usize)
+                .ends_with(vec![".rs".to_string()])
+        };
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+
+        let first_nodes = WorkspaceService::query_workspace(&setup, root.clone(), params()).await?;
+        let ids = indexer.list_context_pack_artifacts()?;
+        let id = ids
+            .first()
+            .expect("successful query should write context-pack artifact")
+            .clone();
+        let artifact_path = local_project_model_dir(&root)
+            .join("context_packs")
+            .join(format!("{}.json", id.as_str()));
+        let first_bytes = fs::read(&artifact_path)?;
+        let pack = indexer.read_context_pack(&id)?;
+        let second_nodes =
+            WorkspaceService::query_workspace(&setup, root.clone(), params()).await?;
+        let second_bytes = fs::read(&artifact_path)?;
+        let actual = (
+            first_nodes.is_empty(),
+            second_nodes.is_empty(),
+            indexer.list_context_pack_artifacts()?.len(),
+            first_bytes.clone(),
+            second_bytes,
+            pack.evidence.is_empty(),
+            pack.provenance
+                .iter()
+                .all(|provenance| provenance.is_complete()),
+        );
+        let expected = (
+            false,
+            false,
+            1usize,
+            first_bytes.clone(),
+            first_bytes,
+            false,
+            true,
+        );
+
+        assert_eq!(actual, expected);
+        let artifact = fs::read_to_string(artifact_path)?;
+        assert!(!artifact.contains("pub struct"));
+        assert!(!artifact.contains("pub fn build_runtime_needle"));
+        assert!(!artifact.contains("runtime integration proof"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_workspace_writes_no_context_pack_for_empty_evidence() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::new(AtomicBool::new(false)),
+                range_read_fails: false,
+            }),
+            Arc::new(NoopDiscovery),
+        );
+        let params = SearchParams::new("absent-token-for-no-evidence", "unused").limit(5usize);
+
+        let actual = WorkspaceService::query_workspace(&setup, root.clone(), params).await?;
+        let expected = Vec::<Node>::new();
+        assert_eq!(actual, expected);
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+        assert!(indexer.list_context_pack_artifacts()?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_workspace_writes_no_context_pack_when_node_readback_fails() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::new(AtomicBool::new(false)),
+                range_read_fails: true,
+            }),
+            Arc::new(NoopDiscovery),
+        );
+        let params = SearchParams::new("build runtime needle", "runtime integration proof")
+            .limit(5usize)
+            .ends_with(vec![".rs".to_string()]);
+
+        let actual = WorkspaceService::query_workspace(&setup, root.clone(), params).await;
+        assert!(actual.is_err());
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+        assert!(indexer.list_context_pack_artifacts()?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn query_workspace_rejects_stale_project_model_manifest() -> Result<()> {
         let (_fixture, root) = fixture_workspace()?;
         write_fixture_project_model(&root)?;
@@ -932,11 +1056,12 @@ mod tests {
                 workspaces: Vec::new(),
                 remote_search_called: Arc::new(AtomicBool::new(false)),
                 range_read_called: Arc::clone(&range_read_called),
+                range_read_fails: false,
             }),
             Arc::new(NoopDiscovery),
         );
         let params = SearchParams::new("build runtime needle", "runtime integration proof");
-        let actual = WorkspaceService::query_workspace(&setup, root, params).await;
+        let actual = WorkspaceService::query_workspace(&setup, root.clone(), params).await;
         let actual_error = match actual {
             Ok(nodes) => {
                 anyhow::bail!("expected stale manifest error, got {} nodes", nodes.len())
@@ -947,6 +1072,8 @@ mod tests {
 
         assert!(actual_error.contains(expected));
         assert!(!range_read_called.load(Ordering::SeqCst));
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+        assert!(indexer.list_context_pack_artifacts()?.is_empty());
         Ok(())
     }
 
@@ -962,6 +1089,7 @@ mod tests {
                 workspaces: Vec::new(),
                 remote_search_called: Arc::new(AtomicBool::new(false)),
                 range_read_called: Arc::new(AtomicBool::new(false)),
+                range_read_fails: false,
             }),
             Arc::new(NoopDiscovery),
         );
@@ -997,6 +1125,7 @@ mod tests {
                 workspaces: Vec::new(),
                 remote_search_called: Arc::new(AtomicBool::new(false)),
                 range_read_called: Arc::new(AtomicBool::new(false)),
+                range_read_fails: false,
             }),
             Arc::new(NoopDiscovery),
         );
@@ -1024,6 +1153,7 @@ mod tests {
                 workspaces: Vec::new(),
                 remote_search_called,
                 range_read_called,
+                range_read_fails: false,
             }),
             Arc::new(NoopDiscovery),
         );
@@ -1071,6 +1201,7 @@ mod tests {
                 workspaces: vec![remote_workspace(&root)],
                 remote_search_called: Arc::new(AtomicBool::new(false)),
                 range_read_called: Arc::new(AtomicBool::new(false)),
+                range_read_fails: false,
             }),
             Arc::new(NoopDiscovery),
         );
@@ -1091,6 +1222,7 @@ mod tests {
                 workspaces: Vec::new(),
                 remote_search_called: Arc::new(AtomicBool::new(false)),
                 range_read_called: Arc::new(AtomicBool::new(false)),
+                range_read_fails: false,
             }),
             Arc::new(NoopDiscovery),
         );
@@ -1119,6 +1251,7 @@ mod tests {
                 workspaces: vec![remote_workspace(&root)],
                 remote_search_called: Arc::new(AtomicBool::new(false)),
                 range_read_called: Arc::new(AtomicBool::new(false)),
+                range_read_fails: false,
             }),
             Arc::new(NoopDiscovery),
         );
