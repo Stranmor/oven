@@ -1,5 +1,6 @@
 //! Typed ingestion boundary for validated external exact facts.
 
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
 use anyhow::{Result, bail};
@@ -393,6 +394,7 @@ fn upsert_batch_metadata(
 
 fn deduplicate_edges(edges: &mut Vec<GraphEdge>) -> usize {
     let before = edges.len();
+    edges.sort_by(canonical_edge_order);
     let mut seen = BTreeSet::new();
     edges.retain(|edge| {
         seen.insert((
@@ -405,6 +407,24 @@ fn deduplicate_edges(edges: &mut Vec<GraphEdge>) -> usize {
         ))
     });
     before.saturating_sub(edges.len())
+}
+
+fn canonical_edge_order(left: &GraphEdge, right: &GraphEdge) -> Ordering {
+    left.from
+        .cmp(&right.from)
+        .then_with(|| left.to.cmp(&right.to))
+        .then_with(|| left.kind.cmp(&right.kind))
+        .then_with(|| left.confidence_kind.cmp(&right.confidence_kind))
+        .then_with(|| left.confidence.total_cmp(&right.confidence))
+        .then_with(|| left.provenance.source.cmp(&right.provenance.source))
+        .then_with(|| {
+            left.provenance
+                .fingerprint
+                .cmp(&right.provenance.fingerprint)
+        })
+        .then_with(|| left.provenance.path.cmp(&right.provenance.path))
+        .then_with(|| left.provenance.start_line.cmp(&right.provenance.start_line))
+        .then_with(|| left.provenance.end_line.cmp(&right.provenance.end_line))
 }
 
 fn batch_source_from_facts(facts: &TypedExternalFacts) -> ExternalFactSource {
@@ -580,6 +600,86 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_external_edges_deduplicate_independently_of_input_order() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let mut left = setup.index()?;
+        let mut right = setup.index()?;
+        let left_batch = duplicate_line_batch(&left, false);
+        let right_batch = duplicate_line_batch(&right, true);
+        assert_eq!(
+            left_batch.metadata.batch_fingerprint,
+            right_batch.metadata.batch_fingerprint
+        );
+
+        ingest_external_fact_batch(&mut left, left_batch)?;
+        ingest_external_fact_batch(&mut right, right_batch)?;
+
+        let actual = left
+            .edges
+            .iter()
+            .filter(|edge| edge.from == "lsp:src/lib.rs:Root::new")
+            .collect::<Vec<_>>();
+        let expected = right
+            .edges
+            .iter()
+            .filter(|edge| edge.from == "lsp:src/lib.rs:Root::new")
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    fn duplicate_line_batch(manifest: &ProjectManifest, reversed: bool) -> ExternalFactBatch {
+        let mut references = vec![
+            TypedExternalReferenceFact {
+                from: "lsp:src/lib.rs:Root::new".to_string(),
+                to: "symbol:src/lib.rs:Struct:Root".to_string(),
+                kind: GraphEdgeKind::References,
+                path: "src/lib.rs".to_string(),
+                start_line: Some(10),
+                end_line: Some(10),
+                source: ExternalFactSource::Lsp,
+            },
+            TypedExternalReferenceFact {
+                from: "lsp:src/lib.rs:Root::new".to_string(),
+                to: "symbol:src/lib.rs:Struct:Root".to_string(),
+                kind: GraphEdgeKind::References,
+                path: "src/lib.rs".to_string(),
+                start_line: Some(11),
+                end_line: Some(11),
+                source: ExternalFactSource::Lsp,
+            },
+        ];
+        if reversed {
+            references.reverse();
+        }
+        let facts = TypedExternalFacts {
+            symbols: vec![TypedExternalSymbolFact {
+                id: "lsp:src/lib.rs:Root::new".to_string(),
+                name: "new".to_string(),
+                kind: SymbolKind::Method,
+                path: "src/lib.rs".to_string(),
+                start_line: 10,
+                end_line: 12,
+                source: ExternalFactSource::Lsp,
+            }],
+            references,
+        };
+        ExternalFactBatch::new(
+            ExternalFactBatchMetadata {
+                source: ExternalFactSource::Lsp,
+                source_label: "rust-analyzer".to_string(),
+                tool_version: Some("fixture-1".to_string()),
+                workspace_root: manifest.root.to_string_lossy().to_string(),
+                source_artifact_fingerprint: fingerprint("duplicate-lines"),
+                manifest_hash_input: manifest.manifest_hash.clone(),
+                batch_fingerprint: String::new(),
+            },
+            facts,
+        )
+    }
+
+    #[test]
     fn different_accepted_external_facts_produce_different_manifest_identities() -> Result<()> {
         let (fixture, root) = fixture_project()?;
         let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
@@ -636,7 +736,12 @@ mod tests {
         let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
         let mut manifest = setup.index()?;
         let mut batch = fixture_batch(&manifest, &fingerprint("snapshot-a"));
-        batch.facts.references[0].to = "missing:symbol".to_string();
+        batch
+            .facts
+            .references
+            .first_mut()
+            .expect("fixture batch should include references")
+            .to = "missing:symbol".to_string();
         batch.metadata.batch_fingerprint =
             external_fact_batch_fingerprint(&batch.metadata, &batch.facts);
         let before_edges = manifest.edges.len();

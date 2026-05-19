@@ -614,11 +614,9 @@ mod tests {
             })
             .expect("graph should include artifact evidence node");
         assert_eq!(actual_freshness, EvidenceFreshness::Fresh);
-        assert_eq!(graph.edges[0].kind, GraphEdgeKind::ToolEpisodeRelates);
-        assert_eq!(
-            graph.edges[0].confidence_kind,
-            EdgeConfidence::HeuristicHigh
-        );
+        let actual_edge = graph.edges.first().expect("graph should include one edge");
+        assert_eq!(actual_edge.kind, GraphEdgeKind::ToolEpisodeRelates);
+        assert_eq!(actual_edge.confidence_kind, EdgeConfidence::HeuristicHigh);
         assert_eq!(
             graph
                 .edges
@@ -668,8 +666,12 @@ mod tests {
         let indexer = ProjectIndexer::new(&root, fixture.path().join("model"));
         let manifest = indexer.index()?;
         let (_id, mut pack) = write_fixture_context_pack(&indexer, &manifest)?;
-        pack.evidence[0].freshness = EvidenceFreshness::Changed;
-        pack.evidence[0].provenance.fingerprint.clear();
+        let evidence = pack
+            .evidence
+            .first_mut()
+            .expect("fixture context pack should include evidence");
+        evidence.freshness = EvidenceFreshness::Changed;
+        evidence.provenance.fingerprint.clear();
         pack.provenance.clear();
         let stale_id = indexer.context_pack_artifact_id(&pack)?;
         fs::write(
@@ -778,7 +780,10 @@ mod tests {
         let indexer = ProjectIndexer::new(&root, fixture.path().join("model"));
         let manifest = indexer.index()?;
         let (_id, mut pack) = write_fixture_context_pack(&indexer, &manifest)?;
-        pack.evidence[0].freshness = EvidenceFreshness::Changed;
+        pack.evidence
+            .first_mut()
+            .expect("fixture context pack should include evidence")
+            .freshness = EvidenceFreshness::Changed;
         let stale_id = indexer.context_pack_artifact_id(&pack)?;
         fs::write(
             artifact_path(fixture.path(), &stale_id),
@@ -808,16 +813,24 @@ mod tests {
         let indexer = ProjectIndexer::new(&root, fixture.path().join("model"));
         let manifest = indexer.index()?;
         let (_id, mut pack) = write_fixture_context_pack(&indexer, &manifest)?;
-        let mut added = pack.evidence[0].clone();
+        let fixture_evidence = pack
+            .evidence
+            .first()
+            .expect("fixture context pack should include evidence")
+            .clone();
+        let mut added = fixture_evidence.clone();
         added.id = "added".to_string();
         added.freshness = EvidenceFreshness::Added;
-        let mut changed = pack.evidence[0].clone();
+        let mut changed = fixture_evidence.clone();
         changed.id = "changed".to_string();
         changed.freshness = EvidenceFreshness::Changed;
-        let mut deleted = pack.evidence[0].clone();
+        let mut deleted = fixture_evidence;
         deleted.id = "deleted".to_string();
         deleted.freshness = EvidenceFreshness::Deleted;
-        pack.evidence[0].freshness = EvidenceFreshness::Fresh;
+        pack.evidence
+            .first_mut()
+            .expect("fixture context pack should include evidence")
+            .freshness = EvidenceFreshness::Fresh;
         pack.evidence.extend([added, changed, deleted]);
 
         let actual = context_pack_worst_case_freshness(&pack);
