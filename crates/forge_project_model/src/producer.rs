@@ -1162,6 +1162,9 @@ fn parse_expected_content_length_message(
         }
         let message: Value = serde_json::from_slice(&bytes[body_start..body_end])
             .map_err(|_| anyhow::anyhow!("native lsp json-rpc message is malformed"))?;
+        if message.get("error").is_some() {
+            bail!("native lsp response returned error");
+        }
         if message.get("method").is_some() && message.get("id").is_none() {
             offset = body_end;
             continue;
@@ -1172,6 +1175,9 @@ fn parse_expected_content_length_message(
         };
         if actual_id == expected_id {
             return Ok(message);
+        }
+        if actual_id > expected_id {
+            bail!("native lsp response id advanced beyond expected references response");
         }
         offset = body_end;
     }
@@ -2598,6 +2604,36 @@ mod tests {
         let manifest = setup.index()?;
         let sensor = FakeNativeLspSensor {
             references: process_output(native_location_response(&root, 7, "src/lib.rs")),
+        };
+        let producer = NativeLspReferenceProducer::new(sensor, available_probe());
+
+        let actual = producer.produce(
+            setup.model_dir(),
+            &manifest,
+            &native_producer_request(Default::default()),
+        )?;
+
+        assert_eq!(actual.status, ExternalFactProductionStatus::Failed);
+        assert_eq!(actual.artifact_path, None);
+        assert_eq!(setup.model_dir().join("external_facts").exists(), false);
+        Ok(())
+    }
+
+    #[test]
+    fn native_lsp_initialize_error_cannot_be_ignored_before_reference_success() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model-native-init-error"));
+        let manifest = setup.index()?;
+        let initialize_error =
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"initialization failed"}}"#;
+        let references_success =
+            std::str::from_utf8(&native_location_response(&root, 7, "src/model.rs"))?
+                .split_once("\r\n\r\n")
+                .expect("framed response should include a body")
+                .1
+                .to_string();
+        let sensor = FakeNativeLspSensor {
+            references: process_output(native_responses(&[initialize_error, &references_success])),
         };
         let producer = NativeLspReferenceProducer::new(sensor, available_probe());
 
