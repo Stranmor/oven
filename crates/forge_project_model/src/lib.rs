@@ -13,6 +13,7 @@ mod policy;
 mod producer;
 mod render;
 mod retrieval;
+mod status;
 mod types;
 mod util;
 mod vector;
@@ -72,6 +73,10 @@ pub use render::{
     render_project_model_context,
 };
 pub use retrieval::{plan_retrieval, retrieve, retrieve_with_boundaries};
+pub use status::{
+    ExactFactArtifactStoreMetadata, ExactFactArtifactStoreState, ExactFactStatus,
+    ExactFactStatusReport, read_exact_fact_artifact_store_metadata, read_exact_fact_status,
+};
 pub use types::{
     CargoDependencyDeclaration, CargoDependencyKind, CargoFeatureMetadata, CargoPackageDependency,
     CargoPackageMetadata, CargoTargetDeclaration, CargoTargetKind, CargoTargetMetadata,

@@ -258,6 +258,12 @@ pub trait API: Sync + Send {
         path: PathBuf,
     ) -> Result<forge_domain::WorkspaceExactFactReferenceReport>;
 
+    /// Reads persisted exact-fact status without producer or writer side effects.
+    async fn workspace_exact_fact_status(
+        &self,
+        path: PathBuf,
+    ) -> Result<forge_domain::WorkspaceExactFactStatusReport>;
+
     /// Query the indexed workspace
     async fn query_workspace(
         &self,

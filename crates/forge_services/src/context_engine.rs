@@ -10,7 +10,8 @@ use forge_domain::{
     SearchParams, SyncProgress, UserId, WorkspaceContextFreshness,
     WorkspaceContextManifestDiagnostic, WorkspaceExactFactBoundedLoss,
     WorkspaceExactFactIngestionSummary, WorkspaceExactFactIssue, WorkspaceExactFactReferenceReport,
-    WorkspaceExactFactReferenceStatus, WorkspaceId, WorkspaceIndexRepository,
+    WorkspaceExactFactReferenceStatus, WorkspaceExactFactStatusReport, WorkspaceId,
+    WorkspaceIndexRepository,
 };
 use forge_project_model::{
     ContextPack, ContextPackArtifactId, ContextPackSelection, ExternalFactArtifactIngestionReport,
@@ -20,7 +21,7 @@ use forge_project_model::{
     RustAnalyzerBounds, RustAnalyzerCapability, RustAnalyzerCapabilityProbe,
     RustAnalyzerCapabilityStatus, RustAnalyzerProbe, StaleEvidencePolicy, StdRustAnalyzerProcess,
     ToolEpisode, derive_native_lsp_reference_request, evidence_line_range, fingerprint,
-    local_project_model_dir, local_project_model_manifest, retrieve,
+    local_project_model_dir, local_project_model_manifest, read_exact_fact_status, retrieve,
 };
 use forge_stream::MpscStream;
 use futures::future::join_all;
@@ -522,6 +523,53 @@ fn unavailable_report(
     }
 }
 
+fn workspace_exact_fact_status_report(
+    report: forge_project_model::ExactFactStatusReport,
+) -> WorkspaceExactFactStatusReport {
+    let issue_count = report.issue_summaries.len();
+    WorkspaceExactFactStatusReport {
+        status: report.status.label().to_string(),
+        manifest_path: report.manifest_path,
+        manifest_hash: report.manifest_hash,
+        manifest_freshness_proof_level: report
+            .manifest_freshness_proof_level
+            .map(|level| format!("{:?}", level).to_ascii_snake_case()),
+        ingestion_report_path: report.ingestion_report_path,
+        artifact_store_state: report.artifact_store_state.label().to_string(),
+        inspected_artifact_count: report.inspected_artifact_count,
+        accepted_artifact_count: report.accepted_artifact_count,
+        accepted_batch_fingerprints: report.accepted_batch_fingerprints,
+        manifest_external_fact_batch_count: report.manifest_external_fact_batch_count,
+        manifest_external_facts_fingerprint: report.manifest_external_facts_fingerprint,
+        reference_edge_count: report.reference_edge_count,
+        exact_compiler_reference_edge_count: report.exact_compiler_reference_edge_count,
+        issue_count,
+        issue_summaries: report.issue_summaries,
+        exact_facts_active: report.exact_facts_active,
+    }
+}
+
+trait SnakeCaseExt {
+    fn to_ascii_snake_case(self) -> String;
+}
+
+impl SnakeCaseExt for String {
+    fn to_ascii_snake_case(self) -> String {
+        let mut output = String::new();
+        for (index, character) in self.chars().enumerate() {
+            if character.is_ascii_uppercase() {
+                if index > 0 {
+                    output.push('_');
+                }
+                output.push(character.to_ascii_lowercase());
+            } else {
+                output.push(character);
+            }
+        }
+        output
+    }
+}
+
 fn workspace_exact_fact_reference_report(
     production: ExternalFactProductionReport,
     ingestion: ExternalFactArtifactIngestionReport,
@@ -676,6 +724,15 @@ impl<
     ) -> Result<WorkspaceExactFactReferenceReport> {
         let driver = StdNativeLspReferenceProductionDriver::default();
         self.produce_workspace_exact_fact_reference_with_driver(path, &driver)
+    }
+
+    async fn workspace_exact_fact_status(
+        &self,
+        path: PathBuf,
+    ) -> Result<WorkspaceExactFactStatusReport> {
+        let root = canonicalize_path(path)?;
+        let report = read_exact_fact_status(&root)?;
+        Ok(workspace_exact_fact_status_report(report))
     }
 
     /// Performs semantic code search on a workspace.

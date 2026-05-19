@@ -12,7 +12,7 @@ use forge_domain::{
     Scope, SearchParams, SteerMessage, SubagentTaskId, SubagentTaskSession,
     SubagentTaskSessionFilter, SyncProgress, SyntaxError, Template, ToolCallFull, ToolOutput,
     WorkspaceAuth, WorkspaceContextManifestDiagnostic, WorkspaceExactFactReferenceReport,
-    WorkspaceId, WorkspaceInfo,
+    WorkspaceExactFactStatusReport, WorkspaceId, WorkspaceInfo,
 };
 use forge_eventsource::EventSource;
 use reqwest::Response;
@@ -546,6 +546,12 @@ pub trait WorkspaceService: Send + Sync {
         &self,
         path: PathBuf,
     ) -> anyhow::Result<WorkspaceExactFactReferenceReport>;
+
+    /// Reads persisted exact-fact status without producing or mutating artifacts.
+    async fn workspace_exact_fact_status(
+        &self,
+        path: PathBuf,
+    ) -> anyhow::Result<WorkspaceExactFactStatusReport>;
 
     /// Query the indexed workspace with semantic search
     async fn query_workspace(
@@ -1532,6 +1538,15 @@ impl<I: Services> WorkspaceService for I {
             .await
     }
 
+    async fn workspace_exact_fact_status(
+        &self,
+        path: PathBuf,
+    ) -> anyhow::Result<WorkspaceExactFactStatusReport> {
+        self.workspace_service()
+            .workspace_exact_fact_status(path)
+            .await
+    }
+
     async fn query_workspace(
         &self,
         path: PathBuf,
@@ -2171,6 +2186,13 @@ mod tests {
             &self,
             _path: PathBuf,
         ) -> anyhow::Result<WorkspaceExactFactReferenceReport> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn workspace_exact_fact_status(
+            &self,
+            _path: PathBuf,
+        ) -> anyhow::Result<WorkspaceExactFactStatusReport> {
             anyhow::bail!("unused workspace service")
         }
 

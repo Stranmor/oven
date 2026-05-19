@@ -775,6 +775,9 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                             self.on_workspace_exact_fact_reference(path, porcelain)
                                 .await?;
                         }
+                        crate::cli::WorkspaceExactFactCommand::Status { path, porcelain } => {
+                            self.on_workspace_exact_fact_status(path, porcelain).await?;
+                        }
                     },
                     crate::cli::WorkspaceCommand::Sync { path, init } => {
                         self.on_index(path, init).await?;
@@ -5097,6 +5100,70 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             }
         }
 
+        Ok(())
+    }
+
+    async fn on_workspace_exact_fact_status(
+        &mut self,
+        path: std::path::PathBuf,
+        porcelain: bool,
+    ) -> anyhow::Result<()> {
+        let report = self.api.workspace_exact_fact_status(path).await?;
+        if porcelain {
+            self.writeln(serde_json::to_string_pretty(&report)?)?;
+            return Ok(());
+        }
+
+        let mut info = Info::new().add_title("Workspace Exact-Fact Status");
+        info = info.add_key_value("Status", report.status);
+        info = info.add_key_value("Active", report.exact_facts_active.to_string());
+        info = info.add_key_value("Manifest Path", report.manifest_path.display().to_string());
+        info = info.add_key_value(
+            "Manifest Hash",
+            report.manifest_hash.as_deref().unwrap_or("<none>"),
+        );
+        info = info.add_key_value(
+            "Freshness Proof",
+            report
+                .manifest_freshness_proof_level
+                .as_deref()
+                .unwrap_or("<none>"),
+        );
+        info = info.add_key_value(
+            "Ingestion Report Path",
+            report.ingestion_report_path.display().to_string(),
+        );
+        info = info.add_key_value("Artifact Store", report.artifact_store_state);
+        info = info.add_key_value(
+            "Artifacts",
+            format!(
+                "inspected={} accepted={}",
+                report.inspected_artifact_count, report.accepted_artifact_count
+            ),
+        );
+        info = info.add_key_value(
+            "Manifest External Facts",
+            format!(
+                "batches={} fingerprint={}",
+                report.manifest_external_fact_batch_count,
+                report
+                    .manifest_external_facts_fingerprint
+                    .as_deref()
+                    .unwrap_or("<none>")
+            ),
+        );
+        info = info.add_key_value(
+            "Graph References",
+            format!(
+                "references={} exact_compiler={}",
+                report.reference_edge_count, report.exact_compiler_reference_edge_count
+            ),
+        );
+        info = info.add_key_value("Issues", report.issue_count.to_string());
+        for issue in report.issue_summaries.iter().take(5) {
+            info = info.add_key_value("Issue", issue);
+        }
+        self.writeln(info)?;
         Ok(())
     }
 

@@ -1533,6 +1533,13 @@ mod tests {
             anyhow::bail!("unused workspace exact-fact reference")
         }
 
+        async fn workspace_exact_fact_status(
+            &self,
+            _path: PathBuf,
+        ) -> Result<WorkspaceExactFactStatusReport> {
+            anyhow::bail!("unused workspace exact-fact status")
+        }
+
         async fn query_workspace(
             &self,
             _path: PathBuf,
@@ -2090,6 +2097,13 @@ mod tests {
             _path: PathBuf,
         ) -> Result<WorkspaceExactFactReferenceReport> {
             anyhow::bail!("unused workspace exact-fact reference")
+        }
+
+        async fn workspace_exact_fact_status(
+            &self,
+            _path: PathBuf,
+        ) -> Result<WorkspaceExactFactStatusReport> {
+            anyhow::bail!("unused workspace exact-fact status")
         }
 
         async fn query_workspace(

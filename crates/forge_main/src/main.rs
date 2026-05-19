@@ -202,8 +202,39 @@ mod tests {
             Some(TopLevelCommand::Workspace(group)) => match group.command {
                 WorkspaceCommand::ExactFact(group) => match group.command {
                     WorkspaceExactFactCommand::Reference { path, porcelain } => {
+                        Some(("reference", path, porcelain))
+                    }
+                    WorkspaceExactFactCommand::Status { path, porcelain } => {
+                        Some(("status", path, porcelain))
+                    }
+                },
+                _ => None,
+            },
+            _ => None,
+        };
+        let expected = Some(("reference", PathBuf::from("."), true));
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_workspace_exact_fact_status_command_parses_porcelain() {
+        let cli = Cli::parse_from([
+            "forge",
+            "workspace",
+            "exact-fact",
+            "status",
+            "--path",
+            ".",
+            "--porcelain",
+        ]);
+        let actual = match cli.subcommands {
+            Some(TopLevelCommand::Workspace(group)) => match group.command {
+                WorkspaceCommand::ExactFact(group) => match group.command {
+                    WorkspaceExactFactCommand::Status { path, porcelain } => {
                         Some((path, porcelain))
                     }
+                    _ => None,
                 },
                 _ => None,
             },

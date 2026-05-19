@@ -126,6 +126,43 @@ pub struct WorkspaceContextExplanation {
     pub skip_reason: Option<String>,
 }
 
+/// Redaction-safe transport report for read-only exact-fact workspace status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceExactFactStatusReport {
+    /// Stable status label.
+    pub status: String,
+    /// Canonical manifest path.
+    pub manifest_path: PathBuf,
+    /// Persisted manifest hash when the manifest is readable.
+    pub manifest_hash: Option<String>,
+    /// Manifest freshness or proof-level label.
+    pub manifest_freshness_proof_level: Option<String>,
+    /// Canonical persisted ingestion-report path.
+    pub ingestion_report_path: PathBuf,
+    /// Read-only artifact-store metadata state label.
+    pub artifact_store_state: String,
+    /// Count of artifact candidates inspected by the persisted ingestion report.
+    pub inspected_artifact_count: usize,
+    /// Count of accepted artifacts in the persisted ingestion report.
+    pub accepted_artifact_count: usize,
+    /// Accepted batch fingerprints in deterministic persisted report order.
+    pub accepted_batch_fingerprints: Vec<String>,
+    /// Accepted external fact batch count persisted in the manifest.
+    pub manifest_external_fact_batch_count: usize,
+    /// Manifest external facts fingerprint when the manifest is readable.
+    pub manifest_external_facts_fingerprint: Option<String>,
+    /// Graph-visible reference edge count.
+    pub reference_edge_count: usize,
+    /// Graph-visible exact compiler reference edge count.
+    pub exact_compiler_reference_edge_count: usize,
+    /// Redaction-safe issue count.
+    pub issue_count: usize,
+    /// Redaction-safe status and ingestion issue summaries.
+    pub issue_summaries: Vec<String>,
+    /// Whether exact facts are active.
+    pub exact_facts_active: bool,
+}
+
 /// Stable status for explicit workspace exact-fact reference production.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkspaceExactFactReferenceStatus {

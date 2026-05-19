@@ -419,6 +419,13 @@ impl<
             .await
     }
 
+    async fn workspace_exact_fact_status(
+        &self,
+        path: PathBuf,
+    ) -> Result<forge_domain::WorkspaceExactFactStatusReport> {
+        self.services.workspace_exact_fact_status(path).await
+    }
+
     async fn query_workspace(
         &self,
         path: PathBuf,

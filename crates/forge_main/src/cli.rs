@@ -465,6 +465,17 @@ pub enum WorkspaceExactFactCommand {
         #[arg(long)]
         porcelain: bool,
     },
+
+    /// Show read-only persisted exact-fact status for a workspace.
+    Status {
+        /// Path to the workspace root.
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        /// Output in machine-readable JSON format.
+        #[arg(long)]
+        porcelain: bool,
+    },
 }
 
 /// Command group for listing resources.
