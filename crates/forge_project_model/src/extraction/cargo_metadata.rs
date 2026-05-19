@@ -357,7 +357,7 @@ fn package_binary_name(manifest: &ParsedManifest) -> String {
         .and_then(|table| table.get("name"))
         .and_then(Item::as_str)
         .unwrap_or("bin")
-        .replace('-', "_")
+        .to_string()
 }
 
 fn extract_features(manifest: &ParsedManifest) -> Vec<CargoFeatureMetadata> {

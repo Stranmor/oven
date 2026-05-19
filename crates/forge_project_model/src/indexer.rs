@@ -910,6 +910,36 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn cargo_inferred_bin_target_preserves_hyphenated_package_name() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = temp.path().join("project");
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"hyphen-pkg\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(root.join("src").join("main.rs"), "fn main() {}\n")?;
+        let setup = ProjectIndexer::new(&root, temp.path().join("model"));
+
+        let manifest = setup.index()?;
+        let actual = manifest
+            .cargo_packages
+            .iter()
+            .find(|package| package.name == "hyphen-pkg")
+            .and_then(|package| {
+                package
+                    .targets
+                    .iter()
+                    .find(|target| target.kind == CargoTargetKind::Bin)
+            })
+            .map(|target| target.name.clone());
+        let expected = Some("hyphen-pkg".to_string());
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
     fn cargo_workspace_indexes_members_and_member_packages_deterministically() -> Result<()> {
         let (left_fixture, left_root) = cargo_workspace_fixture(false)?;
         let (right_fixture, right_root) = cargo_workspace_fixture(true)?;
