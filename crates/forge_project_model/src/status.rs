@@ -1,7 +1,7 @@
 //! Read-only exact-fact status auditing for persisted project-model state.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::policy::{
     local_project_model_dir, local_project_model_external_fact_report, local_project_model_manifest,
@@ -253,6 +253,19 @@ pub fn read_exact_fact_status(workspace_root: &Path) -> anyhow::Result<ExactFact
         ));
     }
 
+    if !workspace_manifest_sources_fresh(workspace_root, &manifest)? {
+        issues.push("manifest_source_file_changed_or_missing".to_string());
+        return Ok(report_from_parts(
+            ExactFactStatus::StaleManifest,
+            manifest_path,
+            ingestion_report_path,
+            artifact_store,
+            &manifest,
+            Some(&report),
+            issues,
+        ));
+    }
+
     if !accepted_batch_metadata_consistent(&manifest, &report) {
         issues.push("accepted_batch_metadata_mismatch".to_string());
         return Ok(report_from_parts(
@@ -317,6 +330,54 @@ fn persisted_manifest_freshness(manifest: &ProjectManifest) -> Result<(), ()> {
         return Err(());
     }
     Ok(())
+}
+
+fn workspace_manifest_sources_fresh(
+    workspace_root: &Path,
+    manifest: &ProjectManifest,
+) -> anyhow::Result<bool> {
+    let root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    for file in &manifest.files {
+        if !manifest_relative_path_is_safe(&file.path) {
+            return Ok(false);
+        }
+        let path = workspace_root.join(&file.path);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Ok(false);
+        }
+        let canonical_path = match path.canonicalize() {
+            Ok(canonical_path) => canonical_path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if !canonical_path.starts_with(&root) {
+            return Ok(false);
+        }
+        let bytes = fs::read(&canonical_path)?;
+        let content = match String::from_utf8(bytes) {
+            Ok(content) => content,
+            Err(_) => return Ok(false),
+        };
+        if hash_text(&content) != file.content_hash {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn manifest_relative_path_is_safe(path: &str) -> bool {
+    !path.is_empty()
+        && !Path::new(path).is_absolute()
+        && Path::new(path)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
 }
 
 fn accepted_batch_metadata_consistent(
@@ -505,6 +566,12 @@ mod tests {
             fs::write(store.join(name), b"{}")?;
             Ok(())
         }
+
+        fn write_source_file(&self) -> Result<()> {
+            fs::create_dir_all(self.root.join("src"))?;
+            fs::write(self.root.join("src/lib.rs"), b"source")?;
+            Ok(())
+        }
     }
 
     fn base_manifest(root: &Path) -> ProjectManifest {
@@ -627,6 +694,7 @@ mod tests {
     #[test]
     fn manifest_present_without_external_facts_returns_typed_inactive_noop() -> Result<()> {
         let setup = Fixture::new()?;
+        setup.write_source_file()?;
         let manifest = base_manifest(&setup.root);
         setup.write_manifest(&manifest)?;
         setup.write_report(&ExternalFactArtifactIngestionReport::default())?;
@@ -642,6 +710,7 @@ mod tests {
     #[test]
     fn accepted_fixture_external_facts_produce_active_status() -> Result<()> {
         let setup = Fixture::new()?;
+        setup.write_source_file()?;
         let (manifest, report) = active_manifest(&setup.root)?;
         setup.write_manifest(&manifest)?;
         setup.write_report(&report)?;
@@ -658,6 +727,7 @@ mod tests {
     #[test]
     fn accepted_batch_with_zero_graph_visible_reference_edges_is_inactive() -> Result<()> {
         let setup = Fixture::new()?;
+        setup.write_source_file()?;
         let (mut manifest, report) = active_manifest(&setup.root)?;
         manifest.edges.clear();
         manifest.manifest_hash = manifest_hash(
@@ -689,6 +759,42 @@ mod tests {
 
         assert_eq!(actual.status, ExactFactStatus::StaleManifest);
         assert_eq!(actual.exact_facts_active, false);
+        Ok(())
+    }
+
+    #[test]
+    fn changed_workspace_file_blocks_active_status() -> Result<()> {
+        let setup = Fixture::new()?;
+        fs::create_dir_all(setup.root.join("src"))?;
+        fs::write(setup.root.join("src/lib.rs"), b"mutated source")?;
+        let (manifest, report) = active_manifest(&setup.root)?;
+        setup.write_manifest(&manifest)?;
+        setup.write_report(&report)?;
+        setup.create_store_file("fixture.json")?;
+
+        let actual = read_exact_fact_status(&setup.root)?;
+
+        assert_eq!(actual.status, ExactFactStatus::StaleManifest);
+        assert_eq!(actual.exact_facts_active, false);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_workspace_file_blocks_active_status() -> Result<()> {
+        let setup = Fixture::new()?;
+        let (manifest, report) = active_manifest(&setup.root)?;
+        setup.write_manifest(&manifest)?;
+        setup.write_report(&report)?;
+        setup.create_store_file("fixture.json")?;
+
+        let actual = read_exact_fact_status(&setup.root)?;
+
+        assert_eq!(actual.status, ExactFactStatus::StaleManifest);
+        assert_eq!(actual.exact_facts_active, false);
+        assert_eq!(
+            actual.issue_summaries,
+            vec!["manifest_source_file_changed_or_missing"]
+        );
         Ok(())
     }
 
@@ -726,6 +832,7 @@ mod tests {
     #[test]
     fn status_reads_do_not_mutate_manifest_report_or_artifacts() -> Result<()> {
         let setup = Fixture::new()?;
+        setup.write_source_file()?;
         let (manifest, report) = active_manifest(&setup.root)?;
         setup.write_manifest(&manifest)?;
         setup.write_report(&report)?;
@@ -766,6 +873,7 @@ mod tests {
     #[test]
     fn accepted_report_without_per_artifact_batch_metadata_is_corrupt() -> Result<()> {
         let setup = Fixture::new()?;
+        setup.write_source_file()?;
         let (manifest, mut report) = active_manifest(&setup.root)?;
         report.artifacts[0].accepted_batch = None;
         setup.write_manifest(&manifest)?;
