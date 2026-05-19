@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 
+use crate::durable_vector_index::{VectorIndexArtifact, VectorIndexArtifactId};
 use crate::extraction::{
     extract_cargo_dependency_edges, extract_rust_import_edges, extract_rust_symbols,
 };
@@ -267,6 +268,131 @@ impl ProjectIndexer {
         Ok(ids)
     }
 
+    /// Computes the deterministic artifact identifier for a vector index.
+    ///
+    /// # Arguments
+    ///
+    /// * `artifact` - Durable vector artifact to identify.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when stable JSON serialization fails.
+    pub fn vector_index_artifact_id(
+        &self,
+        artifact: &VectorIndexArtifact,
+    ) -> Result<VectorIndexArtifactId> {
+        artifact.artifact_id()
+    }
+
+    /// Atomically writes a durable vector index artifact and validates readback.
+    ///
+    /// # Arguments
+    ///
+    /// * `manifest` - Current manifest used to validate source evidence.
+    /// * `artifact` - Durable vector artifact to persist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when validation, atomic storage, directory sync, or
+    /// readback validation fails.
+    pub fn write_vector_index(
+        &self,
+        manifest: &ProjectManifest,
+        artifact: &VectorIndexArtifact,
+    ) -> Result<PathBuf> {
+        artifact.validate(manifest)?;
+        let id = self.vector_index_artifact_id(artifact)?;
+        let directory = self.vector_index_dir();
+        fs::create_dir_all(&directory).context("create vector index dir")?;
+        let path = self.vector_index_path(&id);
+        let json = artifact.to_stable_json()?;
+        let temp_path = write_temp_artifact(&directory, id.as_str(), &json)?;
+        fs::rename(&temp_path, &path)
+            .with_context(|| format!("rename {} to {}", temp_path.display(), path.display()))?;
+        sync_directory(&directory)?;
+        let actual = self.read_vector_index(manifest, &id)?;
+        if &actual != artifact {
+            anyhow::bail!("vector index artifact readback mismatch: {}", id);
+        }
+        Ok(path)
+    }
+
+    /// Reads and validates a persisted vector index artifact by deterministic identifier.
+    ///
+    /// # Arguments
+    ///
+    /// * `manifest` - Current manifest used to validate source evidence.
+    /// * `id` - Hash-only vector index artifact identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when read, decode, source validation, fingerprint, or
+    /// content-derived identifier validation fails.
+    pub fn read_vector_index(
+        &self,
+        manifest: &ProjectManifest,
+        id: &VectorIndexArtifactId,
+    ) -> Result<VectorIndexArtifact> {
+        let path = self.vector_index_path(id);
+        let json = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let artifact = serde_json::from_str::<VectorIndexArtifact>(&json)
+            .context("deserialize vector index")?;
+        artifact.validate(manifest)?;
+        let actual_id = self.vector_index_artifact_id(&artifact)?;
+        if &actual_id != id {
+            anyhow::bail!(
+                "vector index artifact id mismatch: expected {}, got {}",
+                id,
+                actual_id
+            );
+        }
+        Ok(artifact)
+    }
+
+    /// Lists deterministic vector index artifact identifiers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the artifact directory cannot be listed or an
+    /// artifact filename is not a valid hash-only identifier.
+    pub fn list_vector_indexes(&self) -> Result<Vec<VectorIndexArtifactId>> {
+        let directory = self.vector_index_dir();
+        if !directory.exists() {
+            return Ok(Vec::new());
+        }
+        let mut ids = Vec::new();
+        for entry in
+            fs::read_dir(&directory).with_context(|| format!("read {}", directory.display()))?
+        {
+            let entry = entry.context("read vector index artifact entry")?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+                anyhow::bail!(
+                    "vector index artifact filename is not UTF-8: {}",
+                    path.display()
+                );
+            };
+            let Some(id) = file_name.strip_suffix(".json") else {
+                continue;
+            };
+            ids.push(VectorIndexArtifactId::new(id.to_string())?);
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
+    fn vector_index_dir(&self) -> PathBuf {
+        self.model_dir.join("vector_indexes")
+    }
+
+    fn vector_index_path(&self, id: &VectorIndexArtifactId) -> PathBuf {
+        self.vector_index_dir()
+            .join(format!("{}.json", id.as_str()))
+    }
+
     fn context_pack_dir(&self) -> PathBuf {
         self.model_dir.join("context_packs")
     }
@@ -465,6 +591,33 @@ fn sync_directory(directory: &Path) -> Result<()> {
         .with_context(|| format!("sync {}", directory.display()))
 }
 
+fn write_temp_artifact(directory: &Path, id: &str, json: &str) -> Result<PathBuf> {
+    for attempt in 0..100u32 {
+        let temp_path = directory.join(format!(".{id}.{}.{}.tmp", std::process::id(), attempt));
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("create {}", temp_path.display()));
+            }
+        };
+        file.write_all(json.as_bytes())
+            .with_context(|| format!("write {}", temp_path.display()))?;
+        file.write_all(b"\n")
+            .with_context(|| format!("write newline {}", temp_path.display()))?;
+        file.flush()
+            .with_context(|| format!("flush {}", temp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync {}", temp_path.display()))?;
+        return Ok(temp_path);
+    }
+    anyhow::bail!("could not create unique artifact temp file");
+}
+
 fn build_file_nodes(files: &[SourceFile]) -> Vec<FileNode> {
     let mut nodes = BTreeMap::new();
     for file in files {
@@ -630,7 +783,8 @@ pub(crate) mod tests {
     use super::*;
     use crate::{
         ContextPackSelection, GraphEdgeKind, RetrievalQuery, StaleEvidencePolicy, SymbolKind,
-        compare_freshness, fingerprint, retrieve,
+        VectorIndexArtifact, compare_freshness, fingerprint, retrieve,
+        vector_entries_from_manifest_embeddings,
     };
 
     pub(crate) fn fixture_project() -> Result<(TempDir, PathBuf)> {
@@ -920,6 +1074,93 @@ pub(crate) mod tests {
         fs::write(&path, mutated.to_stable_json()?)?;
 
         let actual = setup.read_context_pack(&id).is_err();
+        let expected = true;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    fn fixture_vector_index(
+        manifest: &ProjectManifest,
+        target_symbol: &str,
+    ) -> Result<VectorIndexArtifact> {
+        let symbol = manifest
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == target_symbol)
+            .expect("fixture should include target symbol");
+        let entries = vector_entries_from_manifest_embeddings(
+            manifest,
+            BTreeMap::from([(symbol.id.clone(), vec![1.0, 0.0])]),
+        )?;
+        VectorIndexArtifact::new(manifest, "fixture-model", 2, entries)
+    }
+
+    #[test]
+    fn writes_vector_index_artifact_deterministically_and_round_trips() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let artifact = fixture_vector_index(&manifest, "Widget")?;
+
+        let first_path = setup.write_vector_index(&manifest, &artifact)?;
+        let first_bytes = fs::read(&first_path)?;
+        let second_path = setup.write_vector_index(&manifest, &artifact)?;
+        let second_bytes = fs::read(&second_path)?;
+        let id = setup.vector_index_artifact_id(&artifact)?;
+        let actual = (
+            first_path.clone(),
+            second_path,
+            first_bytes,
+            second_bytes,
+            setup.read_vector_index(&manifest, &id)?,
+            setup.list_vector_indexes()?,
+        );
+        let expected = (
+            first_path.clone(),
+            first_path,
+            actual.2.clone(),
+            actual.2.clone(),
+            artifact,
+            vec![id.clone()],
+        );
+        assert_eq!(actual, expected);
+        assert_eq!(id.as_str().len(), 64);
+        assert!(id.as_str().bytes().all(|byte| byte.is_ascii_hexdigit()));
+        Ok(())
+    }
+
+    #[test]
+    fn read_vector_index_rejects_corrupt_or_mismatched_artifacts() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let artifact = fixture_vector_index(&manifest, "Widget")?;
+        let id = setup.vector_index_artifact_id(&artifact)?;
+        let path = setup.write_vector_index(&manifest, &artifact)?;
+        let mut mutated = artifact.clone();
+        mutated.manifest_hash = "different".to_string();
+        fs::write(&path, mutated.to_stable_json()?)?;
+
+        let actual = setup.read_vector_index(&manifest, &id).is_err();
+        let expected = true;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn vector_index_artifact_rejects_path_influenced_ids_from_listing() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        fs::create_dir_all(setup.model_dir.join("vector_indexes"))?;
+        fs::write(
+            setup
+                .model_dir
+                .join("vector_indexes")
+                .join("src-lib.rs.json"),
+            "{}",
+        )?;
+
+        let actual = setup.list_vector_indexes().is_err();
         let expected = true;
         assert_eq!(actual, expected);
         Ok(())

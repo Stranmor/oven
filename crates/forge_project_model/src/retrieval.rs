@@ -337,6 +337,7 @@ mod tests {
     use crate::ProjectIndexer;
     use crate::indexer::tests::fixture_project;
     use crate::vector::{DeterministicReranker, DeterministicVectorIndex};
+    use crate::{DurableVectorIndex, VectorIndexArtifact, vector_entries_from_manifest_embeddings};
 
     #[test]
     fn content_only_query_returns_source_body_shard() -> Result<()> {
@@ -536,6 +537,55 @@ mod tests {
                 .first()
                 .map(|result| result.score_parts.keys().cloned().collect::<BTreeSet<_>>())
                 .expect("retrieval should return at least one fused result"),
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_vector_index_retrieves_fixture_lexical_alone_misses() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let widget_symbol = manifest
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "Widget")
+            .expect("fixture should include Widget symbol");
+        let entries = vector_entries_from_manifest_embeddings(
+            &manifest,
+            BTreeMap::from([(widget_symbol.id.clone(), vec![1.0, 0.0])]),
+        )?;
+        let artifact = VectorIndexArtifact::new(&manifest, "fixture-model", 2, entries)?;
+        let path = setup.write_vector_index(&manifest, &artifact)?;
+        let id = setup.vector_index_artifact_id(&artifact)?;
+        let persisted = setup.read_vector_index(&manifest, &id)?;
+        let vector_index = DurableVectorIndex::new(&manifest, persisted)?;
+        let query = RetrievalQuery {
+            text: Some("lexicalmissneedle".to_string()),
+            path: None,
+            path_prefix: None,
+            symbol: None,
+            limit: 1,
+            include_graph_expansion: false,
+        };
+
+        let lexical_only = retrieve(&manifest, &query);
+        let actual = retrieve_with_boundaries(
+            &manifest,
+            &query,
+            Some(&VectorQuery { embedding: vec![1.0, 0.0] }),
+            Some(&vector_index),
+            Option::<&DeterministicReranker>::None,
+            &RetrievalScoringWeights::default(),
+        );
+        let expected = Some((widget_symbol.id.clone(), Some(1.0)));
+        assert_eq!(lexical_only.is_empty(), true);
+        assert_eq!(path.ends_with(format!("{}.json", id.as_str())), true);
+        assert_eq!(
+            actual
+                .first()
+                .map(|result| (result.id.clone(), result.score_parts.get("vector").copied(),)),
             expected
         );
         Ok(())

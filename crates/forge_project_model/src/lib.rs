@@ -1,6 +1,7 @@
 //! Project model primitives, indexing, retrieval, graph, and episodic storage.
 
 mod context_adapter;
+mod durable_vector_index;
 mod eval;
 mod extraction;
 mod freshness;
@@ -18,6 +19,10 @@ mod vector;
 pub use context_adapter::{
     ProjectModelContextRenderRoot, ProjectModelSourceNode, evidence_line_range,
     render_source_from_evidence, render_sources_from_context_pack, render_sources_from_nodes,
+};
+pub use durable_vector_index::{
+    DURABLE_VECTOR_INDEX_VERSION, DurableVectorIndex, VectorIndexArtifact, VectorIndexArtifactId,
+    VectorIndexEntry, VectorSourceKind, vector_entries_from_manifest_embeddings,
 };
 pub use eval::{
     context_pack_worst_case_freshness, evaluate_context_pack_artifacts,
