@@ -1176,9 +1176,6 @@ fn parse_expected_content_length_message(
         if actual_id == expected_id {
             return Ok(message);
         }
-        if actual_id > expected_id {
-            bail!("native lsp response id advanced beyond expected references response");
-        }
         offset = body_end;
     }
     bail!("native lsp expected response id was not observed")
@@ -2590,6 +2587,39 @@ mod tests {
 
         assert_eq!(actual.status, ExternalFactProductionStatus::Failed);
         assert_eq!(actual.artifact_path, None);
+        assert_eq!(setup.model_dir().join("external_facts").exists(), false);
+        Ok(())
+    }
+
+    #[test]
+    fn native_lsp_out_of_order_non_error_response_does_not_mask_later_reference_response() -> Result<()>
+    {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model-native-out-of-order"));
+        let manifest = setup.index()?;
+        let shutdown = r#"{"jsonrpc":"2.0","id":8,"result":null}"#;
+        let references_success =
+            std::str::from_utf8(&native_location_response(&root, 7, "src/model.rs"))?
+                .split_once("\r\n\r\n")
+                .expect("framed response should include a body")
+                .1
+                .to_string();
+
+        let actual = NativeLspReferenceNormalizer::normalize(
+            &manifest,
+            &native_responses(&[shutdown, &references_success]),
+            &native_request(Default::default()),
+        )?;
+        let expected = vec![LspReferenceFact::new(
+            "symbol:src/lib.rs:Struct:Root",
+            "symbol:src/model.rs:Enum:Widget",
+            GraphEdgeKind::References,
+            "src/model.rs",
+            Some(1),
+            Some(1),
+        )];
+
+        assert_eq!(actual, expected);
         assert_eq!(setup.model_dir().join("external_facts").exists(), false);
         Ok(())
     }
