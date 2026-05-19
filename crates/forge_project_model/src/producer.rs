@@ -921,10 +921,26 @@ fn parse_native_location(
     if end_line < start_line {
         bail!("native lsp location range is invalid");
     }
-    if !manifest.files.iter().any(|file| file.path == path) {
-        bail!("native lsp location path is not manifest-owned");
-    }
+    ensure_manifest_file_line_range(manifest, &path, start_line, end_line)?;
     Ok((path, start_line, start_character, end_line))
+}
+
+fn ensure_manifest_file_line_range(
+    manifest: &ProjectManifest,
+    path: &str,
+    zero_based_start_line: u32,
+    zero_based_end_line: u32,
+) -> Result<()> {
+    let file = manifest
+        .files
+        .iter()
+        .find(|file| file.path == path)
+        .ok_or_else(|| anyhow::anyhow!("native lsp location path is not manifest-owned"))?;
+    if zero_based_start_line < file.lines && zero_based_end_line < file.lines {
+        Ok(())
+    } else {
+        bail!("native lsp location range is outside manifest file")
+    }
 }
 
 fn native_u32_field(item: &Value, field: &str) -> Result<u32> {
@@ -1016,6 +1032,7 @@ fn ensure_endpoint_owns_position(
     zero_based_line: u32,
 ) -> Result<()> {
     if endpoint == path {
+        ensure_manifest_file_line_range(manifest, path, zero_based_line, zero_based_line)?;
         return Ok(());
     }
     let one_based_line = zero_based_line.saturating_add(1);
@@ -1769,6 +1786,33 @@ mod tests {
 
         assert_eq!(oversized, true);
         assert_eq!(reference_bound, true);
+        assert_eq!(setup.model_dir().join("external_facts").exists(), false);
+        Ok(())
+    }
+
+    #[test]
+    fn native_lsp_file_endpoint_mapping_rejects_line_outside_manifest_file() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let uri_path = root
+            .join("src/model.rs")
+            .to_string_lossy()
+            .replace(' ', "%20");
+        let response = native_response(&format!(
+            r#"{{"jsonrpc":"2.0","id":7,"result":[{{"uri":"file://{uri_path}","range":{{"start":{{"line":9999,"character":0}},"end":{{"line":9999,"character":6}}}}}}]}}"#,
+        ));
+        let request = NativeLspReferenceNormalizationRequest::new(
+            7,
+            "symbol:src/lib.rs:Struct:Root",
+            vec![NativeLspEndpointPosition::new("src/model.rs", 9999, 0, "src/model.rs")],
+            Default::default(),
+        );
+
+        let actual = NativeLspReferenceNormalizer::normalize(&manifest, &response, &request)
+            .is_err();
+
+        assert_eq!(actual, true);
         assert_eq!(setup.model_dir().join("external_facts").exists(), false);
         Ok(())
     }
