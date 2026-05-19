@@ -58,10 +58,11 @@ pub use producer::{
     BoundedLspReferenceParser, ExternalFactProducer, ExternalFactProducerCapability,
     ExternalFactProducerProbe, ExternalFactProductionReport, ExternalFactProductionRequest,
     ExternalFactProductionStatus, LspFixtureExactFactProducer, LspReferenceFact, LspTransport,
-    RustAnalyzerBounds, RustAnalyzerCapability, RustAnalyzerCapabilityProbe,
-    RustAnalyzerCapabilityStatus, RustAnalyzerProbe, RustAnalyzerProcess,
-    RustAnalyzerProcessOutput, RustAnalyzerReferenceProducer, RustAnalyzerReferenceRequest,
-    StdRustAnalyzerProcess,
+    NativeLspEndpointPosition, NativeLspReferenceNormalizationRequest,
+    NativeLspReferenceNormalizer, RustAnalyzerBounds, RustAnalyzerCapability,
+    RustAnalyzerCapabilityProbe, RustAnalyzerCapabilityStatus, RustAnalyzerProbe,
+    RustAnalyzerProcess, RustAnalyzerProcessOutput, RustAnalyzerReferenceProducer,
+    RustAnalyzerReferenceRequest, StdRustAnalyzerProcess,
 };
 pub use render::{
     DEFAULT_RENDERED_SOURCE_LIMIT, ProjectModelContextRenderBudget, ProjectModelContextSource,

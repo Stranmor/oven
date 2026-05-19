@@ -27,12 +27,14 @@ pub trait ExternalFactProducer {
     /// * `request` - Bounded request describing the desired exact-fact slice.
     fn probe(&self, request: &ExternalFactProductionRequest) -> ExternalFactProducerProbe;
 
-    /// Produces a typed external fact artifact through the project-model writer.
+    /// Produces a typed external fact artifact through the project-model
+    /// writer.
     ///
     /// # Arguments
     ///
     /// * `model_dir` - Project-model directory that owns external fact storage.
-    /// * `frozen_manifest` - Immutable manifest baseline used for endpoint validation.
+    /// * `frozen_manifest` - Immutable manifest baseline used for endpoint
+    ///   validation.
     /// * `request` - Explicit bounded production request.
     ///
     /// # Errors
@@ -131,8 +133,10 @@ impl RustAnalyzerReferenceRequest {
     ///
     /// * `production` - External fact metadata and reference fact bound.
     /// * `files` - Manifest-owned files that may be requested.
-    /// * `from_endpoints` - Known manifest endpoints allowed as reference sources.
-    /// * `to_endpoints` - Known manifest endpoints allowed as reference targets.
+    /// * `from_endpoints` - Known manifest endpoints allowed as reference
+    ///   sources.
+    /// * `to_endpoints` - Known manifest endpoints allowed as reference
+    ///   targets.
     /// * `bounds` - Transport and parser limits.
     pub fn new(
         production: ExternalFactProductionRequest,
@@ -222,7 +226,8 @@ pub struct RustAnalyzerProcessOutput {
     pub exit_code: Option<i32>,
     /// Captured stdout bytes, bounded by caller limits before parsing.
     pub stdout: Vec<u8>,
-    /// Captured stderr bytes, used only for redaction-safe failure classification.
+    /// Captured stderr bytes, used only for redaction-safe failure
+    /// classification.
     pub stderr: Vec<u8>,
     /// Whether the process timed out and was canceled.
     pub timed_out: bool,
@@ -478,7 +483,8 @@ pub struct LspReferenceFact {
 }
 
 impl LspReferenceFact {
-    /// Creates a typed LSP reference fact over already-known manifest endpoints.
+    /// Creates a typed LSP reference fact over already-known manifest
+    /// endpoints.
     ///
     /// # Arguments
     ///
@@ -504,6 +510,157 @@ impl LspReferenceFact {
             start_line,
             end_line,
         }
+    }
+}
+
+/// Explicit manifest-owned position-to-endpoint mapping for native LSP
+/// responses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeLspEndpointPosition {
+    /// Manifest-owned path for the mapped position.
+    pub path: String,
+    /// Zero-based LSP line for the mapped position.
+    pub line: u32,
+    /// Zero-based LSP character for the mapped position.
+    pub character: u32,
+    /// Manifest-owned endpoint at this exact position.
+    pub endpoint: String,
+}
+
+impl NativeLspEndpointPosition {
+    /// Creates an explicit native LSP endpoint position mapping.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Manifest-owned path for the mapped position.
+    /// * `line` - Zero-based LSP line for the mapped position.
+    /// * `character` - Zero-based LSP character for the mapped position.
+    /// * `endpoint` - Manifest-owned endpoint at this exact position.
+    pub fn new(
+        path: impl Into<String>,
+        line: u32,
+        character: u32,
+        endpoint: impl Into<String>,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            line,
+            character,
+            endpoint: endpoint.into(),
+        }
+    }
+}
+
+/// Bounded native JSON-RPC response normalization request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeLspReferenceNormalizationRequest {
+    /// Expected JSON-RPC response identifier.
+    pub response_id: u64,
+    /// Manifest-owned endpoint that requested references.
+    pub from_endpoint: String,
+    /// Explicit manifest-owned mapping from native response locations to
+    /// endpoints.
+    pub endpoint_positions: Vec<NativeLspEndpointPosition>,
+    /// Parser and result bounds.
+    pub bounds: RustAnalyzerBounds,
+}
+
+impl NativeLspReferenceNormalizationRequest {
+    /// Creates a bounded native LSP reference normalization request.
+    ///
+    /// # Arguments
+    ///
+    /// * `response_id` - Expected JSON-RPC response identifier.
+    /// * `from_endpoint` - Manifest-owned endpoint that requested references.
+    /// * `endpoint_positions` - Explicit manifest-owned endpoint position
+    ///   mapping.
+    /// * `bounds` - Parser and result bounds.
+    pub fn new(
+        response_id: u64,
+        from_endpoint: impl Into<String>,
+        endpoint_positions: Vec<NativeLspEndpointPosition>,
+        bounds: RustAnalyzerBounds,
+    ) -> Self {
+        Self {
+            response_id,
+            from_endpoint: from_endpoint.into(),
+            endpoint_positions,
+            bounds,
+        }
+    }
+}
+
+/// Pure normalizer for bounded native LSP `Location[]` JSON-RPC responses.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NativeLspReferenceNormalizer;
+
+impl NativeLspReferenceNormalizer {
+    /// Normalizes a bounded native LSP response into typed reference facts.
+    ///
+    /// The normalizer accepts one Content-Length framed JSON-RPC response whose
+    /// `result` is a native `Location[]`. Raw JSON remains local to parsing and
+    /// all cross-boundary output is typed `LspReferenceFact`.
+    ///
+    /// # Arguments
+    ///
+    /// * `manifest` - Frozen manifest that owns every path and endpoint.
+    /// * `bytes` - Native LSP response bytes with `Content-Length` framing.
+    /// * `request` - Expected response id and explicit endpoint-position
+    ///   mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when framing, size, id, path, endpoint, position
+    /// mapping, or reference-count validation fails.
+    pub fn normalize(
+        manifest: &ProjectManifest,
+        bytes: &[u8],
+        request: &NativeLspReferenceNormalizationRequest,
+    ) -> Result<Vec<LspReferenceFact>> {
+        validate_native_lsp_mapping(manifest, request)?;
+        let message = parse_single_content_length_message(bytes, &request.bounds)?;
+        if message.get("error").is_some() {
+            bail!("native lsp response returned error");
+        }
+        let actual_id = message
+            .get("id")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("native lsp response id is missing"))?;
+        if actual_id != request.response_id {
+            bail!("native lsp response id mismatch");
+        }
+        let items = message
+            .get("result")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("native lsp response result is not Location[]"))?;
+        if items.len() > request.bounds.max_references {
+            bail!("native lsp reference result exceeds reference bound");
+        }
+        let mut references = Vec::with_capacity(items.len());
+        for item in items {
+            let (path, start_line, start_character, end_line) =
+                parse_native_location(manifest, item)?;
+            let endpoint = request
+                .endpoint_positions
+                .iter()
+                .find(|position| {
+                    position.path == path
+                        && position.line == start_line
+                        && position.character == start_character
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("native lsp location has no explicit endpoint mapping")
+                })?;
+            references.push(LspReferenceFact::new(
+                request.from_endpoint.clone(),
+                endpoint.endpoint.clone(),
+                GraphEdgeKind::References,
+                path,
+                Some(start_line.saturating_add(1)),
+                Some(end_line.saturating_add(1)),
+            ));
+        }
+        Ok(references)
     }
 }
 
@@ -692,6 +849,191 @@ impl<T: LspTransport> RustAnalyzerReferenceProducer<T> {
     }
 }
 
+fn parse_single_content_length_message(bytes: &[u8], bounds: &RustAnalyzerBounds) -> Result<Value> {
+    if bounds.max_messages == 0 {
+        bail!("native lsp response exceeds message bound");
+    }
+    if bytes.len()
+        > bounds
+            .max_json_bytes_per_message
+            .saturating_mul(bounds.max_messages)
+    {
+        bail!("native lsp response exceeds bounded byte budget");
+    }
+    let header_end = bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| anyhow::anyhow!("native lsp response header is malformed"))?;
+    let headers = std::str::from_utf8(&bytes[..header_end])
+        .map_err(|_| anyhow::anyhow!("native lsp response header is not utf-8"))?;
+    let mut content_length = None;
+    for line in headers.split("\r\n") {
+        let Some((name, value)) = line.split_once(':') else {
+            bail!("native lsp response header is malformed");
+        };
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| anyhow::anyhow!("native lsp content length is malformed"))?,
+            );
+        }
+    }
+    let content_length =
+        content_length.ok_or_else(|| anyhow::anyhow!("native lsp content length is missing"))?;
+    if content_length > bounds.max_json_bytes_per_message {
+        bail!("native lsp json-rpc message exceeds byte bound");
+    }
+    let body_start = header_end + 4;
+    let body_end = body_start
+        .checked_add(content_length)
+        .ok_or_else(|| anyhow::anyhow!("native lsp content length overflow"))?;
+    if body_end != bytes.len() {
+        bail!("native lsp response frame length mismatch");
+    }
+    serde_json::from_slice(&bytes[body_start..body_end])
+        .map_err(|_| anyhow::anyhow!("native lsp json-rpc message is malformed"))
+}
+
+fn parse_native_location(
+    manifest: &ProjectManifest,
+    item: &Value,
+) -> Result<(String, u32, u32, u32)> {
+    let uri = item
+        .get("uri")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("native lsp location uri is missing"))?;
+    let path = manifest_relative_path_from_uri(manifest, uri)?;
+    let range = item
+        .get("range")
+        .ok_or_else(|| anyhow::anyhow!("native lsp location range is missing"))?;
+    let start = range
+        .get("start")
+        .ok_or_else(|| anyhow::anyhow!("native lsp location start is missing"))?;
+    let end = range
+        .get("end")
+        .ok_or_else(|| anyhow::anyhow!("native lsp location end is missing"))?;
+    let start_line = native_u32_field(start, "line")?;
+    let start_character = native_u32_field(start, "character")?;
+    let end_line = native_u32_field(end, "line")?;
+    let _end_character = native_u32_field(end, "character")?;
+    if end_line < start_line {
+        bail!("native lsp location range is invalid");
+    }
+    if !manifest.files.iter().any(|file| file.path == path) {
+        bail!("native lsp location path is not manifest-owned");
+    }
+    Ok((path, start_line, start_character, end_line))
+}
+
+fn native_u32_field(item: &Value, field: &str) -> Result<u32> {
+    item.get(field)
+        .and_then(Value::as_u64)
+        .and_then(|number| u32::try_from(number).ok())
+        .ok_or_else(|| anyhow::anyhow!("native lsp position field is invalid: {field}"))
+}
+
+fn manifest_relative_path_from_uri(manifest: &ProjectManifest, uri: &str) -> Result<String> {
+    let Some(raw_path) = uri.strip_prefix("file://") else {
+        bail!("native lsp location uri is not file scheme");
+    };
+    let absolute = PathBuf::from(percent_decode_file_uri_path(raw_path)?);
+    let relative = absolute
+        .strip_prefix(&manifest.root)
+        .map_err(|_| anyhow::anyhow!("native lsp location uri is outside manifest root"))?;
+    Ok(relative.to_string_lossy().replace('\\', "/"))
+}
+
+fn percent_decode_file_uri_path(raw_path: &str) -> Result<String> {
+    let bytes = raw_path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = bytes
+                .get(index + 1)
+                .copied()
+                .and_then(hex_value)
+                .ok_or_else(|| anyhow::anyhow!("native lsp uri percent escape is malformed"))?;
+            let low = bytes
+                .get(index + 2)
+                .copied()
+                .and_then(hex_value)
+                .ok_or_else(|| anyhow::anyhow!("native lsp uri percent escape is malformed"))?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| anyhow::anyhow!("native lsp uri path is not utf-8"))
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn validate_native_lsp_mapping(
+    manifest: &ProjectManifest,
+    request: &NativeLspReferenceNormalizationRequest,
+) -> Result<()> {
+    if request.endpoint_positions.len() > request.bounds.max_endpoints {
+        bail!("native lsp endpoint mapping exceeds endpoint bound");
+    }
+    ensure_manifest_endpoint(manifest, &request.from_endpoint)?;
+    for position in &request.endpoint_positions {
+        if !manifest.files.iter().any(|file| file.path == position.path) {
+            bail!("native lsp mapping path is not manifest-owned");
+        }
+        ensure_manifest_endpoint(manifest, &position.endpoint)?;
+        ensure_endpoint_owns_position(manifest, &position.endpoint, &position.path, position.line)?;
+    }
+    Ok(())
+}
+
+fn ensure_manifest_endpoint(manifest: &ProjectManifest, endpoint: &str) -> Result<()> {
+    if manifest_endpoint_strings(manifest)
+        .iter()
+        .any(|known| *known == endpoint)
+    {
+        Ok(())
+    } else {
+        bail!("native lsp endpoint is not manifest-owned")
+    }
+}
+
+fn ensure_endpoint_owns_position(
+    manifest: &ProjectManifest,
+    endpoint: &str,
+    path: &str,
+    zero_based_line: u32,
+) -> Result<()> {
+    if endpoint == path {
+        return Ok(());
+    }
+    let one_based_line = zero_based_line.saturating_add(1);
+    let symbol = manifest
+        .symbols
+        .iter()
+        .find(|symbol| symbol.id == endpoint)
+        .ok_or_else(|| anyhow::anyhow!("native lsp mapped endpoint is not a symbol"))?;
+    if symbol.path == path
+        && symbol.start_line <= one_based_line
+        && symbol.end_line >= one_based_line
+    {
+        Ok(())
+    } else {
+        bail!("native lsp mapped endpoint does not own position")
+    }
+}
+
 fn parse_reference_item(item: &Value) -> Result<LspReferenceFact> {
     let from = string_field(item, "from")?;
     let to = string_field(item, "to")?;
@@ -750,7 +1092,7 @@ fn validate_rust_analyzer_request(
     let endpoints = manifest_endpoint_strings(manifest);
     for path in &request.files {
         if !files.iter().any(|known| known == path) {
-            return Some(producer_issue(format!("rust_analyzer_unknown_path:{path}")));
+            return Some(producer_issue("rust_analyzer_unknown_path"));
         }
     }
     for endpoint in request
@@ -759,9 +1101,7 @@ fn validate_rust_analyzer_request(
         .chain(request.to_endpoints.iter())
     {
         if !endpoints.iter().any(|known| known == endpoint) {
-            return Some(producer_issue(format!(
-                "rust_analyzer_unknown_endpoint:{endpoint}"
-            )));
+            return Some(producer_issue("rust_analyzer_unknown_endpoint"));
         }
     }
     None
@@ -935,7 +1275,8 @@ impl LspFixtureExactFactProducer {
     /// # Arguments
     ///
     /// * `snapshot_label` - Redaction-safe fixture or endpoint snapshot label.
-    /// * `references` - Typed reference facts over already-known manifest endpoints.
+    /// * `references` - Typed reference facts over already-known manifest
+    ///   endpoints.
     pub fn available(snapshot_label: impl Into<String>, references: Vec<LspReferenceFact>) -> Self {
         Self {
             available: true,
@@ -963,13 +1304,15 @@ impl LspFixtureExactFactProducer {
     ///
     /// # Arguments
     ///
-    /// * `frozen_manifest` - Immutable manifest baseline used for endpoint validation.
+    /// * `frozen_manifest` - Immutable manifest baseline used for endpoint
+    ///   validation.
     /// * `request` - Explicit bounded production request.
     ///
     /// # Errors
     ///
     /// Returns an error when the producer is unavailable, the request bound is
-    /// exceeded, source metadata is incomplete, or validation rejects endpoints.
+    /// exceeded, source metadata is incomplete, or validation rejects
+    /// endpoints.
     pub fn produce_batch(
         &self,
         frozen_manifest: &ProjectManifest,
@@ -1196,6 +1539,271 @@ mod tests {
         )
     }
 
+    fn native_response(body: &str) -> Vec<u8> {
+        format!("Content-Length: {}\r\n\r\n{}", body.len(), body).into_bytes()
+    }
+
+    fn native_location_response(root: &Path, response_id: u64, relative_path: &str) -> Vec<u8> {
+        let uri_path = root
+            .join(relative_path)
+            .to_string_lossy()
+            .replace(' ', "%20");
+        native_response(&format!(
+            r#"{{"jsonrpc":"2.0","id":{response_id},"result":[{{"uri":"file://{uri_path}","range":{{"start":{{"line":0,"character":0}},"end":{{"line":0,"character":6}}}}}}]}}"#,
+        ))
+    }
+
+    fn native_request(bounds: RustAnalyzerBounds) -> NativeLspReferenceNormalizationRequest {
+        NativeLspReferenceNormalizationRequest::new(
+            7,
+            "symbol:src/lib.rs:Struct:Root",
+            vec![NativeLspEndpointPosition::new(
+                "src/model.rs",
+                0,
+                0,
+                "symbol:src/model.rs:Enum:Widget",
+            )],
+            bounds,
+        )
+    }
+
+    #[test]
+    fn rust_analyzer_version_probe_timeout_returns_timeout_without_artifact_write() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let process = FakeRustAnalyzerProcess {
+            version: timed_out_output(),
+            references: process_output(valid_lsp_response()),
+        };
+
+        let actual = RustAnalyzerCapabilityProbe::new(process)
+            .probe(RustAnalyzerCapability::References, Duration::from_secs(1));
+
+        assert_eq!(actual.status, RustAnalyzerCapabilityStatus::Timeout);
+        assert_eq!(actual.timed_out, true);
+        assert_eq!(
+            actual.failure_reason,
+            Some("rust_analyzer_probe_timeout".to_string())
+        );
+        assert_eq!(setup.model_dir().join("external_facts").exists(), false);
+        Ok(())
+    }
+
+    #[test]
+    fn rust_analyzer_probe_failure_redacts_raw_stderr_from_report_details() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let process = FakeRustAnalyzerProcess {
+            version: RustAnalyzerProcessOutput {
+                exit_code: Some(1),
+                stdout: Vec::new(),
+                stderr: b"token=secret-native-json".to_vec(),
+                timed_out: false,
+            },
+            references: process_output(valid_lsp_response()),
+        };
+        let probe = RustAnalyzerCapabilityProbe::new(process.clone())
+            .probe(RustAnalyzerCapability::References, Duration::from_secs(1));
+        let producer = RustAnalyzerReferenceProducer::new(process, probe.clone());
+
+        let actual = producer.produce(
+            setup.model_dir(),
+            &manifest,
+            &fake_request(Default::default()),
+        )?;
+
+        assert_eq!(
+            probe.failure_reason,
+            Some("rust_analyzer_process_exit:1".to_string())
+        );
+        assert_eq!(
+            actual.probe.unavailable_reason,
+            Some("rust_analyzer_process_exit:1".to_string())
+        );
+        assert_eq!(actual.status, ExternalFactProductionStatus::Unavailable);
+        assert_eq!(setup.model_dir().join("external_facts").exists(), false);
+        Ok(())
+    }
+
+    #[test]
+    fn native_lsp_location_array_maps_only_through_explicit_manifest_mapping() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let request = native_request(Default::default());
+
+        let actual = NativeLspReferenceNormalizer::normalize(
+            &manifest,
+            &native_location_response(&root, 7, "src/model.rs"),
+            &request,
+        )?;
+        let expected = vec![LspReferenceFact::new(
+            "symbol:src/lib.rs:Struct:Root",
+            "symbol:src/model.rs:Enum:Widget",
+            GraphEdgeKind::References,
+            "src/model.rs",
+            Some(1),
+            Some(1),
+        )];
+
+        assert_eq!(actual, expected);
+        assert_eq!(setup.model_dir().join("external_facts").exists(), false);
+        Ok(())
+    }
+
+    #[test]
+    fn native_lsp_unknown_position_mapping_fails_without_artifact() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let request = NativeLspReferenceNormalizationRequest::new(
+            7,
+            "symbol:src/lib.rs:Struct:Root",
+            vec![NativeLspEndpointPosition::new(
+                "src/model.rs",
+                1,
+                0,
+                "symbol:src/model.rs:Enum:Widget",
+            )],
+            Default::default(),
+        );
+
+        let actual = NativeLspReferenceNormalizer::normalize(
+            &manifest,
+            &native_location_response(&root, 7, "src/model.rs"),
+            &request,
+        )
+        .is_err();
+
+        assert_eq!(actual, true);
+        assert_eq!(setup.model_dir().join("external_facts").exists(), false);
+        Ok(())
+    }
+
+    #[test]
+    fn native_lsp_unknown_mapping_endpoint_fails_without_artifact() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let request = NativeLspReferenceNormalizationRequest::new(
+            7,
+            "symbol:src/lib.rs:Struct:Root",
+            vec![NativeLspEndpointPosition::new(
+                "src/model.rs",
+                0,
+                0,
+                "symbol:missing:Endpoint",
+            )],
+            Default::default(),
+        );
+
+        let actual = NativeLspReferenceNormalizer::normalize(
+            &manifest,
+            &native_location_response(&root, 7, "src/model.rs"),
+            &request,
+        )
+        .is_err();
+
+        assert_eq!(actual, true);
+        assert_eq!(setup.model_dir().join("external_facts").exists(), false);
+        Ok(())
+    }
+
+    #[test]
+    fn native_lsp_response_id_mismatch_fails_without_artifact() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+
+        let actual = NativeLspReferenceNormalizer::normalize(
+            &manifest,
+            &native_location_response(&root, 99, "src/model.rs"),
+            &native_request(Default::default()),
+        )
+        .is_err();
+
+        assert_eq!(actual, true);
+        assert_eq!(setup.model_dir().join("external_facts").exists(), false);
+        Ok(())
+    }
+
+    #[test]
+    fn native_lsp_malformed_header_fails_without_artifact() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+
+        let actual = NativeLspReferenceNormalizer::normalize(
+            &manifest,
+            b"Content-Length nope\r\n\r\n{}",
+            &native_request(Default::default()),
+        )
+        .is_err();
+
+        assert_eq!(actual, true);
+        assert_eq!(setup.model_dir().join("external_facts").exists(), false);
+        Ok(())
+    }
+
+    #[test]
+    fn native_lsp_oversized_frame_and_reference_count_fail_without_artifact() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let oversized = NativeLspReferenceNormalizer::normalize(
+            &manifest,
+            &native_location_response(&root, 7, "src/model.rs"),
+            &native_request(RustAnalyzerBounds {
+                max_json_bytes_per_message: 8,
+                ..Default::default()
+            }),
+        )
+        .is_err();
+        let reference_bound = NativeLspReferenceNormalizer::normalize(
+            &manifest,
+            &native_location_response(&root, 7, "src/model.rs"),
+            &native_request(RustAnalyzerBounds { max_references: 0, ..Default::default() }),
+        )
+        .is_err();
+
+        assert_eq!(oversized, true);
+        assert_eq!(reference_bound, true);
+        assert_eq!(setup.model_dir().join("external_facts").exists(), false);
+        Ok(())
+    }
+
+    #[test]
+    fn native_lsp_raw_json_is_not_persisted_into_report_details() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let process = FakeRustAnalyzerProcess {
+            version: process_output("rust-analyzer 1.2.3\n"),
+            references: process_output(native_location_response(&root, 99, "src/model.rs")),
+        };
+        let producer = RustAnalyzerReferenceProducer::new(process, available_probe());
+
+        let actual = producer.produce(
+            setup.model_dir(),
+            &manifest,
+            &fake_request(Default::default()),
+        )?;
+
+        assert_eq!(actual.status, ExternalFactProductionStatus::Failed);
+        assert_eq!(
+            actual
+                .issues
+                .first()
+                .expect("native json report should include redacted issue")
+                .detail
+                .contains("file://"),
+            false
+        );
+        assert_eq!(setup.model_dir().join("external_facts").exists(), false);
+        Ok(())
+    }
+
     #[test]
     fn rust_analyzer_process_unavailable_returns_unavailable_and_writes_no_artifact() -> Result<()>
     {
@@ -1415,7 +2023,7 @@ mod tests {
                 .first()
                 .expect("unknown path report should include issue")
                 .detail,
-            "rust_analyzer_unknown_path:src/missing.rs"
+            "rust_analyzer_unknown_path"
         );
         assert_eq!(setup.model_dir().join("external_facts").exists(), false);
         Ok(())
@@ -1442,6 +2050,58 @@ mod tests {
 
         assert_eq!(actual.status, ExternalFactProductionStatus::Failed);
         assert_eq!(actual.artifact_path, None);
+        assert_eq!(setup.model_dir().join("external_facts").exists(), false);
+        Ok(())
+    }
+
+    #[test]
+    fn rust_analyzer_unknown_request_path_and_endpoint_are_redacted_in_report_details() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let process = FakeRustAnalyzerProcess {
+            version: process_output("rust-analyzer 1.2.3\n"),
+            references: process_output(valid_lsp_response()),
+        };
+        let unknown_path_request = RustAnalyzerReferenceRequest::new(
+            fixture_request(),
+            vec!["src/token=secret-native-json.rs".to_string()],
+            vec!["symbol:src/lib.rs:Struct:Root".to_string()],
+            vec!["symbol:src/model.rs:Enum:Widget".to_string()],
+            Default::default(),
+        );
+        let unknown_endpoint_request = RustAnalyzerReferenceRequest::new(
+            fixture_request(),
+            vec!["src/lib.rs".to_string()],
+            vec!["symbol:token=secret-native-json:Struct:Root".to_string()],
+            vec!["symbol:src/model.rs:Enum:Widget".to_string()],
+            Default::default(),
+        );
+        let producer = RustAnalyzerReferenceProducer::new(process, available_probe());
+
+        let path_report = producer.produce(setup.model_dir(), &manifest, &unknown_path_request)?;
+        let endpoint_report = producer.produce(setup.model_dir(), &manifest, &unknown_endpoint_request)?;
+
+        assert_eq!(path_report.status, ExternalFactProductionStatus::Failed);
+        assert_eq!(endpoint_report.status, ExternalFactProductionStatus::Failed);
+        assert_eq!(
+            path_report
+                .issues
+                .first()
+                .expect("unknown path report should include issue")
+                .detail
+                .contains("secret-native-json"),
+            false
+        );
+        assert_eq!(
+            endpoint_report
+                .issues
+                .first()
+                .expect("unknown endpoint report should include issue")
+                .detail
+                .contains("secret-native-json"),
+            false
+        );
         assert_eq!(setup.model_dir().join("external_facts").exists(), false);
         Ok(())
     }
