@@ -11,8 +11,9 @@ use forge_domain::{
     WorkspaceContextManifestDiagnostic, WorkspaceId, WorkspaceIndexRepository,
 };
 use forge_project_model::{
-    ContextPack, ContextPackSelection, ProjectIndexer, RetrievalQuery, StaleEvidencePolicy,
-    evidence_line_range, local_project_model_dir, local_project_model_manifest, retrieve,
+    ContextPack, ContextPackArtifactId, ContextPackSelection, ProjectIndexer, Provenance,
+    RetrievalQuery, StaleEvidencePolicy, ToolEpisode, evidence_line_range, fingerprint,
+    local_project_model_dir, local_project_model_manifest, retrieve,
 };
 use forge_stream::MpscStream;
 use futures::future::join_all;
@@ -20,6 +21,10 @@ use tracing::info;
 
 use crate::fd::FileDiscovery;
 use crate::sync::{WorkspaceSyncEngine, canonicalize_path};
+
+const PROJECT_MODEL_SEARCH_TOOL: &str = "project_model_search";
+const PROJECT_MODEL_SEARCH_SUCCESS: &str = "success";
+const PROJECT_MODEL_SEARCH_PROVENANCE_SOURCE: &str = "WorkspaceService::query_workspace";
 
 /// Service for indexing workspaces and performing semantic search.
 ///
@@ -292,7 +297,17 @@ impl<
             });
         }
         if !nodes.is_empty() {
-            indexer.write_context_pack(&pack)?;
+            let _artifact_path = indexer.write_context_pack(&pack)?;
+            let artifact_id = indexer.context_pack_artifact_id(&pack)?;
+            let episode = project_model_search_episode(
+                &params,
+                &manifest.manifest_hash,
+                &artifact_id,
+                &nodes,
+            );
+            indexer
+                .append_episode(&episode)
+                .context("append project-model search episode")?;
         }
         nodes.sort_by(|left, right| {
             right
@@ -302,6 +317,49 @@ impl<
                 .then_with(|| left.node_id.as_str().cmp(right.node_id.as_str()))
         });
         Ok(nodes)
+    }
+}
+
+fn project_model_search_episode(
+    params: &SearchParams<'_>,
+    manifest_hash: &str,
+    artifact_id: &ContextPackArtifactId,
+    nodes: &[Node],
+) -> ToolEpisode {
+    let mut node_ids = nodes
+        .iter()
+        .map(|node| node.node_id.as_str().to_string())
+        .collect::<Vec<_>>();
+    node_ids.sort();
+    let input_fingerprint = fingerprint(&format!(
+        "query={};use_case={};limit={:?};top_k={:?};starts_with={:?};ends_with={:?}",
+        params.query,
+        params.use_case,
+        params.limit,
+        params.top_k,
+        params.starts_with,
+        params.ends_with
+    ));
+    let output_seed = format!(
+        "artifact={};manifest={};nodes={}",
+        artifact_id.as_str(),
+        manifest_hash,
+        node_ids.join("\0")
+    );
+    let output_fingerprint = fingerprint(&output_seed);
+    ToolEpisode {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        tool: PROJECT_MODEL_SEARCH_TOOL.to_string(),
+        input_fingerprint,
+        output_fingerprint,
+        status: PROJECT_MODEL_SEARCH_SUCCESS.to_string(),
+        provenance: Provenance {
+            path: format!("context_packs/{}.json", artifact_id.as_str()),
+            start_line: None,
+            end_line: None,
+            source: PROJECT_MODEL_SEARCH_PROVENANCE_SOURCE.to_string(),
+            fingerprint: fingerprint(&output_seed),
+        },
     }
 }
 
@@ -957,35 +1015,54 @@ mod tests {
             .join(format!("{}.json", id.as_str()));
         let first_bytes = fs::read(&artifact_path)?;
         let pack = indexer.read_context_pack(&id)?;
+        let first_episodes = indexer.read_episodes()?;
         let second_nodes =
             WorkspaceService::query_workspace(&setup, root.clone(), params()).await?;
         let second_bytes = fs::read(&artifact_path)?;
-        let actual = (
-            first_nodes.is_empty(),
-            second_nodes.is_empty(),
-            indexer.list_context_pack_artifacts()?.len(),
-            first_bytes.clone(),
-            second_bytes,
-            pack.evidence.is_empty(),
+        let second_episodes = indexer.read_episodes()?;
+        let episode = first_episodes
+            .first()
+            .expect("successful query should append search episode")
+            .clone();
+        assert_eq!(first_nodes.is_empty(), false);
+        assert_eq!(second_nodes.is_empty(), false);
+        assert_eq!(indexer.list_context_pack_artifacts()?.len(), 1usize);
+        assert_eq!(second_bytes, first_bytes);
+        assert_eq!(pack.evidence.is_empty(), false);
+        assert_eq!(
             pack.provenance
                 .iter()
                 .all(|provenance| provenance.is_complete()),
+            true
         );
-        let expected = (
-            false,
-            false,
-            1usize,
-            first_bytes.clone(),
-            first_bytes,
-            false,
-            true,
+        assert_eq!(first_episodes.len(), 1usize);
+        assert_eq!(second_episodes.len(), 2usize);
+        assert_eq!(episode.tool, PROJECT_MODEL_SEARCH_TOOL.to_string());
+        assert_eq!(episode.status, PROJECT_MODEL_SEARCH_SUCCESS.to_string());
+        assert_eq!(
+            episode.provenance.path,
+            format!("context_packs/{}.json", id.as_str())
         );
-
-        assert_eq!(actual, expected);
+        assert_eq!(
+            episode.provenance.source,
+            PROJECT_MODEL_SEARCH_PROVENANCE_SOURCE.to_string()
+        );
+        assert_eq!(episode.input_fingerprint.is_empty(), false);
+        assert_eq!(episode.output_fingerprint.is_empty(), false);
+        assert_eq!(episode.provenance.fingerprint.is_empty(), false);
         let artifact = fs::read_to_string(artifact_path)?;
+        let episode_json =
+            fs::read_to_string(local_project_model_dir(&root).join("tool_episodes.jsonl"))?;
         assert!(!artifact.contains("pub struct"));
         assert!(!artifact.contains("pub fn build_runtime_needle"));
         assert!(!artifact.contains("runtime integration proof"));
+        assert!(!episode_json.contains("build runtime needle"));
+        assert!(!episode_json.contains("runtime integration proof"));
+        assert!(!episode_json.contains("pub struct"));
+        assert!(!episode_json.contains("pub fn build_runtime_needle"));
+        assert!(!episode_json.contains("<project_model_context>"));
+        assert!(!episode_json.contains("remote search should not be used"));
+        assert!(!episode_json.contains("test-token"));
         Ok(())
     }
 
@@ -1011,6 +1088,7 @@ mod tests {
         assert_eq!(actual, expected);
         let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
         assert!(indexer.list_context_pack_artifacts()?.is_empty());
+        assert!(indexer.read_episodes()?.is_empty());
         Ok(())
     }
 
@@ -1037,6 +1115,70 @@ mod tests {
         assert!(actual.is_err());
         let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
         assert!(indexer.list_context_pack_artifacts()?.is_empty());
+        assert!(indexer.read_episodes()?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_workspace_writes_no_episode_when_context_pack_write_fails() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        fs::write(
+            local_project_model_dir(&root).join("context_packs"),
+            "not a directory",
+        )?;
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::new(AtomicBool::new(false)),
+                range_read_fails: false,
+            }),
+            Arc::new(NoopDiscovery),
+        );
+        let params = SearchParams::new("build runtime needle", "runtime integration proof")
+            .limit(5usize)
+            .ends_with(vec![".rs".to_string()]);
+
+        let actual = WorkspaceService::query_workspace(&setup, root.clone(), params).await;
+        assert!(actual.is_err());
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+        assert!(indexer.read_episodes()?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_workspace_returns_error_when_episode_append_fails_after_pack_write() -> Result<()>
+    {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        fs::create_dir(local_project_model_dir(&root).join("tool_episodes.jsonl"))?;
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::new(AtomicBool::new(false)),
+                range_read_fails: false,
+            }),
+            Arc::new(NoopDiscovery),
+        );
+        let params = SearchParams::new("build runtime needle", "runtime integration proof")
+            .limit(5usize)
+            .ends_with(vec![".rs".to_string()]);
+
+        let actual = WorkspaceService::query_workspace(&setup, root.clone(), params).await;
+        let expected = "append project-model search episode";
+        let actual_error = match actual {
+            Ok(nodes) => anyhow::bail!("expected episode append error, got {} nodes", nodes.len()),
+            Err(error) => error.to_string(),
+        };
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+        assert!(actual_error.contains(expected));
+        assert_eq!(indexer.list_context_pack_artifacts()?.len(), 1);
         Ok(())
     }
 
@@ -1074,6 +1216,7 @@ mod tests {
         assert!(!range_read_called.load(Ordering::SeqCst));
         let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
         assert!(indexer.list_context_pack_artifacts()?.is_empty());
+        assert!(indexer.read_episodes()?.is_empty());
         Ok(())
     }
 
@@ -1227,7 +1370,7 @@ mod tests {
             Arc::new(NoopDiscovery),
         );
         let params = SearchParams::new("build runtime needle", "runtime integration proof");
-        let actual = WorkspaceService::query_workspace(&setup, root, params).await;
+        let actual = WorkspaceService::query_workspace(&setup, root.clone(), params).await;
         let expected = "Workspace project model is not indexed";
         let actual_error = match actual {
             Ok(nodes) => {
@@ -1237,6 +1380,9 @@ mod tests {
         };
 
         assert!(actual_error.contains(expected));
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+        assert!(indexer.list_context_pack_artifacts()?.is_empty());
+        assert!(indexer.read_episodes()?.is_empty());
         Ok(())
     }
 
