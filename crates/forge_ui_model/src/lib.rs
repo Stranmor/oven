@@ -42,7 +42,362 @@ impl UiModel {
     }
 }
 
-/// A typed render block that preserves the semantics of a chat response.
+/// Renderer-neutral projection of a complete Forge conversation UI state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UiConversationProjection {
+    /// Status and session counters shown by renderer headers.
+    pub status: UiStatusSummary,
+    /// Transcript pane items with tool detail payloads excluded.
+    pub transcript: Vec<UiTranscriptItem>,
+    /// Tool activity rail items preserving lifecycle, retry, and payload hints.
+    pub tool_activity: Vec<UiToolActivityItem>,
+    /// Latest tool detail or output pane projection.
+    pub tool_detail: UiToolDetailView,
+}
+
+/// Header status and deterministic session summary for a UI projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UiStatusSummary {
+    /// Semantic status pill selected from the latest meaningful conversation state.
+    pub pill: UiStatusPill,
+    /// Number of submitted user turns.
+    pub turns: usize,
+    /// Number of assistant markdown reply blocks.
+    pub replies: usize,
+    /// Number of tool lifecycle status blocks.
+    pub tools: usize,
+    /// Number of failed tool lifecycle status blocks.
+    pub errors: usize,
+}
+
+impl UiStatusSummary {
+    /// Formats the session counters as deterministic header text.
+    pub fn display_text(&self) -> String {
+        format!(
+            "turns {} · replies {} · tools {} · errors {}",
+            self.turns, self.replies, self.tools, self.errors
+        )
+    }
+}
+
+/// Renderer-neutral status pill selected from typed conversation state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UiStatusPill {
+    /// The UI has no active assistant or tool work.
+    Ready,
+    /// Assistant turn is pending, running, or has just been submitted.
+    Thinking,
+    /// A tool lifecycle event is currently running.
+    ToolRunning,
+    /// The latest meaningful state is a tool failure.
+    Error,
+    /// The latest meaningful state is task completion.
+    Complete,
+}
+
+impl UiStatusPill {
+    /// Returns the stable label renderers should show for this pill.
+    pub fn label(self) -> &'static str {
+        match self {
+            UiStatusPill::Ready => "Ready",
+            UiStatusPill::Thinking => "Thinking",
+            UiStatusPill::ToolRunning => "Tool running",
+            UiStatusPill::Error => "Error",
+            UiStatusPill::Complete => "Complete",
+        }
+    }
+}
+
+/// Renderer-neutral transcript item classification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UiTranscriptItem {
+    /// Empty-state guidance line for a new conversation.
+    EmptyHint { text: String },
+    /// Submitted user message.
+    UserMessage { text: String },
+    /// Assistant turn lifecycle status.
+    TurnStatus { text: String, phase: UiTurnPhase },
+    /// Assistant markdown content.
+    AssistantMarkdown { text: String, partial: bool },
+    /// Assistant reasoning content.
+    Reasoning { text: String },
+    /// Tool request summary.
+    ToolRequest { text: String },
+    /// Placeholder indicating the payload is available in the tool rail.
+    ToolOutputAvailable,
+    /// Tool lifecycle summary.
+    ToolStatus { name: String, phase: UiToolPhase },
+    /// Retry status summary.
+    Retry { cause: String, delay: UiRetryDelay },
+    /// Task completion marker.
+    Completion,
+    /// Interrupt marker.
+    Interrupt { reason: String },
+}
+
+/// Renderer-neutral tool activity rail item classification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UiToolActivityItem {
+    /// Empty-state heading for the tool activity rail.
+    EmptyTitle { text: String },
+    /// Empty-state guidance for the tool activity rail.
+    EmptyHint { text: String },
+    /// Tool request title.
+    Request { text: String },
+    /// Tool output preview with raw body compressed for rail display.
+    Output { preview: String },
+    /// Tool lifecycle status item.
+    Status { name: String, phase: UiToolPhase },
+    /// Retry lifecycle item.
+    Retry { cause: String, delay: UiRetryDelay },
+    /// Tool detail summary item.
+    Detail { title: String, is_error: bool },
+}
+
+/// Renderer-neutral detail pane projection for latest tool payloads.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UiToolDetailView {
+    /// Empty-state detail pane.
+    Empty {
+        /// Empty pane title.
+        title: String,
+        /// Guidance lines shown below the title.
+        hints: Vec<String>,
+    },
+    /// Latest raw tool output when no structured detail is available.
+    Output {
+        /// Detail pane title.
+        title: String,
+        /// Output payload.
+        output: String,
+    },
+    /// Latest structured tool detail.
+    Detail(UiToolDetail),
+}
+
+/// Builds a deterministic renderer-neutral projection from a typed UI model.
+///
+/// # Arguments
+/// * `model` - Append-only typed UI model to project.
+pub fn project_conversation(model: &UiModel) -> UiConversationProjection {
+    UiConversationProjection {
+        status: status_summary(model),
+        transcript: transcript_items(model),
+        tool_activity: tool_activity_items(model),
+        tool_detail: tool_detail_view(model),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LatestConversationState {
+    UserSubmitted,
+    TurnPending,
+    TurnRunning,
+    ToolRunning,
+    ToolFinished,
+    ToolFailed,
+    Complete,
+}
+
+fn status_summary(model: &UiModel) -> UiStatusSummary {
+    UiStatusSummary {
+        pill: status_pill(model),
+        turns: model
+            .blocks
+            .iter()
+            .filter(|block| matches!(block, UiBlock::UserMessage(_)))
+            .count(),
+        replies: model
+            .blocks
+            .iter()
+            .filter(|block| matches!(block, UiBlock::Markdown { .. }))
+            .count(),
+        tools: model
+            .blocks
+            .iter()
+            .filter(|block| matches!(block, UiBlock::ToolStatus(_)))
+            .count(),
+        errors: model
+            .blocks
+            .iter()
+            .filter(|block| matches!(block, UiBlock::ToolStatus(status) if matches!(status.phase, UiToolPhase::Failed)))
+            .count(),
+    }
+}
+
+fn status_pill(model: &UiModel) -> UiStatusPill {
+    match latest_conversation_state(model) {
+        Some(LatestConversationState::ToolFailed) => UiStatusPill::Error,
+        Some(LatestConversationState::Complete) => UiStatusPill::Complete,
+        Some(LatestConversationState::ToolRunning) => UiStatusPill::ToolRunning,
+        Some(
+            LatestConversationState::TurnRunning
+            | LatestConversationState::TurnPending
+            | LatestConversationState::UserSubmitted,
+        ) => UiStatusPill::Thinking,
+        Some(LatestConversationState::ToolFinished) | None => UiStatusPill::Ready,
+    }
+}
+
+fn latest_conversation_state(model: &UiModel) -> Option<LatestConversationState> {
+    model.blocks.iter().rev().find_map(|block| match block {
+        UiBlock::TurnStatus(status) => match status.phase {
+            UiTurnPhase::Pending => Some(LatestConversationState::TurnPending),
+            UiTurnPhase::Running => Some(LatestConversationState::TurnRunning),
+        },
+        UiBlock::Markdown { partial, .. } if *partial => Some(LatestConversationState::TurnRunning),
+        UiBlock::Reasoning(_) => Some(LatestConversationState::TurnRunning),
+        UiBlock::ToolStatus(status) => match status.phase {
+            UiToolPhase::Started => Some(LatestConversationState::ToolRunning),
+            UiToolPhase::Finished => Some(LatestConversationState::ToolFinished),
+            UiToolPhase::Failed => Some(LatestConversationState::ToolFailed),
+        },
+        UiBlock::Completion => Some(LatestConversationState::Complete),
+        UiBlock::UserMessage(_) => Some(LatestConversationState::UserSubmitted),
+        UiBlock::Markdown { .. }
+        | UiBlock::ToolInput(_)
+        | UiBlock::ToolOutput(_)
+        | UiBlock::ToolDetail(_)
+        | UiBlock::Retry { .. }
+        | UiBlock::Interrupt(_) => None,
+    })
+}
+
+fn transcript_items(model: &UiModel) -> Vec<UiTranscriptItem> {
+    if model.is_empty() {
+        return vec![
+            UiTranscriptItem::EmptyHint {
+                text: "Start a conversation. Assistant replies, tool cards, and status updates appear here."
+                    .to_string(),
+            },
+            UiTranscriptItem::EmptyHint {
+                text: "Tool payloads stay out of transcript; the rail keeps arguments, output, and errors discoverable."
+                    .to_string(),
+            },
+        ];
+    }
+
+    model
+        .blocks
+        .iter()
+        .filter(|block| !matches!(block, UiBlock::ToolDetail(_)))
+        .map(transcript_item)
+        .collect()
+}
+
+fn transcript_item(block: &UiBlock) -> UiTranscriptItem {
+    match block {
+        UiBlock::UserMessage(text) => UiTranscriptItem::UserMessage { text: text.clone() },
+        UiBlock::TurnStatus(status) => UiTranscriptItem::TurnStatus {
+            text: status.display_text().replace("turn ", ""),
+            phase: status.phase.clone(),
+        },
+        UiBlock::Markdown { text, partial } => {
+            UiTranscriptItem::AssistantMarkdown { text: text.clone(), partial: *partial }
+        }
+        UiBlock::Reasoning(text) => UiTranscriptItem::Reasoning { text: text.clone() },
+        UiBlock::ToolInput(title) => UiTranscriptItem::ToolRequest { text: title.display_text() },
+        UiBlock::ToolOutput(_) => UiTranscriptItem::ToolOutputAvailable,
+        UiBlock::ToolStatus(status) => {
+            UiTranscriptItem::ToolStatus { name: status.name.clone(), phase: status.phase.clone() }
+        }
+        UiBlock::ToolDetail(detail) => UiTranscriptItem::ToolRequest { text: detail.name.clone() },
+        UiBlock::Retry { cause, delay } => {
+            UiTranscriptItem::Retry { cause: cause.clone(), delay: *delay }
+        }
+        UiBlock::Completion => UiTranscriptItem::Completion,
+        UiBlock::Interrupt(reason) => UiTranscriptItem::Interrupt { reason: reason.clone() },
+    }
+}
+
+fn tool_activity_items(model: &UiModel) -> Vec<UiToolActivityItem> {
+    let mut items = Vec::new();
+    for block in &model.blocks {
+        match block {
+            UiBlock::ToolInput(title) => {
+                items.push(UiToolActivityItem::Request { text: title.display_text() });
+            }
+            UiBlock::ToolOutput(output) => {
+                items.push(UiToolActivityItem::Output { preview: preview_text(output) });
+            }
+            UiBlock::ToolStatus(status) => items.push(UiToolActivityItem::Status {
+                name: status.name.clone(),
+                phase: status.phase.clone(),
+            }),
+            UiBlock::Retry { cause, delay } => {
+                items.push(UiToolActivityItem::Retry { cause: cause.clone(), delay: *delay })
+            }
+            UiBlock::ToolDetail(detail) => items.push(UiToolActivityItem::Detail {
+                title: tool_activity_title(detail),
+                is_error: detail.is_error,
+            }),
+            UiBlock::UserMessage(_)
+            | UiBlock::TurnStatus(_)
+            | UiBlock::Markdown { .. }
+            | UiBlock::Reasoning(_)
+            | UiBlock::Completion
+            | UiBlock::Interrupt(_) => {}
+        }
+    }
+
+    if items.is_empty() {
+        return vec![
+            UiToolActivityItem::EmptyTitle { text: "No tool activity yet".to_string() },
+            UiToolActivityItem::EmptyHint {
+                text: "Requests, lifecycle cards, retries, output, and errors appear here."
+                    .to_string(),
+            },
+        ];
+    }
+    items
+}
+
+fn tool_detail_view(model: &UiModel) -> UiToolDetailView {
+    if let Some(detail) = model.blocks.iter().rev().find_map(|block| match block {
+        UiBlock::ToolDetail(detail) => Some(detail),
+        _ => None,
+    }) {
+        return UiToolDetailView::Detail(detail.clone());
+    }
+
+    if let Some(output) = model.blocks.iter().rev().find_map(|block| match block {
+        UiBlock::ToolOutput(output) => Some(output),
+        _ => None,
+    }) {
+        return UiToolDetailView::Output {
+            title: "Latest tool output".to_string(),
+            output: output.clone(),
+        };
+    }
+
+    UiToolDetailView::Empty {
+        title: "Selected/latest tool".to_string(),
+        hints: vec![
+            "No selected tool yet.".to_string(),
+            "Call id, arguments, output, and errors appear here without raw transcript spam."
+                .to_string(),
+        ],
+    }
+}
+
+fn preview_text(text: &str) -> String {
+    const LIMIT: usize = 96;
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= LIMIT {
+        return normalized;
+    }
+
+    let mut preview = normalized.chars().take(LIMIT).collect::<String>();
+    preview.push_str("...");
+    preview
+}
+
+fn tool_activity_title(detail: &UiToolDetail) -> String {
+    match &detail.call_id {
+        Some(call_id) => format!("{} · {call_id}", detail.name),
+        None => detail.name.clone(),
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UiBlock {
     /// Submitted user message for a turn that has been accepted by the UI.
@@ -590,5 +945,122 @@ mod tests {
         assert_eq!(actual.as_duration(), fixture);
         assert_eq!(actual.as_millis(), 1_250);
         assert_eq!(actual.display_text(), "1250ms");
+    }
+
+    #[test]
+    fn test_projection_status_summary_uses_latest_meaningful_state() {
+        let fixture = UiModel::new(vec![
+            UiBlock::Completion,
+            UiBlock::UserMessage("Retry".to_string()),
+            UiBlock::TurnStatus(UiTurnStatus::running()),
+            UiBlock::ToolStatus(UiToolStatus {
+                name: "shell".to_string(),
+                phase: UiToolPhase::Failed,
+                summary: Some("exit 1".to_string()),
+            }),
+        ]);
+
+        let actual = project_conversation(&fixture).status;
+
+        let expected = UiStatusSummary {
+            pill: UiStatusPill::Error,
+            turns: 1,
+            replies: 0,
+            tools: 1,
+            errors: 1,
+        };
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual.display_text(),
+            "turns 1 · replies 0 · tools 1 · errors 1"
+        );
+    }
+
+    #[test]
+    fn test_projection_keeps_tool_payload_out_of_transcript_and_in_rail() {
+        let fixture = UiModel::new(vec![
+            UiBlock::Markdown { text: "Checking".to_string(), partial: false },
+            UiBlock::ToolStatus(UiToolStatus {
+                name: "shell".to_string(),
+                phase: UiToolPhase::Finished,
+                summary: Some("SECRET_RAW_OUTPUT_SHOULD_NOT_RENDER".to_string()),
+            }),
+            UiBlock::ToolOutput("SECRET_TOOL_OUTPUT_BODY_SHOULD_NOT_RENDER".to_string()),
+            UiBlock::ToolDetail(UiToolDetail {
+                call_id: Some("call-1".to_string()),
+                name: "shell".to_string(),
+                arguments: Some("{\"command\":\"true\"}".to_string()),
+                output: Some("exit 0".to_string()),
+                is_error: false,
+            }),
+        ]);
+
+        let actual = project_conversation(&fixture);
+
+        let expected_transcript = vec![
+            UiTranscriptItem::AssistantMarkdown { text: "Checking".to_string(), partial: false },
+            UiTranscriptItem::ToolStatus {
+                name: "shell".to_string(),
+                phase: UiToolPhase::Finished,
+            },
+            UiTranscriptItem::ToolOutputAvailable,
+        ];
+        assert_eq!(actual.transcript, expected_transcript);
+        assert!(actual.tool_activity.contains(&UiToolActivityItem::Output {
+            preview: "SECRET_TOOL_OUTPUT_BODY_SHOULD_NOT_RENDER".to_string()
+        }));
+        assert_eq!(
+            actual.tool_detail,
+            UiToolDetailView::Detail(UiToolDetail {
+                call_id: Some("call-1".to_string()),
+                name: "shell".to_string(),
+                arguments: Some("{\"command\":\"true\"}".to_string()),
+                output: Some("exit 0".to_string()),
+                is_error: false,
+            })
+        );
+    }
+
+    #[test]
+    fn test_projection_empty_model_has_renderer_neutral_empty_states() {
+        let fixture = UiModel::default();
+
+        let actual = project_conversation(&fixture);
+
+        let expected = UiConversationProjection {
+            status: UiStatusSummary {
+                pill: UiStatusPill::Ready,
+                turns: 0,
+                replies: 0,
+                tools: 0,
+                errors: 0,
+            },
+            transcript: vec![
+                UiTranscriptItem::EmptyHint {
+                    text: "Start a conversation. Assistant replies, tool cards, and status updates appear here."
+                        .to_string(),
+                },
+                UiTranscriptItem::EmptyHint {
+                    text: "Tool payloads stay out of transcript; the rail keeps arguments, output, and errors discoverable."
+                        .to_string(),
+                },
+            ],
+            tool_activity: vec![
+                UiToolActivityItem::EmptyTitle { text: "No tool activity yet".to_string() },
+                UiToolActivityItem::EmptyHint {
+                    text: "Requests, lifecycle cards, retries, output, and errors appear here."
+                        .to_string(),
+                },
+            ],
+            tool_detail: UiToolDetailView::Empty {
+                title: "Selected/latest tool".to_string(),
+                hints: vec![
+                    "No selected tool yet.".to_string(),
+                    "Call id, arguments, output, and errors appear here without raw transcript spam."
+                        .to_string(),
+                ],
+            },
+        };
+        assert_eq!(actual, expected);
     }
 }
