@@ -4,7 +4,10 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-use crate::types::{EdgeConfidence, GraphEdge, GraphEdgeKind, Language, Provenance, SourceFile};
+use crate::types::{
+    EdgeConfidence, ExternalFactBatchMetadata, GraphEdge, GraphEdgeKind, Language, Provenance,
+    SourceFile,
+};
 
 /// Builds a redaction-safe SHA-256 fingerprint for arbitrary sensitive text.
 ///
@@ -102,12 +105,47 @@ pub(crate) fn hash_text(content: &str) -> String {
         .collect()
 }
 
-pub(crate) fn manifest_hash(files: &[SourceFile]) -> String {
+pub(crate) fn manifest_hash(
+    files: &[SourceFile],
+    external_fact_batches: &[ExternalFactBatchMetadata],
+    external_facts_fingerprint: &str,
+) -> String {
     let mut content = String::new();
     for file in files {
         content.push_str(&file.path);
         content.push('\0');
         content.push_str(&file.content_hash);
+        content.push('\n');
+    }
+    content.push_str("external_facts_fingerprint");
+    content.push('\0');
+    content.push_str(external_facts_fingerprint);
+    content.push('\n');
+    for batch in external_fact_batches {
+        content.push_str(&batch.batch_fingerprint);
+        content.push('\0');
+        content.push_str(&batch.source_label);
+        content.push('\0');
+        content.push_str(&batch.source_artifact_fingerprint);
+        content.push('\n');
+    }
+    hash_text(&content)
+}
+
+pub(crate) fn external_facts_fingerprint(batches: &[ExternalFactBatchMetadata]) -> String {
+    let mut content = String::new();
+    for batch in batches {
+        content.push_str(&batch.batch_fingerprint);
+        content.push('\0');
+        content.push_str(&batch.source_label);
+        content.push('\0');
+        content.push_str(batch.tool_version.as_deref().unwrap_or_default());
+        content.push('\0');
+        content.push_str(&batch.workspace_root);
+        content.push('\0');
+        content.push_str(&batch.source_artifact_fingerprint);
+        content.push('\0');
+        content.push_str(&batch.manifest_hash_input);
         content.push('\n');
     }
     hash_text(&content)

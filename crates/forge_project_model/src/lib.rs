@@ -31,7 +31,10 @@ pub use extraction::{
 };
 pub use freshness::compare_freshness;
 pub use indexer::ProjectIndexer;
-pub use ingestion::{ingest_external_facts, ingest_typed_external_facts};
+pub use ingestion::{
+    external_fact_batch_fingerprint, ingest_external_fact_batch, ingest_external_facts,
+    ingest_typed_external_facts, validate_external_fact_batch,
+};
 pub use learning::{
     LearningContextPayload, LearningContextRecord, LearningContextTransport,
     LearningLedgerFreshness, LearningProvenance, LearningRedactionStatus, LearningReviewState,
@@ -51,14 +54,15 @@ pub use types::{
     ContextPack, ContextPackArtifactEvalReport, ContextPackArtifactId, ContextPackEvidence,
     ContextPackEvidenceSource, ContextPackSelection, DecisionGraphNode, EdgeConfidence,
     EvalCaseGraphNode, EvidenceFreshness, EvidenceLedgerEvalIssue, EvidenceLedgerEvalIssueCode,
-    EvidenceLedgerLinkageReport, ExternalFactSource, ExternalFacts, ExternalReferenceFact,
-    ExternalSymbolFact, FileGraphNode, FileNode, FileNodeKind, FreshnessEvalReport,
-    FreshnessProofLevel, FreshnessState, FutureVectorRetrievalScaffold, GraphCoverageReport,
-    GraphEdge, GraphEdgeKind, KnowledgeGraph, KnowledgeGraphEdge, KnowledgeGraphNode,
-    KnowledgeGraphNodeId, KnowledgeGraphNodeKind, Language, LexicalDocument, LexicalDocumentKind,
-    LexicalSearchHit, ManifestFreshnessEvaluation, ProjectManifest, Provenance,
-    ProvenanceCompletenessReport, RerankCandidate, RerankScore, RetrievalEvalCase,
-    RetrievalEvalReport, RetrievalQuery, RetrievalResult, RetrievalScoringPlan,
+    EvidenceLedgerLinkageReport, ExternalFactBatch, ExternalFactBatchMetadata,
+    ExternalFactIngestionIssue, ExternalFactIngestionIssueCode, ExternalFactIngestionReport,
+    ExternalFactSource, ExternalFacts, ExternalReferenceFact, ExternalSymbolFact, FileGraphNode,
+    FileNode, FileNodeKind, FreshnessEvalReport, FreshnessProofLevel, FreshnessState,
+    FutureVectorRetrievalScaffold, GraphCoverageReport, GraphEdge, GraphEdgeKind, KnowledgeGraph,
+    KnowledgeGraphEdge, KnowledgeGraphNode, KnowledgeGraphNodeId, KnowledgeGraphNodeKind, Language,
+    LexicalDocument, LexicalDocumentKind, LexicalSearchHit, ManifestFreshnessEvaluation,
+    ProjectManifest, Provenance, ProvenanceCompletenessReport, RerankCandidate, RerankScore,
+    RetrievalEvalCase, RetrievalEvalReport, RetrievalQuery, RetrievalResult, RetrievalScoringPlan,
     RetrievalScoringWeights, RetrievedEvidenceGraphNode, ShardGraphNode, ShardManifest,
     ShardStrategy, SourceFile, StaleEvidencePolicy, SymbolGraphNode, SymbolKind, SymbolNode,
     TaskGraphNode, ToolEpisode, ToolEpisodeEvalReport, ToolEpisodeGraphNode, TypedExternalFacts,

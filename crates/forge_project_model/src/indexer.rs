@@ -114,7 +114,11 @@ impl ProjectIndexer {
             &self.root,
             &ShardStrategy::RustSemanticWithLineFallback,
         )?;
-        let manifest_hash = manifest_hash(&files);
+        let external_fact_batches = Vec::new();
+        let external_facts_fingerprint =
+            crate::util::external_facts_fingerprint(&external_fact_batches);
+        let manifest_hash =
+            manifest_hash(&files, &external_fact_batches, &external_facts_fingerprint);
         Ok(ProjectManifest {
             version: 1,
             root: self.root.clone(),
@@ -122,6 +126,8 @@ impl ProjectIndexer {
             file_nodes,
             symbols,
             edges,
+            external_fact_batches,
+            external_facts_fingerprint,
             shards,
             manifest_hash,
         })

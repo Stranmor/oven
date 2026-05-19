@@ -23,9 +23,16 @@ pub struct ProjectManifest {
     pub symbols: Vec<SymbolNode>,
     /// Typed knowledge and dependency edges.
     pub edges: Vec<GraphEdge>,
+    /// Accepted external exact fact batch provenance.
+    #[serde(default)]
+    pub external_fact_batches: Vec<ExternalFactBatchMetadata>,
+    /// Manifest-level fingerprint for accepted external exact fact batches.
+    #[serde(default)]
+    pub external_facts_fingerprint: String,
     /// Content shards used by retrieval.
     pub shards: Vec<ShardManifest>,
-    /// Manifest-level content hash over deterministic file hashes.
+    /// Manifest-level content hash over deterministic file hashes and accepted
+    /// external fact fingerprints.
     pub manifest_hash: String,
 }
 
@@ -134,8 +141,8 @@ pub struct GraphEdge {
 /// Semantic confidence carried by graph edges.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum EdgeConfidence {
-    /// Compiler, LSP, or SCIP fact imported from an authoritative external
-    /// source.
+    /// Exact fact accepted from a typed external batch whose source contract and
+    /// manifest baseline were validated before ingestion.
     ExactCompiler,
     /// High-confidence syntax heuristic produced without type resolution.
     #[default]
@@ -1193,8 +1200,79 @@ pub struct RerankScore {
     pub score: f32,
 }
 
-/// Typed external fact source accepted at the compiler/LSP/SCIP ingestion
-/// boundary.
+/// External exact fact batch metadata persisted into manifests after validated
+/// ingestion.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ExternalFactBatchMetadata {
+    /// Typed source boundary for the external fact producer.
+    pub source: ExternalFactSource,
+    /// Human-readable source label or tool name.
+    pub source_label: String,
+    /// Optional producer version when supplied by the caller.
+    pub tool_version: Option<String>,
+    /// Workspace root identity used by the producer.
+    pub workspace_root: String,
+    /// Redaction-safe fingerprint for the source artifact or source snapshot.
+    pub source_artifact_fingerprint: String,
+    /// Manifest baseline identity the batch was produced against.
+    pub manifest_hash_input: String,
+    /// Deterministic fingerprint over batch metadata and fact payloads.
+    pub batch_fingerprint: String,
+}
+
+/// External exact fact batch imported through the safe fixture-backed boundary.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalFactBatch {
+    /// Batch-level metadata and deterministic fingerprint.
+    pub metadata: ExternalFactBatchMetadata,
+    /// Symbol and reference facts carried by this batch.
+    pub facts: TypedExternalFacts,
+}
+
+/// Stable issue code emitted by external exact fact ingestion.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ExternalFactIngestionIssueCode {
+    /// Batch metadata is missing source, artifact, workspace, or baseline data.
+    IncompleteBatchMetadata,
+    /// Batch metadata baseline does not match the current manifest baseline.
+    ManifestBaselineMismatch,
+    /// Batch fingerprint does not match deterministic recomputation.
+    BatchFingerprintMismatch,
+    /// A symbol fact points at a file not present in the manifest.
+    MissingSymbolFileEndpoint,
+    /// A reference or call edge source is absent from accepted file, symbol, or shard endpoints.
+    MissingReferenceSourceEndpoint,
+    /// A reference or call edge target is absent from accepted file, symbol, or shard endpoints.
+    MissingReferenceTargetEndpoint,
+    /// A fact cannot be accepted as exact under the batch source contract.
+    InvalidExactSourceContract,
+}
+
+/// Redaction-safe issue emitted by external exact fact ingestion.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalFactIngestionIssue {
+    /// Stable machine-readable issue code.
+    pub code: ExternalFactIngestionIssueCode,
+    /// Optional rejected endpoint or fact identifier.
+    pub endpoint: Option<String>,
+    /// Redaction-safe detail containing only labels, paths, and fingerprints.
+    pub detail: String,
+}
+
+/// Result of applying one validated external exact fact batch.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalFactIngestionReport {
+    /// Number of accepted symbol facts.
+    pub accepted_symbols: usize,
+    /// Number of accepted reference or call edge facts.
+    pub accepted_edges: usize,
+    /// Number of duplicate accepted edge facts removed deterministically.
+    pub deduplicated_edges: usize,
+    /// Batch metadata persisted into the manifest.
+    pub batch_metadata: ExternalFactBatchMetadata,
+}
+
+/// Typed external fact source accepted at the exact fact ingestion boundary.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ExternalFactSource {
     /// Language Server Protocol facts.
@@ -1238,7 +1316,8 @@ impl ExternalFactSource {
     }
 }
 
-/// External compiler, LSP, or SCIP symbol fact accepted by the typed importer.
+/// External symbol fact accepted by the typed importer only as part of a
+/// validated external fact batch.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypedExternalSymbolFact {
     /// Stable external symbol identifier.
@@ -1257,8 +1336,8 @@ pub struct TypedExternalSymbolFact {
     pub source: ExternalFactSource,
 }
 
-/// External compiler, LSP, or SCIP relationship fact accepted by the typed
-/// importer.
+/// External relationship fact accepted by the typed importer only as part of a
+/// validated external fact batch.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypedExternalReferenceFact {
     /// Stable source node identifier.
@@ -1277,7 +1356,7 @@ pub struct TypedExternalReferenceFact {
     pub source: ExternalFactSource,
 }
 
-/// Typed external facts bundle imported through a compiler/LSP/SCIP boundary.
+/// Typed external facts bundle imported through a validated batch boundary.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypedExternalFacts {
     /// Symbol facts to merge into the project model.
