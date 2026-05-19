@@ -1,14 +1,21 @@
 //! Rust-native evaluation harness for retrieval, graph, freshness, and
 //! provenance.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
+use crate::ProjectIndexer;
 use crate::freshness::compare_freshness;
 use crate::retrieval::retrieve;
 use crate::types::{
-    FreshnessEvalReport, GraphCoverageReport, GraphEdge, ProjectManifest,
-    ProvenanceCompletenessReport, RetrievalEvalCase, RetrievalEvalReport,
+    ContextPack, ContextPackArtifactEvalReport, ContextPackArtifactId, EdgeConfidence,
+    EvidenceFreshness, EvidenceLedgerEvalIssue, EvidenceLedgerEvalIssueCode,
+    EvidenceLedgerLinkageReport, FreshnessEvalReport, GraphCoverageReport, GraphEdge,
+    GraphEdgeKind, KnowledgeGraph, KnowledgeGraphEdge, KnowledgeGraphNode, KnowledgeGraphNodeId,
+    ProjectManifest, Provenance, ProvenanceCompletenessReport, RetrievalEvalCase,
+    RetrievalEvalReport, RetrievedEvidenceGraphNode, ToolEpisode, ToolEpisodeEvalReport,
+    ToolEpisodeGraphNode,
 };
+use crate::util::fingerprint;
 
 /// Evaluates retrieval precision@k, recall@k, and mean reciprocal rank.
 ///
@@ -127,6 +134,338 @@ pub fn evaluate_freshness(
     FreshnessEvalReport { state, provenance_complete }
 }
 
+/// Evaluates persisted context-pack artifacts from a project indexer.
+///
+/// # Arguments
+///
+/// * `indexer` - Project indexer whose artifact directory is evaluated.
+///
+/// # Errors
+///
+/// Returns an error when the artifact directory cannot be listed.
+pub fn evaluate_context_pack_artifacts(
+    indexer: &ProjectIndexer,
+) -> anyhow::Result<ContextPackArtifactEvalReport> {
+    let artifact_ids = indexer.list_context_pack_artifacts()?;
+    evaluate_context_pack_artifacts_by_id(indexer, &artifact_ids)
+}
+
+/// Evaluates explicit context-pack artifact identifiers from a project indexer.
+///
+/// # Arguments
+///
+/// * `indexer` - Project indexer used to read persisted artifacts.
+/// * `artifact_ids` - Artifact identifiers to validate.
+///
+/// # Errors
+///
+/// Returns an error only when directory-level artifact discovery is impossible;
+/// individual corrupt or missing artifacts are reported as typed issues.
+pub fn evaluate_context_pack_artifacts_by_id(
+    indexer: &ProjectIndexer,
+    artifact_ids: &[ContextPackArtifactId],
+) -> anyhow::Result<ContextPackArtifactEvalReport> {
+    let mut issues = Vec::new();
+    for artifact_id in artifact_ids {
+        match indexer.read_context_pack(artifact_id) {
+            Ok(pack) => evaluate_context_pack_artifact(artifact_id, &pack, &mut issues),
+            Err(error) => {
+                let (code, reason) = if error_is_not_found(&error) {
+                    (EvidenceLedgerEvalIssueCode::MissingArtifact, "missing")
+                } else {
+                    (EvidenceLedgerEvalIssueCode::CorruptArtifact, "corrupt")
+                };
+                issues.push(issue(
+                    code,
+                    Some(artifact_id),
+                    None,
+                    format!("artifact_read_failed:{artifact_id}:{reason}"),
+                ));
+            }
+        }
+    }
+    Ok(ContextPackArtifactEvalReport {
+        checked: artifact_ids.len(),
+        valid: issues.is_empty(),
+        issues,
+    })
+}
+
+/// Evaluates redaction-safe tool episodes.
+///
+/// # Arguments
+///
+/// * `episodes` - Tool episodes loaded from JSONL storage.
+pub fn evaluate_tool_episodes(episodes: &[ToolEpisode]) -> ToolEpisodeEvalReport {
+    let mut issues = Vec::new();
+    let mut identities = BTreeSet::new();
+    for episode in episodes {
+        let episode_id = tool_episode_graph_id(episode);
+        if episode.input_fingerprint.is_empty() {
+            issues.push(issue(
+                EvidenceLedgerEvalIssueCode::EmptyEpisodeInputFingerprint,
+                None,
+                Some(episode_id.clone()),
+                "episode_input_fingerprint_empty".to_string(),
+            ));
+        }
+        if episode.output_fingerprint.is_empty() {
+            issues.push(issue(
+                EvidenceLedgerEvalIssueCode::EmptyEpisodeOutputFingerprint,
+                None,
+                Some(episode_id.clone()),
+                "episode_output_fingerprint_empty".to_string(),
+            ));
+        }
+        if !episode.provenance.is_complete() {
+            issues.push(issue(
+                EvidenceLedgerEvalIssueCode::IncompleteEpisodeProvenance,
+                None,
+                Some(episode_id.clone()),
+                "episode_provenance_incomplete".to_string(),
+            ));
+        }
+        if !identities.insert(episode_id.clone()) {
+            issues.push(issue(
+                EvidenceLedgerEvalIssueCode::DuplicateEpisodeIdentity,
+                None,
+                Some(episode_id),
+                "episode_identity_duplicated".to_string(),
+            ));
+        }
+    }
+    ToolEpisodeEvalReport { checked: episodes.len(), valid: issues.is_empty(), issues }
+}
+
+/// Evaluates whether tool episodes link to existing context-pack artifacts.
+///
+/// # Arguments
+///
+/// * `episodes` - Tool episodes loaded from JSONL storage.
+/// * `artifact_ids` - Existing context-pack artifact identifiers.
+pub fn evaluate_episode_artifact_links(
+    episodes: &[ToolEpisode],
+    artifact_ids: &[ContextPackArtifactId],
+) -> EvidenceLedgerLinkageReport {
+    let artifact_set = artifact_ids
+        .iter()
+        .map(|artifact_id| artifact_id.as_str().to_string())
+        .collect::<BTreeSet<_>>();
+    let mut linked_count = 0usize;
+    let mut issues = Vec::new();
+    for episode in episodes {
+        let episode_id = tool_episode_graph_id(episode);
+        let Some(artifact_id) = episode_context_pack_artifact_id(episode) else {
+            issues.push(issue(
+                EvidenceLedgerEvalIssueCode::MissingEpisodeArtifactReference,
+                None,
+                Some(episode_id),
+                "episode_context_pack_reference_missing".to_string(),
+            ));
+            continue;
+        };
+        if artifact_set.contains(artifact_id.as_str()) {
+            linked_count = linked_count.saturating_add(1);
+        } else {
+            issues.push(issue(
+                EvidenceLedgerEvalIssueCode::MissingLinkedArtifact,
+                Some(&artifact_id),
+                Some(episode_id),
+                format!("episode_context_pack_missing:{artifact_id}"),
+            ));
+        }
+    }
+    EvidenceLedgerLinkageReport {
+        artifact_count: artifact_ids.len(),
+        episode_count: episodes.len(),
+        linked_count,
+        issues,
+    }
+}
+
+/// Builds a knowledge graph for tool episodes and context-pack artifacts.
+///
+/// # Arguments
+///
+/// * `episodes` - Tool episodes to represent as graph nodes.
+/// * `artifact_ids` - Context-pack artifact identifiers to represent as evidence nodes.
+///
+/// # Errors
+///
+/// Returns an error when graph validation finds duplicate nodes or invalid edge endpoints.
+pub fn tool_episodes_to_graph(
+    episodes: &[ToolEpisode],
+    artifact_ids: &[ContextPackArtifactId],
+) -> anyhow::Result<KnowledgeGraph> {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut artifact_nodes = BTreeMap::new();
+    for artifact_id in artifact_ids {
+        let node_id = KnowledgeGraphNodeId::RetrievedEvidence(context_pack_graph_id(artifact_id));
+        let provenance = context_pack_artifact_provenance(artifact_id);
+        artifact_nodes.insert(artifact_id.as_str().to_string(), node_id.clone());
+        nodes.push(KnowledgeGraphNode::RetrievedEvidence(
+            RetrievedEvidenceGraphNode {
+                id: node_id,
+                evidence_id: artifact_id.as_str().to_string(),
+                path: format!("context_packs/{}.json", artifact_id.as_str()),
+                freshness: EvidenceFreshness::Fresh,
+                provenance,
+            },
+        ));
+    }
+    for episode in episodes {
+        let episode_node_id = KnowledgeGraphNodeId::ToolEpisode(tool_episode_graph_id(episode));
+        nodes.push(KnowledgeGraphNode::ToolEpisode(ToolEpisodeGraphNode {
+            id: episode_node_id.clone(),
+            tool: episode.tool.clone(),
+            status: episode.status.clone(),
+            provenance: episode.provenance.clone(),
+        }));
+        if let Some(artifact_id) = episode_context_pack_artifact_id(episode)
+            && let Some(artifact_node_id) = artifact_nodes.get(artifact_id.as_str())
+        {
+            edges.push(KnowledgeGraphEdge {
+                from: episode_node_id,
+                to: artifact_node_id.clone(),
+                kind: GraphEdgeKind::ToolEpisodeRelates,
+                confidence: 0.9,
+                confidence_kind: EdgeConfidence::HeuristicHigh,
+                provenance: episode.provenance.clone(),
+            });
+        }
+    }
+    KnowledgeGraph::new(nodes, edges)
+}
+
+/// Returns the deterministic graph identifier for a tool episode.
+///
+/// # Arguments
+///
+/// * `episode` - Redaction-safe tool episode.
+pub fn tool_episode_graph_id(episode: &ToolEpisode) -> String {
+    let identity = [
+        episode.tool.as_str(),
+        episode.timestamp.as_str(),
+        episode.input_fingerprint.as_str(),
+        episode.output_fingerprint.as_str(),
+        episode.provenance.fingerprint.as_str(),
+    ];
+    fingerprint(&length_prefixed_fields(&identity))
+}
+
+fn length_prefixed_fields(fields: &[&str]) -> String {
+    let mut encoded = String::new();
+    for field in fields {
+        encoded.push_str(&field.len().to_string());
+        encoded.push(':');
+        encoded.push_str(field);
+        encoded.push(';');
+    }
+    encoded
+}
+
+fn evaluate_context_pack_artifact(
+    artifact_id: &ContextPackArtifactId,
+    pack: &ContextPack,
+    issues: &mut Vec<EvidenceLedgerEvalIssue>,
+) {
+    if pack.evidence.is_empty() {
+        issues.push(issue(
+            EvidenceLedgerEvalIssueCode::EmptyArtifactEvidence,
+            Some(artifact_id),
+            None,
+            format!("artifact_evidence_empty:{artifact_id}"),
+        ));
+    }
+    if pack.provenance.is_empty() {
+        issues.push(issue(
+            EvidenceLedgerEvalIssueCode::IncompleteArtifactProvenance,
+            Some(artifact_id),
+            None,
+            format!("artifact_provenance_empty:{artifact_id}"),
+        ));
+    }
+    for provenance in &pack.provenance {
+        if !provenance.is_complete() {
+            issues.push(issue(
+                EvidenceLedgerEvalIssueCode::IncompleteArtifactProvenance,
+                Some(artifact_id),
+                None,
+                format!("artifact_provenance_incomplete:{artifact_id}"),
+            ));
+        }
+    }
+    for evidence in &pack.evidence {
+        if !evidence.provenance.is_complete() {
+            issues.push(issue(
+                EvidenceLedgerEvalIssueCode::IncompleteArtifactProvenance,
+                Some(artifact_id),
+                None,
+                format!(
+                    "artifact_evidence_provenance_incomplete:{artifact_id}:{}",
+                    evidence.id
+                ),
+            ));
+        }
+        if matches!(
+            evidence.freshness,
+            EvidenceFreshness::Changed | EvidenceFreshness::Deleted
+        ) {
+            issues.push(issue(
+                EvidenceLedgerEvalIssueCode::StaleArtifactEvidence,
+                Some(artifact_id),
+                None,
+                format!("artifact_evidence_stale:{artifact_id}:{}", evidence.id),
+            ));
+        }
+    }
+}
+
+fn episode_context_pack_artifact_id(episode: &ToolEpisode) -> Option<ContextPackArtifactId> {
+    let id = episode
+        .provenance
+        .path
+        .strip_prefix("context_packs/")?
+        .strip_suffix(".json")?;
+    ContextPackArtifactId::new(id.to_string()).ok()
+}
+
+fn context_pack_graph_id(artifact_id: &ContextPackArtifactId) -> String {
+    format!("context_pack_artifact:{}", artifact_id.as_str())
+}
+
+fn context_pack_artifact_provenance(artifact_id: &ContextPackArtifactId) -> Provenance {
+    Provenance {
+        path: format!("context_packs/{}.json", artifact_id.as_str()),
+        start_line: None,
+        end_line: None,
+        source: "context_pack_artifact".to_string(),
+        fingerprint: fingerprint(&format!("context_pack_artifact:{}", artifact_id.as_str())),
+    }
+}
+
+fn issue(
+    code: EvidenceLedgerEvalIssueCode,
+    artifact_id: Option<&ContextPackArtifactId>,
+    episode_fingerprint: Option<String>,
+    detail: String,
+) -> EvidenceLedgerEvalIssue {
+    EvidenceLedgerEvalIssue {
+        code,
+        artifact_id: artifact_id.map(|value| value.as_str().to_string()),
+        episode_fingerprint,
+        detail,
+    }
+}
+
+fn error_is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|cause| cause.kind() == std::io::ErrorKind::NotFound)
+}
+
 fn manifest_provenance(manifest: &ProjectManifest) -> Vec<&crate::types::Provenance> {
     manifest
         .files
@@ -148,13 +487,260 @@ fn is_complete(provenance: &crate::types::Provenance) -> bool {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::PathBuf;
 
     use anyhow::Result;
     use pretty_assertions::assert_eq;
 
     use super::*;
     use crate::indexer::tests::fixture_project;
-    use crate::{GraphEdgeKind, ProjectIndexer, RetrievalQuery};
+    use crate::{
+        ContextPackSelection, EvidenceLedgerEvalIssueCode, FreshnessState, GraphEdgeKind,
+        ProjectIndexer, RetrievalQuery, StaleEvidencePolicy,
+    };
+
+    fn write_fixture_context_pack(
+        indexer: &ProjectIndexer,
+        manifest: &ProjectManifest,
+    ) -> Result<(ContextPackArtifactId, ContextPack)> {
+        let result = retrieve(
+            manifest,
+            &RetrievalQuery {
+                text: Some("Root".to_string()),
+                path: None,
+                path_prefix: None,
+                symbol: None,
+                limit: 1,
+                include_graph_expansion: false,
+            },
+        )
+        .into_iter()
+        .next()
+        .expect("fixture should retrieve Root evidence");
+        let pack = ContextPack::from_selection(
+            manifest,
+            ContextPackSelection {
+                retrieval_results: vec![result],
+                shards: Vec::new(),
+                evidence: Vec::new(),
+                freshness: FreshnessState { fresh: true, ..Default::default() },
+                stale_policy: StaleEvidencePolicy::Reject,
+            },
+        )?;
+        indexer.write_context_pack(&pack)?;
+        let id = indexer.context_pack_artifact_id(&pack)?;
+        Ok((id, pack))
+    }
+
+    fn fixture_episode(artifact_id: &ContextPackArtifactId) -> ToolEpisode {
+        ToolEpisode {
+            timestamp: "2026-05-19T14:42:31+03:00".to_string(),
+            tool: "project_model_search".to_string(),
+            input_fingerprint: crate::fingerprint("input"),
+            output_fingerprint: crate::fingerprint("output"),
+            status: "success".to_string(),
+            provenance: Provenance {
+                path: format!("context_packs/{}.json", artifact_id.as_str()),
+                start_line: None,
+                end_line: None,
+                source: "WorkspaceService::query_workspace".to_string(),
+                fingerprint: crate::fingerprint("episode-provenance"),
+            },
+        }
+    }
+
+    fn artifact_path(model_root: &std::path::Path, artifact_id: &ContextPackArtifactId) -> PathBuf {
+        model_root
+            .join("model")
+            .join("context_packs")
+            .join(format!("{}.json", artifact_id.as_str()))
+    }
+
+    #[test]
+    fn evaluates_context_pack_episode_linkage_and_graph_happy_path() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let indexer = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = indexer.index()?;
+        let (artifact_id, _pack) = write_fixture_context_pack(&indexer, &manifest)?;
+        let episode = fixture_episode(&artifact_id);
+
+        let artifact_report = evaluate_context_pack_artifacts(&indexer)?;
+        let episode_report = evaluate_tool_episodes(std::slice::from_ref(&episode));
+        let linkage_report = evaluate_episode_artifact_links(
+            std::slice::from_ref(&episode),
+            std::slice::from_ref(&artifact_id),
+        );
+        let graph = tool_episodes_to_graph(
+            std::slice::from_ref(&episode),
+            std::slice::from_ref(&artifact_id),
+        )?;
+        let graph_again = tool_episodes_to_graph(
+            std::slice::from_ref(&episode),
+            std::slice::from_ref(&artifact_id),
+        )?;
+
+        assert_eq!(artifact_report.checked, 1usize);
+        assert_eq!(artifact_report.valid, true);
+        assert_eq!(episode_report.checked, 1usize);
+        assert_eq!(episode_report.valid, true);
+        assert_eq!(linkage_report.linked_count, 1usize);
+        assert_eq!(linkage_report.issues, Vec::new());
+        assert_eq!(graph, graph_again);
+        assert_eq!(graph.nodes.len(), 2usize);
+        assert_eq!(graph.edges.len(), 1usize);
+        assert_eq!(graph.edges[0].kind, GraphEdgeKind::ToolEpisodeRelates);
+        assert_eq!(
+            graph.edges[0].confidence_kind,
+            EdgeConfidence::HeuristicHigh
+        );
+        assert_eq!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.confidence_kind == EdgeConfidence::ExactCompiler),
+            false
+        );
+        let report_json = serde_json::to_string(&artifact_report)?;
+        assert!(!report_json.contains("pub struct"));
+        assert!(!report_json.contains("capture a deterministic"));
+        assert!(!report_json.contains("<project_model_context>"));
+        Ok(())
+    }
+
+    #[test]
+    fn reports_missing_and_corrupt_context_pack_artifacts() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let indexer = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let missing_id = ContextPackArtifactId::new("a".repeat(64))?;
+        let corrupt_id = ContextPackArtifactId::new("b".repeat(64))?;
+        fs::create_dir_all(fixture.path().join("model").join("context_packs"))?;
+        fs::write(artifact_path(fixture.path(), &corrupt_id), "not json")?;
+
+        let actual = evaluate_context_pack_artifacts_by_id(
+            &indexer,
+            &[missing_id.clone(), corrupt_id.clone()],
+        )?;
+        let actual_codes = actual
+            .issues
+            .iter()
+            .map(|issue| issue.code.clone())
+            .collect::<BTreeSet<_>>();
+        let expected = BTreeSet::from([
+            EvidenceLedgerEvalIssueCode::MissingArtifact,
+            EvidenceLedgerEvalIssueCode::CorruptArtifact,
+        ]);
+
+        assert_eq!(actual.checked, 2usize);
+        assert_eq!(actual.valid, false);
+        assert_eq!(actual_codes, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn reports_stale_and_incomplete_context_pack_artifact() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let indexer = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = indexer.index()?;
+        let (_id, mut pack) = write_fixture_context_pack(&indexer, &manifest)?;
+        pack.evidence[0].freshness = EvidenceFreshness::Changed;
+        pack.evidence[0].provenance.fingerprint.clear();
+        pack.provenance.clear();
+        let stale_id = indexer.context_pack_artifact_id(&pack)?;
+        fs::write(
+            artifact_path(fixture.path(), &stale_id),
+            pack.to_stable_json()?,
+        )?;
+
+        let actual = evaluate_context_pack_artifacts_by_id(&indexer, &[stale_id])?;
+        let actual_codes = actual
+            .issues
+            .iter()
+            .map(|issue| issue.code.clone())
+            .collect::<BTreeSet<_>>();
+        let expected = BTreeSet::from([
+            EvidenceLedgerEvalIssueCode::IncompleteArtifactProvenance,
+            EvidenceLedgerEvalIssueCode::StaleArtifactEvidence,
+        ]);
+
+        assert_eq!(actual.valid, false);
+        assert_eq!(actual_codes, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn reports_episode_fingerprint_provenance_and_duplicate_failures() -> Result<()> {
+        let artifact_id = ContextPackArtifactId::new("c".repeat(64))?;
+        let mut episode = fixture_episode(&artifact_id);
+        episode.input_fingerprint.clear();
+        episode.output_fingerprint.clear();
+        episode.provenance.fingerprint.clear();
+        let actual = evaluate_tool_episodes(&[episode.clone(), episode]);
+        let actual_codes = actual
+            .issues
+            .iter()
+            .map(|issue| issue.code.clone())
+            .collect::<BTreeSet<_>>();
+        let expected = BTreeSet::from([
+            EvidenceLedgerEvalIssueCode::DuplicateEpisodeIdentity,
+            EvidenceLedgerEvalIssueCode::EmptyEpisodeInputFingerprint,
+            EvidenceLedgerEvalIssueCode::EmptyEpisodeOutputFingerprint,
+            EvidenceLedgerEvalIssueCode::IncompleteEpisodeProvenance,
+        ]);
+
+        assert_eq!(actual.checked, 2usize);
+        assert_eq!(actual.valid, false);
+        assert_eq!(actual_codes, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn episode_identity_uses_length_prefixed_fields() -> Result<()> {
+        let artifact_id = ContextPackArtifactId::new("e".repeat(64))?;
+        let mut left = fixture_episode(&artifact_id);
+        left.tool = "tool=a;timestamp=b".to_string();
+        left.timestamp = "c".to_string();
+        let mut right = fixture_episode(&artifact_id);
+        right.tool = "tool=a".to_string();
+        right.timestamp = "b;timestamp=c".to_string();
+
+        let left_id = tool_episode_graph_id(&left);
+        let right_id = tool_episode_graph_id(&right);
+        let report = evaluate_tool_episodes(&[left, right]);
+
+        assert_ne!(left_id, right_id);
+        assert_eq!(report.valid, true);
+        Ok(())
+    }
+
+    #[test]
+    fn reports_missing_episode_artifact_links_and_rejects_duplicate_graph_nodes() -> Result<()> {
+        let artifact_id = ContextPackArtifactId::new("d".repeat(64))?;
+        let mut missing_reference = fixture_episode(&artifact_id);
+        missing_reference.provenance.path = "episodes/local.jsonl".to_string();
+        let missing_artifact = fixture_episode(&artifact_id);
+        let linkage = evaluate_episode_artifact_links(&[missing_reference, missing_artifact], &[]);
+        let actual_codes = linkage
+            .issues
+            .iter()
+            .map(|issue| issue.code.clone())
+            .collect::<BTreeSet<_>>();
+        let expected = BTreeSet::from([
+            EvidenceLedgerEvalIssueCode::MissingEpisodeArtifactReference,
+            EvidenceLedgerEvalIssueCode::MissingLinkedArtifact,
+        ]);
+        let duplicate = fixture_episode(&artifact_id);
+        let graph_error = tool_episodes_to_graph(
+            &[duplicate.clone(), duplicate],
+            std::slice::from_ref(&artifact_id),
+        )
+        .expect_err("duplicate episode graph nodes should fail validation")
+        .to_string();
+
+        assert_eq!(linkage.linked_count, 0usize);
+        assert_eq!(actual_codes, expected);
+        assert!(graph_error.contains("duplicated"));
+        Ok(())
+    }
 
     #[test]
     fn evaluates_retrieval_metrics_on_fixture() -> Result<()> {

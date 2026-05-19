@@ -1386,6 +1386,81 @@ pub struct FreshnessEvalReport {
     pub provenance_complete: bool,
 }
 
+/// Stable issue code emitted by artifact, episode, and linkage evaluators.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum EvidenceLedgerEvalIssueCode {
+    /// A referenced artifact does not exist in the persisted context-pack store.
+    MissingArtifact,
+    /// A persisted artifact could not be decoded or failed its hash readback.
+    CorruptArtifact,
+    /// A context-pack artifact contains no evidence.
+    EmptyArtifactEvidence,
+    /// A context-pack artifact has incomplete provenance.
+    IncompleteArtifactProvenance,
+    /// A context-pack artifact contains changed or deleted evidence.
+    StaleArtifactEvidence,
+    /// A tool episode is missing an input fingerprint.
+    EmptyEpisodeInputFingerprint,
+    /// A tool episode is missing an output fingerprint.
+    EmptyEpisodeOutputFingerprint,
+    /// A tool episode has incomplete provenance.
+    IncompleteEpisodeProvenance,
+    /// Multiple tool episodes resolve to the same deterministic identity.
+    DuplicateEpisodeIdentity,
+    /// A tool episode references no context-pack artifact.
+    MissingEpisodeArtifactReference,
+    /// A tool episode references a context-pack artifact that is absent.
+    MissingLinkedArtifact,
+}
+
+/// Redaction-safe issue emitted by artifact, episode, and linkage evaluators.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceLedgerEvalIssue {
+    /// Stable machine-readable issue code.
+    pub code: EvidenceLedgerEvalIssueCode,
+    /// Optional context-pack artifact identifier associated with the issue.
+    pub artifact_id: Option<String>,
+    /// Optional redaction-safe deterministic episode fingerprint associated with the issue.
+    pub episode_fingerprint: Option<String>,
+    /// Redaction-safe detail string containing only codes, hashes, and storage labels.
+    pub detail: String,
+}
+
+/// Evaluation report for persisted context-pack artifacts.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextPackArtifactEvalReport {
+    /// Number of artifact identifiers checked.
+    pub checked: usize,
+    /// True when all checked artifacts satisfy structural invariants.
+    pub valid: bool,
+    /// Redaction-safe issues discovered during artifact evaluation.
+    pub issues: Vec<EvidenceLedgerEvalIssue>,
+}
+
+/// Evaluation report for persisted tool episodes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolEpisodeEvalReport {
+    /// Number of tool episodes checked.
+    pub checked: usize,
+    /// True when all checked episodes satisfy structural invariants.
+    pub valid: bool,
+    /// Redaction-safe issues discovered during episode evaluation.
+    pub issues: Vec<EvidenceLedgerEvalIssue>,
+}
+
+/// Evaluation report for context-pack artifact and tool-episode linkage.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceLedgerLinkageReport {
+    /// Number of context-pack artifact identifiers checked.
+    pub artifact_count: usize,
+    /// Number of tool episodes checked.
+    pub episode_count: usize,
+    /// Number of episodes linked to an existing context-pack artifact.
+    pub linked_count: usize,
+    /// Redaction-safe issues discovered during linkage evaluation.
+    pub issues: Vec<EvidenceLedgerEvalIssue>,
+}
+
 /// Future vector and reranking integration point without provider coupling.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FutureVectorRetrievalScaffold {

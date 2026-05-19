@@ -20,8 +20,10 @@ pub use context_adapter::{
     render_source_from_evidence, render_sources_from_context_pack, render_sources_from_nodes,
 };
 pub use eval::{
-    evaluate_freshness, evaluate_graph_coverage, evaluate_provenance_completeness,
-    evaluate_retrieval,
+    evaluate_context_pack_artifacts, evaluate_context_pack_artifacts_by_id,
+    evaluate_episode_artifact_links, evaluate_freshness, evaluate_graph_coverage,
+    evaluate_provenance_completeness, evaluate_retrieval, evaluate_tool_episodes,
+    tool_episode_graph_id, tool_episodes_to_graph,
 };
 pub use extraction::{
     RustExtraction, extract_cargo_dependency_edges, extract_rust_call_edges,
@@ -46,18 +48,20 @@ pub use render::{
 };
 pub use retrieval::{plan_retrieval, retrieve, retrieve_with_boundaries};
 pub use types::{
-    ContextPack, ContextPackArtifactId, ContextPackEvidence, ContextPackEvidenceSource,
-    ContextPackSelection, DecisionGraphNode, EdgeConfidence, EvalCaseGraphNode, EvidenceFreshness,
-    ExternalFactSource, ExternalFacts, ExternalReferenceFact, ExternalSymbolFact, FileGraphNode,
-    FileNode, FileNodeKind, FreshnessEvalReport, FreshnessProofLevel, FreshnessState,
-    FutureVectorRetrievalScaffold, GraphCoverageReport, GraphEdge, GraphEdgeKind, KnowledgeGraph,
-    KnowledgeGraphEdge, KnowledgeGraphNode, KnowledgeGraphNodeId, KnowledgeGraphNodeKind, Language,
-    LexicalDocument, LexicalDocumentKind, LexicalSearchHit, ManifestFreshnessEvaluation,
-    ProjectManifest, Provenance, ProvenanceCompletenessReport, RerankCandidate, RerankScore,
-    RetrievalEvalCase, RetrievalEvalReport, RetrievalQuery, RetrievalResult, RetrievalScoringPlan,
+    ContextPack, ContextPackArtifactEvalReport, ContextPackArtifactId, ContextPackEvidence,
+    ContextPackEvidenceSource, ContextPackSelection, DecisionGraphNode, EdgeConfidence,
+    EvalCaseGraphNode, EvidenceFreshness, EvidenceLedgerEvalIssue, EvidenceLedgerEvalIssueCode,
+    EvidenceLedgerLinkageReport, ExternalFactSource, ExternalFacts, ExternalReferenceFact,
+    ExternalSymbolFact, FileGraphNode, FileNode, FileNodeKind, FreshnessEvalReport,
+    FreshnessProofLevel, FreshnessState, FutureVectorRetrievalScaffold, GraphCoverageReport,
+    GraphEdge, GraphEdgeKind, KnowledgeGraph, KnowledgeGraphEdge, KnowledgeGraphNode,
+    KnowledgeGraphNodeId, KnowledgeGraphNodeKind, Language, LexicalDocument, LexicalDocumentKind,
+    LexicalSearchHit, ManifestFreshnessEvaluation, ProjectManifest, Provenance,
+    ProvenanceCompletenessReport, RerankCandidate, RerankScore, RetrievalEvalCase,
+    RetrievalEvalReport, RetrievalQuery, RetrievalResult, RetrievalScoringPlan,
     RetrievalScoringWeights, RetrievedEvidenceGraphNode, ShardGraphNode, ShardManifest,
     ShardStrategy, SourceFile, StaleEvidencePolicy, SymbolGraphNode, SymbolKind, SymbolNode,
-    TaskGraphNode, ToolEpisode, ToolEpisodeGraphNode, TypedExternalFacts,
+    TaskGraphNode, ToolEpisode, ToolEpisodeEvalReport, ToolEpisodeGraphNode, TypedExternalFacts,
     TypedExternalReferenceFact, TypedExternalSymbolFact, VectorQuery, VectorSearchHit,
     classify_evidence_freshness,
 };
