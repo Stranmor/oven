@@ -1422,6 +1422,10 @@ pub enum ExternalFactIngestionIssueCode {
     MissingReferenceSourceEndpoint,
     /// A reference or call edge target is absent from accepted file, symbol, or shard endpoints.
     MissingReferenceTargetEndpoint,
+    /// A symbol fact uses an invalid one-based inclusive line range.
+    InvalidSymbolLineRange,
+    /// A reference fact uses an invalid optional one-based inclusive line range.
+    InvalidReferenceLineRange,
     /// A fact cannot be accepted as exact under the batch source contract.
     InvalidExactSourceContract,
 }

@@ -340,9 +340,29 @@ pub fn validate_external_fact_batch(
                 format!("symbol_file_missing:{}", symbol.id),
             ));
         }
+        if !valid_required_line_range(symbol.start_line, symbol.end_line) {
+            issues.push(issue(
+                ExternalFactIngestionIssueCode::InvalidSymbolLineRange,
+                Some(symbol.id.clone()),
+                format!(
+                    "symbol_line_range_invalid:{}:{}-{}",
+                    symbol.id, symbol.start_line, symbol.end_line
+                ),
+            ));
+        }
         endpoints.insert(symbol.id.clone());
     }
     for reference in &batch.facts.references {
+        if !valid_optional_line_range(reference.start_line, reference.end_line) {
+            issues.push(issue(
+                ExternalFactIngestionIssueCode::InvalidReferenceLineRange,
+                Some(reference.path.clone()),
+                format!(
+                    "reference_line_range_invalid:{}->{}:{:?}-{:?}",
+                    reference.from, reference.to, reference.start_line, reference.end_line
+                ),
+            ));
+        }
         if !file_endpoints.contains(&reference.path) {
             issues.push(issue(
                 ExternalFactIngestionIssueCode::MissingReferenceFileEndpoint,
@@ -376,6 +396,18 @@ pub fn validate_external_fact_batch(
     });
     issues.dedup();
     issues
+}
+
+fn valid_required_line_range(start_line: u32, end_line: u32) -> bool {
+    start_line >= 1 && end_line >= start_line
+}
+
+fn valid_optional_line_range(start_line: Option<u32>, end_line: Option<u32>) -> bool {
+    match (start_line, end_line) {
+        (Some(start_line), Some(end_line)) => valid_required_line_range(start_line, end_line),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 impl ExternalFactBatch {
@@ -1279,6 +1311,32 @@ mod tests {
 
         assert_eq!(actual, expected);
         assert_eq!(manifest.edges, before_edges);
+        Ok(())
+    }
+
+    #[test]
+    fn external_symbol_with_invalid_line_range_is_rejected_before_manifest_mutation() -> Result<()>
+    {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let mut manifest = setup.index()?;
+        let before_symbols = manifest.symbols.clone();
+        let mut batch = fixture_batch(&manifest, &fingerprint("invalid-line-range"));
+        let symbol = batch
+            .facts
+            .symbols
+            .first_mut()
+            .expect("fixture batch should include symbols");
+        symbol.start_line = 0;
+        symbol.end_line = 0;
+        batch.metadata.batch_fingerprint =
+            external_fact_batch_fingerprint(&batch.metadata, &batch.facts);
+
+        let actual = ingest_external_fact_batch(&mut manifest, batch).is_err();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+        assert_eq!(manifest.symbols, before_symbols);
         Ok(())
     }
 
