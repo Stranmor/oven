@@ -125,3 +125,92 @@ pub struct WorkspaceContextExplanation {
     /// Exact top-level reason context would not be injected.
     pub skip_reason: Option<String>,
 }
+
+/// Stable status for explicit workspace exact-fact reference production.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceExactFactReferenceStatus {
+    /// A typed external fact artifact was written.
+    ArtifactWritten,
+    /// No eligible manifest-owned endpoint was available for one bounded request.
+    NoEligibleEndpoint,
+    /// rust-analyzer was unavailable or failed its capability probe.
+    RustAnalyzerUnavailable,
+    /// The capability probe or production request timed out.
+    Timeout,
+    /// The producer ran successfully but returned no reference facts.
+    NoFacts,
+    /// Request validation or typed normalization failed.
+    Failed,
+}
+
+impl WorkspaceExactFactReferenceStatus {
+    /// Returns the stable lowercase status label used by human output.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::ArtifactWritten => "artifact_written",
+            Self::NoEligibleEndpoint => "no_eligible_endpoint",
+            Self::RustAnalyzerUnavailable => "rust_analyzer_unavailable",
+            Self::Timeout => "timeout",
+            Self::NoFacts => "no_facts",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Bounded-loss summary for a single explicit native LSP reference request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceExactFactBoundedLoss {
+    /// Eligible endpoint positions omitted because request bounds were reached.
+    pub omitted_endpoint_positions: usize,
+    /// Manifest-owned source files omitted from didOpen because request bounds were reached.
+    pub omitted_open_files: usize,
+}
+
+/// Redaction-safe issue emitted by exact-fact reference production or ingestion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceExactFactIssue {
+    /// Stable issue code.
+    pub code: String,
+    /// Optional typed endpoint involved in the issue.
+    pub endpoint: Option<String>,
+    /// Redaction-safe detail without raw source, JSON-RPC, stdout, or stderr.
+    pub detail: String,
+}
+
+/// Compact ingestion summary after refreshing the manifest from typed artifacts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceExactFactIngestionSummary {
+    /// Number of external fact artifacts inspected.
+    pub inspected_artifacts: usize,
+    /// Number of external fact artifacts accepted.
+    pub accepted_artifacts: usize,
+    /// Accepted batch fingerprints in deterministic ingestion order.
+    pub accepted_batch_fingerprints: Vec<String>,
+    /// Number of ingestion issues surfaced across artifacts.
+    pub issue_count: usize,
+}
+
+/// Redaction-safe command report for explicit workspace exact-fact references.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceExactFactReferenceReport {
+    /// Explicit command status.
+    pub status: WorkspaceExactFactReferenceStatus,
+    /// Persisted artifact path when exactly one typed artifact was written.
+    pub artifact_path: Option<PathBuf>,
+    /// Batch fingerprint when an artifact was written and accepted by validation.
+    pub batch_fingerprint: Option<String>,
+    /// Number of produced typed reference facts.
+    pub produced_reference_count: usize,
+    /// Bounded loss marker for the single native LSP request.
+    pub bounded_loss: WorkspaceExactFactBoundedLoss,
+    /// Manifest hash used as the frozen production baseline.
+    pub manifest_hash_input: String,
+    /// Redaction-safe command and validation issues.
+    pub issues: Vec<WorkspaceExactFactIssue>,
+    /// Summary of the manifest refresh ingestion pass.
+    pub ingestion_summary: WorkspaceExactFactIngestionSummary,
+    /// Path of the refreshed project manifest written after re-ingestion.
+    pub manifest_path: PathBuf,
+    /// Path of the refreshed external fact ingestion report.
+    pub ingestion_report_path: PathBuf,
+}

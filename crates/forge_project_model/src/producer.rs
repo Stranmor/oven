@@ -263,6 +263,7 @@ impl NativeLspReferenceRequest {
 }
 
 /// Typed result of deterministic native LSP reference request derivation.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NativeLspReferenceRequestDerivation {
     /// Exactly one manifest-owned request was derived.
@@ -1601,12 +1602,20 @@ fn parse_expected_content_length_message(
         if messages > bounds.max_messages {
             bail!("native lsp response exceeds message bound");
         }
-        let header_relative_end = bytes[offset..]
+        let remaining = bytes
+            .get(offset..)
+            .ok_or_else(|| anyhow::anyhow!("native lsp response frame offset is invalid"))?;
+        let header_relative_end = remaining
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
             .ok_or_else(|| anyhow::anyhow!("native lsp response header is malformed"))?;
-        let header_end = offset + header_relative_end;
-        let headers = std::str::from_utf8(&bytes[offset..header_end])
+        let header_end = offset
+            .checked_add(header_relative_end)
+            .ok_or_else(|| anyhow::anyhow!("native lsp response header offset overflow"))?;
+        let header_bytes = bytes
+            .get(offset..header_end)
+            .ok_or_else(|| anyhow::anyhow!("native lsp response header range is invalid"))?;
+        let headers = std::str::from_utf8(header_bytes)
             .map_err(|_| anyhow::anyhow!("native lsp response header is not utf-8"))?;
         let mut content_length = None;
         for line in headers.split("\r\n") {
@@ -1627,14 +1636,19 @@ fn parse_expected_content_length_message(
         if content_length > bounds.max_json_bytes_per_message {
             bail!("native lsp json-rpc message exceeds byte bound");
         }
-        let body_start = header_end + 4;
+        let body_start = header_end
+            .checked_add(4)
+            .ok_or_else(|| anyhow::anyhow!("native lsp body offset overflow"))?;
         let body_end = body_start
             .checked_add(content_length)
             .ok_or_else(|| anyhow::anyhow!("native lsp content length overflow"))?;
         if body_end > bytes.len() {
             bail!("native lsp response frame length mismatch");
         }
-        let message: Value = serde_json::from_slice(&bytes[body_start..body_end])
+        let body = bytes
+            .get(body_start..body_end)
+            .ok_or_else(|| anyhow::anyhow!("native lsp response body range is invalid"))?;
+        let message: Value = serde_json::from_slice(body)
             .map_err(|_| anyhow::anyhow!("native lsp json-rpc message is malformed"))?;
         if message.get("error").is_some() {
             bail!("native lsp response returned error");
@@ -1725,22 +1739,36 @@ fn percent_decode_file_uri_path(raw_path: &str) -> Result<String> {
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0usize;
     while index < bytes.len() {
-        if bytes[index] == b'%' {
+        let byte = bytes
+            .get(index)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("native lsp uri path index is invalid"))?;
+        if byte == b'%' {
+            let high_index = index
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("native lsp uri percent escape overflow"))?;
+            let low_index = index
+                .checked_add(2)
+                .ok_or_else(|| anyhow::anyhow!("native lsp uri percent escape overflow"))?;
             let high = bytes
-                .get(index + 1)
+                .get(high_index)
                 .copied()
                 .and_then(hex_value)
                 .ok_or_else(|| anyhow::anyhow!("native lsp uri percent escape is malformed"))?;
             let low = bytes
-                .get(index + 2)
+                .get(low_index)
                 .copied()
                 .and_then(hex_value)
                 .ok_or_else(|| anyhow::anyhow!("native lsp uri percent escape is malformed"))?;
             decoded.push((high << 4) | low);
-            index += 3;
+            index = index
+                .checked_add(3)
+                .ok_or_else(|| anyhow::anyhow!("native lsp uri index overflow"))?;
         } else {
-            decoded.push(bytes[index]);
-            index += 1;
+            decoded.push(byte);
+            index = index
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("native lsp uri index overflow"))?;
         }
     }
     String::from_utf8(decoded).map_err(|_| anyhow::anyhow!("native lsp uri path is not utf-8"))
@@ -1748,9 +1776,13 @@ fn percent_decode_file_uri_path(raw_path: &str) -> Result<String> {
 
 fn hex_value(byte: u8) -> Option<u8> {
     match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
+        b'0'..=b'9' => byte.checked_sub(b'0'),
+        b'a'..=b'f' => byte
+            .checked_sub(b'a')
+            .and_then(|value| value.checked_add(10)),
+        b'A'..=b'F' => byte
+            .checked_sub(b'A')
+            .and_then(|value| value.checked_add(10)),
         _ => None,
     }
 }
@@ -1774,10 +1806,7 @@ fn validate_native_lsp_mapping(
 }
 
 fn ensure_manifest_endpoint(manifest: &ProjectManifest, endpoint: &str) -> Result<()> {
-    if manifest_endpoint_strings(manifest)
-        .iter()
-        .any(|known| *known == endpoint)
-    {
+    if manifest_endpoint_strings(manifest).contains(&endpoint) {
         Ok(())
     } else {
         bail!("native lsp endpoint is not manifest-owned")
@@ -2196,17 +2225,17 @@ fn run_native_lsp_references_with_timeout(
             };
         }
     };
-    if let Some(mut stdin) = child.stdin.take() {
-        if stdin.write_all(&stdin_payload).is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return RustAnalyzerProcessOutput {
-                exit_code: None,
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-                timed_out: false,
-            };
-        }
+    if let Some(mut stdin) = child.stdin.take()
+        && stdin.write_all(&stdin_payload).is_err()
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return RustAnalyzerProcessOutput {
+            exit_code: None,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out: false,
+        };
     }
     let deadline = Instant::now()
         .checked_add(request.bounds.process_timeout)
@@ -2299,9 +2328,13 @@ fn native_lsp_outbound_messages(
             "context": { "includeDeclaration": false }
         }
     }));
+    let shutdown_id = request
+        .response_id
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("native lsp shutdown id overflow"))?;
     messages.push(serde_json::json!({
         "jsonrpc": "2.0",
-        "id": request.response_id + 1,
+        "id": shutdown_id,
         "method": "shutdown",
         "params": null
     }));
@@ -2314,7 +2347,10 @@ fn native_lsp_outbound_messages(
 
 fn native_lsp_framed_message_len(message: &Value) -> Result<usize> {
     let body = serde_json::to_vec(message)?;
-    Ok(format!("Content-Length: {}\r\n\r\n", body.len()).len() + body.len())
+    let header_len = format!("Content-Length: {}\r\n\r\n", body.len()).len();
+    header_len
+        .checked_add(body.len())
+        .ok_or_else(|| anyhow::anyhow!("native lsp framed message length overflow"))
 }
 
 fn native_lsp_stdin_payload(

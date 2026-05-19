@@ -11,7 +11,8 @@ use forge_domain::{
     ProcessReadOutput, ProcessStartOutput, ProcessStatus, Provider, ProviderId, ResultStream,
     Scope, SearchParams, SteerMessage, SubagentTaskId, SubagentTaskSession,
     SubagentTaskSessionFilter, SyncProgress, SyntaxError, Template, ToolCallFull, ToolOutput,
-    WorkspaceAuth, WorkspaceContextManifestDiagnostic, WorkspaceId, WorkspaceInfo,
+    WorkspaceAuth, WorkspaceContextManifestDiagnostic, WorkspaceExactFactReferenceReport,
+    WorkspaceId, WorkspaceInfo,
 };
 use forge_eventsource::EventSource;
 use reqwest::Response;
@@ -539,6 +540,12 @@ pub trait WorkspaceService: Send + Sync {
         &self,
         path: PathBuf,
     ) -> anyhow::Result<forge_stream::MpscStream<anyhow::Result<SyncProgress>>>;
+
+    /// Produces one explicit bounded workspace exact-fact reference artifact.
+    async fn produce_workspace_exact_fact_reference(
+        &self,
+        path: PathBuf,
+    ) -> anyhow::Result<WorkspaceExactFactReferenceReport>;
 
     /// Query the indexed workspace with semantic search
     async fn query_workspace(
@@ -1516,6 +1523,15 @@ impl<I: Services> WorkspaceService for I {
         self.workspace_service().sync_workspace(path).await
     }
 
+    async fn produce_workspace_exact_fact_reference(
+        &self,
+        path: PathBuf,
+    ) -> anyhow::Result<WorkspaceExactFactReferenceReport> {
+        self.workspace_service()
+            .produce_workspace_exact_fact_reference(path)
+            .await
+    }
+
     async fn query_workspace(
         &self,
         path: PathBuf,
@@ -2148,6 +2164,13 @@ mod tests {
             &self,
             _path: PathBuf,
         ) -> anyhow::Result<forge_stream::MpscStream<anyhow::Result<SyncProgress>>> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn produce_workspace_exact_fact_reference(
+            &self,
+            _path: PathBuf,
+        ) -> anyhow::Result<WorkspaceExactFactReferenceReport> {
             anyhow::bail!("unused workspace service")
         }
 

@@ -770,6 +770,12 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             }
             TopLevelCommand::Workspace(index_group) => {
                 match index_group.command {
+                    crate::cli::WorkspaceCommand::ExactFact(group) => match group.command {
+                        crate::cli::WorkspaceExactFactCommand::Reference { path, porcelain } => {
+                            self.on_workspace_exact_fact_reference(path, porcelain)
+                                .await?;
+                        }
+                    },
                     crate::cli::WorkspaceCommand::Sync { path, init } => {
                         self.on_index(path, init).await?;
                     }
@@ -5092,6 +5098,75 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         }
 
         Ok(())
+    }
+
+    async fn on_workspace_exact_fact_reference(
+        &mut self,
+        path: std::path::PathBuf,
+        porcelain: bool,
+    ) -> anyhow::Result<()> {
+        let report = self
+            .api
+            .produce_workspace_exact_fact_reference(path)
+            .await?;
+        if porcelain {
+            self.writeln(serde_json::to_string_pretty(&report)?)?;
+            return Ok(());
+        }
+
+        let mut info = Info::new().add_title("Workspace Exact-Fact Reference");
+        info = info.add_key_value("Status", report.status.label());
+        info = info.add_key_value("Manifest Hash Input", report.manifest_hash_input);
+        info = info.add_key_value(
+            "Produced References",
+            report.produced_reference_count.to_string(),
+        );
+        info = info.add_key_value(
+            "Bounded Loss",
+            format!(
+                "omitted_endpoint_positions={} omitted_open_files={}",
+                report.bounded_loss.omitted_endpoint_positions,
+                report.bounded_loss.omitted_open_files
+            ),
+        );
+        info = info.add_key_value(
+            "Artifact Path",
+            report
+                .artifact_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+        );
+        info = info.add_key_value(
+            "Batch Fingerprint",
+            report.batch_fingerprint.as_deref().unwrap_or("<none>"),
+        );
+        info = info.add_key_value("Manifest Path", report.manifest_path.display().to_string());
+        info = info.add_key_value(
+            "Ingestion Report Path",
+            report.ingestion_report_path.display().to_string(),
+        );
+        info = info.add_key_value(
+            "Ingestion",
+            format!(
+                "inspected={} accepted={} issues={}",
+                report.ingestion_summary.inspected_artifacts,
+                report.ingestion_summary.accepted_artifacts,
+                report.ingestion_summary.issue_count
+            ),
+        );
+        for issue in &report.issues {
+            info = info.add_key_value(
+                "Issue",
+                format!(
+                    "code={} endpoint={} detail={}",
+                    issue.code,
+                    issue.endpoint.as_deref().unwrap_or("<none>"),
+                    issue.detail
+                ),
+            );
+        }
+        self.writeln(info)
     }
 
     async fn on_index(&mut self, path: std::path::PathBuf, init: bool) -> anyhow::Result<()> {

@@ -346,6 +346,9 @@ pub struct WorkspaceCommandGroup {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum WorkspaceCommand {
+    /// Produce opt-in exact-fact workspace artifacts.
+    ExactFact(WorkspaceExactFactCommandGroup),
+
     /// Synchronize a directory for semantic search.
     Sync {
         /// Path to the directory to sync
@@ -440,6 +443,27 @@ pub enum WorkspaceCommand {
         /// Automatically confirm initialization without prompting
         #[arg(short = 'y', long)]
         yes: bool,
+    },
+}
+
+/// Command group for explicit workspace exact-fact production.
+#[derive(Parser, Debug, Clone)]
+pub struct WorkspaceExactFactCommandGroup {
+    #[command(subcommand)]
+    pub command: WorkspaceExactFactCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum WorkspaceExactFactCommand {
+    /// Produce one bounded native LSP reference exact-fact artifact.
+    Reference {
+        /// Path to the workspace root.
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        /// Output in machine-readable JSON format.
+        #[arg(long)]
+        porcelain: bool,
     },
 }
 

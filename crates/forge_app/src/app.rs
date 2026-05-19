@@ -1526,6 +1526,13 @@ mod tests {
             anyhow::bail!("unused workspace sync")
         }
 
+        async fn produce_workspace_exact_fact_reference(
+            &self,
+            _path: PathBuf,
+        ) -> Result<WorkspaceExactFactReferenceReport> {
+            anyhow::bail!("unused workspace exact-fact reference")
+        }
+
         async fn query_workspace(
             &self,
             _path: PathBuf,
@@ -2076,6 +2083,13 @@ mod tests {
             _path: PathBuf,
         ) -> Result<forge_stream::MpscStream<Result<SyncProgress>>> {
             anyhow::bail!("unused workspace sync")
+        }
+
+        async fn produce_workspace_exact_fact_reference(
+            &self,
+            _path: PathBuf,
+        ) -> Result<WorkspaceExactFactReferenceReport> {
+            anyhow::bail!("unused workspace exact-fact reference")
         }
 
         async fn query_workspace(

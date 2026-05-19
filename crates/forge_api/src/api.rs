@@ -252,6 +252,12 @@ pub trait API: Sync + Send {
         path: PathBuf,
     ) -> Result<MpscStream<Result<forge_domain::SyncProgress>>>;
 
+    /// Produces one explicit bounded exact-fact reference artifact for a workspace.
+    async fn produce_workspace_exact_fact_reference(
+        &self,
+        path: PathBuf,
+    ) -> Result<forge_domain::WorkspaceExactFactReferenceReport>;
+
     /// Query the indexed workspace
     async fn query_workspace(
         &self,

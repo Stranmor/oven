@@ -410,6 +410,15 @@ impl<
         self.services.sync_workspace(path).await
     }
 
+    async fn produce_workspace_exact_fact_reference(
+        &self,
+        path: PathBuf,
+    ) -> Result<forge_domain::WorkspaceExactFactReferenceReport> {
+        self.services
+            .produce_workspace_exact_fact_reference(path)
+            .await
+    }
+
     async fn query_workspace(
         &self,
         path: PathBuf,

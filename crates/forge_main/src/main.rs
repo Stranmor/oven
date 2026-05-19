@@ -131,7 +131,7 @@ async fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use forge_main::TopLevelCommand;
+    use forge_main::{TopLevelCommand, WorkspaceCommand, WorkspaceExactFactCommand};
     use pretty_assertions::assert_eq;
 
     use super::*;
@@ -175,7 +175,6 @@ mod tests {
 
     #[test]
     fn test_commit_command_diff_field_initially_none() {
-        // Test that the diff field in CommitCommandGroup starts as None
         let cli = Cli::parse_from(["forge", "commit", "--preview"]);
         let actual = match cli.subcommands {
             Some(TopLevelCommand::Commit(commit_group)) => {
@@ -184,6 +183,34 @@ mod tests {
             _ => None,
         };
         let expected = Some((true, None));
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_workspace_exact_fact_reference_command_parses_porcelain() {
+        let cli = Cli::parse_from([
+            "forge",
+            "workspace",
+            "exact-fact",
+            "reference",
+            "--path",
+            ".",
+            "--porcelain",
+        ]);
+        let actual = match cli.subcommands {
+            Some(TopLevelCommand::Workspace(group)) => match group.command {
+                WorkspaceCommand::ExactFact(group) => match group.command {
+                    WorkspaceExactFactCommand::Reference { path, porcelain } => {
+                        Some((path, porcelain))
+                    }
+                },
+                _ => None,
+            },
+            _ => None,
+        };
+        let expected = Some((PathBuf::from("."), true));
+
         assert_eq!(actual, expected);
     }
 }

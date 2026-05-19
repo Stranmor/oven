@@ -8,11 +8,18 @@ use forge_app::{CommandInfra, EnvironmentInfra, FileReaderInfra, WalkerInfra, Wo
 use forge_domain::{
     AuthCredential, AuthDetails, FileChunk, Node, NodeData, NodeId, ProviderId, ProviderRepository,
     SearchParams, SyncProgress, UserId, WorkspaceContextFreshness,
-    WorkspaceContextManifestDiagnostic, WorkspaceId, WorkspaceIndexRepository,
+    WorkspaceContextManifestDiagnostic, WorkspaceExactFactBoundedLoss,
+    WorkspaceExactFactIngestionSummary, WorkspaceExactFactIssue, WorkspaceExactFactReferenceReport,
+    WorkspaceExactFactReferenceStatus, WorkspaceId, WorkspaceIndexRepository,
 };
 use forge_project_model::{
-    ContextPack, ContextPackArtifactId, ContextPackSelection, ProjectIndexer, Provenance,
-    RetrievalQuery, StaleEvidencePolicy, ToolEpisode, evidence_line_range, fingerprint,
+    ContextPack, ContextPackArtifactId, ContextPackSelection, ExternalFactArtifactIngestionReport,
+    ExternalFactIngestionIssue, ExternalFactProductionReport, ExternalFactProductionRequest,
+    ExternalFactProductionStatus, NativeLspReferenceProducer, NativeLspReferenceRequest,
+    NativeLspReferenceRequestDerivation, ProjectIndexer, Provenance, RetrievalQuery,
+    RustAnalyzerBounds, RustAnalyzerCapability, RustAnalyzerCapabilityProbe,
+    RustAnalyzerCapabilityStatus, RustAnalyzerProbe, StaleEvidencePolicy, StdRustAnalyzerProcess,
+    ToolEpisode, derive_native_lsp_reference_request, evidence_line_range, fingerprint,
     local_project_model_dir, local_project_model_manifest, retrieve,
 };
 use forge_stream::MpscStream;
@@ -107,6 +114,58 @@ impl<
         let manifest_path = indexer.write_manifest(&manifest)?;
         indexer.write_external_fact_artifact_ingestion_report(&report)?;
         Ok(manifest_path)
+    }
+
+    fn produce_workspace_exact_fact_reference_with_driver<Dp>(
+        &self,
+        path: PathBuf,
+        driver: &Dp,
+    ) -> Result<WorkspaceExactFactReferenceReport>
+    where
+        Dp: NativeLspReferenceProductionDriver,
+    {
+        let root = canonicalize_path(path)?;
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+        let baseline = indexer.external_fact_production_baseline()?;
+        let production = ExternalFactProductionRequest::new(
+            "rust-analyzer-native-lsp-reference",
+            None,
+            RustAnalyzerBounds::default().max_references,
+        );
+        let derivation = derive_native_lsp_reference_request(
+            &baseline.manifest,
+            &baseline.rust_source_texts,
+            production,
+            RustAnalyzerBounds::default(),
+        );
+        let production_report = match derivation {
+            NativeLspReferenceRequestDerivation::NoEligibleEndpoint(reason) => {
+                ExternalFactProductionReport::no_eligible_endpoint(
+                    no_request_probe(),
+                    &baseline.manifest,
+                    reason,
+                )
+            }
+            NativeLspReferenceRequestDerivation::Request(request) => {
+                let probe = driver.probe(request.bounds.process_timeout);
+                if probe.status == RustAnalyzerCapabilityStatus::Available {
+                    driver.produce(indexer.model_dir(), &baseline.manifest, &request, probe)?
+                } else {
+                    unavailable_report(probe, &baseline.manifest, &request)
+                }
+            }
+        };
+        let (refreshed_manifest, ingestion_report) =
+            indexer.ingest_external_fact_artifacts_from_manifest(&baseline.manifest)?;
+        let manifest_path = indexer.write_manifest(&refreshed_manifest)?;
+        let ingestion_report_path =
+            indexer.write_external_fact_artifact_ingestion_report(&ingestion_report)?;
+        Ok(workspace_exact_fact_reference_report(
+            production_report,
+            ingestion_report,
+            manifest_path,
+            ingestion_report_path,
+        ))
     }
 
     /// Gets the ForgeCode services credential and extracts workspace auth
@@ -379,6 +438,164 @@ fn matches_path_filters(path: &str, params: &SearchParams<'_>) -> bool {
     true
 }
 
+trait NativeLspReferenceProductionDriver {
+    fn probe(&self, timeout: std::time::Duration) -> RustAnalyzerProbe;
+
+    fn produce(
+        &self,
+        model_dir: &Path,
+        frozen_manifest: &forge_project_model::ProjectManifest,
+        request: &NativeLspReferenceRequest,
+        probe: RustAnalyzerProbe,
+    ) -> Result<ExternalFactProductionReport>;
+}
+
+#[derive(Clone, Debug)]
+struct StdNativeLspReferenceProductionDriver {
+    executable: PathBuf,
+}
+
+impl Default for StdNativeLspReferenceProductionDriver {
+    fn default() -> Self {
+        Self { executable: PathBuf::from("rust-analyzer") }
+    }
+}
+
+impl NativeLspReferenceProductionDriver for StdNativeLspReferenceProductionDriver {
+    fn probe(&self, timeout: std::time::Duration) -> RustAnalyzerProbe {
+        RustAnalyzerCapabilityProbe::new(StdRustAnalyzerProcess::new(self.executable.clone()))
+            .probe(RustAnalyzerCapability::References, timeout)
+    }
+
+    fn produce(
+        &self,
+        model_dir: &Path,
+        frozen_manifest: &forge_project_model::ProjectManifest,
+        request: &NativeLspReferenceRequest,
+        probe: RustAnalyzerProbe,
+    ) -> Result<ExternalFactProductionReport> {
+        NativeLspReferenceProducer::new(StdRustAnalyzerProcess::new(self.executable.clone()), probe)
+            .produce(model_dir, frozen_manifest, request)
+    }
+}
+
+fn no_request_probe() -> forge_project_model::ExternalFactProducerProbe {
+    forge_project_model::ExternalFactProducerProbe {
+        source: forge_project_model::ExternalFactSource::Lsp,
+        capability: forge_project_model::ExternalFactProducerCapability::LspReferenceFacts,
+        source_label: "rust-analyzer-native-lsp-reference".to_string(),
+        tool_version: None,
+        available: false,
+        unavailable_reason: Some("native_lsp_no_eligible_endpoint".to_string()),
+    }
+}
+
+fn unavailable_report(
+    probe: RustAnalyzerProbe,
+    manifest: &forge_project_model::ProjectManifest,
+    request: &NativeLspReferenceRequest,
+) -> ExternalFactProductionReport {
+    ExternalFactProductionReport {
+        probe: forge_project_model::ExternalFactProducerProbe {
+            source: forge_project_model::ExternalFactSource::Lsp,
+            capability: forge_project_model::ExternalFactProducerCapability::LspReferenceFacts,
+            source_label: request.production.source_label.clone(),
+            tool_version: probe
+                .version
+                .clone()
+                .or_else(|| request.production.tool_version.clone()),
+            available: false,
+            unavailable_reason: probe.failure_reason.clone(),
+        },
+        status: if probe.status == RustAnalyzerCapabilityStatus::Timeout {
+            ExternalFactProductionStatus::Timeout
+        } else {
+            ExternalFactProductionStatus::RustAnalyzerUnavailable
+        },
+        manifest_hash_input: manifest.manifest_hash.clone(),
+        produced_reference_facts: 0,
+        artifact_path: None,
+        batch_fingerprint: None,
+        bounded_loss: Some(request.bounded_loss.clone()),
+        batch_metadata: None,
+        issues: Vec::new(),
+    }
+}
+
+fn workspace_exact_fact_reference_report(
+    production: ExternalFactProductionReport,
+    ingestion: ExternalFactArtifactIngestionReport,
+    manifest_path: PathBuf,
+    ingestion_report_path: PathBuf,
+) -> WorkspaceExactFactReferenceReport {
+    let status = match production.status {
+        ExternalFactProductionStatus::ArtifactWritten => {
+            WorkspaceExactFactReferenceStatus::ArtifactWritten
+        }
+        ExternalFactProductionStatus::NoEligibleEndpoint => {
+            WorkspaceExactFactReferenceStatus::NoEligibleEndpoint
+        }
+        ExternalFactProductionStatus::RustAnalyzerUnavailable => {
+            WorkspaceExactFactReferenceStatus::RustAnalyzerUnavailable
+        }
+        ExternalFactProductionStatus::Timeout => WorkspaceExactFactReferenceStatus::Timeout,
+        ExternalFactProductionStatus::NoFacts => WorkspaceExactFactReferenceStatus::NoFacts,
+        ExternalFactProductionStatus::Failed => WorkspaceExactFactReferenceStatus::Failed,
+        ExternalFactProductionStatus::NotRequested => WorkspaceExactFactReferenceStatus::Failed,
+    };
+    let bounded_loss = production
+        .bounded_loss
+        .map(|loss| WorkspaceExactFactBoundedLoss {
+            omitted_endpoint_positions: loss.omitted_endpoint_positions,
+            omitted_open_files: loss.omitted_open_files,
+        })
+        .unwrap_or_default();
+    let mut issues = production
+        .issues
+        .iter()
+        .map(workspace_exact_fact_issue)
+        .collect::<Vec<_>>();
+    issues.extend(
+        ingestion
+            .artifacts
+            .iter()
+            .flat_map(|artifact| artifact.issues.iter().map(workspace_exact_fact_issue)),
+    );
+    WorkspaceExactFactReferenceReport {
+        status,
+        artifact_path: production.artifact_path,
+        batch_fingerprint: production.batch_fingerprint,
+        produced_reference_count: production.produced_reference_facts,
+        bounded_loss,
+        manifest_hash_input: production.manifest_hash_input,
+        issues,
+        ingestion_summary: WorkspaceExactFactIngestionSummary {
+            inspected_artifacts: ingestion.inspected_artifacts,
+            accepted_artifacts: ingestion.accepted_artifacts,
+            accepted_batch_fingerprints: ingestion
+                .accepted_batches
+                .iter()
+                .map(|batch| batch.batch_metadata.batch_fingerprint.clone())
+                .collect(),
+            issue_count: ingestion
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.issues.len())
+                .sum(),
+        },
+        manifest_path,
+        ingestion_report_path,
+    }
+}
+
+fn workspace_exact_fact_issue(issue: &ExternalFactIngestionIssue) -> WorkspaceExactFactIssue {
+    WorkspaceExactFactIssue {
+        code: format!("{:?}", issue.code),
+        endpoint: issue.endpoint.clone(),
+        detail: issue.detail.clone(),
+    }
+}
+
 fn evaluate_project_model_context(path: &Path) -> WorkspaceContextManifestDiagnostic {
     let manifest_path = local_project_model_manifest(path);
     if !path.is_dir() || !manifest_path.is_file() {
@@ -451,6 +668,14 @@ impl<
         });
 
         Ok(stream)
+    }
+
+    async fn produce_workspace_exact_fact_reference(
+        &self,
+        path: PathBuf,
+    ) -> Result<WorkspaceExactFactReferenceReport> {
+        let driver = StdNativeLspReferenceProductionDriver::default();
+        self.produce_workspace_exact_fact_reference_with_driver(path, &driver)
     }
 
     /// Performs semantic code search on a workspace.
@@ -635,8 +860,10 @@ mod tests {
     };
     use forge_project_model::{
         ExternalFactArtifactIngestionReport, ExternalFactBatch, ExternalFactBatchMetadata,
-        ExternalFactIngestionIssueCode, ExternalFactSource, FreshnessState, GraphEdgeKind,
-        SymbolKind, TypedExternalFacts, TypedExternalReferenceFact, TypedExternalSymbolFact,
+        ExternalFactIngestionIssueCode, ExternalFactProductionReport, ExternalFactProductionStatus,
+        ExternalFactSource, FreshnessState, GraphEdgeKind, NativeLspReferenceRequest,
+        RustAnalyzerCapability, RustAnalyzerCapabilityStatus, RustAnalyzerProbe, SymbolKind,
+        TypedExternalFacts, TypedExternalReferenceFact, TypedExternalSymbolFact,
         external_fact_artifact_fingerprint, external_fact_batch_fingerprint,
         write_external_fact_artifact,
     };
@@ -654,6 +881,109 @@ mod tests {
     }
 
     struct NoopDiscovery;
+
+    #[derive(Clone)]
+    struct FakeExactFactDriver {
+        probe: RustAnalyzerProbe,
+        produce_calls: Arc<std::sync::atomic::AtomicUsize>,
+        create_file_during_produce: bool,
+    }
+
+    impl FakeExactFactDriver {
+        fn available() -> Self {
+            Self {
+                probe: RustAnalyzerProbe {
+                    executable_available: true,
+                    version: Some("rust-analyzer fixture".to_string()),
+                    capability: RustAnalyzerCapability::References,
+                    status: RustAnalyzerCapabilityStatus::Available,
+                    timed_out: false,
+                    failure_reason: None,
+                },
+                produce_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                create_file_during_produce: false,
+            }
+        }
+
+        fn unavailable() -> Self {
+            Self {
+                probe: RustAnalyzerProbe {
+                    executable_available: false,
+                    version: None,
+                    capability: RustAnalyzerCapability::References,
+                    status: RustAnalyzerCapabilityStatus::Unavailable,
+                    timed_out: false,
+                    failure_reason: Some("rust_analyzer_process_unavailable".to_string()),
+                },
+                produce_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                create_file_during_produce: false,
+            }
+        }
+
+        fn creating_file_during_produce() -> Self {
+            let mut setup = Self::available();
+            setup.create_file_during_produce = true;
+            setup
+        }
+
+        fn produce_call_count(&self) -> usize {
+            self.produce_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl NativeLspReferenceProductionDriver for FakeExactFactDriver {
+        fn probe(&self, _timeout: std::time::Duration) -> RustAnalyzerProbe {
+            self.probe.clone()
+        }
+
+        fn produce(
+            &self,
+            model_dir: &Path,
+            frozen_manifest: &forge_project_model::ProjectManifest,
+            request: &NativeLspReferenceRequest,
+            probe: RustAnalyzerProbe,
+        ) -> Result<ExternalFactProductionReport> {
+            self.produce_calls.fetch_add(1, Ordering::SeqCst);
+            if self.create_file_during_produce {
+                fs::write(
+                    frozen_manifest.root.join("src").join("late.rs"),
+                    "pub fn late_exact_fact_file() {}\n",
+                )?;
+            }
+            let mut batch = runtime_external_artifact_batch(
+                frozen_manifest,
+                &request.production.source_label,
+                "lsp:src/lib.rs:fixture_reference_site",
+            );
+            batch.metadata.tool_version = probe.version.clone();
+            batch.facts.references[0].to = request.source.endpoint.clone();
+            batch.metadata.source_artifact_fingerprint = external_fact_artifact_fingerprint(&batch);
+            batch.metadata.batch_fingerprint =
+                external_fact_batch_fingerprint(&batch.metadata, &batch.facts);
+            let batch_fingerprint = batch.metadata.batch_fingerprint.clone();
+            let batch_metadata = batch.metadata.clone();
+            let artifact_path = write_external_fact_artifact(model_dir, frozen_manifest, batch)?;
+            Ok(ExternalFactProductionReport {
+                probe: forge_project_model::ExternalFactProducerProbe {
+                    source: ExternalFactSource::Lsp,
+                    capability:
+                        forge_project_model::ExternalFactProducerCapability::LspReferenceFacts,
+                    source_label: request.production.source_label.clone(),
+                    tool_version: probe.version,
+                    available: true,
+                    unavailable_reason: None,
+                },
+                status: ExternalFactProductionStatus::ArtifactWritten,
+                manifest_hash_input: frozen_manifest.manifest_hash.clone(),
+                produced_reference_facts: 1,
+                artifact_path: Some(artifact_path),
+                batch_fingerprint: Some(batch_fingerprint),
+                bounded_loss: Some(request.bounded_loss.clone()),
+                batch_metadata: Some(batch_metadata),
+                issues: Vec::new(),
+            })
+        }
+    }
 
     #[async_trait]
     impl FileDiscovery for NoopDiscovery {
@@ -939,6 +1269,18 @@ mod tests {
             root.join("src").join("lib.rs"),
             "pub struct RuntimeNeedle {\n    pub value: usize,\n}\n\npub fn build_runtime_needle() -> RuntimeNeedle {\n    RuntimeNeedle { value: 7 }\n}\n",
         )?;
+        Ok((fixture, root))
+    }
+
+    fn fixture_without_eligible_endpoint() -> Result<(TempDir, PathBuf)> {
+        let fixture = TempDir::new()?;
+        let root = fixture.path().join("workspace");
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"empty_fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )?;
+        fs::write(root.join("src").join("lib.rs"), "// no eligible symbols\n")?;
         Ok((fixture, root))
     }
 
@@ -1545,6 +1887,206 @@ mod tests {
 
         assert_eq!(report.accepted_artifacts, 1usize);
         assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_workspace_does_not_invoke_exact_fact_reference_producer() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = fixture_sync_service(&root);
+        let mut stream = WorkspaceService::sync_workspace(&setup, root.clone()).await?;
+        while let Some(_event) = stream.next().await {}
+        let actual = local_project_model_dir(&root)
+            .join("external_facts")
+            .exists();
+        let expected = false;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_fact_reference_command_invokes_one_bounded_producer_path() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = fixture_sync_service(&root);
+        let driver = FakeExactFactDriver::available();
+        let actual =
+            setup.produce_workspace_exact_fact_reference_with_driver(root.clone(), &driver)?;
+        let manifest =
+            ProjectIndexer::new(&root, local_project_model_dir(&root)).read_manifest()?;
+        let expected = (
+            WorkspaceExactFactReferenceStatus::ArtifactWritten,
+            1usize,
+            1usize,
+            1usize,
+            true,
+        );
+
+        assert_eq!(
+            (
+                actual.status,
+                actual.produced_reference_count,
+                driver.produce_call_count(),
+                manifest.external_fact_batches.len(),
+                actual.artifact_path.is_some(),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_fact_reference_no_eligible_endpoint_is_typed_noop() -> Result<()> {
+        let (_fixture, root) = fixture_without_eligible_endpoint()?;
+        let setup = fixture_sync_service(&root);
+        let driver = FakeExactFactDriver::available();
+        let actual =
+            setup.produce_workspace_exact_fact_reference_with_driver(root.clone(), &driver)?;
+        let expected = (
+            WorkspaceExactFactReferenceStatus::NoEligibleEndpoint,
+            0usize,
+            0usize,
+            None,
+        );
+
+        assert_eq!(
+            (
+                actual.status,
+                actual.produced_reference_count,
+                driver.produce_call_count(),
+                actual.artifact_path,
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_fact_reference_unavailable_rust_analyzer_is_typed_status() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = fixture_sync_service(&root);
+        let driver = FakeExactFactDriver::unavailable();
+        let actual = setup.produce_workspace_exact_fact_reference_with_driver(root, &driver)?;
+        let expected = (
+            WorkspaceExactFactReferenceStatus::RustAnalyzerUnavailable,
+            0usize,
+            0usize,
+            None,
+        );
+
+        assert_eq!(
+            (
+                actual.status,
+                actual.produced_reference_count,
+                driver.produce_call_count(),
+                actual.artifact_path,
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_fact_reference_reingests_from_frozen_manifest_without_second_walk() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = fixture_sync_service(&root);
+        let driver = FakeExactFactDriver::creating_file_during_produce();
+        let actual =
+            setup.produce_workspace_exact_fact_reference_with_driver(root.clone(), &driver)?;
+        let manifest =
+            ProjectIndexer::new(&root, local_project_model_dir(&root)).read_manifest()?;
+        let late_file_indexed = manifest.files.iter().any(|file| file.path == "src/late.rs");
+        let expected = (
+            WorkspaceExactFactReferenceStatus::ArtifactWritten,
+            false,
+            true,
+        );
+
+        assert_eq!(
+            (
+                actual.status,
+                late_file_indexed,
+                root.join("src").join("late.rs").is_file()
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_fact_reference_report_is_redaction_safe() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = fixture_sync_service(&root);
+        let driver = FakeExactFactDriver::available();
+        let report = setup.produce_workspace_exact_fact_reference_with_driver(root, &driver)?;
+        let actual = serde_json::to_string_pretty(&report)?;
+
+        assert!(!actual.contains("pub struct"));
+        assert!(!actual.contains("RuntimeNeedle"));
+        assert!(!actual.contains("Content-Length"));
+        assert!(!actual.contains("jsonrpc"));
+        assert!(!actual.contains("stdout"));
+        assert!(!actual.contains("stderr"));
+        Ok(())
+    }
+
+    #[test]
+    fn exact_fact_reference_repeated_fingerprint_does_not_duplicate_batches_or_edges() -> Result<()>
+    {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = fixture_sync_service(&root);
+        let driver = FakeExactFactDriver::available();
+        let first =
+            setup.produce_workspace_exact_fact_reference_with_driver(root.clone(), &driver)?;
+        let second =
+            setup.produce_workspace_exact_fact_reference_with_driver(root.clone(), &driver)?;
+        let manifest =
+            ProjectIndexer::new(&root, local_project_model_dir(&root)).read_manifest()?;
+        let exact_reference_edges = manifest
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == GraphEdgeKind::References)
+            .count();
+        let expected = (
+            first.batch_fingerprint.clone(),
+            first.batch_fingerprint,
+            1usize,
+            1usize,
+        );
+
+        assert_eq!(
+            (
+                second.batch_fingerprint,
+                second
+                    .ingestion_summary
+                    .accepted_batch_fingerprints
+                    .first()
+                    .cloned(),
+                manifest.external_fact_batches.len(),
+                exact_reference_edges,
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_fact_reference_report_porcelain_shape_is_stable_json_object() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = fixture_sync_service(&root);
+        let driver = FakeExactFactDriver::available();
+        let report = setup.produce_workspace_exact_fact_reference_with_driver(root, &driver)?;
+        let actual: serde_json::Value = serde_json::from_str(&serde_json::to_string(&report)?)?;
+
+        assert!(actual.is_object());
+        assert_eq!(actual["status"], "ArtifactWritten");
+        assert!(actual.get("artifact_path").is_some());
+        assert!(actual.get("batch_fingerprint").is_some());
+        assert!(actual.get("produced_reference_count").is_some());
+        assert!(actual.get("bounded_loss").is_some());
+        assert!(actual.get("manifest_hash_input").is_some());
+        assert!(actual.get("issues").is_some());
+        assert!(actual.get("ingestion_summary").is_some());
         Ok(())
     }
 
