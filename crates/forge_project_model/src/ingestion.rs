@@ -1003,11 +1003,18 @@ mod tests {
 
         assert_eq!(actual, expected);
         assert_eq!(
-            issues.iter().any(|issue| issue.code
-                == ExternalFactIngestionIssueCode::ConflictingManifestSymbolId),
+            issues
+                .iter()
+                .any(|issue| issue.code
+                    == ExternalFactIngestionIssueCode::ConflictingManifestSymbolId),
             true
         );
         assert_eq!(manifest.symbols, before_symbols);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_external_facts_reject_unresolved_endpoints() -> Result<()> {
         let (fixture, root) = fixture_project()?;
         let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
         let mut manifest = setup.index()?;
