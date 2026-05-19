@@ -317,6 +317,8 @@ pub enum TextMessageKind {
     RuntimeContext,
     /// Project-model context injected as an internal user-scoped payload.
     ProjectModelContext,
+    /// Reviewed self-learning context injected as an internal user-scoped payload.
+    LearningContext,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, Setters)]
@@ -387,12 +389,16 @@ impl TextMessage {
         self.role == role
     }
 
-    /// Returns whether this message is live runtime or project-model context,
-    /// not a real user-authored message.
+    /// Returns whether this message is live runtime, project-model, or learning
+    /// context, not a real user-authored message.
     pub fn is_internal_context(&self) -> bool {
         matches!(
             self.kind,
-            Some(TextMessageKind::RuntimeContext | TextMessageKind::ProjectModelContext)
+            Some(
+                TextMessageKind::RuntimeContext
+                    | TextMessageKind::ProjectModelContext
+                    | TextMessageKind::LearningContext
+            )
         )
     }
 
@@ -405,6 +411,19 @@ impl TextMessage {
     pub fn project_model_context(role: Role, content: impl Into<String>) -> Self {
         Self::new(role, content)
             .kind(TextMessageKind::ProjectModelContext)
+            .droppable(true)
+            .cacheable(false)
+    }
+
+    /// Returns whether this message is reviewed self-learning context.
+    pub fn is_learning_context(&self) -> bool {
+        self.kind == Some(TextMessageKind::LearningContext)
+    }
+
+    /// Marks this message as a reviewed self-learning context payload.
+    pub fn learning_context(role: Role, content: impl Into<String>) -> Self {
+        Self::new(role, content)
+            .kind(TextMessageKind::LearningContext)
             .droppable(true)
             .cacheable(false)
     }
@@ -962,6 +981,22 @@ mod tests {
         );
         let actual = (
             fixture.is_project_model_context(),
+            fixture.is_internal_context(),
+            fixture.droppable,
+            fixture.is_cache_eligible(),
+        );
+        let expected = (true, true, true, false);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_learning_context_constructor_sets_internal_transport_invariants() {
+        let fixture = TextMessage::learning_context(
+            Role::User,
+            "<learning_context>dynamic</learning_context>",
+        );
+        let actual = (
+            fixture.is_learning_context(),
             fixture.is_internal_context(),
             fixture.droppable,
             fixture.is_cache_eligible(),

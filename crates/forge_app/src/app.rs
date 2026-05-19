@@ -7,8 +7,14 @@ use chrono::Local;
 use forge_config::ForgeConfig;
 use forge_domain::*;
 use forge_project_model::{
-    ProjectContextTarget, ProjectModelContextRenderBudget, ProjectModelSourceNode,
-    TargetResolutionBudget, directory_path_filter, local_project_model_manifest, mentioned_paths,
+    LearningContextPayload, LearningContextRecord,
+    LearningLedgerFreshness as ProjectLearningLedgerFreshness,
+    LearningProvenance as ProjectLearningProvenance,
+    LearningRedactionStatus as ProjectLearningRedactionStatus,
+    LearningReviewState as ProjectLearningReviewState,
+    LearningSourceKind as ProjectLearningSourceKind, ProjectContextTarget,
+    ProjectModelContextRenderBudget, ProjectModelSourceNode, TargetResolutionBudget,
+    directory_path_filter, local_project_model_manifest, mentioned_paths,
     render_project_model_context, render_sources_from_nodes,
 };
 use forge_stream::MpscStream;
@@ -19,8 +25,8 @@ use crate::changed_files::ChangedFiles;
 use crate::dto::ToolsOverview;
 use crate::dto::openai::ProviderRequestEstimate as OpenAiProviderRequestEstimate;
 use crate::hooks::{
-    CompactionHandler, DoomLoopDetector, PendingTodosHandler, TitleGenerationHandler,
-    TracingHandler,
+    CompactionHandler, DoomLoopDetector, LearningCapture, PendingTodosHandler,
+    TitleGenerationHandler, TracingHandler,
 };
 use crate::init_conversation_metrics::InitConversationMetrics;
 use crate::orch::Orchestrator;
@@ -34,8 +40,8 @@ use crate::tool_registry::ToolRegistry;
 use crate::tool_resolver::ToolResolver;
 use crate::user_prompt::UserPromptGenerator;
 use crate::{
-    AgentExt, AgentProviderResolver, ConversationService, EnvironmentInfra, ProviderService,
-    Services, WorkspaceService,
+    AgentExt, AgentProviderResolver, ConversationService, EnvironmentInfra, LearningService,
+    ProviderService, Services, WorkspaceService,
 };
 
 /// Builds a [`TemplateConfig`] from a [`ForgeConfig`].
@@ -64,9 +70,130 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
     const MAX_TARGETS: usize = 4;
     const MAX_EXPLICIT_TARGET_CANDIDATES: usize = 8;
     const MAX_INDEX_PROBES: usize = 32;
+    const MAX_LEARNING_RECORDS: usize = 8;
+    const MAX_LEARNING_CONTEXT_CHARS: usize = 8_192;
 
     fn new(services: Arc<S>, agent: Agent) -> Self {
         Self { services, agent }
+    }
+
+    async fn inject_learning(&self, mut conversation: Conversation) -> Conversation
+    where
+        S: LearningService,
+    {
+        let records = match self
+            .services
+            .list_learning_records(
+                Some(LearningReviewState::Accepted),
+                Self::MAX_LEARNING_RECORDS,
+            )
+            .await
+        {
+            Ok(records) => records,
+            Err(error) => {
+                tracing::debug!(error = ?error, "Skipping learning context injection because reviewed query failed");
+                return conversation;
+            }
+        };
+        if records.is_empty() {
+            return conversation;
+        }
+        let freshness = match self
+            .services
+            .learning_freshness(Some(LearningReviewState::Accepted))
+            .await
+        {
+            Ok(freshness) => freshness,
+            Err(error) => {
+                tracing::debug!(error = ?error, "Skipping learning context injection because freshness query failed");
+                return conversation;
+            }
+        };
+        let payload = LearningContextPayload::new(
+            Self::learning_freshness_to_project(freshness),
+            records
+                .into_iter()
+                .filter_map(Self::learning_record_to_project)
+                .collect(),
+        );
+        if payload.records.is_empty() {
+            return conversation;
+        }
+        let content = match payload.render() {
+            Ok(content) => content,
+            Err(error) => {
+                tracing::debug!(error = ?error, "Skipping learning context injection because payload violated reviewed-only transport invariants");
+                return conversation;
+            }
+        };
+        if content.chars().count() > Self::MAX_LEARNING_CONTEXT_CHARS {
+            tracing::debug!(
+                actual_chars = content.chars().count(),
+                max_chars = Self::MAX_LEARNING_CONTEXT_CHARS,
+                "Skipping learning context injection because rendered payload exceeds bounded budget"
+            );
+            return conversation;
+        }
+        let mut context = conversation.context.take().unwrap_or_default();
+        let message = TextMessage::learning_context(Role::User, content)
+            .model(self.agent.model.clone())
+            .droppable(true)
+            .cacheable(false);
+        context = context.add_message(ContextMessage::Text(message));
+        conversation.context(context)
+    }
+
+    fn learning_freshness_to_project(
+        freshness: LearningLedgerFreshness,
+    ) -> ProjectLearningLedgerFreshness {
+        ProjectLearningLedgerFreshness {
+            ledger_cursor: freshness.ledger_cursor,
+            projection_version: freshness.projection_version,
+            review_state_fingerprint: freshness.review_state_fingerprint,
+        }
+    }
+
+    fn learning_record_to_project(
+        projection: LearningRecordProjection,
+    ) -> Option<LearningContextRecord> {
+        if projection.review_state != LearningReviewState::Accepted {
+            return None;
+        }
+        Some(LearningContextRecord {
+            id: projection.record_id.into_string(),
+            summary: projection.summary,
+            review_state: ProjectLearningReviewState::Accepted,
+            redaction_status: Self::learning_redaction_to_project(projection.redaction_status),
+            provenance: Self::learning_provenance_to_project(projection.provenance)?,
+        })
+    }
+
+    fn learning_redaction_to_project(
+        status: LearningRedactionStatus,
+    ) -> ProjectLearningRedactionStatus {
+        match status {
+            LearningRedactionStatus::Clean => ProjectLearningRedactionStatus::Clean,
+            LearningRedactionStatus::Redacted => ProjectLearningRedactionStatus::Redacted,
+        }
+    }
+
+    fn learning_provenance_to_project(
+        provenance: LearningProvenance,
+    ) -> Option<ProjectLearningProvenance> {
+        let source_kind = match provenance.source_kind {
+            LearningSourceKind::Conversation => ProjectLearningSourceKind::Conversation,
+            LearningSourceKind::Task => ProjectLearningSourceKind::Task,
+            LearningSourceKind::Tool => ProjectLearningSourceKind::Tool,
+            LearningSourceKind::Eval => ProjectLearningSourceKind::Eval,
+        };
+        let source_id = provenance.source_id().ok()?;
+        Some(ProjectLearningProvenance {
+            source_kind,
+            source_id,
+            source_event_id: Some(provenance.source_event_id),
+            source_timestamp: None,
+            source_fingerprint: provenance.source_fingerprint,
+        })
     }
 
     async fn inject(&self, mut conversation: Conversation) -> Conversation {
@@ -606,6 +733,12 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig> + SteerS
             .inject(conversation)
             .await;
 
+        // Inject reviewed learning records as late-bound internal context. This
+        // path is reviewed-only, bounded, droppable, and cache-ineligible.
+        let conversation = ProjectContextInjection::new(self.services.clone(), agent.clone())
+            .inject_learning(conversation)
+            .await;
+
         // Detect and render externally changed files notification
         let conversation = ChangedFiles::new(services.clone(), agent.clone())
             .update_file_stats(conversation)
@@ -665,7 +798,12 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig> + SteerS
 
                     // Always save conversation using get_conversation()
                     let conversation = orch.get_conversation().clone();
-                    let save_result = services.upsert_conversation(conversation).await;
+                    let save_result = services.upsert_conversation(conversation.clone()).await;
+                    if save_result.is_ok() {
+                        LearningCapture::new(services.clone())
+                            .capture_saved_conversation(&conversation)
+                            .await;
+                    }
 
                     // Send any error to the stream (prioritize dispatch error over save error)
                     let final_err = match (dispatch_result, save_result) {
@@ -933,7 +1071,9 @@ mod tests {
     use anyhow::Result;
     use forge_domain::{
         Agent, AgentId, ChatCompletionMessage, Content, Context, ContextMessage, Conversation,
-        Environment, FileChunk, FileStatus, FinishReason, Model, ModelId, Node, NodeData, NodeId,
+        Environment, FileChunk, FileStatus, FinishReason, LearningLedgerEvent,
+        LearningLedgerFreshness, LearningRecordId, LearningRecordProjection,
+        LearningRedactionStatus, LearningReviewState, Model, ModelId, Node, NodeData, NodeId,
         ProviderId, ResultStream, SearchParams, SteerMessage, SyncProgress, ToolCallContext,
         ToolCallFull, ToolResult, WorkspaceAuth, WorkspaceContextFreshness,
         WorkspaceContextManifestDiagnostic, WorkspaceId, WorkspaceInfo,
@@ -957,6 +1097,8 @@ mod tests {
         queried_workspaces: Mutex<Vec<PathBuf>>,
         query_filters: Mutex<Vec<Option<String>>>,
         index_checks: AtomicUsize,
+        learning_records: Mutex<Vec<LearningRecordProjection>>,
+        learning_freshness: LearningLedgerFreshness,
     }
 
     impl ProjectContextHarness {
@@ -1028,7 +1170,17 @@ mod tests {
                 queried_workspaces: Mutex::new(Vec::new()),
                 query_filters: Mutex::new(Vec::new()),
                 index_checks: AtomicUsize::new(0),
+                learning_records: Mutex::new(Vec::new()),
+                learning_freshness: LearningLedgerFreshness {
+                    ledger_cursor: 1,
+                    projection_version: 1,
+                    review_state_fingerprint: "fixture-learning".to_string(),
+                },
             })
+        }
+
+        async fn set_learning_records(&self, records: Vec<LearningRecordProjection>) {
+            *self.learning_records.lock().await = records;
         }
     }
 
@@ -1226,6 +1378,45 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    impl LearningService for ProjectContextHarness {
+        async fn capture_candidate_from_conversation(
+            &self,
+            _conversation_id: ConversationId,
+            _source_event_id: String,
+            _summary: String,
+        ) -> Result<LearningLedgerEvent> {
+            anyhow::bail!("unused learning capture")
+        }
+
+        async fn insert_learning_event(
+            &self,
+            _event: LearningLedgerEvent,
+        ) -> Result<LearningLedgerEvent> {
+            anyhow::bail!("unused learning insert")
+        }
+
+        async fn list_learning_records(
+            &self,
+            review_state: Option<LearningReviewState>,
+            limit: usize,
+        ) -> Result<Vec<LearningRecordProjection>> {
+            let mut records = self.learning_records.lock().await.clone();
+            if let Some(review_state) = review_state {
+                records.retain(|record| record.review_state == review_state);
+            }
+            records.truncate(limit);
+            Ok(records)
+        }
+
+        async fn learning_freshness(
+            &self,
+            _review_state: Option<LearningReviewState>,
+        ) -> Result<LearningLedgerFreshness> {
+            Ok(self.learning_freshness.clone())
+        }
+    }
+
+    #[async_trait::async_trait]
     impl AgentService for ProjectContextHarness {
         async fn chat_agent(
             &self,
@@ -1279,6 +1470,144 @@ mod tests {
             root.join(".forge_project_model/project_manifest.json"),
             r#"{"version":1,"root":"fixture","files":[],"file_nodes":[],"symbols":[],"edges":[],"shards":[],"manifest_hash":"fixture"}"#,
         )?;
+        Ok(())
+    }
+
+    fn fixture_learning_projection(
+        review_state: LearningReviewState,
+        summary: &str,
+    ) -> LearningRecordProjection {
+        let conversation_id = ConversationId::generate();
+        LearningRecordProjection {
+            record_id: LearningRecordId::generate(),
+            summary: summary.to_string(),
+            review_state,
+            redaction_status: LearningRedactionStatus::Clean,
+            provenance: LearningProvenance::conversation(
+                conversation_id,
+                "learning-event-1",
+                "learning-source-fingerprint",
+            ),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            schema_version: LEARNING_LEDGER_SCHEMA_VERSION,
+        }
+    }
+
+    #[tokio::test]
+    async fn learning_context_injection_uses_only_reviewed_accepted_records() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root);
+        setup
+            .set_learning_records(vec![
+                fixture_learning_projection(
+                    LearningReviewState::Candidate,
+                    "candidate must not inject",
+                ),
+                fixture_learning_projection(
+                    LearningReviewState::Accepted,
+                    "accepted reviewed learning",
+                ),
+            ])
+            .await;
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let conversation = Conversation::generate().context(Context::default().add_message(
+            ContextMessage::user("find automatic injection needle", Some(model_id)),
+        ));
+
+        let actual = ProjectContextInjection::new(setup, agent)
+            .inject_learning(conversation)
+            .await
+            .context
+            .unwrap();
+        let learning_message = actual
+            .messages
+            .iter()
+            .find_map(|message| match &message.message {
+                ContextMessage::Text(text) if text.is_learning_context() => Some(text),
+                _ => None,
+            })
+            .expect("accepted learning context should be injected");
+
+        assert!(
+            learning_message
+                .content
+                .contains("accepted reviewed learning")
+        );
+        assert!(
+            !learning_message
+                .content
+                .contains("candidate must not inject")
+        );
+        assert_eq!(learning_message.droppable, true);
+        assert_eq!(learning_message.is_cache_eligible(), false);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_context_injection_does_not_inject_unreviewed_candidates() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root);
+        setup
+            .set_learning_records(vec![fixture_learning_projection(
+                LearningReviewState::Candidate,
+                "candidate must not inject",
+            )])
+            .await;
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let conversation = Conversation::generate().context(Context::default().add_message(
+            ContextMessage::user("find automatic injection needle", Some(model_id)),
+        ));
+
+        let actual = ProjectContextInjection::new(setup, agent)
+            .inject_learning(conversation)
+            .await
+            .context
+            .unwrap();
+        let injected = actual
+            .messages
+            .iter()
+            .any(|message| match &message.message {
+                ContextMessage::Text(text) => text.is_learning_context(),
+                _ => false,
+            });
+
+        assert_eq!(injected, false);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_context_injection_skips_payload_over_char_budget() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root);
+        setup
+            .set_learning_records(vec![fixture_learning_projection(
+                LearningReviewState::Accepted,
+                &"oversized reviewed learning ".repeat(1_000),
+            )])
+            .await;
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let conversation = Conversation::generate().context(Context::default().add_message(
+            ContextMessage::user("find automatic injection needle", Some(model_id)),
+        ));
+
+        let actual = ProjectContextInjection::new(setup, agent)
+            .inject_learning(conversation)
+            .await
+            .context
+            .unwrap();
+        let injected = actual
+            .messages
+            .iter()
+            .any(|message| match &message.message {
+                ContextMessage::Text(text) => text.is_learning_context(),
+                _ => false,
+            });
+
+        assert_eq!(injected, false);
         Ok(())
     }
 
