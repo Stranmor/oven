@@ -9,6 +9,10 @@ pub const LOCAL_PROJECT_MODEL_DIR_NAME: &str = ".forge_project_model";
 /// Manifest file name used by local project-model storage.
 pub const LOCAL_PROJECT_MODEL_MANIFEST_FILE_NAME: &str = "project_manifest.json";
 
+/// External fact ingestion report file name used by local project-model storage.
+pub const LOCAL_PROJECT_MODEL_EXTERNAL_FACT_REPORT_FILE_NAME: &str =
+    "external_fact_artifact_ingestion_report.json";
+
 /// Returns the canonical local project-model directory for a workspace root.
 ///
 /// # Arguments
@@ -25,6 +29,15 @@ pub fn local_project_model_dir(workspace_root: &Path) -> PathBuf {
 /// * `workspace_root` - Workspace root that owns local project-model storage.
 pub fn local_project_model_manifest(workspace_root: &Path) -> PathBuf {
     local_project_model_dir(workspace_root).join(LOCAL_PROJECT_MODEL_MANIFEST_FILE_NAME)
+}
+
+/// Returns the canonical local project-model external fact ingestion report path.
+///
+/// # Arguments
+///
+/// * `workspace_root` - Workspace root that owns local project-model storage.
+pub fn local_project_model_external_fact_report(workspace_root: &Path) -> PathBuf {
+    local_project_model_dir(workspace_root).join(LOCAL_PROJECT_MODEL_EXTERNAL_FACT_REPORT_FILE_NAME)
 }
 
 /// A selected project-model context target.
@@ -290,6 +303,16 @@ mod tests {
         let setup = PathBuf::from("/workspace");
         let actual = local_project_model_manifest(&setup);
         let expected = PathBuf::from("/workspace/.forge_project_model/project_manifest.json");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn local_external_fact_report_path_uses_single_convention() {
+        let setup = PathBuf::from("/workspace");
+        let actual = local_project_model_external_fact_report(&setup);
+        let expected = PathBuf::from(
+            "/workspace/.forge_project_model/external_fact_artifact_ingestion_report.json",
+        );
         assert_eq!(actual, expected);
     }
 }

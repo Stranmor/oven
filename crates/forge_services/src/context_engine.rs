@@ -103,8 +103,10 @@ impl<
 
     fn write_local_project_model_manifest(&self, root: &Path) -> Result<PathBuf> {
         let indexer = ProjectIndexer::new(root, local_project_model_dir(root));
-        let manifest = indexer.index()?;
-        indexer.write_manifest(&manifest)
+        let (manifest, report) = indexer.index_with_external_fact_report()?;
+        let manifest_path = indexer.write_manifest(&manifest)?;
+        indexer.write_external_fact_artifact_ingestion_report(&report)?;
+        Ok(manifest_path)
     }
 
     /// Gets the ForgeCode services credential and extracts workspace auth
@@ -631,7 +633,13 @@ mod tests {
         ProcessStartOutput, ProcessStatus, ProviderTemplate, ShellHandoffTimeoutSeconds,
         WorkspaceFiles, WorkspaceInfo,
     };
-    use forge_project_model::FreshnessState;
+    use forge_project_model::{
+        ExternalFactArtifactIngestionReport, ExternalFactBatch, ExternalFactBatchMetadata,
+        ExternalFactIngestionIssueCode, ExternalFactSource, FreshnessState, GraphEdgeKind,
+        SymbolKind, TypedExternalFacts, TypedExternalReferenceFact, TypedExternalSymbolFact,
+        external_fact_artifact_fingerprint, external_fact_batch_fingerprint,
+        write_external_fact_artifact,
+    };
     use futures::{Stream, StreamExt};
     use tempfile::TempDir;
 
@@ -1308,6 +1316,72 @@ mod tests {
         Ok(())
     }
 
+    fn runtime_external_artifact_batch(
+        manifest: &forge_project_model::ProjectManifest,
+        source_label: &str,
+        external_symbol_id: &str,
+    ) -> ExternalFactBatch {
+        let facts = TypedExternalFacts {
+            symbols: vec![TypedExternalSymbolFact {
+                id: external_symbol_id.to_string(),
+                name: "runtime_external_new".to_string(),
+                kind: SymbolKind::Method,
+                path: "src/lib.rs".to_string(),
+                start_line: 5,
+                end_line: 7,
+                source: ExternalFactSource::Lsp,
+            }],
+            references: vec![TypedExternalReferenceFact {
+                from: external_symbol_id.to_string(),
+                to: "symbol:src/lib.rs:Struct:RuntimeNeedle".to_string(),
+                kind: GraphEdgeKind::References,
+                path: "src/lib.rs".to_string(),
+                start_line: Some(5),
+                end_line: Some(5),
+                source: ExternalFactSource::Lsp,
+            }],
+        };
+        let mut batch = ExternalFactBatch {
+            metadata: ExternalFactBatchMetadata {
+                source: ExternalFactSource::Lsp,
+                source_label: source_label.to_string(),
+                tool_version: Some("fixture-1".to_string()),
+                workspace_root: manifest.root.to_string_lossy().to_string(),
+                source_artifact_fingerprint: String::new(),
+                manifest_hash_input: manifest.manifest_hash.clone(),
+                batch_fingerprint: String::new(),
+            },
+            facts,
+        };
+        batch.metadata.source_artifact_fingerprint = external_fact_artifact_fingerprint(&batch);
+        batch.metadata.batch_fingerprint =
+            external_fact_batch_fingerprint(&batch.metadata, &batch.facts);
+        batch
+    }
+
+    fn fixture_sync_service(root: &Path) -> ForgeWorkspaceService<LocalSearchInfra, NoopDiscovery> {
+        ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.to_path_buf(),
+                credential: Some(workspace_auth_credential()),
+                workspaces: vec![remote_workspace(root)],
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::new(AtomicBool::new(false)),
+                range_read_fails: false,
+            }),
+            Arc::new(NoopDiscovery),
+        )
+    }
+
+    fn read_runtime_external_fact_report(
+        root: &Path,
+    ) -> Result<ExternalFactArtifactIngestionReport> {
+        let json = fs::read_to_string(
+            forge_project_model::local_project_model_external_fact_report(root),
+        )?;
+        Ok(serde_json::from_str(&json)?)
+    }
+
     fn workspace_auth_credential() -> AuthCredential {
         let mut url_params = HashMap::new();
         url_params.insert(
@@ -1389,22 +1463,86 @@ mod tests {
     async fn sync_workspace_writes_local_project_model_manifest_before_remote_file_sync()
     -> Result<()> {
         let (_fixture, root) = fixture_workspace()?;
-        let setup = ForgeWorkspaceService::new(
-            Arc::new(LocalSearchInfra {
-                cwd: root.clone(),
-                credential: Some(workspace_auth_credential()),
-                workspaces: vec![remote_workspace(&root)],
-                remote_search_called: Arc::new(AtomicBool::new(false)),
-                range_read_called: Arc::new(AtomicBool::new(false)),
-                range_read_fails: false,
-            }),
-            Arc::new(NoopDiscovery),
-        );
+        let setup = fixture_sync_service(&root);
         let mut stream = WorkspaceService::sync_workspace(&setup, root.clone()).await?;
         while let Some(_event) = stream.next().await {}
         let actual = local_project_model_manifest(&root).is_file();
         let expected = true;
 
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_workspace_writes_empty_external_fact_ingestion_report() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = fixture_sync_service(&root);
+        let mut stream = WorkspaceService::sync_workspace(&setup, root.clone()).await?;
+        while let Some(_event) = stream.next().await {}
+        let actual = read_runtime_external_fact_report(&root)?;
+        let expected = ExternalFactArtifactIngestionReport {
+            store_path: "external_facts".to_string(),
+            inspected_artifacts: 0,
+            accepted_artifacts: 0,
+            artifacts: Vec::new(),
+            accepted_batches: Vec::new(),
+        };
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_workspace_report_surfaces_invalid_external_fact_rejection() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        fs::create_dir_all(local_project_model_dir(&root).join("external_facts"))?;
+        fs::write(
+            local_project_model_dir(&root)
+                .join("external_facts")
+                .join("invalid.json"),
+            "{",
+        )?;
+        let setup = fixture_sync_service(&root);
+        let mut stream = WorkspaceService::sync_workspace(&setup, root.clone()).await?;
+        while let Some(_event) = stream.next().await {}
+        let actual = read_runtime_external_fact_report(&root)?;
+        let expected = ExternalFactIngestionIssueCode::ArtifactParseFailed;
+
+        assert_eq!(actual.accepted_artifacts, 0usize);
+        assert_eq!(actual.inspected_artifacts, 1usize);
+        assert_eq!(
+            actual.artifacts[0].artifact_path,
+            "invalid.json".to_string()
+        );
+        assert_eq!(actual.artifacts[0].issues[0].code, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_workspace_report_surfaces_accepted_batch_fingerprint_and_source_label()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+        let base = indexer.index()?;
+        let batch =
+            runtime_external_artifact_batch(&base, "rust-analyzer", "lsp:src/lib.rs:runtime_sync");
+        let expected = (
+            batch.metadata.batch_fingerprint.clone(),
+            batch.metadata.source_label.clone(),
+        );
+        write_external_fact_artifact(&local_project_model_dir(&root), &base, batch)?;
+        let setup = fixture_sync_service(&root);
+        let mut stream = WorkspaceService::sync_workspace(&setup, root.clone()).await?;
+        while let Some(_event) = stream.next().await {}
+        let report = read_runtime_external_fact_report(&root)?;
+        let accepted = report
+            .artifacts
+            .first()
+            .and_then(|artifact| artifact.accepted_batch.clone())
+            .expect("accepted runtime artifact should carry batch metadata");
+        let actual = (accepted.batch_fingerprint, accepted.source_label);
+
+        assert_eq!(report.accepted_artifacts, 1usize);
         assert_eq!(actual, expected);
         Ok(())
     }

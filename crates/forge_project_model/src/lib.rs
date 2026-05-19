@@ -39,7 +39,8 @@ pub use indexer::ProjectIndexer;
 pub use ingestion::{
     external_fact_artifact_fingerprint, external_fact_batch_fingerprint,
     ingest_external_fact_artifacts, ingest_external_fact_batch, ingest_external_facts,
-    ingest_typed_external_facts, validate_external_fact_batch,
+    ingest_typed_external_facts, prepared_external_fact_artifact_batch,
+    validate_external_fact_batch, write_external_fact_artifact,
 };
 pub use learning::{
     LearningContextPayload, LearningContextRecord, LearningContextTransport,
@@ -49,7 +50,8 @@ pub use learning::{
 pub use lexical::{LexicalIndex, documents_from_manifest};
 pub use policy::{
     ProjectContextTarget, TargetResolutionBudget, directory_path_filter, local_project_model_dir,
-    local_project_model_manifest, mentioned_paths, resolve_mentioned_path,
+    local_project_model_external_fact_report, local_project_model_manifest, mentioned_paths,
+    resolve_mentioned_path,
 };
 pub use render::{
     DEFAULT_RENDERED_SOURCE_LIMIT, ProjectModelContextRenderBudget, ProjectModelContextSource,

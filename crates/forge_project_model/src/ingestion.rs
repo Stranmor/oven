@@ -2,7 +2,8 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
@@ -19,6 +20,90 @@ use crate::util::{
 };
 
 const MAX_EXTERNAL_FACT_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Writes one bounded external exact-fact artifact into a model-dir scoped store.
+///
+/// This helper is a serialization scaffold only: it accepts an already typed
+/// batch, computes deterministic artifact and batch fingerprints, validates the
+/// result against a frozen manifest, writes pretty JSON atomically, and verifies
+/// readback before returning. It never spawns producer tools or reads raw tool
+/// output.
+///
+/// # Arguments
+///
+/// * `model_dir` - Project-model directory that owns the `external_facts` store.
+/// * `frozen_manifest` - Manifest baseline the facts were produced against.
+/// * `batch` - Already typed external facts and source metadata to serialize.
+///
+/// # Errors
+///
+/// Returns an error when source metadata is not explicit, validation fails, the
+/// artifact cannot be written atomically, or readback validation fails.
+pub fn write_external_fact_artifact(
+    model_dir: &Path,
+    frozen_manifest: &ProjectManifest,
+    batch: ExternalFactBatch,
+) -> Result<PathBuf> {
+    let batch = prepared_external_fact_artifact_batch(frozen_manifest, batch)?;
+    let issues = validate_external_fact_batch(frozen_manifest, &batch);
+    if !issues.is_empty() {
+        bail!(
+            "external fact artifact rejected before write: {}",
+            issue_summary(&issues)
+        );
+    }
+
+    let directory = model_dir.join("external_facts");
+    fs::create_dir_all(&directory)?;
+    let filename = external_fact_artifact_filename(&batch);
+    let path = directory.join(filename);
+    let temp_path = directory.join(format!(".{}.tmp", batch.metadata.batch_fingerprint));
+    let json = serde_json::to_string_pretty(&batch)?;
+    write_json_atomically(&temp_path, &path, json.as_bytes())?;
+
+    let readback_json = fs::read_to_string(&path)?;
+    let readback: ExternalFactBatch = serde_json::from_str(&readback_json)?;
+    let readback_issues = validate_external_fact_batch(frozen_manifest, &readback);
+    if !readback_issues.is_empty() || readback != batch {
+        bail!(
+            "external fact artifact readback rejected: {}",
+            issue_summary(&readback_issues)
+        );
+    }
+    Ok(path)
+}
+
+/// Prepares deterministic metadata for one external fact artifact without writing it.
+///
+/// # Arguments
+///
+/// * `frozen_manifest` - Manifest baseline used for workspace and hash identity.
+/// * `batch` - Batch whose source and fact payload are already typed.
+///
+/// # Errors
+///
+/// Returns an error when the artifact source is unknown or uses an implicit label.
+pub fn prepared_external_fact_artifact_batch(
+    frozen_manifest: &ProjectManifest,
+    mut batch: ExternalFactBatch,
+) -> Result<ExternalFactBatch> {
+    if batch.metadata.source == ExternalFactSource::Unknown {
+        bail!("external fact artifact source must be explicit");
+    }
+    if batch.metadata.source_label.trim().is_empty()
+        || batch.metadata.source_label == ExternalFactSource::Unknown.provenance_label()
+    {
+        bail!("external fact artifact source label must be explicit");
+    }
+    batch.metadata.workspace_root = frozen_manifest.root.to_string_lossy().to_string();
+    batch.metadata.manifest_hash_input = frozen_manifest.manifest_hash.clone();
+    batch.metadata.source_artifact_fingerprint.clear();
+    batch.metadata.batch_fingerprint.clear();
+    batch.metadata.source_artifact_fingerprint = external_fact_artifact_fingerprint(&batch);
+    batch.metadata.batch_fingerprint =
+        external_fact_batch_fingerprint(&batch.metadata, &batch.facts);
+    Ok(batch)
+}
 
 /// Loads and applies durable precomputed external exact-fact artifacts from a
 /// model-dir scoped store.
@@ -547,6 +632,65 @@ pub fn external_fact_batch_fingerprint(
         ));
     }
     fingerprint(&content)
+}
+
+fn write_json_atomically(temp_path: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+    if temp_path.exists() {
+        let _ = fs::remove_file(temp_path);
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp_path)?;
+    if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(temp_path);
+        return Err(error.into());
+    }
+    drop(file);
+    if let Err(error) = fs::rename(temp_path, path) {
+        let _ = fs::remove_file(temp_path);
+        return Err(error.into());
+    }
+    if let Some(parent) = path.parent()
+        && let Ok(directory) = File::open(parent)
+    {
+        directory.sync_all()?;
+    }
+    Ok(())
+}
+
+fn external_fact_artifact_filename(batch: &ExternalFactBatch) -> String {
+    let label = sanitized_source_label(&batch.metadata.source_label);
+    format!(
+        "{}-{}-{}.json",
+        label,
+        fingerprint_prefix(&batch.metadata.batch_fingerprint),
+        fingerprint_prefix(&batch.metadata.source_artifact_fingerprint)
+    )
+}
+
+fn sanitized_source_label(label: &str) -> String {
+    let sanitized = label
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if sanitized.is_empty() {
+        "external-facts".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn fingerprint_prefix(fingerprint: &str) -> &str {
+    fingerprint.get(..16).unwrap_or(fingerprint)
 }
 
 fn validate_batch_metadata(
@@ -1439,8 +1583,9 @@ mod tests {
 
         assert_eq!(actual, expected);
         assert_eq!(
-            issues.iter().any(|issue| issue.code
-                == ExternalFactIngestionIssueCode::InvalidReferenceLineRange),
+            issues.iter().any(
+                |issue| issue.code == ExternalFactIngestionIssueCode::InvalidReferenceLineRange
+            ),
             true
         );
         assert_eq!(manifest.edges, before_edges);

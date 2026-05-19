@@ -15,7 +15,9 @@ use crate::extraction::{
 };
 use crate::freshness::compare_freshness;
 use crate::ingestion::ingest_external_fact_artifacts;
-use crate::policy::LOCAL_PROJECT_MODEL_MANIFEST_FILE_NAME;
+use crate::policy::{
+    LOCAL_PROJECT_MODEL_EXTERNAL_FACT_REPORT_FILE_NAME, LOCAL_PROJECT_MODEL_MANIFEST_FILE_NAME,
+};
 use crate::types::{
     ContextPack, ContextPackArtifactId, ExternalFactArtifactIngestionReport, FileNode,
     FileNodeKind, FreshnessProofLevel, FreshnessState, Language, ManifestFreshnessEvaluation,
@@ -194,6 +196,30 @@ impl ProjectIndexer {
         Ok(path)
     }
 
+    /// Writes the redaction-safe external fact artifact ingestion report using stable pretty JSON.
+    ///
+    /// # Arguments
+    ///
+    /// * `report` - Ingestion report produced by `index_with_external_fact_report`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model directory cannot be created or JSON
+    /// cannot be written.
+    pub fn write_external_fact_artifact_ingestion_report(
+        &self,
+        report: &ExternalFactArtifactIngestionReport,
+    ) -> Result<PathBuf> {
+        fs::create_dir_all(&self.model_dir).context("create model dir")?;
+        let path = self
+            .model_dir
+            .join(LOCAL_PROJECT_MODEL_EXTERNAL_FACT_REPORT_FILE_NAME);
+        let json =
+            serde_json::to_string_pretty(report).context("serialize external fact report")?;
+        fs::write(&path, json).with_context(|| format!("write {}", path.display()))?;
+        Ok(path)
+    }
+
     /// Reads the deterministic project manifest from storage.
     ///
     /// # Errors
@@ -203,6 +229,21 @@ impl ProjectIndexer {
         let path = self.model_dir.join(LOCAL_PROJECT_MODEL_MANIFEST_FILE_NAME);
         let json = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         serde_json::from_str(&json).context("deserialize manifest")
+    }
+
+    /// Reads the deterministic external fact artifact ingestion report from storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the report cannot be read or decoded.
+    pub fn read_external_fact_artifact_ingestion_report(
+        &self,
+    ) -> Result<ExternalFactArtifactIngestionReport> {
+        let path = self
+            .model_dir
+            .join(LOCAL_PROJECT_MODEL_EXTERNAL_FACT_REPORT_FILE_NAME);
+        let json = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        serde_json::from_str(&json).context("deserialize external fact report")
     }
 
     /// Computes the deterministic artifact identifier for a context pack.
@@ -835,6 +876,7 @@ pub(crate) mod tests {
         TypedExternalReferenceFact, TypedExternalSymbolFact, VectorIndexArtifact,
         compare_freshness, external_fact_artifact_fingerprint, external_fact_batch_fingerprint,
         fingerprint, retrieve, vector_entries_from_manifest_embeddings,
+        write_external_fact_artifact,
     };
 
     pub(crate) fn fixture_project() -> Result<(TempDir, PathBuf)> {
@@ -1174,6 +1216,123 @@ pub(crate) mod tests {
         let batch =
             external_artifact_batch(&base, "rust-analyzer", "lsp:src/lib.rs:graph_neighbor");
         write_external_artifact(&setup, "graph.json", &batch)?;
+        let manifest = setup.index()?;
+        let query = RetrievalQuery {
+            text: None,
+            path: None,
+            path_prefix: None,
+            symbol: Some("external_new".to_string()),
+            limit: 5,
+            include_graph_expansion: true,
+        };
+
+        let actual = retrieve(&manifest, &query)
+            .into_iter()
+            .map(|result| result.id)
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(actual.contains("symbol:src/lib.rs:Struct:Root"), true);
+        Ok(())
+    }
+
+    #[test]
+    fn external_fact_artifact_writer_writes_artifact_accepted_by_indexer() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let base = setup.index()?;
+        let batch = external_artifact_batch(&base, "rust-analyzer", "lsp:src/lib.rs:writer");
+        let expected = batch.metadata.clone();
+
+        let actual_path = write_external_fact_artifact(&setup.model_dir, &base, batch)?;
+        let (actual, report) = setup.index_with_external_fact_report()?;
+
+        assert!(actual_path.is_file());
+        assert_eq!(report.accepted_artifacts, 1usize);
+        assert_eq!(actual.external_fact_batches, vec![expected]);
+        assert_eq!(
+            report.artifacts[0].artifact_path,
+            actual_path.file_name().unwrap().to_string_lossy()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn external_fact_artifact_writer_output_is_rejected_after_source_file_change() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let base = setup.index()?;
+        let batch = external_artifact_batch(&base, "rust-analyzer", "lsp:src/lib.rs:stale_writer");
+        write_external_fact_artifact(&setup.model_dir, &base, batch)?;
+        fs::write(
+            root.join("src").join("lib.rs"),
+            "use serde::{Serialize, Deserialize};\npub use crate::model::Widget;\nmod model;\nextern crate core;\n\npub struct Root {\n    value: usize,\n}\n\nimpl Root {\n    pub fn new() -> Self {\n        Self { value: 1 }\n    }\n}\n",
+        )?;
+        let current_base = setup.index_base_manifest()?;
+
+        let (actual, report) = setup.index_with_external_fact_report()?;
+
+        assert_eq!(report.accepted_artifacts, 0usize);
+        assert_eq!(actual, current_base);
+        assert_eq!(
+            report.artifacts[0].issues.iter().any(|issue| issue.code
+                == crate::ExternalFactIngestionIssueCode::ManifestBaselineMismatch),
+            true
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn external_fact_artifact_writer_rejects_mixed_source_batch() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let base = setup.index()?;
+        let mut batch = external_artifact_batch(&base, "rust-analyzer", "lsp:src/lib.rs:mixed");
+        batch
+            .facts
+            .references
+            .first_mut()
+            .expect("fixture should include reference")
+            .source = ExternalFactSource::Scip;
+
+        let actual = write_external_fact_artifact(&setup.model_dir, &base, batch).is_err();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn partial_external_fact_json_is_reported_and_not_accepted() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let base = setup.index()?;
+        let directory = setup.model_dir.join("external_facts");
+        fs::create_dir_all(&directory)?;
+        fs::write(directory.join("partial.json"), "{")?;
+
+        let (actual, report) = setup.index_with_external_fact_report()?;
+
+        assert_eq!(actual, base);
+        assert_eq!(report.accepted_artifacts, 0usize);
+        assert_eq!(report.inspected_artifacts, 1usize);
+        assert_eq!(
+            report.artifacts[0].issues[0].code,
+            crate::ExternalFactIngestionIssueCode::ArtifactParseFailed
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn writer_to_indexer_ingested_edge_participates_in_retrieval_graph_expansion() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let base = setup.index()?;
+        let batch = external_artifact_batch(
+            &base,
+            "rust-analyzer",
+            "lsp:src/lib.rs:writer_graph_neighbor",
+        );
+        write_external_fact_artifact(&setup.model_dir, &base, batch)?;
         let manifest = setup.index()?;
         let query = RetrievalQuery {
             text: None,
