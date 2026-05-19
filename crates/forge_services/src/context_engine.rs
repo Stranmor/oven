@@ -1346,6 +1346,7 @@ mod tests {
                 source: ExternalFactSource::Lsp,
                 source_label: source_label.to_string(),
                 tool_version: Some("fixture-1".to_string()),
+                producer_snapshot_fingerprint: fingerprint("context-engine-fixture"),
                 workspace_root: manifest.root.to_string_lossy().to_string(),
                 source_artifact_fingerprint: String::new(),
                 manifest_hash_input: manifest.manifest_hash.clone(),

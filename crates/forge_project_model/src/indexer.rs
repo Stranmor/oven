@@ -1259,8 +1259,15 @@ pub(crate) mod tests {
         assert_eq!(report.accepted_artifacts, 1usize);
         assert_eq!(actual.external_fact_batches, vec![expected]);
         assert_eq!(
-            report.artifacts[0].artifact_path,
-            actual_path.file_name().unwrap().to_string_lossy()
+            report
+                .artifacts
+                .first()
+                .expect("accepted report should include artifact")
+                .artifact_path,
+            actual_path
+                .file_name()
+                .expect("artifact path should have filename")
+                .to_string_lossy()
         );
         Ok(())
     }
@@ -1283,8 +1290,14 @@ pub(crate) mod tests {
         assert_eq!(report.accepted_artifacts, 0usize);
         assert_eq!(actual, current_base);
         assert_eq!(
-            report.artifacts[0].issues.iter().any(|issue| issue.code
-                == crate::ExternalFactIngestionIssueCode::ManifestBaselineMismatch),
+            report
+                .artifacts
+                .first()
+                .expect("rejection report should include artifact")
+                .issues
+                .iter()
+                .any(|issue| issue.code
+                    == crate::ExternalFactIngestionIssueCode::ManifestBaselineMismatch),
             true
         );
         Ok(())
@@ -1325,7 +1338,12 @@ pub(crate) mod tests {
         assert_eq!(report.accepted_artifacts, 0usize);
         assert_eq!(report.inspected_artifacts, 1usize);
         assert_eq!(
-            report.artifacts[0].issues[0].code,
+            report
+                .artifacts
+                .first()
+                .and_then(|artifact| artifact.issues.first())
+                .expect("partial artifact report should include parse issue")
+                .code,
             crate::ExternalFactIngestionIssueCode::ArtifactParseFailed
         );
         Ok(())
