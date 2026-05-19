@@ -1,6 +1,6 @@
 use forge_domain::{
     Compact, CompactionStrategy, Context, ContextMessage, ContextSummary, Environment,
-    MessageEntry, Transformer,
+    MessageEntry, TextMessage, Transformer,
 };
 use tracing::info;
 
@@ -185,7 +185,9 @@ impl Compactor {
         });
 
         // Replace the range with the summary, transferring the accumulated usage
-        let mut summary_entry = MessageEntry::from(ContextMessage::user(summary, None));
+        let mut summary_entry = MessageEntry::from(ContextMessage::Text(
+            TextMessage::compaction_summary(summary),
+        ));
         summary_entry.usage = compacted_usage;
         context
             .messages
@@ -286,6 +288,35 @@ mod tests {
         } else {
             panic!("Expected TextMessage");
         }
+    }
+
+    #[test]
+    fn test_compress_single_sequence_marks_summary_non_selectable_for_branching() {
+        let environment = test_environment();
+        let compactor = Compactor::new(Compact::new(), environment);
+        let context = Context::default()
+            .add_message(ContextMessage::user("M1", None))
+            .add_message(ContextMessage::assistant("R1", None, None, None))
+            .add_message(ContextMessage::user("M2", None));
+
+        let actual = compactor.compress_single_sequence(context, (0, 1)).unwrap();
+        let actual_targets = actual
+            .selectable_branch_targets()
+            .into_iter()
+            .map(|target| target.ordinal)
+            .collect::<Vec<_>>();
+        let expected_targets = vec![1usize];
+        let actual_summary_kind = actual
+            .messages
+            .first()
+            .and_then(|entry| match &entry.message {
+                ContextMessage::Text(text) => Some(text.is_compaction_summary()),
+                _ => None,
+            });
+        let expected_summary_kind = Some(true);
+
+        assert_eq!(actual_summary_kind, expected_summary_kind);
+        assert_eq!(actual_targets, expected_targets);
     }
 
     #[test]

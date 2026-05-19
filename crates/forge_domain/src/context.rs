@@ -472,6 +472,8 @@ pub enum TextMessageKind {
     ProjectModelContext,
     /// Reviewed self-learning context injected as an internal user-scoped payload.
     LearningContext,
+    /// Context compaction summary replacing older conversation messages.
+    CompactionSummary,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, Setters)]
@@ -542,8 +544,8 @@ impl TextMessage {
         self.role == role
     }
 
-    /// Returns whether this message is live runtime, project-model, or learning
-    /// context, not a real user-authored message.
+    /// Returns whether this message is live runtime, project-model, learning,
+    /// or compaction context, not a real user-authored message.
     pub fn is_internal_context(&self) -> bool {
         matches!(
             self.kind,
@@ -551,6 +553,7 @@ impl TextMessage {
                 TextMessageKind::RuntimeContext
                     | TextMessageKind::ProjectModelContext
                     | TextMessageKind::LearningContext
+                    | TextMessageKind::CompactionSummary
             )
         )
     }
@@ -579,6 +582,19 @@ impl TextMessage {
             .kind(TextMessageKind::LearningContext)
             .droppable(true)
             .cacheable(false)
+    }
+
+    /// Returns whether this message is a compacted conversation summary.
+    pub fn is_compaction_summary(&self) -> bool {
+        self.kind == Some(TextMessageKind::CompactionSummary)
+    }
+
+    /// Marks this message as a compacted conversation summary.
+    ///
+    /// # Arguments
+    /// * `content` - Rendered summary text replacing the compacted range.
+    pub fn compaction_summary(content: impl Into<String>) -> Self {
+        Self::new(Role::User, content).kind(TextMessageKind::CompactionSummary)
     }
 
     /// Returns whether this message is eligible for provider prompt-cache
@@ -1247,6 +1263,7 @@ mod tests {
             ContextMessage::system("system").into(),
             ContextMessage::Text(TextMessage::project_model_context(Role::User, "project")).into(),
             ContextMessage::Text(TextMessage::learning_context(Role::User, "learning")).into(),
+            ContextMessage::Text(TextMessage::compaction_summary("summary")).into(),
             ContextMessage::Text(TextMessage::new(Role::User, "droppable").droppable(true)).into(),
             user_message("real user"),
             ContextMessage::assistant("tooling", None, None, Some(vec![tool_call])).into(),
@@ -1264,7 +1281,24 @@ mod tests {
             .into_iter()
             .map(|target| (target.ordinal, target.role))
             .collect::<Vec<_>>();
-        let expected = vec![(4, Role::User), (7, Role::Assistant)];
+        let expected = vec![(5, Role::User), (8, Role::Assistant)];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_compaction_summary_text_is_not_selectable_branch_target() {
+        let fixture = Context::default().messages(vec![
+            ContextMessage::Text(TextMessage::compaction_summary("summary")).into(),
+            user_message("real user"),
+        ]);
+
+        let actual = fixture
+            .selectable_branch_targets()
+            .into_iter()
+            .map(|target| (target.ordinal, target.role))
+            .collect::<Vec<_>>();
+        let expected = vec![(1, Role::User)];
 
         assert_eq!(actual, expected);
     }
