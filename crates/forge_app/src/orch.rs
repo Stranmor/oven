@@ -438,9 +438,24 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
         context_window: usize,
         original_output_reservation: usize,
     ) -> std::result::Result<Option<PreflightContexts>, PreflightContextWindowError> {
+        self.try_recover_context_with_output_cap(
+            compacted_canonical,
+            compacted_estimate.estimated_input_tokens,
+            context_window,
+            original_output_reservation,
+        )
+    }
+
+    fn try_recover_context_with_output_cap(
+        &self,
+        compacted_canonical: Context,
+        estimated_input_tokens: usize,
+        context_window: usize,
+        original_output_reservation: usize,
+    ) -> std::result::Result<Option<PreflightContexts>, PreflightContextWindowError> {
         let mut output_cap = match Self::recovery_output_cap(
             context_window,
-            compacted_estimate.estimated_input_tokens,
+            estimated_input_tokens,
             original_output_reservation,
         ) {
             Some(output_cap) => output_cap,
@@ -455,7 +470,7 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
                     context_window,
                     original_output_reservation,
                     effective_output_cap: output_cap,
-                    estimated_input_tokens: compacted_estimate.estimated_input_tokens,
+                    estimated_input_tokens,
                 });
             let recovered_reasoning_supported = recovered_canonical.is_reasoning_supported();
             let recovered_outbound = self
@@ -509,6 +524,129 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
         }
 
         Ok(None)
+    }
+
+    const OBSERVER_RECOVERY_OUTPUT_CAP: usize = 4_096;
+
+    fn is_observer_perception_recovery_candidate(&self, context: &Context) -> bool {
+        let has_current_image = context
+            .messages
+            .iter()
+            .any(|message| matches!(&message.message, ContextMessage::Image(_)));
+        let has_tool_protocol_messages = context
+            .messages
+            .iter()
+            .any(|message| message.has_tool_call() || message.has_tool_result());
+        let agent_id = self.agent.id.as_str().to_lowercase();
+        let agent_title = self
+            .agent
+            .title
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase();
+        let agent_description = self
+            .agent
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase();
+        let agent_is_perception = [&agent_id, &agent_title, &agent_description]
+            .iter()
+            .any(|value| value.contains("observer") || value.contains("perception"));
+        let no_tool_request = context.tool_choice == Some(ToolChoice::None)
+            || context.tools.is_empty()
+            || self.agent.tool_supported == Some(false);
+
+        has_current_image && !has_tool_protocol_messages && (agent_is_perception || no_tool_request)
+    }
+
+    fn without_stale_historical_images(mut context: Context) -> Context {
+        let Some(last_image_index) = context
+            .messages
+            .iter()
+            .rposition(|message| matches!(&message.message, ContextMessage::Image(_)))
+        else {
+            return context;
+        };
+        let mut index = 0_usize;
+        context.messages.retain(|message| {
+            let keep =
+                !matches!(&message.message, ContextMessage::Image(_)) || index == last_image_index;
+            index = index.saturating_add(1);
+            keep
+        });
+        context
+    }
+
+    fn strip_tool_surface(mut context: Context) -> Context {
+        context.tools.clear();
+        context.tool_choice = None;
+        context
+    }
+
+    fn observer_recovery_context(
+        &self,
+        context: Context,
+        original_output_reservation: usize,
+    ) -> Option<Context> {
+        if !self.is_observer_perception_recovery_candidate(&context) {
+            return None;
+        }
+        let capped_output = original_output_reservation.min(Self::OBSERVER_RECOVERY_OUTPUT_CAP);
+        Some(
+            Self::strip_tool_surface(Self::without_stale_historical_images(context))
+                .max_tokens(capped_output),
+        )
+    }
+
+    fn try_recover_observer_perception_context(
+        &self,
+        compacted_canonical: Context,
+        context_window: usize,
+        original_output_reservation: usize,
+    ) -> std::result::Result<Option<PreflightContexts>, PreflightContextWindowError> {
+        let Some(recovery_canonical) =
+            self.observer_recovery_context(compacted_canonical, original_output_reservation)
+        else {
+            return Ok(None);
+        };
+        let recovery_reasoning_supported = recovery_canonical.is_reasoning_supported();
+        let recovery_outbound = self
+            .final_outbound_context(
+                &self.agent.model,
+                recovery_canonical.clone(),
+                recovery_reasoning_supported,
+            )
+            .map_err(PreflightContextWindowError::other)?;
+        let recovery_estimate = self
+            .estimated_request(&recovery_outbound)
+            .map_err(PreflightContextWindowError::other)?;
+        let final_output_reservation = recovery_estimate.output_token_reservation;
+        let Some(recovery_budget) =
+            Self::effective_input_budget(context_window, final_output_reservation)
+        else {
+            return Ok(None);
+        };
+
+        if recovery_estimate.estimated_input_tokens <= recovery_budget {
+            let recovery = ContextWindowRecovery {
+                context_window,
+                original_output_reservation,
+                effective_output_cap: final_output_reservation,
+                estimated_input_tokens: recovery_estimate.estimated_input_tokens,
+            };
+            return Ok(Some(PreflightContexts {
+                canonical: recovery_canonical.context_window_recovery(recovery.clone()),
+                outbound: recovery_outbound.context_window_recovery(recovery),
+            }));
+        }
+
+        self.try_recover_context_with_output_cap(
+            recovery_canonical,
+            recovery_estimate.estimated_input_tokens,
+            context_window,
+            original_output_reservation,
+        )
     }
 
     /// Compacts canonical context and prepares its final outbound projection before
@@ -605,6 +743,14 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
                 canonical: compacted_canonical,
                 outbound: compacted_outbound,
             });
+        }
+
+        if let Some(recovered) = self.try_recover_observer_perception_context(
+            compacted_canonical.clone(),
+            context_window,
+            output_reservation,
+        )? {
+            return Ok(recovered);
         }
 
         if let Some(recovered) = self.try_recover_with_output_cap(
@@ -1442,6 +1588,112 @@ mod tests {
 
     fn droppable_user_message(content: String) -> ContextMessage {
         TextMessage::new(Role::User, content).droppable(true).into()
+    }
+
+    fn image_urls(context: &Context) -> Vec<String> {
+        context
+            .messages
+            .iter()
+            .filter_map(|message| match &message.message {
+                ContextMessage::Image(image) => Some(image.url().clone()),
+                ContextMessage::Text(_) | ContextMessage::Tool(_) => None,
+            })
+            .collect()
+    }
+
+    fn observer_orchestrator_fixture(
+        compact: Compact,
+        context_length: u64,
+    ) -> Orchestrator<FixtureServices> {
+        let agent = Agent::new(
+            AgentId::new("naive-observer"),
+            ProviderId::OPENAI,
+            ModelId::new("context-guard-model"),
+        )
+        .title("Zero-context observer")
+        .description("Perception-only visual observer")
+        .compact(compact);
+
+        Orchestrator::new(
+            Arc::new(FixtureServices),
+            forge_domain::Conversation::generate(),
+            agent,
+            forge_config::ForgeConfig::default(),
+        )
+        .models(vec![model_fixture(context_length)])
+    }
+
+    #[test]
+    fn test_preflight_recovers_observer_image_turn_by_stripping_tools_and_stale_media() {
+        let stale_image = Image::new_base64("A".repeat(40_000), "image/png");
+        let current_image = Image::new_base64("B".repeat(40_000), "image/png");
+        let setup = Context::default()
+            .add_message(ContextMessage::user("observe the current screenshot", None))
+            .add_base64_url(stale_image)
+            .add_message(ContextMessage::user("fresh pasted screenshot", None))
+            .add_base64_url(current_image.clone())
+            .add_tool(
+                ToolDefinition::new("large_tool_one")
+                    .description(large_text(8_000))
+                    .input_schema(schemars::schema_for!(())),
+            )
+            .add_tool(
+                ToolDefinition::new("large_tool_two")
+                    .description(large_text(8_000))
+                    .input_schema(schemars::schema_for!(())),
+            )
+            .max_tokens(50_000_usize);
+        let fixture =
+            observer_orchestrator_fixture(Compact::new().retention_window(64_usize), 100_000);
+
+        let actual = fixture.preflight_context_window(setup).unwrap();
+        let actual_budget = Orchestrator::<FixtureServices>::effective_input_budget(
+            100_000,
+            actual.outbound.max_tokens.unwrap(),
+        )
+        .unwrap();
+        let actual_estimate = fixture.estimated_request_tokens(&actual.outbound).unwrap();
+        let actual_images = image_urls(&actual.canonical);
+        let expected_images = vec![current_image.url().clone()];
+        let expected = true;
+
+        assert_eq!(actual.canonical.tools.is_empty(), expected);
+        assert_eq!(actual.canonical.max_tokens, Some(4_096));
+        assert_eq!(actual.canonical.context_window_recovery.is_some(), expected);
+        assert_eq!(actual_images, expected_images);
+        assert_eq!(actual_estimate <= actual_budget, expected);
+    }
+
+    #[test]
+    fn test_preflight_does_not_strip_tools_for_normal_tool_using_image_turn() {
+        let stale_image = Image::new_base64("A".repeat(40_000), "image/png");
+        let current_image = Image::new_base64("B".repeat(40_000), "image/png");
+        let setup = Context::default()
+            .add_message(ContextMessage::user("use tools with this image", None))
+            .add_base64_url(stale_image)
+            .add_message(ContextMessage::user("fresh pasted screenshot", None))
+            .add_base64_url(current_image)
+            .add_tool(
+                ToolDefinition::new("large_tool_one")
+                    .description(large_text(8_000))
+                    .input_schema(schemars::schema_for!(())),
+            )
+            .add_tool(
+                ToolDefinition::new("large_tool_two")
+                    .description(large_text(8_000))
+                    .input_schema(schemars::schema_for!(())),
+            )
+            .max_tokens(50_000_usize);
+        let fixture = orchestrator_fixture(Compact::new().retention_window(64_usize), 100_000);
+
+        let actual = fixture
+            .preflight_context_window(setup)
+            .unwrap_err()
+            .to_string();
+        let expected = true;
+
+        assert_eq!(actual.contains("tools="), expected);
+        assert_eq!(actual.contains("media padding="), expected);
     }
 
     #[test]
