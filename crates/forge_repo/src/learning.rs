@@ -195,16 +195,58 @@ impl LearningRepository for LearningRepositoryImpl {
 
 impl LearningLedgerEventRecord {
     fn new(event: LearningLedgerEvent, workspace_id: i64) -> anyhow::Result<Self> {
-        let source_id = event.provenance.source_id()?;
+        let source_kind = event.provenance.source_kind;
+        let raw_source_id = event.provenance.source_id()?;
         let redacted = RedactedLearningSummary::from_raw(&event.summary);
-        let redaction_status = match (event.redaction_status, redacted.status) {
-            (LearningRedactionStatus::Redacted, _) | (_, LearningRedactionStatus::Redacted) => {
+        let redacted_source_event_id =
+            RedactedLearningSummary::from_raw(&event.provenance.source_event_id);
+        let redacted_source_fingerprint =
+            RedactedLearningSummary::from_raw(&event.provenance.source_fingerprint);
+        let redacted_tool_name = event
+            .provenance
+            .tool_name
+            .as_ref()
+            .map(RedactedLearningSummary::from_raw);
+        let redacted_eval_id = event
+            .provenance
+            .eval_id
+            .as_ref()
+            .map(RedactedLearningSummary::from_raw);
+        let source_id = match source_kind {
+            LearningSourceKind::Conversation | LearningSourceKind::Task => raw_source_id,
+            LearningSourceKind::Tool => redacted_tool_name
+                .as_ref()
+                .map(|redacted| redacted.summary.clone())
+                .unwrap_or(raw_source_id),
+            LearningSourceKind::Eval => redacted_eval_id
+                .as_ref()
+                .map(|redacted| redacted.summary.clone())
+                .unwrap_or(raw_source_id),
+        };
+        let redaction_status = [
+            event.redaction_status,
+            redacted.status,
+            redacted_source_event_id.status,
+            redacted_source_fingerprint.status,
+            redacted_tool_name
+                .as_ref()
+                .map(|redacted| redacted.status)
+                .unwrap_or(LearningRedactionStatus::Clean),
+            redacted_eval_id
+                .as_ref()
+                .map(|redacted| redacted.status)
+                .unwrap_or(LearningRedactionStatus::Clean),
+        ]
+        .into_iter()
+        .fold(LearningRedactionStatus::Clean, |actual, status| {
+            if actual == LearningRedactionStatus::Redacted
+                || status == LearningRedactionStatus::Redacted
+            {
                 LearningRedactionStatus::Redacted
-            }
-            (LearningRedactionStatus::Clean, LearningRedactionStatus::Clean) => {
+            } else {
                 LearningRedactionStatus::Clean
             }
-        };
+        });
         Ok(Self {
             event_seq: 0,
             event_id: event.event_id.into_string(),
@@ -217,12 +259,12 @@ impl LearningLedgerEventRecord {
             redaction_status: redaction_status.to_string(),
             source_kind: event.provenance.source_kind.to_string(),
             source_id,
-            source_event_id: event.provenance.source_event_id,
-            source_fingerprint: event.provenance.source_fingerprint,
+            source_event_id: redacted_source_event_id.summary,
+            source_fingerprint: redacted_source_fingerprint.fingerprint,
             conversation_id: event.provenance.conversation_id.map(|id| id.into_string()),
             task_id: event.provenance.task_id.map(|id| id.into_string()),
-            tool_name: event.provenance.tool_name,
-            eval_id: event.provenance.eval_id,
+            tool_name: redacted_tool_name.map(|redacted| redacted.summary),
+            eval_id: redacted_eval_id.map(|redacted| redacted.summary),
             created_at: event.created_at.naive_utc(),
             schema_version: event.schema_version,
         })
@@ -564,7 +606,7 @@ mod tests {
             provenance: LearningProvenance::conversation(
                 conversation_id,
                 "event-raw-secret",
-                "source-fingerprint-raw-secret",
+                "source fingerprint contains token sk-123456789012345678901234",
             ),
             created_at: Utc::now(),
             schema_version: LEARNING_LEDGER_SCHEMA_VERSION,
@@ -574,11 +616,80 @@ mod tests {
             Ok(_) => fixture
                 .list_learning_records(None, 10)
                 .await?
-                .iter()
-                .any(|projection| projection.summary.contains("sk-")),
-            Err(_) => false,
+                .first()
+                .map(|projection| {
+                    (
+                        projection.summary.contains("sk-")
+                            || projection.provenance.source_fingerprint.contains("sk-"),
+                        projection.redaction_status,
+                    )
+                }),
+            Err(_) => None,
         };
-        let expected = false;
+        let expected = Some((false, LearningRedactionStatus::Redacted));
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_insert_redacts_secret_bearing_provenance_identity_fields()
+    -> anyhow::Result<()> {
+        let fixture = fixture_repo(9)?;
+        let event = LearningLedgerEvent {
+            event_id: LearningEventId::generate(),
+            record_id: LearningRecordId::generate(),
+            idempotency_key: "explicit-raw-secret-provenance".to_string(),
+            event_kind: LearningEventKind::CandidateCaptured,
+            summary: "safe summary".to_string(),
+            content_fingerprint: "safe-fingerprint".to_string(),
+            redaction_status: LearningRedactionStatus::Clean,
+            provenance: LearningProvenance {
+                source_kind: LearningSourceKind::Tool,
+                conversation_id: None,
+                task_id: None,
+                tool_name: Some("tool token sk-123456789012345678901234".to_string()),
+                eval_id: Some("eval token sk-123456789012345678901234".to_string()),
+                source_event_id: "event token sk-123456789012345678901234".to_string(),
+                source_fingerprint: "safe-source-fingerprint".to_string(),
+            },
+            created_at: Utc::now(),
+            schema_version: LEARNING_LEDGER_SCHEMA_VERSION,
+        };
+
+        fixture.insert_learning_event(event).await?;
+
+        let projection = fixture.list_learning_records(None, 10).await?.remove(0);
+        let persisted_event = fixture
+            .run_with_connection(move |connection, wid| {
+                learning_ledger_events::table
+                    .filter(learning_ledger_events::workspace_id.eq(workspace_db_id(wid)))
+                    .first::<LearningLedgerEventRecord>(connection)
+                    .map_err(Into::into)
+            })
+            .await?;
+        let actual = (
+            projection
+                .provenance
+                .tool_name
+                .unwrap_or_default()
+                .contains("sk-")
+                || projection.provenance.source_event_id.contains("sk-")
+                || projection
+                    .provenance
+                    .eval_id
+                    .unwrap_or_default()
+                    .contains("sk-"),
+            persisted_event.source_id.contains("sk-")
+                || persisted_event.source_event_id.contains("sk-")
+                || persisted_event
+                    .tool_name
+                    .unwrap_or_default()
+                    .contains("sk-")
+                || persisted_event.eval_id.unwrap_or_default().contains("sk-"),
+            projection.redaction_status,
+        );
+        let expected = (false, false, LearningRedactionStatus::Redacted);
 
         assert_eq!(actual, expected);
         Ok(())
