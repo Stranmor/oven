@@ -188,6 +188,19 @@ pub enum CargoDependencyDeclaration {
     UnresolvedStatic,
 }
 
+/// Transient base manifest and manifest-owned Rust source texts for external fact producers.
+///
+/// This DTO intentionally does not implement serialization: `rust_source_texts`
+/// carries complete source text for the immediate producer boundary and must not
+/// be persisted or exported by default.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ExternalFactProductionBaseline {
+    /// Base project manifest built before external fact artifact ingestion.
+    pub manifest: ProjectManifest,
+    /// Complete Rust source text keyed by manifest-relative path.
+    pub rust_source_texts: BTreeMap<String, String>,
+}
+
 /// A source file known to the project model.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceFile {

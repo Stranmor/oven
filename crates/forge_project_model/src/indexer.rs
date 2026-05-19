@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
@@ -19,9 +19,10 @@ use crate::policy::{
     LOCAL_PROJECT_MODEL_EXTERNAL_FACT_REPORT_FILE_NAME, LOCAL_PROJECT_MODEL_MANIFEST_FILE_NAME,
 };
 use crate::types::{
-    ContextPack, ContextPackArtifactId, ExternalFactArtifactIngestionReport, FileNode,
-    FileNodeKind, FreshnessProofLevel, FreshnessState, Language, ManifestFreshnessEvaluation,
-    ProjectManifest, ShardManifest, ShardStrategy, SourceFile, SymbolNode, ToolEpisode,
+    ContextPack, ContextPackArtifactId, ExternalFactArtifactIngestionReport,
+    ExternalFactProductionBaseline, FileNode, FileNodeKind, FreshnessProofLevel, FreshnessState,
+    Language, ManifestFreshnessEvaluation, ProjectManifest, ShardManifest, ShardStrategy,
+    SourceFile, SymbolNode, ToolEpisode,
 };
 use crate::util::{
     detect_language, edge_sort_key, hash_text, line_count, manifest_hash, normalize_path,
@@ -84,6 +85,81 @@ impl ProjectIndexer {
         let mut manifest = self.index_base_manifest()?;
         let report = ingest_external_fact_artifacts(&mut manifest, &self.external_facts_dir())?;
         Ok((manifest, report))
+    }
+
+    /// Builds a base project manifest and transient manifest-owned Rust source texts.
+    ///
+    /// The returned manifest is the base filesystem manifest before external
+    /// fact artifact ingestion. Source texts are read only for Rust files already
+    /// listed in that base manifest, are verified against manifest hashes, and
+    /// are kept in memory without persistence or export side effects.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when base indexing fails, a manifest Rust path is not a
+    /// safe project-relative path, the resolved file escapes the project root,
+    /// the file is missing, unreadable, non-UTF-8, symlinked, or the source text
+    /// fingerprint no longer matches the manifest file hash.
+    pub fn external_fact_production_baseline(&self) -> Result<ExternalFactProductionBaseline> {
+        let manifest = self.index_base_manifest()?;
+        let rust_source_texts = self.collect_manifest_owned_rust_source_texts(&manifest)?;
+        Ok(ExternalFactProductionBaseline { manifest, rust_source_texts })
+    }
+
+    fn collect_manifest_owned_rust_source_texts(
+        &self,
+        manifest: &ProjectManifest,
+    ) -> Result<BTreeMap<String, String>> {
+        let mut rust_source_texts = BTreeMap::new();
+        for file in manifest
+            .files
+            .iter()
+            .filter(|file| file.language == Language::Rust)
+        {
+            let source_text = self.read_manifest_owned_source_text(file)?;
+            rust_source_texts.insert(file.path.clone(), source_text);
+        }
+        Ok(rust_source_texts)
+    }
+
+    fn read_manifest_owned_source_text(&self, file: &SourceFile) -> Result<String> {
+        validate_manifest_relative_path(&file.path)?;
+        let root = self
+            .root
+            .canonicalize()
+            .with_context(|| format!("canonicalize project root {}", self.root.display()))?;
+        let path = self.root.join(&file.path);
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("inspect manifest source {}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("manifest Rust source path is a symlink: {}", file.path);
+        }
+        if !metadata.is_file() {
+            anyhow::bail!("manifest Rust source path is not a file: {}", file.path);
+        }
+        let canonical_path = path
+            .canonicalize()
+            .with_context(|| format!("canonicalize manifest source {}", path.display()))?;
+        if !canonical_path.starts_with(&root) {
+            anyhow::bail!(
+                "manifest Rust source path escapes project root: {}",
+                file.path
+            );
+        }
+        let bytes = fs::read(&canonical_path)
+            .with_context(|| format!("read manifest source {}", canonical_path.display()))?;
+        let source_text = String::from_utf8(bytes)
+            .with_context(|| format!("manifest Rust source is not UTF-8: {}", file.path))?;
+        let actual_hash = hash_text(&source_text);
+        if actual_hash != file.content_hash {
+            anyhow::bail!(
+                "manifest Rust source hash mismatch for {}: expected {}, got {}",
+                file.path,
+                file.content_hash,
+                actual_hash
+            );
+        }
+        Ok(source_text)
     }
 
     fn index_base_manifest(&self) -> Result<ProjectManifest> {
@@ -679,6 +755,28 @@ impl ProjectIndexer {
     }
 }
 
+fn validate_manifest_relative_path(path: &str) -> Result<()> {
+    let candidate = Path::new(path);
+    if path.is_empty() {
+        anyhow::bail!("manifest source path is empty");
+    }
+    if candidate.is_absolute() {
+        anyhow::bail!("manifest source path is absolute: {path}");
+    }
+    for component in candidate.components() {
+        match component {
+            Component::Normal(_) => {}
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                anyhow::bail!("manifest source path is not a safe relative path: {path}");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn sync_directory(directory: &Path) -> Result<()> {
     File::open(directory)
         .with_context(|| format!("open {}", directory.display()))?
@@ -962,6 +1060,182 @@ pub(crate) mod tests {
         let path = directory.join(name);
         fs::write(&path, serde_json::to_string_pretty(batch)?)?;
         Ok(path)
+    }
+
+    #[test]
+    fn external_fact_production_baseline_excludes_external_facts_while_index_ingests_them()
+    -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let base = setup.index_base_manifest()?;
+        let batch =
+            external_artifact_batch(&base, "rust-analyzer", "lsp:src/lib.rs:baseline_external");
+        write_external_artifact(&setup, "accepted.json", &batch)?;
+
+        let actual = setup.external_fact_production_baseline()?;
+        let normal = setup.index()?;
+
+        assert_eq!(actual.manifest, base);
+        assert_eq!(actual.manifest.external_fact_batches, Vec::new());
+        assert_eq!(normal.external_fact_batches, vec![batch.metadata]);
+        assert_eq!(
+            normal
+                .symbols
+                .iter()
+                .any(|symbol| symbol.id == "lsp:src/lib.rs:baseline_external"),
+            true
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn external_fact_production_baseline_collects_only_manifest_rust_source_texts() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        fs::write(root.join("notes.md"), "# Notes\n")?;
+        fs::create_dir_all(setup.model_dir.join("external_facts"))?;
+        fs::write(
+            setup.model_dir.join("external_facts").join("ignored.rs"),
+            "pub struct Stored;\n",
+        )?;
+
+        let actual = setup.external_fact_production_baseline()?;
+        let expected = BTreeSet::from(["src/lib.rs".to_string(), "src/model.rs".to_string()]);
+
+        assert_eq!(
+            actual
+                .rust_source_texts
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+        assert_eq!(
+            actual
+                .manifest
+                .files
+                .iter()
+                .any(|file| file.path == "notes.md" && file.language == Language::Markdown),
+            true
+        );
+        assert_eq!(actual.rust_source_texts.contains_key("notes.md"), false);
+        assert_eq!(actual.rust_source_texts.contains_key("ignored.rs"), false);
+        assert_eq!(
+            actual
+                .rust_source_texts
+                .iter()
+                .all(|(path, source_text)| actual
+                    .manifest
+                    .files
+                    .iter()
+                    .any(|file| file.path == *path
+                        && file.language == Language::Rust
+                        && hash_text(source_text) == file.content_hash)),
+            true
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn external_fact_production_baseline_rejects_manifest_source_hash_mismatch() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index_base_manifest()?;
+        fs::write(root.join("src").join("lib.rs"), "pub struct Changed;\n")?;
+
+        let actual = setup
+            .collect_manifest_owned_rust_source_texts(&manifest)
+            .is_err();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn external_fact_production_baseline_rejects_unsafe_manifest_paths() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index_base_manifest()?;
+        let fixture_file = manifest
+            .files
+            .iter()
+            .find(|file| file.path == "src/lib.rs")
+            .expect("fixture should include src/lib.rs");
+        let mut parent_escape = fixture_file.clone();
+        parent_escape.path = "../escape.rs".to_string();
+        let mut absolute_escape = fixture_file.clone();
+        absolute_escape.path = root
+            .join("src")
+            .join("lib.rs")
+            .to_string_lossy()
+            .to_string();
+
+        let actual = (
+            setup
+                .read_manifest_owned_source_text(&parent_escape)
+                .is_err(),
+            setup
+                .read_manifest_owned_source_text(&absolute_escape)
+                .is_err(),
+        );
+        let expected = (true, true);
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_fact_production_baseline_rejects_manifest_symlink_source() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index_base_manifest()?;
+        let fixture_file = manifest
+            .files
+            .iter()
+            .find(|file| file.path == "src/lib.rs")
+            .expect("fixture should include src/lib.rs");
+        std::os::unix::fs::symlink(
+            root.join("src").join("lib.rs"),
+            root.join("src").join("link.rs"),
+        )?;
+        let mut symlink_file = fixture_file.clone();
+        symlink_file.path = "src/link.rs".to_string();
+
+        let actual = setup
+            .read_manifest_owned_source_text(&symlink_file)
+            .is_err();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn external_fact_production_baseline_has_no_external_fact_store_side_effects() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let directory = setup.model_dir.join("external_facts");
+        fs::create_dir_all(&directory)?;
+        fs::write(directory.join("partial.json"), "{")?;
+
+        let actual = (
+            setup
+                .external_fact_production_baseline()?
+                .manifest
+                .external_fact_batches,
+            setup.model_dir.join("project_manifest.json").exists(),
+            setup
+                .model_dir
+                .join("external_fact_artifact_ingestion_report.json")
+                .exists(),
+            fs::read_to_string(directory.join("partial.json"))?,
+        );
+        let expected = (Vec::new(), false, false, "{".to_string());
+
+        assert_eq!(actual, expected);
+        Ok(())
     }
 
     #[test]
