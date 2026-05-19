@@ -1945,6 +1945,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_execute_command_handoff_process_read_status_kill_without_duplicate_start() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let marker_path = temp_dir.path().join("tool-handoff-side-effect");
+        let command = format!(
+            "printf run >> {marker}; sleep 2; printf delayed-output; sleep 5",
+            marker = marker_path.display()
+        );
+        let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
+        let started_at = Instant::now();
+
+        let actual = fixture
+            .execute_command(
+                command,
+                temp_dir.path().to_path_buf(),
+                true,
+                None,
+                ShellHandoffTimeoutSeconds::new(1).unwrap(),
+            )
+            .await
+            .unwrap();
+        let handoff_elapsed = started_at.elapsed();
+        let process = actual
+            .process
+            .clone()
+            .expect("long-running shell command should hand off to a managed process");
+        let read_output = fixture
+            .read_process(
+                process.process_id.clone(),
+                ProcessReadCursor::new(0),
+                Some(ProcessObservationWaitSeconds::new(3).unwrap()),
+            )
+            .await
+            .unwrap();
+        let status = fixture
+            .process_status(process.process_id.clone(), None)
+            .await
+            .unwrap();
+        let kill_status = fixture.kill_process(process.process_id).await.unwrap();
+        let side_effects = std::fs::read_to_string(marker_path).unwrap();
+
+        assert!(handoff_elapsed < Duration::from_secs(2));
+        assert_eq!(actual.output.exit_code, None);
+        assert!(
+            actual
+                .output
+                .stderr
+                .contains("exceeded the 1 second synchronous shell window")
+        );
+        assert_eq!(process.status, ProcessStatusKind::Running);
+        assert!(
+            read_output
+                .entries
+                .iter()
+                .any(|entry| entry.content.contains("delayed-output"))
+        );
+        assert_eq!(status.status, ProcessStatusKind::Running);
+        assert_eq!(kill_status.status, ProcessStatusKind::Killed);
+        assert_eq!(side_effects, "run");
+    }
+
+    #[tokio::test]
     async fn test_execute_command_custom_handoff_timeout_is_reported_and_managed() {
         let temp_dir = tempfile::tempdir().unwrap();
         let marker_path = temp_dir.path().join("custom-timeout-side-effect");
