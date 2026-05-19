@@ -58,6 +58,44 @@ pub struct ProjectModelExactFactReadinessMetadata {
     pub exact_compiler_reference_edge_count: usize,
 }
 
+/// Compact read-only evidence readiness metadata for context rendering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectModelEvidenceReadinessMetadata {
+    /// Number of context-pack artifacts inspected under the bounded diagnostic budget.
+    pub context_pack_artifact_count: usize,
+    /// Whether inspected context-pack artifacts were readable and structurally valid.
+    pub context_pack_valid: bool,
+    /// Total redaction-safe context-pack issue count before summary capping.
+    pub context_pack_issue_count: usize,
+    /// Number of valid tool episodes inspected under the bounded diagnostic budget.
+    pub tool_episode_count: usize,
+    /// Whether inspected tool episodes were readable and structurally valid.
+    pub tool_episode_valid: bool,
+    /// Total redaction-safe tool-episode issue count before summary capping.
+    pub tool_episode_issue_count: usize,
+    /// Whether inspected tool episodes link only to existing context-pack artifacts.
+    pub episode_artifact_link_valid: bool,
+    /// Number of inspected tool episodes linked to an existing context-pack artifact.
+    pub linked_episode_count: usize,
+    /// Number of linkage issues or missing context-pack artifact references.
+    pub missing_link_count: usize,
+    /// Worst-case freshness across readable context-pack artifacts.
+    pub worst_case_freshness: Option<String>,
+    /// Deterministically capped redaction-safe issue summaries.
+    pub issue_summaries: Vec<String>,
+    /// Whether inspection exceeded configured diagnostic budgets.
+    pub truncated: bool,
+}
+
+/// Compact read-only readiness metadata for context rendering.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProjectModelContextReadinessMetadata {
+    /// Optional exact-fact readiness metadata.
+    pub exact_fact_readiness: Option<ProjectModelExactFactReadinessMetadata>,
+    /// Optional context-pack and tool-episode evidence readiness metadata.
+    pub evidence_readiness: Option<ProjectModelEvidenceReadinessMetadata>,
+}
+
 /// A typed project-model context source prepared by an adapter layer.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProjectModelContextSource {
@@ -172,6 +210,7 @@ struct ProjectModelContextRenderRoot<'a> {
     freshness: &'a str,
     provenance: &'a str,
     exact_fact_readiness: Option<&'a ProjectModelExactFactReadinessMetadata>,
+    evidence_readiness: Option<&'a ProjectModelEvidenceReadinessMetadata>,
 }
 
 /// Renders dynamic project-model context under a typed budget.
@@ -182,7 +221,7 @@ struct ProjectModelContextRenderRoot<'a> {
 /// * `manifest_path` - Display path for the local project-model manifest.
 /// * `freshness` - Root freshness label.
 /// * `provenance` - Root provenance label.
-/// * `exact_fact_readiness` - Compact read-only exact-fact readiness metadata.
+/// * `readiness` - Compact read-only readiness metadata.
 /// * `sources` - Candidate evidence sources in caller-selected ranking order.
 /// * `budget` - Rendering budget that bounds sources, lines, and characters.
 pub fn render_project_model_context(
@@ -190,7 +229,7 @@ pub fn render_project_model_context(
     manifest_path: &str,
     freshness: &str,
     provenance: &str,
-    exact_fact_readiness: Option<&ProjectModelExactFactReadinessMetadata>,
+    readiness: Option<&ProjectModelContextReadinessMetadata>,
     sources: &[ProjectModelContextSource],
     budget: &ProjectModelContextRenderBudget,
 ) -> String {
@@ -199,7 +238,8 @@ pub fn render_project_model_context(
         manifest_path,
         freshness,
         provenance,
-        exact_fact_readiness,
+        exact_fact_readiness: readiness.and_then(|metadata| metadata.exact_fact_readiness.as_ref()),
+        evidence_readiness: readiness.and_then(|metadata| metadata.evidence_readiness.as_ref()),
     };
     let rendered = render_project_model_context_inner(&root, sources, budget, false);
     if rendered.chars().count() <= budget.max_rendered_chars {
@@ -237,6 +277,7 @@ fn render_project_model_context_inner(
         budget.max_total_content_chars,
     ));
     render_exact_fact_readiness_attrs(&mut rendered, root.exact_fact_readiness, budget);
+    render_evidence_readiness_attrs(&mut rendered, root.evidence_readiness, budget);
     rendered.push('>');
 
     let mut remaining_content_chars = budget.max_total_content_chars;
@@ -261,6 +302,7 @@ fn render_minimal_project_model_context(root: &ProjectModelContextRenderRoot<'_>
     );
     let budget = ProjectModelContextRenderBudget::default();
     render_exact_fact_readiness_attrs(&mut rendered, root.exact_fact_readiness, &budget);
+    render_evidence_readiness_attrs(&mut rendered, root.evidence_readiness, &budget);
     rendered.push_str(" />");
     rendered
 }
@@ -297,6 +339,45 @@ fn render_exact_fact_readiness_attrs(
     if !readiness.issue_summaries.is_empty() {
         rendered.push_str(&format!(
             " exact_fact_issue_summaries=\"{}\"",
+            xml_attr(truncate_attr(
+                &readiness.issue_summaries.join(";"),
+                budget.max_metadata_attr_chars,
+            ))
+        ));
+    }
+}
+
+fn render_evidence_readiness_attrs(
+    rendered: &mut String,
+    readiness: Option<&ProjectModelEvidenceReadinessMetadata>,
+    budget: &ProjectModelContextRenderBudget,
+) {
+    let Some(readiness) = readiness else {
+        rendered.push_str(" evidence_readiness=\"not_evaluated\"");
+        return;
+    };
+    rendered.push_str(&format!(
+        " evidence_readiness=\"evaluated\" context_pack_artifact_count=\"{}\" context_pack_valid=\"{}\" context_pack_issue_count=\"{}\" tool_episode_count=\"{}\" tool_episode_valid=\"{}\" tool_episode_issue_count=\"{}\" episode_artifact_link_valid=\"{}\" linked_episode_count=\"{}\" missing_link_count=\"{}\" evidence_readiness_truncated=\"{}\"",
+        readiness.context_pack_artifact_count,
+        readiness.context_pack_valid,
+        readiness.context_pack_issue_count,
+        readiness.tool_episode_count,
+        readiness.tool_episode_valid,
+        readiness.tool_episode_issue_count,
+        readiness.episode_artifact_link_valid,
+        readiness.linked_episode_count,
+        readiness.missing_link_count,
+        readiness.truncated,
+    ));
+    if let Some(freshness) = &readiness.worst_case_freshness {
+        rendered.push_str(&format!(
+            " worst_case_freshness=\"{}\"",
+            xml_attr(truncate_attr(freshness, budget.max_metadata_attr_chars))
+        ));
+    }
+    if !readiness.issue_summaries.is_empty() {
+        rendered.push_str(&format!(
+            " evidence_readiness_issue_summaries=\"{}\"",
             xml_attr(truncate_attr(
                 &readiness.issue_summaries.join(";"),
                 budget.max_metadata_attr_chars,
@@ -589,6 +670,11 @@ mod tests {
             exact_compiler_reference_edge_count: 3,
         };
 
+        let readiness = ProjectModelContextReadinessMetadata {
+            exact_fact_readiness: Some(readiness),
+            evidence_readiness: None,
+        };
+
         let actual = render_project_model_context(
             "/workspace",
             "/manifest",
@@ -608,6 +694,55 @@ mod tests {
                 actual.contains("exact_fact_issue_count=\"1\""),
                 actual.contains("manifest_external_facts_fingerprint=\"external-fingerprint\""),
                 actual.contains("exact_fact_issue_summaries=\"safe_issue\""),
+            ),
+            expected,
+        );
+    }
+
+    #[test]
+    fn renderer_includes_evidence_readiness_metadata() {
+        let setup = vec![fixture_source("pub fn needle() -> usize { 42 }")];
+        let readiness = ProjectModelEvidenceReadinessMetadata {
+            context_pack_artifact_count: 2,
+            context_pack_valid: false,
+            context_pack_issue_count: 1,
+            tool_episode_count: 3,
+            tool_episode_valid: true,
+            tool_episode_issue_count: 0,
+            episode_artifact_link_valid: false,
+            linked_episode_count: 2,
+            missing_link_count: 1,
+            worst_case_freshness: Some("deleted".to_string()),
+            issue_summaries: vec!["context_pack:StaleArtifactEvidence".to_string()],
+            truncated: true,
+        };
+
+        let readiness = ProjectModelContextReadinessMetadata {
+            exact_fact_readiness: None,
+            evidence_readiness: Some(readiness),
+        };
+
+        let actual = render_project_model_context(
+            "/workspace",
+            "/manifest",
+            "fresh",
+            "test",
+            Some(&readiness),
+            &setup,
+            &ProjectModelContextRenderBudget::default(),
+        );
+        let expected = (true, true, true, true, true, true);
+
+        assert_eq!(
+            (
+                actual.contains("evidence_readiness=\"evaluated\""),
+                actual.contains("context_pack_artifact_count=\"2\""),
+                actual.contains("tool_episode_count=\"3\""),
+                actual.contains("episode_artifact_link_valid=\"false\""),
+                actual.contains("worst_case_freshness=\"deleted\""),
+                actual.contains(
+                    "evidence_readiness_issue_summaries=\"context_pack:StaleArtifactEvidence\""
+                ),
             ),
             expected,
         );

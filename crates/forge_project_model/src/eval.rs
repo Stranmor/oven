@@ -2,6 +2,9 @@
 //! provenance.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
+use std::path::Path;
 
 use crate::ProjectIndexer;
 use crate::freshness::compare_freshness;
@@ -9,13 +12,261 @@ use crate::retrieval::retrieve;
 use crate::types::{
     ContextPack, ContextPackArtifactEvalReport, ContextPackArtifactId, EdgeConfidence,
     EvidenceFreshness, EvidenceLedgerEvalIssue, EvidenceLedgerEvalIssueCode,
-    EvidenceLedgerLinkageReport, FreshnessEvalReport, GraphCoverageReport, GraphEdge,
-    GraphEdgeKind, KnowledgeGraph, KnowledgeGraphEdge, KnowledgeGraphNode, KnowledgeGraphNodeId,
-    ProjectManifest, Provenance, ProvenanceCompletenessReport, RetrievalEvalCase,
-    RetrievalEvalReport, RetrievedEvidenceGraphNode, ToolEpisode, ToolEpisodeEvalReport,
-    ToolEpisodeGraphNode,
+    EvidenceLedgerLinkageReport, EvidenceReadinessDiagnostic, FreshnessEvalReport,
+    GraphCoverageReport, GraphEdge, GraphEdgeKind, KnowledgeGraph, KnowledgeGraphEdge,
+    KnowledgeGraphNode, KnowledgeGraphNodeId, ProjectManifest, Provenance,
+    ProvenanceCompletenessReport, RetrievalEvalCase, RetrievalEvalReport,
+    RetrievedEvidenceGraphNode, ToolEpisode, ToolEpisodeEvalReport, ToolEpisodeGraphNode,
 };
 use crate::util::fingerprint;
+
+/// Bounded budgets for read-only evidence readiness diagnostics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvidenceReadinessDiagnosticBudget {
+    /// Maximum context-pack artifact files to inspect.
+    pub max_artifacts: usize,
+    /// Maximum non-empty tool episode JSONL lines to inspect.
+    pub max_episode_lines: usize,
+    /// Maximum redaction-safe issue summaries to retain.
+    pub max_issue_summaries: usize,
+}
+
+impl Default for EvidenceReadinessDiagnosticBudget {
+    fn default() -> Self {
+        Self {
+            max_artifacts: 128,
+            max_episode_lines: 512,
+            max_issue_summaries: 16,
+        }
+    }
+}
+
+/// Builds a read-only bounded evidence readiness diagnostic for context packs and tool episodes.
+///
+/// Missing storage files are reported as valid zero-count diagnostics. Corrupt
+/// artifacts and malformed JSONL lines are counted as redaction-safe issues
+/// without aborting the whole report.
+///
+/// # Arguments
+///
+/// * `indexer` - Project indexer whose model storage is inspected.
+/// * `budget` - Hard caps for artifact, episode, and issue-summary inspection.
+pub fn diagnose_evidence_readiness(
+    indexer: &ProjectIndexer,
+    budget: &EvidenceReadinessDiagnosticBudget,
+) -> EvidenceReadinessDiagnostic {
+    let mut builder = EvidenceReadinessDiagnosticBuilder::new(budget.max_issue_summaries);
+    let artifact_paths = context_pack_artifact_paths(indexer.model_dir(), budget, &mut builder);
+    let mut artifact_ids = Vec::new();
+    let mut readable_packs = Vec::new();
+
+    for (artifact_id, _path) in &artifact_paths {
+        artifact_ids.push(artifact_id.clone());
+        if let Ok(pack) = indexer.read_context_pack(artifact_id) {
+            readable_packs.push(pack);
+        }
+    }
+
+    let artifact_report = evaluate_context_pack_artifacts_by_id(indexer, &artifact_ids)
+        .unwrap_or_else(|error| {
+            builder.push_issue(format!("context_pack_artifact_eval_failed:{error}"));
+            ContextPackArtifactEvalReport {
+                checked: artifact_ids.len(),
+                valid: false,
+                issues: Vec::new(),
+            }
+        });
+    builder.push_eval_issues("context_pack", &artifact_report.issues);
+
+    let episode_read = read_tool_episode_lines(indexer.model_dir(), budget, &mut builder);
+    let episode_report = evaluate_tool_episodes(&episode_read.episodes);
+    builder.push_eval_issues("tool_episode", &episode_report.issues);
+
+    let linkage_report = evaluate_episode_artifact_links(&episode_read.episodes, &artifact_ids);
+    builder.push_eval_issues("episode_artifact_link", &linkage_report.issues);
+
+    let worst_case_freshness = readable_packs
+        .iter()
+        .map(context_pack_worst_case_freshness)
+        .max_by_key(freshness_rank)
+        .map(|freshness| evidence_freshness_label(&freshness).to_string());
+
+    let tool_episode_issue_count = episode_report
+        .issues
+        .len()
+        .saturating_add(episode_read.malformed_line_count)
+        .saturating_add(episode_read.read_issue_count);
+    let context_pack_issue_count = artifact_report
+        .issues
+        .len()
+        .saturating_add(builder.context_pack_reader_issue_count);
+
+    EvidenceReadinessDiagnostic {
+        context_pack_artifact_count: artifact_report.checked,
+        context_pack_valid: artifact_report.valid && builder.context_pack_reader_issue_count == 0,
+        context_pack_issue_count,
+        tool_episode_count: episode_report.checked,
+        tool_episode_valid: episode_report.valid
+            && episode_read.malformed_line_count == 0
+            && episode_read.read_issue_count == 0,
+        tool_episode_issue_count,
+        episode_artifact_link_valid: linkage_report.issues.is_empty(),
+        linked_episode_count: linkage_report.linked_count,
+        missing_link_count: linkage_report.issues.len(),
+        worst_case_freshness,
+        issue_summaries: builder.issue_summaries,
+        truncated: builder.truncated || episode_read.truncated,
+    }
+}
+
+struct EvidenceReadinessDiagnosticBuilder {
+    max_issue_summaries: usize,
+    issue_summaries: Vec<String>,
+    truncated: bool,
+    context_pack_reader_issue_count: usize,
+}
+
+impl EvidenceReadinessDiagnosticBuilder {
+    fn new(max_issue_summaries: usize) -> Self {
+        Self {
+            max_issue_summaries,
+            issue_summaries: Vec::new(),
+            truncated: false,
+            context_pack_reader_issue_count: 0,
+        }
+    }
+
+    fn push_issue(&mut self, summary: String) {
+        if summary.starts_with("context_pack_") {
+            self.context_pack_reader_issue_count =
+                self.context_pack_reader_issue_count.saturating_add(1);
+        }
+        if self.issue_summaries.len() < self.max_issue_summaries {
+            self.issue_summaries.push(summary);
+        } else {
+            self.truncated = true;
+        }
+    }
+
+    fn push_eval_issues(&mut self, prefix: &str, issues: &[EvidenceLedgerEvalIssue]) {
+        for issue in issues {
+            self.push_issue(format!("{prefix}:{:?}", issue.code));
+        }
+    }
+}
+
+struct EpisodeReadResult {
+    episodes: Vec<ToolEpisode>,
+    malformed_line_count: usize,
+    read_issue_count: usize,
+    truncated: bool,
+}
+
+fn context_pack_artifact_paths(
+    model_dir: &Path,
+    budget: &EvidenceReadinessDiagnosticBudget,
+    builder: &mut EvidenceReadinessDiagnosticBuilder,
+) -> Vec<(ContextPackArtifactId, std::path::PathBuf)> {
+    let directory = model_dir.join("context_packs");
+    let Ok(entries) = fs::read_dir(&directory) else {
+        if directory.exists() {
+            builder.push_issue("context_pack_dir_unreadable".to_string());
+        }
+        return Vec::new();
+    };
+    let mut artifact_paths = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            builder.push_issue("context_pack_dir_entry_unreadable".to_string());
+            continue;
+        };
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            builder.push_issue("context_pack_filename_non_utf8".to_string());
+            continue;
+        };
+        let Some(raw_id) = file_name.strip_suffix(".json") else {
+            continue;
+        };
+        let Ok(artifact_id) = ContextPackArtifactId::new(raw_id.to_string()) else {
+            builder.push_issue("context_pack_filename_invalid".to_string());
+            continue;
+        };
+        if artifact_paths.len() >= budget.max_artifacts {
+            builder.truncated = true;
+            break;
+        }
+        artifact_paths.push((artifact_id, path));
+    }
+    artifact_paths.sort_by(|left, right| left.0.cmp(&right.0));
+    artifact_paths
+}
+
+fn read_tool_episode_lines(
+    model_dir: &Path,
+    budget: &EvidenceReadinessDiagnosticBudget,
+    builder: &mut EvidenceReadinessDiagnosticBuilder,
+) -> EpisodeReadResult {
+    let path = model_dir.join("tool_episodes.jsonl");
+    let Ok(file) = File::open(&path) else {
+        if path.exists() {
+            builder.push_issue("tool_episode_file_unreadable".to_string());
+            return EpisodeReadResult {
+                episodes: Vec::new(),
+                malformed_line_count: 0,
+                read_issue_count: 1,
+                truncated: false,
+            };
+        }
+        return EpisodeReadResult {
+            episodes: Vec::new(),
+            malformed_line_count: 0,
+            read_issue_count: 0,
+            truncated: false,
+        };
+    };
+    let mut episodes = Vec::new();
+    let mut malformed_line_count = 0usize;
+    let mut read_issue_count = 0usize;
+    let mut truncated = false;
+    for line in BufReader::new(file).lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(_) => {
+                read_issue_count = read_issue_count.saturating_add(1);
+                builder.push_issue("tool_episode_line_unreadable".to_string());
+                continue;
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        if episodes.len().saturating_add(malformed_line_count) >= budget.max_episode_lines {
+            truncated = true;
+            break;
+        }
+        match serde_json::from_str::<ToolEpisode>(&line) {
+            Ok(episode) => episodes.push(episode),
+            Err(_) => {
+                malformed_line_count = malformed_line_count.saturating_add(1);
+                builder.push_issue("tool_episode_line_malformed".to_string());
+            }
+        }
+    }
+    EpisodeReadResult { episodes, malformed_line_count, read_issue_count, truncated }
+}
+
+fn evidence_freshness_label(freshness: &EvidenceFreshness) -> &'static str {
+    match freshness {
+        EvidenceFreshness::Fresh => "fresh",
+        EvidenceFreshness::Added => "added",
+        EvidenceFreshness::Changed => "changed",
+        EvidenceFreshness::Deleted => "deleted",
+    }
+}
 
 /// Evaluates retrieval precision@k, recall@k, and mean reciprocal rank.
 ///
@@ -608,6 +859,180 @@ mod tests {
             .join(format!("{}.json", artifact_id.as_str()))
     }
 
+    #[test]
+    fn evidence_readiness_missing_context_pack_dir_and_episode_file_is_valid_zero_count()
+    -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let model_dir = fixture.path().join("model");
+        let setup = ProjectIndexer::new(&root, &model_dir);
+
+        let actual =
+            diagnose_evidence_readiness(&setup, &EvidenceReadinessDiagnosticBudget::default());
+        let expected = EvidenceReadinessDiagnostic {
+            context_pack_artifact_count: 0,
+            context_pack_valid: true,
+            context_pack_issue_count: 0,
+            tool_episode_count: 0,
+            tool_episode_valid: true,
+            tool_episode_issue_count: 0,
+            episode_artifact_link_valid: true,
+            linked_episode_count: 0,
+            missing_link_count: 0,
+            worst_case_freshness: None,
+            issue_summaries: Vec::new(),
+            truncated: false,
+        };
+
+        assert_eq!(actual, expected);
+        assert_eq!(model_dir.exists(), false);
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_readiness_counts_corrupt_context_pack_artifact_without_panic() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let artifact_id = ContextPackArtifactId::new("b".repeat(64))?;
+        fs::create_dir_all(fixture.path().join("model").join("context_packs"))?;
+        fs::write(artifact_path(fixture.path(), &artifact_id), "not json")?;
+
+        let actual =
+            diagnose_evidence_readiness(&setup, &EvidenceReadinessDiagnosticBudget::default());
+        let expected = (1usize, false, 1usize, true);
+
+        assert_eq!(
+            (
+                actual.context_pack_artifact_count,
+                actual.context_pack_valid,
+                actual.context_pack_issue_count,
+                actual
+                    .issue_summaries
+                    .iter()
+                    .any(|summary| summary == "context_pack:CorruptArtifact"),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_readiness_counts_corrupt_episode_line_without_aborting_report() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        fs::create_dir_all(fixture.path().join("model"))?;
+        fs::write(
+            fixture.path().join("model").join("tool_episodes.jsonl"),
+            "not json\n",
+        )?;
+
+        let actual =
+            diagnose_evidence_readiness(&setup, &EvidenceReadinessDiagnosticBudget::default());
+        let expected = (0usize, false, 1usize, true);
+
+        assert_eq!(
+            (
+                actual.tool_episode_count,
+                actual.tool_episode_valid,
+                actual.tool_episode_issue_count,
+                actual
+                    .issue_summaries
+                    .iter()
+                    .any(|summary| summary == "tool_episode_line_malformed"),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_readiness_reports_episode_link_to_missing_context_pack_artifact() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let artifact_id = ContextPackArtifactId::new("a".repeat(64))?;
+        setup.append_episode(&fixture_episode(&artifact_id))?;
+
+        let actual =
+            diagnose_evidence_readiness(&setup, &EvidenceReadinessDiagnosticBudget::default());
+        let expected = (1usize, false, 0usize, 1usize);
+
+        assert_eq!(
+            (
+                actual.tool_episode_count,
+                actual.episode_artifact_link_valid,
+                actual.linked_episode_count,
+                actual.missing_link_count,
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_readiness_aggregates_worst_case_freshness_for_readable_packs() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let (_id, mut changed_pack) = write_fixture_context_pack(&setup, &manifest)?;
+        changed_pack
+            .evidence
+            .first_mut()
+            .expect("fixture context pack should include evidence")
+            .freshness = EvidenceFreshness::Changed;
+        let changed_id = setup.context_pack_artifact_id(&changed_pack)?;
+        fs::write(
+            artifact_path(fixture.path(), &changed_id),
+            changed_pack.to_stable_json()?,
+        )?;
+        let (_id, mut deleted_pack) = write_fixture_context_pack(&setup, &manifest)?;
+        deleted_pack
+            .evidence
+            .first_mut()
+            .expect("fixture context pack should include evidence")
+            .freshness = EvidenceFreshness::Deleted;
+        let deleted_id = setup.context_pack_artifact_id(&deleted_pack)?;
+        fs::write(
+            artifact_path(fixture.path(), &deleted_id),
+            deleted_pack.to_stable_json()?,
+        )?;
+
+        let actual =
+            diagnose_evidence_readiness(&setup, &EvidenceReadinessDiagnosticBudget::default());
+        let expected = Some("deleted".to_string());
+
+        assert_eq!(actual.worst_case_freshness, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_readiness_reports_truncated_when_budgets_are_exceeded() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let (_id, pack) = write_fixture_context_pack(&setup, &manifest)?;
+        let first_id = setup.context_pack_artifact_id(&pack)?;
+        let second_id = ContextPackArtifactId::new("f".repeat(64))?;
+        fs::write(
+            artifact_path(fixture.path(), &second_id),
+            pack.to_stable_json()?,
+        )?;
+
+        let actual = diagnose_evidence_readiness(
+            &setup,
+            &EvidenceReadinessDiagnosticBudget {
+                max_artifacts: 1,
+                max_episode_lines: 1,
+                max_issue_summaries: 1,
+            },
+        );
+        let expected = (1usize, true);
+
+        assert_eq!(
+            (actual.context_pack_artifact_count, actual.truncated),
+            expected
+        );
+        assert_eq!(first_id.as_str().len(), 64usize);
+        Ok(())
+    }
     #[test]
     fn evaluates_context_pack_episode_linkage_and_graph_happy_path() -> Result<()> {
         let (fixture, root) = fixture_project()?;

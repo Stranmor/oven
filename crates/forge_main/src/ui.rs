@@ -19,7 +19,7 @@ use forge_config::ForgeConfig;
 use forge_display::MarkdownFormat;
 use forge_domain::{
     AuthMethod, ChatResponseContent, ConsoleWriter, ContextMessage, Role, TitleFormat, UserCommand,
-    WorkspaceExactFactReadinessDiagnostic,
+    WorkspaceEvidenceReadinessDiagnostic, WorkspaceExactFactReadinessDiagnostic,
 };
 use forge_fs::ForgeFS;
 use forge_select::{ForgeWidget, SelectRow};
@@ -5574,12 +5574,13 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             info = info.add_key_value(
                 "Target",
                 format!(
-                    "workspace={} manifest_found={} manifest_path={} freshness={} exact_fact_readiness={}",
+                    "workspace={} manifest_found={} manifest_path={} freshness={} exact_fact_readiness={} evidence_readiness={}",
                     target.workspace_root.display(),
                     target.manifest_found,
                     target.manifest_path.display(),
                     target.freshness.label(),
-                    Self::format_exact_fact_readiness(target.exact_fact_readiness.as_ref())
+                    Self::format_exact_fact_readiness(target.exact_fact_readiness.as_ref()),
+                    Self::format_evidence_readiness(target.evidence_readiness.as_ref())
                 ),
             );
         }
@@ -5593,12 +5594,13 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                 info = info.add_key_value(
                     "Skipped Manifest",
                     format!(
-                        "workspace={} manifest_found={} manifest_path={} freshness={} exact_fact_readiness={}",
+                        "workspace={} manifest_found={} manifest_path={} freshness={} exact_fact_readiness={} evidence_readiness={}",
                         target.workspace_root.display(),
                         target.manifest_found,
                         target.manifest_path.display(),
                         target.freshness.label(),
-                        Self::format_exact_fact_readiness(target.exact_fact_readiness.as_ref())
+                        Self::format_exact_fact_readiness(target.exact_fact_readiness.as_ref()),
+                        Self::format_evidence_readiness(target.evidence_readiness.as_ref())
                     ),
                 );
             }
@@ -5632,6 +5634,30 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                         .unwrap_or("unknown"),
                     readiness.reference_edge_count,
                     readiness.exact_compiler_reference_edge_count,
+                )
+            },
+        )
+    }
+
+    fn format_evidence_readiness(
+        readiness: Option<&WorkspaceEvidenceReadinessDiagnostic>,
+    ) -> String {
+        readiness.map_or_else(
+            || "not_evaluated".to_string(),
+            |readiness| {
+                format!(
+                    "context_packs={} context_pack_valid={} context_pack_issues={} tool_episodes={} tool_episode_valid={} tool_episode_issues={} link_valid={} linked_episodes={} missing_links={} worst_case_freshness={} truncated={}",
+                    readiness.context_pack_artifact_count,
+                    readiness.context_pack_valid,
+                    readiness.context_pack_issue_count,
+                    readiness.tool_episode_count,
+                    readiness.tool_episode_valid,
+                    readiness.tool_episode_issue_count,
+                    readiness.episode_artifact_link_valid,
+                    readiness.linked_episode_count,
+                    readiness.missing_link_count,
+                    readiness.worst_case_freshness.as_deref().unwrap_or("unknown"),
+                    readiness.truncated,
                 )
             },
         )

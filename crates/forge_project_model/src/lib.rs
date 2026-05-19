@@ -27,7 +27,8 @@ pub use durable_vector_index::{
     VectorIndexEntry, VectorSourceKind, vector_entries_from_manifest_embeddings,
 };
 pub use eval::{
-    context_pack_worst_case_freshness, evaluate_context_pack_artifacts,
+    EvidenceReadinessDiagnosticBudget, context_pack_worst_case_freshness,
+    diagnose_evidence_readiness, evaluate_context_pack_artifacts,
     evaluate_context_pack_artifacts_by_id, evaluate_episode_artifact_links, evaluate_freshness,
     evaluate_graph_coverage, evaluate_provenance_completeness, evaluate_retrieval,
     evaluate_tool_episodes, tool_episode_graph_id, tool_episodes_to_graph,
@@ -69,8 +70,10 @@ pub use producer::{
     StdRustAnalyzerProcess, derive_native_lsp_reference_request,
 };
 pub use render::{
-    DEFAULT_RENDERED_SOURCE_LIMIT, ProjectModelContextRenderBudget, ProjectModelContextSource,
-    ProjectModelExactFactReadinessMetadata, render_project_model_context,
+    DEFAULT_RENDERED_SOURCE_LIMIT, ProjectModelContextReadinessMetadata,
+    ProjectModelContextRenderBudget, ProjectModelContextSource,
+    ProjectModelEvidenceReadinessMetadata, ProjectModelExactFactReadinessMetadata,
+    render_project_model_context,
 };
 pub use retrieval::{plan_retrieval, retrieve, retrieve_with_boundaries};
 pub use status::{
@@ -83,16 +86,16 @@ pub use types::{
     CargoWorkspaceMetadata, ContextPack, ContextPackArtifactEvalReport, ContextPackArtifactId,
     ContextPackEvidence, ContextPackEvidenceSource, ContextPackSelection, DecisionGraphNode,
     EdgeConfidence, EvalCaseGraphNode, EvidenceFreshness, EvidenceLedgerEvalIssue,
-    EvidenceLedgerEvalIssueCode, EvidenceLedgerLinkageReport, ExternalFactArtifactIngestionReport,
-    ExternalFactArtifactReport, ExternalFactBatch, ExternalFactBatchMetadata,
-    ExternalFactIngestionIssue, ExternalFactIngestionIssueCode, ExternalFactIngestionReport,
-    ExternalFactProductionBaseline, ExternalFactSource, ExternalFacts, ExternalReferenceFact,
-    ExternalSymbolFact, FileGraphNode, FileNode, FileNodeKind, FreshnessEvalReport,
-    FreshnessProofLevel, FreshnessState, FutureVectorRetrievalScaffold, GraphCoverageReport,
-    GraphEdge, GraphEdgeKind, KnowledgeGraph, KnowledgeGraphEdge, KnowledgeGraphNode,
-    KnowledgeGraphNodeId, KnowledgeGraphNodeKind, Language, LexicalDocument, LexicalDocumentKind,
-    LexicalSearchHit, ManifestFreshnessEvaluation, ProjectManifest, Provenance,
-    ProvenanceCompletenessReport, RerankCandidate, RerankScore, RetrievalEvalCase,
+    EvidenceLedgerEvalIssueCode, EvidenceLedgerLinkageReport, EvidenceReadinessDiagnostic,
+    ExternalFactArtifactIngestionReport, ExternalFactArtifactReport, ExternalFactBatch,
+    ExternalFactBatchMetadata, ExternalFactIngestionIssue, ExternalFactIngestionIssueCode,
+    ExternalFactIngestionReport, ExternalFactProductionBaseline, ExternalFactSource, ExternalFacts,
+    ExternalReferenceFact, ExternalSymbolFact, FileGraphNode, FileNode, FileNodeKind,
+    FreshnessEvalReport, FreshnessProofLevel, FreshnessState, FutureVectorRetrievalScaffold,
+    GraphCoverageReport, GraphEdge, GraphEdgeKind, KnowledgeGraph, KnowledgeGraphEdge,
+    KnowledgeGraphNode, KnowledgeGraphNodeId, KnowledgeGraphNodeKind, Language, LexicalDocument,
+    LexicalDocumentKind, LexicalSearchHit, ManifestFreshnessEvaluation, ProjectManifest,
+    Provenance, ProvenanceCompletenessReport, RerankCandidate, RerankScore, RetrievalEvalCase,
     RetrievalEvalReport, RetrievalQuery, RetrievalResult, RetrievalScoringPlan,
     RetrievalScoringWeights, RetrievedEvidenceGraphNode, ShardGraphNode, ShardManifest,
     ShardStrategy, SourceFile, StaleEvidencePolicy, SymbolGraphNode, SymbolKind, SymbolNode,

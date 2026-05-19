@@ -1733,6 +1733,35 @@ pub struct EvidenceLedgerEvalIssue {
     pub detail: String,
 }
 
+/// Read-only evidence readiness diagnostic for context-pack artifacts and tool episodes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceReadinessDiagnostic {
+    /// Number of context-pack artifacts inspected under the bounded diagnostic budget.
+    pub context_pack_artifact_count: usize,
+    /// Whether inspected context-pack artifacts were readable and structurally valid.
+    pub context_pack_valid: bool,
+    /// Total redaction-safe context-pack issue count before summary capping.
+    pub context_pack_issue_count: usize,
+    /// Number of valid tool episodes inspected under the bounded diagnostic budget.
+    pub tool_episode_count: usize,
+    /// Whether inspected tool episodes were readable and structurally valid.
+    pub tool_episode_valid: bool,
+    /// Total redaction-safe tool-episode issue count before summary capping.
+    pub tool_episode_issue_count: usize,
+    /// Whether inspected tool episodes link only to existing context-pack artifacts.
+    pub episode_artifact_link_valid: bool,
+    /// Number of inspected tool episodes linked to an existing context-pack artifact.
+    pub linked_episode_count: usize,
+    /// Number of linkage issues or missing context-pack artifact references.
+    pub missing_link_count: usize,
+    /// Worst-case freshness across readable context-pack artifacts.
+    pub worst_case_freshness: Option<String>,
+    /// Deterministically capped redaction-safe issue summaries.
+    pub issue_summaries: Vec<String>,
+    /// Whether inspection exceeded configured diagnostic budgets.
+    pub truncated: bool,
+}
+
 /// Evaluation report for persisted context-pack artifacts.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextPackArtifactEvalReport {

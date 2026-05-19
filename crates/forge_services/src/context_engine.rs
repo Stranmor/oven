@@ -8,21 +8,23 @@ use forge_app::{CommandInfra, EnvironmentInfra, FileReaderInfra, WalkerInfra, Wo
 use forge_domain::{
     AuthCredential, AuthDetails, FileChunk, Node, NodeData, NodeId, ProviderId, ProviderRepository,
     SearchParams, SyncProgress, UserId, WorkspaceContextFreshness,
-    WorkspaceContextManifestDiagnostic, WorkspaceExactFactBoundedLoss,
-    WorkspaceExactFactIngestionSummary, WorkspaceExactFactIssue,
+    WorkspaceContextManifestDiagnostic, WorkspaceEvidenceReadinessDiagnostic,
+    WorkspaceExactFactBoundedLoss, WorkspaceExactFactIngestionSummary, WorkspaceExactFactIssue,
     WorkspaceExactFactReadinessDiagnostic, WorkspaceExactFactReferenceReport,
     WorkspaceExactFactReferenceStatus, WorkspaceExactFactStatusReport, WorkspaceId,
     WorkspaceIndexRepository,
 };
 use forge_project_model::{
-    ContextPack, ContextPackArtifactId, ContextPackSelection, ExternalFactArtifactIngestionReport,
+    ContextPack, ContextPackArtifactId, ContextPackSelection, EvidenceReadinessDiagnostic,
+    EvidenceReadinessDiagnosticBudget, ExternalFactArtifactIngestionReport,
     ExternalFactIngestionIssue, ExternalFactProductionReport, ExternalFactProductionRequest,
     ExternalFactProductionStatus, NativeLspReferenceProducer, NativeLspReferenceRequest,
     NativeLspReferenceRequestDerivation, ProjectIndexer, Provenance, RetrievalQuery,
     RustAnalyzerBounds, RustAnalyzerCapability, RustAnalyzerCapabilityProbe,
     RustAnalyzerCapabilityStatus, RustAnalyzerProbe, StaleEvidencePolicy, StdRustAnalyzerProcess,
-    ToolEpisode, derive_native_lsp_reference_request, evidence_line_range, fingerprint,
-    local_project_model_dir, local_project_model_manifest, read_exact_fact_status, retrieve,
+    ToolEpisode, derive_native_lsp_reference_request, diagnose_evidence_readiness,
+    evidence_line_range, fingerprint, local_project_model_dir, local_project_model_manifest,
+    read_exact_fact_status, retrieve,
 };
 use forge_stream::MpscStream;
 use futures::future::join_all;
@@ -683,6 +685,33 @@ fn evaluate_exact_fact_readiness(path: &Path) -> Option<WorkspaceExactFactReadin
     }
 }
 
+fn evaluate_evidence_readiness(path: &Path) -> WorkspaceEvidenceReadinessDiagnostic {
+    let indexer = ProjectIndexer::new(path, local_project_model_dir(path));
+    workspace_evidence_readiness_diagnostic(diagnose_evidence_readiness(
+        &indexer,
+        &EvidenceReadinessDiagnosticBudget::default(),
+    ))
+}
+
+fn workspace_evidence_readiness_diagnostic(
+    diagnostic: EvidenceReadinessDiagnostic,
+) -> WorkspaceEvidenceReadinessDiagnostic {
+    WorkspaceEvidenceReadinessDiagnostic {
+        context_pack_artifact_count: diagnostic.context_pack_artifact_count,
+        context_pack_valid: diagnostic.context_pack_valid,
+        context_pack_issue_count: diagnostic.context_pack_issue_count,
+        tool_episode_count: diagnostic.tool_episode_count,
+        tool_episode_valid: diagnostic.tool_episode_valid,
+        tool_episode_issue_count: diagnostic.tool_episode_issue_count,
+        episode_artifact_link_valid: diagnostic.episode_artifact_link_valid,
+        linked_episode_count: diagnostic.linked_episode_count,
+        missing_link_count: diagnostic.missing_link_count,
+        worst_case_freshness: diagnostic.worst_case_freshness,
+        issue_summaries: diagnostic.issue_summaries,
+        truncated: diagnostic.truncated,
+    }
+}
+
 fn evaluate_project_model_context(path: &Path) -> WorkspaceContextManifestDiagnostic {
     let manifest_path = local_project_model_manifest(path);
     if !path.is_dir() || !manifest_path.is_file() {
@@ -694,9 +723,11 @@ fn evaluate_project_model_context(path: &Path) -> WorkspaceContextManifestDiagno
                 reason: "project-model manifest not found".to_string(),
             },
             exact_fact_readiness: None,
+            evidence_readiness: None,
         };
     }
     let exact_fact_readiness = evaluate_exact_fact_readiness(path);
+    let evidence_readiness = Some(evaluate_evidence_readiness(path));
 
     let indexer = ProjectIndexer::new(path, local_project_model_dir(path));
     let freshness = match indexer
@@ -721,6 +752,7 @@ fn evaluate_project_model_context(path: &Path) -> WorkspaceContextManifestDiagno
         manifest_found: true,
         freshness,
         exact_fact_readiness,
+        evidence_readiness,
     }
 }
 
@@ -1445,23 +1477,38 @@ mod tests {
         write_fixture_project_model(&root)?;
         let model_dir = local_project_model_dir(&root);
         let external_facts_dir = model_dir.join("external_facts");
+        let context_pack_dir = model_dir.join("context_packs");
+        let episode_file = model_dir.join("tool_episodes.jsonl");
         let ingestion_report = forge_project_model::local_project_model_external_fact_report(&root);
 
         let actual = evaluate_project_model_context(&root);
-        let expected = (true, false, false, false);
+        let expected = (true, true, false, false, false, false);
 
         assert_eq!(
             (
                 actual.exact_fact_readiness.is_some(),
+                actual.evidence_readiness.is_some(),
                 external_facts_dir.exists(),
+                context_pack_dir.exists(),
+                episode_file.exists(),
                 ingestion_report.exists(),
-                actual
-                    .exact_fact_readiness
-                    .as_ref()
-                    .unwrap()
-                    .exact_facts_active,
             ),
             expected,
+        );
+        assert!(
+            !actual
+                .exact_fact_readiness
+                .as_ref()
+                .unwrap()
+                .exact_facts_active,
+        );
+        assert_eq!(
+            actual
+                .evidence_readiness
+                .as_ref()
+                .unwrap()
+                .context_pack_artifact_count,
+            0usize,
         );
         Ok(())
     }

@@ -13,7 +13,8 @@ use forge_project_model::{
     LearningRedactionStatus as ProjectLearningRedactionStatus,
     LearningReviewState as ProjectLearningReviewState,
     LearningSourceKind as ProjectLearningSourceKind, ProjectContextTarget,
-    ProjectModelContextRenderBudget, ProjectModelExactFactReadinessMetadata,
+    ProjectModelContextReadinessMetadata, ProjectModelContextRenderBudget,
+    ProjectModelEvidenceReadinessMetadata, ProjectModelExactFactReadinessMetadata,
     ProjectModelSourceNode, TargetResolutionBudget, directory_path_filter,
     local_project_model_manifest, mentioned_paths, render_project_model_context,
     render_sources_from_nodes,
@@ -238,6 +239,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
             rendered_contexts.push(Self::render_context(
                 &target.workspace_root,
                 target_diagnostic.diagnostic.exact_fact_readiness.as_ref(),
+                target_diagnostic.diagnostic.evidence_readiness.as_ref(),
                 nodes,
             ));
         }
@@ -572,6 +574,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
     fn render_context(
         workspace_root: &std::path::Path,
         exact_fact_readiness: Option<&WorkspaceExactFactReadinessDiagnostic>,
+        evidence_readiness: Option<&WorkspaceEvidenceReadinessDiagnostic>,
         nodes: Vec<Node>,
     ) -> String {
         let manifest_path = local_project_model_manifest(workspace_root);
@@ -581,12 +584,15 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
             .collect::<Vec<_>>();
         let sources = render_sources_from_nodes(source_nodes);
         let exact_fact_readiness = exact_fact_readiness.map(Self::exact_fact_readiness_metadata);
+        let evidence_readiness = evidence_readiness.map(Self::evidence_readiness_metadata);
+        let readiness =
+            ProjectModelContextReadinessMetadata { exact_fact_readiness, evidence_readiness };
         render_project_model_context(
             &workspace_root.display().to_string(),
             &manifest_path.display().to_string(),
             "local_manifest_available",
             "WorkspaceService::query_workspace",
-            exact_fact_readiness.as_ref(),
+            Some(&readiness),
             &sources,
             &ProjectModelContextRenderBudget::default(),
         )
@@ -606,6 +612,25 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
                 .clone(),
             reference_edge_count: readiness.reference_edge_count,
             exact_compiler_reference_edge_count: readiness.exact_compiler_reference_edge_count,
+        }
+    }
+
+    fn evidence_readiness_metadata(
+        readiness: &WorkspaceEvidenceReadinessDiagnostic,
+    ) -> ProjectModelEvidenceReadinessMetadata {
+        ProjectModelEvidenceReadinessMetadata {
+            context_pack_artifact_count: readiness.context_pack_artifact_count,
+            context_pack_valid: readiness.context_pack_valid,
+            context_pack_issue_count: readiness.context_pack_issue_count,
+            tool_episode_count: readiness.tool_episode_count,
+            tool_episode_valid: readiness.tool_episode_valid,
+            tool_episode_issue_count: readiness.tool_episode_issue_count,
+            episode_artifact_link_valid: readiness.episode_artifact_link_valid,
+            linked_episode_count: readiness.linked_episode_count,
+            missing_link_count: readiness.missing_link_count,
+            worst_case_freshness: readiness.worst_case_freshness.clone(),
+            issue_summaries: readiness.issue_summaries.clone(),
+            truncated: readiness.truncated,
         }
     }
 
@@ -1144,7 +1169,7 @@ mod tests {
         NodeData, NodeId, PermissionOperation, Provider, ProviderId, ProviderType, ResultStream,
         Scope, SearchParams, SteerMessage, SyncProgress, ToolCallContext, ToolCallFull, ToolOutput,
         ToolResult, WorkspaceAuth, WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
-        WorkspaceId, WorkspaceInfo,
+        WorkspaceEvidenceReadinessDiagnostic, WorkspaceId, WorkspaceInfo,
     };
     use futures::StreamExt;
     use pretty_assertions::assert_eq;
@@ -1632,6 +1657,7 @@ mod tests {
                     reason: "runtime proof does not index workspace".to_string(),
                 },
                 exact_fact_readiness: None,
+                evidence_readiness: None,
             })
         }
 
@@ -2346,12 +2372,27 @@ mod tests {
                     }
                 }
             });
+            let evidence_readiness = manifest_found.then(|| WorkspaceEvidenceReadinessDiagnostic {
+                context_pack_artifact_count: 1,
+                context_pack_valid: true,
+                context_pack_issue_count: 0,
+                tool_episode_count: 1,
+                tool_episode_valid: true,
+                tool_episode_issue_count: 0,
+                episode_artifact_link_valid: true,
+                linked_episode_count: 1,
+                missing_link_count: 0,
+                worst_case_freshness: Some("fresh".to_string()),
+                issue_summaries: Vec::new(),
+                truncated: false,
+            });
             Ok(WorkspaceContextManifestDiagnostic {
                 workspace_root: path.to_path_buf(),
                 manifest_found,
                 manifest_path,
                 freshness,
                 exact_fact_readiness,
+                evidence_readiness,
             })
         }
 
@@ -3125,6 +3166,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explain_context_reports_evidence_readiness_for_selected_target() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root.clone());
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
+
+        let actual = ProjectContextInjection::new(setup, agent)
+            .explain(Some("find automatic injection needle".to_string()))
+            .await;
+        let actual_readiness = actual.selected_targets[0]
+            .evidence_readiness
+            .as_ref()
+            .unwrap();
+        let expected = (1usize, true, 1usize, true, true, Some("fresh"));
+
+        assert_eq!(
+            (
+                actual_readiness.context_pack_artifact_count,
+                actual_readiness.context_pack_valid,
+                actual_readiness.tool_episode_count,
+                actual_readiness.tool_episode_valid,
+                actual_readiness.episode_artifact_link_valid,
+                actual_readiness.worst_case_freshness.as_deref(),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn explain_context_reports_exact_fact_inactive_without_blocking_manifest_injection()
     -> Result<()> {
         let (_fixture, root) = fixture_workspace()?;
@@ -3176,7 +3247,7 @@ mod tests {
             .filter_map(|message| message.content().map(str::to_string))
             .find(|content| content.contains("<project_model_context"))
             .unwrap();
-        let expected = (true, true, true, false);
+        let expected = (true, true, true, true, true, true, false);
 
         assert_eq!(
             (
@@ -3184,6 +3255,9 @@ mod tests {
                 actual_context.contains("exact_fact_status=\"active\""),
                 actual_context
                     .contains("manifest_external_facts_fingerprint=\"fixture-external-facts\""),
+                actual_context.contains("evidence_readiness=\"evaluated\""),
+                actual_context.contains("context_pack_artifact_count=\"1\""),
+                actual_context.contains("episode_artifact_link_valid=\"true\""),
                 actual_context.contains("local_manifest_available\"")
                     && !actual_context.contains("exact_fact_readiness"),
             ),
@@ -3208,6 +3282,20 @@ mod tests {
                 manifest_external_facts_fingerprint: Some("fingerprint".to_string()),
                 reference_edge_count: 0,
                 exact_compiler_reference_edge_count: 0,
+            }),
+            evidence_readiness: Some(WorkspaceEvidenceReadinessDiagnostic {
+                context_pack_artifact_count: 1,
+                context_pack_valid: false,
+                context_pack_issue_count: 1,
+                tool_episode_count: 1,
+                tool_episode_valid: true,
+                tool_episode_issue_count: 0,
+                episode_artifact_link_valid: true,
+                linked_episode_count: 1,
+                missing_link_count: 0,
+                worst_case_freshness: Some("changed".to_string()),
+                issue_summaries: vec!["context_pack:StaleArtifactEvidence".to_string()],
+                truncated: false,
             }),
         };
         let actual = setup.can_inject();
@@ -3289,6 +3377,11 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("project-model manifest stale"))
         }));
+        let actual_readiness = actual.nearest_skipped_manifest_candidates[0]
+            .evidence_readiness
+            .as_ref()
+            .unwrap();
+        assert_eq!(actual_readiness.context_pack_valid, true);
         Ok(())
     }
 
