@@ -1098,6 +1098,48 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn rejected_external_artifact_duplicate_symbol_does_not_poison_later_acceptance() -> Result<()>
+    {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let base = setup.index()?;
+        let first = external_artifact_batch(&base, "rust-analyzer", "lsp:src/lib.rs:first");
+        let mut rejected =
+            external_artifact_batch(&base, "rust-analyzer-rejected", "lsp:src/lib.rs:second");
+        rejected.facts.symbols.push(TypedExternalSymbolFact {
+            id: "lsp:src/lib.rs:first".to_string(),
+            name: "first_duplicate".to_string(),
+            kind: SymbolKind::Method,
+            path: "src/lib.rs".to_string(),
+            start_line: 10,
+            end_line: 12,
+            source: ExternalFactSource::Lsp,
+        });
+        rejected.metadata.source_artifact_fingerprint =
+            external_fact_artifact_fingerprint(&rejected);
+        rejected.metadata.batch_fingerprint =
+            external_fact_batch_fingerprint(&rejected.metadata, &rejected.facts);
+        let later_valid =
+            external_artifact_batch(&base, "rust-analyzer-later", "lsp:src/lib.rs:second");
+        write_external_artifact(&setup, "a-first.json", &first)?;
+        write_external_artifact(&setup, "b-rejected.json", &rejected)?;
+        write_external_artifact(&setup, "c-later-valid.json", &later_valid)?;
+
+        let (actual, report) = setup.index_with_external_fact_report()?;
+
+        assert_eq!(report.accepted_artifacts, 2usize);
+        assert_eq!(actual.external_fact_batches.len(), 2usize);
+        assert_eq!(
+            actual
+                .symbols
+                .iter()
+                .any(|symbol| symbol.id == "lsp:src/lib.rs:second"),
+            true
+        );
+        Ok(())
+    }
+
+    #[test]
     fn external_artifact_exact_edge_participates_in_retrieval_graph_expansion() -> Result<()> {
         let (fixture, root) = fixture_project()?;
         let setup = ProjectIndexer::new(&root, fixture.path().join("model"));

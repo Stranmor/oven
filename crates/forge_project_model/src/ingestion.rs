@@ -91,28 +91,39 @@ pub fn ingest_external_fact_artifacts(
         if has_report_issues {
             continue;
         }
+
+        let duplicate_symbols = artifact
+            .batch
+            .facts
+            .symbols
+            .iter()
+            .filter(|symbol| seen_symbol_ids.contains(&symbol.id))
+            .map(|symbol| symbol.id.clone())
+            .collect::<Vec<_>>();
+        if !duplicate_symbols.is_empty() {
+            if let Some(report) = reports
+                .iter_mut()
+                .find(|report| report.artifact_path == artifact.artifact_path)
+            {
+                for symbol_id in duplicate_symbols {
+                    report.issues.push(issue(
+                        ExternalFactIngestionIssueCode::DuplicateAcceptedSymbolId,
+                        Some(symbol_id.clone()),
+                        format!("duplicate_accepted_symbol_id:{symbol_id}"),
+                    ));
+                }
+                sort_issues(&mut report.issues);
+            }
+            continue;
+        }
+
         if !seen_batch_fingerprints.insert(artifact.batch.metadata.batch_fingerprint.clone()) {
             continue;
         }
-        let mut symbol_duplicate = false;
         for symbol in &artifact.batch.facts.symbols {
-            if !seen_symbol_ids.insert(symbol.id.clone()) {
-                symbol_duplicate = true;
-                if let Some(report) = reports
-                    .iter_mut()
-                    .find(|report| report.artifact_path == artifact.artifact_path)
-                {
-                    report.issues.push(issue(
-                        ExternalFactIngestionIssueCode::DuplicateAcceptedSymbolId,
-                        Some(symbol.id.clone()),
-                        format!("duplicate_accepted_symbol_id:{}", symbol.id),
-                    ));
-                }
-            }
+            seen_symbol_ids.insert(symbol.id.clone());
         }
-        if !symbol_duplicate {
-            accepted_filtered.push(artifact);
-        }
+        accepted_filtered.push(artifact);
     }
 
     accepted_filtered.sort_by(|left, right| {
