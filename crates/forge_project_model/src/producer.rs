@@ -2773,7 +2773,8 @@ mod tests {
     }
 
     #[test]
-    fn native_lsp_request_derivation_computes_utf16_character_after_non_ascii_source() {
+    fn native_lsp_request_derivation_computes_utf16_character_after_non_ascii_source() -> Result<()>
+    {
         let source = "const 🦀: usize = 0; pub struct Widget;\n";
         let manifest = ProjectManifest {
             root: PathBuf::from("/tmp/native-lsp-utf16"),
@@ -2807,7 +2808,8 @@ mod tests {
             fixture_request(),
             Default::default(),
         );
-        let expected_character = "const 🦀: usize = 0; pub struct ".encode_utf16().count() as u32;
+        let expected_character =
+            u32::try_from("const 🦀: usize = 0; pub struct ".encode_utf16().count())?;
 
         match actual {
             NativeLspReferenceRequestDerivation::Request(request) => {
@@ -2816,9 +2818,10 @@ mod tests {
                 assert_eq!(request.source.endpoint, "symbol:src/lib.rs:Struct:Widget");
             }
             NativeLspReferenceRequestDerivation::NoEligibleEndpoint(reason) => {
-                panic!("expected request, got no-op: {reason:?}")
+                anyhow::bail!("expected request, got no-op: {reason:?}")
             }
         }
+        Ok(())
     }
 
     #[test]
@@ -2973,7 +2976,7 @@ mod tests {
                 );
             }
             NativeLspReferenceRequestDerivation::NoEligibleEndpoint(reason) => {
-                panic!("expected request, got no-op: {reason:?}")
+                anyhow::bail!("expected request, got no-op: {reason:?}")
             }
         }
         Ok(())
@@ -3036,7 +3039,7 @@ mod tests {
                 assert_eq!(report.bounded_loss, Some(request.bounded_loss.clone()));
             }
             NativeLspReferenceRequestDerivation::NoEligibleEndpoint(reason) => {
-                panic!("expected bounded request, got no-op: {reason:?}")
+                anyhow::bail!("expected bounded request, got no-op: {reason:?}")
             }
         }
         Ok(())

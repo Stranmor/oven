@@ -674,9 +674,8 @@ mod tests {
                 }],
             },
         };
-        let batch = prepared_external_fact_artifact_batch(manifest, batch)
-            .expect("fixture batch should prepare");
-        batch
+        prepared_external_fact_artifact_batch(manifest, batch)
+            .expect("fixture batch should prepare")
     }
 
     #[test]
@@ -875,7 +874,11 @@ mod tests {
         let setup = Fixture::new()?;
         setup.write_source_file()?;
         let (manifest, mut report) = active_manifest(&setup.root)?;
-        report.artifacts[0].accepted_batch = None;
+        report
+            .artifacts
+            .first_mut()
+            .expect("fixture report should contain one artifact")
+            .accepted_batch = None;
         setup.write_manifest(&manifest)?;
         setup.write_report(&report)?;
         setup.create_store_file("fixture.json")?;
@@ -914,7 +917,7 @@ mod tests {
         let mut snapshot = BTreeMap::new();
         for path in paths {
             let bytes = fs::read(path)?;
-            let content_hash = hash_text(&String::from_utf8_lossy(&bytes));
+            let content_hash = hash_text(std::str::from_utf8(&bytes)?);
             snapshot.insert(path.clone(), (u64::try_from(bytes.len())?, content_hash));
         }
         Ok(snapshot)

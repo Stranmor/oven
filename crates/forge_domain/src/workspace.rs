@@ -72,6 +72,27 @@ impl WorkspaceContextFreshness {
     }
 }
 
+/// Local project-model exact-fact readiness diagnostic for a workspace candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceExactFactReadinessDiagnostic {
+    /// Stable readiness status label.
+    pub status_label: String,
+    /// Whether persisted exact facts are active for this workspace.
+    pub exact_facts_active: bool,
+    /// Total redaction-safe issue count before summary capping.
+    pub issue_count: usize,
+    /// Deterministically capped redaction-safe issue summaries.
+    pub issue_summaries: Vec<String>,
+    /// Persisted manifest hash when available.
+    pub manifest_hash: Option<String>,
+    /// Manifest external-facts fingerprint when available.
+    pub manifest_external_facts_fingerprint: Option<String>,
+    /// Graph-visible reference edge count.
+    pub reference_edge_count: usize,
+    /// Graph-visible exact compiler reference edge count.
+    pub exact_compiler_reference_edge_count: usize,
+}
+
 /// Local project-model manifest diagnostic for a workspace candidate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceContextManifestDiagnostic {
@@ -83,6 +104,8 @@ pub struct WorkspaceContextManifestDiagnostic {
     pub manifest_found: bool,
     /// Freshness classification for the manifest when present.
     pub freshness: WorkspaceContextFreshness,
+    /// Read-only exact-fact readiness for this manifest root, when evaluated.
+    pub exact_fact_readiness: Option<WorkspaceExactFactReadinessDiagnostic>,
 }
 
 impl WorkspaceContextManifestDiagnostic {
@@ -117,6 +140,8 @@ pub struct WorkspaceContextExplanation {
     pub candidates: Vec<WorkspaceContextCandidateDiagnostic>,
     /// Fresh selected targets that would be queried for context.
     pub selected_targets: Vec<WorkspaceContextManifestDiagnostic>,
+    /// Nearest manifest candidates skipped because manifest readiness blocked injection.
+    pub nearest_skipped_manifest_candidates: Vec<WorkspaceContextManifestDiagnostic>,
     /// Selected target roots whose retrieval returned no usable nodes for the
     /// explained query.
     pub retrieval_empty_targets: Vec<PathBuf>,

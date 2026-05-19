@@ -37,6 +37,27 @@ impl Default for ProjectModelContextRenderBudget {
     }
 }
 
+/// Compact read-only exact-fact readiness metadata for context rendering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectModelExactFactReadinessMetadata {
+    /// Stable readiness status label.
+    pub status_label: String,
+    /// Whether persisted exact facts are active for this workspace.
+    pub exact_facts_active: bool,
+    /// Total redaction-safe issue count before summary capping.
+    pub issue_count: usize,
+    /// Deterministically capped redaction-safe issue summaries.
+    pub issue_summaries: Vec<String>,
+    /// Persisted manifest hash when available.
+    pub manifest_hash: Option<String>,
+    /// Manifest external-facts fingerprint when available.
+    pub manifest_external_facts_fingerprint: Option<String>,
+    /// Graph-visible reference edge count.
+    pub reference_edge_count: usize,
+    /// Graph-visible exact compiler reference edge count.
+    pub exact_compiler_reference_edge_count: usize,
+}
+
 /// A typed project-model context source prepared by an adapter layer.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProjectModelContextSource {
@@ -145,6 +166,14 @@ impl ProjectModelContextSource {
     }
 }
 
+struct ProjectModelContextRenderRoot<'a> {
+    workspace_root: &'a str,
+    manifest_path: &'a str,
+    freshness: &'a str,
+    provenance: &'a str,
+    exact_fact_readiness: Option<&'a ProjectModelExactFactReadinessMetadata>,
+}
+
 /// Renders dynamic project-model context under a typed budget.
 ///
 /// # Arguments
@@ -153,6 +182,7 @@ impl ProjectModelContextSource {
 /// * `manifest_path` - Display path for the local project-model manifest.
 /// * `freshness` - Root freshness label.
 /// * `provenance` - Root provenance label.
+/// * `exact_fact_readiness` - Compact read-only exact-fact readiness metadata.
 /// * `sources` - Candidate evidence sources in caller-selected ranking order.
 /// * `budget` - Rendering budget that bounds sources, lines, and characters.
 pub fn render_project_model_context(
@@ -160,35 +190,26 @@ pub fn render_project_model_context(
     manifest_path: &str,
     freshness: &str,
     provenance: &str,
+    exact_fact_readiness: Option<&ProjectModelExactFactReadinessMetadata>,
     sources: &[ProjectModelContextSource],
     budget: &ProjectModelContextRenderBudget,
 ) -> String {
-    let rendered = render_project_model_context_inner(
+    let root = ProjectModelContextRenderRoot {
         workspace_root,
         manifest_path,
         freshness,
         provenance,
-        sources,
-        budget,
-        false,
-    );
+        exact_fact_readiness,
+    };
+    let rendered = render_project_model_context_inner(&root, sources, budget, false);
     if rendered.chars().count() <= budget.max_rendered_chars {
         return rendered;
     }
-    let metadata_only = render_project_model_context_inner(
-        workspace_root,
-        manifest_path,
-        freshness,
-        provenance,
-        sources,
-        budget,
-        true,
-    );
+    let metadata_only = render_project_model_context_inner(&root, sources, budget, true);
     if metadata_only.chars().count() <= budget.max_rendered_chars {
         return metadata_only;
     }
-    let minimal =
-        render_minimal_project_model_context(workspace_root, manifest_path, freshness, provenance);
+    let minimal = render_minimal_project_model_context(&root);
     truncate_rendered_context(minimal, budget.max_rendered_chars)
 }
 
@@ -200,24 +221,23 @@ fn truncate_rendered_context(rendered: String, max_chars: usize) -> String {
 }
 
 fn render_project_model_context_inner(
-    workspace_root: &str,
-    manifest_path: &str,
-    freshness: &str,
-    provenance: &str,
+    root: &ProjectModelContextRenderRoot<'_>,
     sources: &[ProjectModelContextSource],
     budget: &ProjectModelContextRenderBudget,
     force_metadata_only: bool,
 ) -> String {
     let mut rendered = String::new();
     rendered.push_str(&format!(
-        "<project_model_context workspace_root=\"{}\" manifest_path=\"{}\" freshness=\"{}\" provenance=\"{}\" rendered_source_limit=\"{}\" max_total_content_chars=\"{}\">",
-        xml_attr(workspace_root),
-        xml_attr(manifest_path),
-        xml_attr(freshness),
-        xml_attr(provenance),
+        "<project_model_context workspace_root=\"{}\" manifest_path=\"{}\" freshness=\"{}\" provenance=\"{}\" rendered_source_limit=\"{}\" max_total_content_chars=\"{}\"",
+        xml_attr(root.workspace_root),
+        xml_attr(root.manifest_path),
+        xml_attr(root.freshness),
+        xml_attr(root.provenance),
         budget.max_sources,
         budget.max_total_content_chars,
     ));
+    render_exact_fact_readiness_attrs(&mut rendered, root.exact_fact_readiness, budget);
+    rendered.push('>');
 
     let mut remaining_content_chars = budget.max_total_content_chars;
     for source in sources.iter().take(budget.max_sources) {
@@ -231,19 +251,58 @@ fn render_project_model_context_inner(
     rendered
 }
 
-fn render_minimal_project_model_context(
-    workspace_root: &str,
-    manifest_path: &str,
-    freshness: &str,
-    provenance: &str,
-) -> String {
-    format!(
-        "<project_model_context workspace_root=\"{}\" manifest_path=\"{}\" freshness=\"{}\" provenance=\"{}\" omitted_reason=\"rendered_context_budget_exceeded\" />",
-        xml_attr(truncate_attr(workspace_root, 64)),
-        xml_attr(truncate_attr(manifest_path, 64)),
-        xml_attr(truncate_attr(freshness, 64)),
-        xml_attr(truncate_attr(provenance, 64)),
-    )
+fn render_minimal_project_model_context(root: &ProjectModelContextRenderRoot<'_>) -> String {
+    let mut rendered = format!(
+        "<project_model_context workspace_root=\"{}\" manifest_path=\"{}\" freshness=\"{}\" provenance=\"{}\" omitted_reason=\"rendered_context_budget_exceeded\"",
+        xml_attr(truncate_attr(root.workspace_root, 64)),
+        xml_attr(truncate_attr(root.manifest_path, 64)),
+        xml_attr(truncate_attr(root.freshness, 64)),
+        xml_attr(truncate_attr(root.provenance, 64)),
+    );
+    let budget = ProjectModelContextRenderBudget::default();
+    render_exact_fact_readiness_attrs(&mut rendered, root.exact_fact_readiness, &budget);
+    rendered.push_str(" />");
+    rendered
+}
+
+fn render_exact_fact_readiness_attrs(
+    rendered: &mut String,
+    readiness: Option<&ProjectModelExactFactReadinessMetadata>,
+    budget: &ProjectModelContextRenderBudget,
+) {
+    let Some(readiness) = readiness else {
+        rendered.push_str(" exact_fact_readiness=\"not_evaluated\"");
+        return;
+    };
+    rendered.push_str(&format!(
+        " exact_fact_readiness=\"evaluated\" exact_fact_status=\"{}\" exact_facts_active=\"{}\" exact_fact_issue_count=\"{}\" reference_edge_count=\"{}\" exact_compiler_reference_edge_count=\"{}\"",
+        xml_attr(&readiness.status_label),
+        readiness.exact_facts_active,
+        readiness.issue_count,
+        readiness.reference_edge_count,
+        readiness.exact_compiler_reference_edge_count,
+    ));
+    if let Some(manifest_hash) = &readiness.manifest_hash {
+        rendered.push_str(&format!(
+            " manifest_hash=\"{}\"",
+            xml_attr(truncate_attr(manifest_hash, budget.max_metadata_attr_chars))
+        ));
+    }
+    if let Some(fingerprint) = &readiness.manifest_external_facts_fingerprint {
+        rendered.push_str(&format!(
+            " manifest_external_facts_fingerprint=\"{}\"",
+            xml_attr(truncate_attr(fingerprint, budget.max_metadata_attr_chars))
+        ));
+    }
+    if !readiness.issue_summaries.is_empty() {
+        rendered.push_str(&format!(
+            " exact_fact_issue_summaries=\"{}\"",
+            xml_attr(truncate_attr(
+                &readiness.issue_summaries.join(";"),
+                budget.max_metadata_attr_chars,
+            ))
+        ));
+    }
 }
 
 struct RenderedSourceContent {
@@ -496,6 +555,7 @@ mod tests {
             "/workspace/.forge_project_model/project_manifest.json",
             "local_manifest_available",
             "WorkspaceService::query_workspace",
+            None,
             &setup,
             &ProjectModelContextRenderBudget::default(),
         );
@@ -510,6 +570,44 @@ mod tests {
                 actual.contains("content_digest=\""),
                 actual.contains("pub fn needle() -> usize { 42 }"),
                 actual.contains("truncated_reason"),
+            ),
+            expected,
+        );
+    }
+
+    #[test]
+    fn renderer_includes_exact_fact_readiness_metadata() {
+        let setup = vec![fixture_source("pub fn needle() -> usize { 42 }")];
+        let readiness = ProjectModelExactFactReadinessMetadata {
+            status_label: "active".to_string(),
+            exact_facts_active: true,
+            issue_count: 1,
+            issue_summaries: vec!["safe_issue".to_string()],
+            manifest_hash: Some("manifest-hash".to_string()),
+            manifest_external_facts_fingerprint: Some("external-fingerprint".to_string()),
+            reference_edge_count: 4,
+            exact_compiler_reference_edge_count: 3,
+        };
+
+        let actual = render_project_model_context(
+            "/workspace",
+            "/manifest",
+            "fresh",
+            "test",
+            Some(&readiness),
+            &setup,
+            &ProjectModelContextRenderBudget::default(),
+        );
+        let expected = (true, true, true, true, true, true);
+
+        assert_eq!(
+            (
+                actual.contains("exact_fact_readiness=\"evaluated\""),
+                actual.contains("exact_fact_status=\"active\""),
+                actual.contains("exact_facts_active=\"true\""),
+                actual.contains("exact_fact_issue_count=\"1\""),
+                actual.contains("manifest_external_facts_fingerprint=\"external-fingerprint\""),
+                actual.contains("exact_fact_issue_summaries=\"safe_issue\""),
             ),
             expected,
         );
@@ -537,6 +635,7 @@ mod tests {
             "/manifest",
             "fresh",
             "test",
+            None,
             &setup,
             &budget,
         );
@@ -568,6 +667,7 @@ mod tests {
             "/manifest",
             "fresh",
             "test",
+            None,
             &setup,
             &budget,
         );
@@ -595,6 +695,7 @@ mod tests {
             "/manifest",
             "fresh",
             "test",
+            None,
             &setup,
             &ProjectModelContextRenderBudget::default(),
         );
@@ -637,6 +738,7 @@ mod tests {
             "/manifest",
             "fresh",
             "test",
+            None,
             &setup,
             &budget,
         );

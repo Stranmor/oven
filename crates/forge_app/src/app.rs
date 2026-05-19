@@ -13,9 +13,10 @@ use forge_project_model::{
     LearningRedactionStatus as ProjectLearningRedactionStatus,
     LearningReviewState as ProjectLearningReviewState,
     LearningSourceKind as ProjectLearningSourceKind, ProjectContextTarget,
-    ProjectModelContextRenderBudget, ProjectModelSourceNode, TargetResolutionBudget,
-    directory_path_filter, local_project_model_manifest, mentioned_paths,
-    render_project_model_context, render_sources_from_nodes,
+    ProjectModelContextRenderBudget, ProjectModelExactFactReadinessMetadata,
+    ProjectModelSourceNode, TargetResolutionBudget, directory_path_filter,
+    local_project_model_manifest, mentioned_paths, render_project_model_context,
+    render_sources_from_nodes,
 };
 use forge_stream::MpscStream;
 use url::Url;
@@ -57,6 +58,11 @@ pub(crate) fn build_template_config(config: &ForgeConfig) -> forge_domain::Templ
         stdout_max_suffix_length: config.max_stdout_suffix_lines,
         stdout_max_line_length: config.max_stdout_line_chars,
     }
+}
+
+struct ProjectContextTargetDiagnostic {
+    target: ProjectContextTarget,
+    diagnostic: WorkspaceContextManifestDiagnostic,
 }
 
 struct ProjectContextInjection<S> {
@@ -208,7 +214,8 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
 
         let max_sources = ProjectModelContextRenderBudget::default().max_sources;
         let mut rendered_contexts = Vec::new();
-        for target in targets {
+        for target_diagnostic in targets {
+            let target = target_diagnostic.target;
             let mut params = SearchParams::new(&query, "automatic project-model context injection")
                 .limit(max_sources);
             if let Some(path_filter) = target.path_filter.clone() {
@@ -228,7 +235,11 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
             if nodes.is_empty() {
                 continue;
             }
-            rendered_contexts.push(Self::render_context(&target.workspace_root, nodes));
+            rendered_contexts.push(Self::render_context(
+                &target.workspace_root,
+                target_diagnostic.diagnostic.exact_fact_readiness.as_ref(),
+                nodes,
+            ));
         }
         if rendered_contexts.is_empty() {
             return conversation;
@@ -262,6 +273,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
         );
         let mut candidate_diagnostics = Vec::new();
         let mut selected_targets = Vec::new();
+        let mut nearest_skipped_manifest_candidates = Vec::new();
         let mut target_specs = Vec::new();
         let mut seen = BTreeSet::new();
         for candidate in candidates {
@@ -274,13 +286,18 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
                 });
                 break;
             }
-            let (candidate_diagnostic, manifest_diagnostic, target) =
+            let (candidate_diagnostic, manifest_diagnostic, skipped_manifest_diagnostic, target) =
                 self.resolve_target_diagnostic(candidate, &mut budget).await;
             if let (Some(manifest_diagnostic), Some(target)) = (manifest_diagnostic, target) {
                 if seen.insert(target.clone()) {
-                    selected_targets.push(manifest_diagnostic);
-                    target_specs.push(target);
+                    selected_targets.push(manifest_diagnostic.clone());
+                    target_specs.push(ProjectContextTargetDiagnostic {
+                        target,
+                        diagnostic: manifest_diagnostic,
+                    });
                 }
+            } else if let Some(skipped_manifest_diagnostic) = skipped_manifest_diagnostic {
+                nearest_skipped_manifest_candidates.push(skipped_manifest_diagnostic);
             }
             candidate_diagnostics.push(candidate_diagnostic);
             if target_specs.len() >= Self::MAX_TARGETS {
@@ -292,7 +309,8 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
         let mut would_inject = false;
         if let Some(query) = query.as_deref() {
             let max_sources = ProjectModelContextRenderBudget::default().max_sources;
-            for target in &target_specs {
+            for target_diagnostic in &target_specs {
+                let target = &target_diagnostic.target;
                 let mut params =
                     SearchParams::new(query, "automatic project-model context injection")
                         .limit(max_sources);
@@ -333,6 +351,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
             query,
             candidates: candidate_diagnostics,
             selected_targets,
+            nearest_skipped_manifest_candidates,
             retrieval_empty_targets,
             would_inject,
             skip_reason,
@@ -346,6 +365,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
     ) -> (
         WorkspaceContextCandidateDiagnostic,
         Option<WorkspaceContextManifestDiagnostic>,
+        Option<WorkspaceContextManifestDiagnostic>,
         Option<ProjectContextTarget>,
     ) {
         let candidate_path = path.clone();
@@ -358,6 +378,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
                         path_filter: None,
                         skip_reason: Some("index freshness probe limit reached".to_string()),
                     },
+                    None,
                     None,
                     None,
                 );
@@ -382,6 +403,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
                         },
                         None,
                         None,
+                        None,
                     );
                 }
             };
@@ -395,6 +417,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
                             skip_reason: Some(Self::manifest_skip_reason(&diagnostic)),
                         },
                         None,
+                        Some(diagnostic),
                         None,
                     );
                 }
@@ -411,6 +434,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
                     skip_reason: None,
                 },
                 Some(diagnostic),
+                None,
                 Some(target),
             );
         }
@@ -423,6 +447,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
                     "no fresh project-model manifest found in candidate ancestors".to_string(),
                 ),
             },
+            None,
             None,
             None,
         )
@@ -450,7 +475,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
         &self,
         environment: &Environment,
         latest_user_message: &str,
-    ) -> Vec<ProjectContextTarget> {
+    ) -> Vec<ProjectContextTargetDiagnostic> {
         let mut candidates = vec![environment.cwd.clone()];
         candidates.extend(mentioned_paths(
             latest_user_message,
@@ -468,11 +493,12 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
             if !budget.claim_candidate() {
                 break;
             }
-            let Some(target) = self.resolve_target(candidate, &mut budget).await else {
+            let Some((target, diagnostic)) = self.resolve_target(candidate, &mut budget).await
+            else {
                 continue;
             };
             if seen.insert(target.clone()) {
-                targets.push(target);
+                targets.push(ProjectContextTargetDiagnostic { target, diagnostic });
             }
             if targets.len() >= Self::MAX_TARGETS {
                 break;
@@ -485,7 +511,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
         &self,
         path: PathBuf,
         budget: &mut TargetResolutionBudget,
-    ) -> Option<ProjectContextTarget> {
+    ) -> Option<(ProjectContextTarget, WorkspaceContextManifestDiagnostic)> {
         for ancestor in path.ancestors() {
             if !budget.claim_index_probe() {
                 return None;
@@ -511,7 +537,10 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
             }
             let workspace_root = ancestor.to_path_buf();
             let path_filter = directory_path_filter(&path, &workspace_root);
-            return Some(ProjectContextTarget::new(workspace_root, path_filter));
+            return Some((
+                ProjectContextTarget::new(workspace_root, path_filter),
+                diagnostic,
+            ));
         }
         None
     }
@@ -540,21 +569,44 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
             .filter(|content| !content.is_empty())
     }
 
-    fn render_context(workspace_root: &std::path::Path, nodes: Vec<Node>) -> String {
+    fn render_context(
+        workspace_root: &std::path::Path,
+        exact_fact_readiness: Option<&WorkspaceExactFactReadinessDiagnostic>,
+        nodes: Vec<Node>,
+    ) -> String {
         let manifest_path = local_project_model_manifest(workspace_root);
         let source_nodes = nodes
             .into_iter()
             .map(Self::source_node_from_node)
             .collect::<Vec<_>>();
         let sources = render_sources_from_nodes(source_nodes);
+        let exact_fact_readiness = exact_fact_readiness.map(Self::exact_fact_readiness_metadata);
         render_project_model_context(
             &workspace_root.display().to_string(),
             &manifest_path.display().to_string(),
             "local_manifest_available",
             "WorkspaceService::query_workspace",
+            exact_fact_readiness.as_ref(),
             &sources,
             &ProjectModelContextRenderBudget::default(),
         )
+    }
+
+    fn exact_fact_readiness_metadata(
+        readiness: &WorkspaceExactFactReadinessDiagnostic,
+    ) -> ProjectModelExactFactReadinessMetadata {
+        ProjectModelExactFactReadinessMetadata {
+            status_label: readiness.status_label.clone(),
+            exact_facts_active: readiness.exact_facts_active,
+            issue_count: readiness.issue_count,
+            issue_summaries: readiness.issue_summaries.clone(),
+            manifest_hash: readiness.manifest_hash.clone(),
+            manifest_external_facts_fingerprint: readiness
+                .manifest_external_facts_fingerprint
+                .clone(),
+            reference_edge_count: readiness.reference_edge_count,
+            exact_compiler_reference_edge_count: readiness.exact_compiler_reference_edge_count,
+        }
     }
 
     fn source_node_from_node(node: Node) -> ProjectModelSourceNode {
@@ -1579,6 +1631,7 @@ mod tests {
                 freshness: WorkspaceContextFreshness::Unknown {
                     reason: "runtime proof does not index workspace".to_string(),
                 },
+                exact_fact_readiness: None,
             })
         }
 
@@ -1961,6 +2014,7 @@ mod tests {
         error_paths: Vec<PathBuf>,
         stale_paths: Vec<PathBuf>,
         unknown_paths: Vec<PathBuf>,
+        inactive_exact_fact_paths: Vec<PathBuf>,
         captured_context: Mutex<Option<Context>>,
         workspace_queries: AtomicUsize,
         queried_workspaces: Mutex<Vec<PathBuf>>,
@@ -1972,8 +2026,9 @@ mod tests {
 
     impl ProjectContextHarness {
         fn new(cwd: PathBuf) -> Arc<Self> {
-            Self::new_with_empty_error_stale_and_unknown_paths(
+            Self::new_with_empty_error_stale_unknown_and_inactive_exact_fact_paths(
                 cwd,
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -1982,9 +2037,10 @@ mod tests {
         }
 
         fn new_with_empty_paths(cwd: PathBuf, empty_paths: Vec<PathBuf>) -> Arc<Self> {
-            Self::new_with_empty_error_stale_and_unknown_paths(
+            Self::new_with_empty_error_stale_unknown_and_inactive_exact_fact_paths(
                 cwd,
                 empty_paths,
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -1992,41 +2048,59 @@ mod tests {
         }
 
         fn new_with_error_paths(cwd: PathBuf, error_paths: Vec<PathBuf>) -> Arc<Self> {
-            Self::new_with_empty_error_stale_and_unknown_paths(
+            Self::new_with_empty_error_stale_unknown_and_inactive_exact_fact_paths(
                 cwd,
                 Vec::new(),
                 error_paths,
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
             )
         }
 
         fn new_with_stale_paths(cwd: PathBuf, stale_paths: Vec<PathBuf>) -> Arc<Self> {
-            Self::new_with_empty_error_stale_and_unknown_paths(
+            Self::new_with_empty_error_stale_unknown_and_inactive_exact_fact_paths(
                 cwd,
                 Vec::new(),
                 Vec::new(),
                 stale_paths,
                 Vec::new(),
+                Vec::new(),
             )
         }
 
         fn new_with_unknown_paths(cwd: PathBuf, unknown_paths: Vec<PathBuf>) -> Arc<Self> {
-            Self::new_with_empty_error_stale_and_unknown_paths(
+            Self::new_with_empty_error_stale_unknown_and_inactive_exact_fact_paths(
                 cwd,
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 unknown_paths,
+                Vec::new(),
             )
         }
 
-        fn new_with_empty_error_stale_and_unknown_paths(
+        fn new_with_inactive_exact_fact_paths(
+            cwd: PathBuf,
+            inactive_exact_fact_paths: Vec<PathBuf>,
+        ) -> Arc<Self> {
+            Self::new_with_empty_error_stale_unknown_and_inactive_exact_fact_paths(
+                cwd,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                inactive_exact_fact_paths,
+            )
+        }
+
+        fn new_with_empty_error_stale_unknown_and_inactive_exact_fact_paths(
             cwd: PathBuf,
             empty_paths: Vec<PathBuf>,
             error_paths: Vec<PathBuf>,
             stale_paths: Vec<PathBuf>,
             unknown_paths: Vec<PathBuf>,
+            inactive_exact_fact_paths: Vec<PathBuf>,
         ) -> Arc<Self> {
             Arc::new(Self {
                 cwd,
@@ -2034,6 +2108,7 @@ mod tests {
                 error_paths,
                 stale_paths,
                 unknown_paths,
+                inactive_exact_fact_paths,
                 captured_context: Mutex::new(None),
                 workspace_queries: AtomicUsize::new(0),
                 queried_workspaces: Mutex::new(Vec::new()),
@@ -2235,11 +2310,48 @@ mod tests {
                     reason: "project-model manifest not found".to_string(),
                 }
             };
+            let exact_fact_readiness = manifest_found.then(|| {
+                if self
+                    .inactive_exact_fact_paths
+                    .iter()
+                    .any(|inactive_path| inactive_path == path)
+                {
+                    WorkspaceExactFactReadinessDiagnostic {
+                        status_label: "accepted_but_no_graph_edges".to_string(),
+                        exact_facts_active: false,
+                        issue_count: 2,
+                        issue_summaries: vec![
+                            "accepted_but_no_graph_edges".to_string(),
+                            "redaction_safe_fixture_issue".to_string(),
+                        ],
+                        manifest_hash: Some("fixture-manifest-hash".to_string()),
+                        manifest_external_facts_fingerprint: Some(
+                            "fixture-external-facts".to_string(),
+                        ),
+                        reference_edge_count: 0,
+                        exact_compiler_reference_edge_count: 0,
+                    }
+                } else {
+                    WorkspaceExactFactReadinessDiagnostic {
+                        status_label: "active".to_string(),
+                        exact_facts_active: true,
+                        issue_count: 0,
+                        issue_summaries: Vec::new(),
+                        manifest_hash: Some("fixture-manifest-hash".to_string()),
+                        manifest_external_facts_fingerprint: Some(
+                            "fixture-external-facts".to_string(),
+                        ),
+                        reference_edge_count: 2,
+                        exact_compiler_reference_edge_count: 1,
+                    }
+                }
+            });
             Ok(WorkspaceContextManifestDiagnostic {
                 workspace_root: path.to_path_buf(),
                 manifest_found,
                 manifest_path,
                 freshness,
+                exact_fact_readiness,
             })
         }
 
@@ -2980,6 +3092,169 @@ mod tests {
                 actual.skip_reason,
             ),
             expected
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_context_reports_exact_fact_active_for_selected_target() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root.clone());
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
+
+        let actual = ProjectContextInjection::new(setup, agent)
+            .explain(Some("find automatic injection needle".to_string()))
+            .await;
+        let actual_readiness = actual.selected_targets[0]
+            .exact_fact_readiness
+            .as_ref()
+            .unwrap();
+        let expected = (true, "active", 2usize, 1usize);
+
+        assert_eq!(
+            (
+                actual_readiness.exact_facts_active,
+                actual_readiness.status_label.as_str(),
+                actual_readiness.reference_edge_count,
+                actual_readiness.exact_compiler_reference_edge_count,
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_context_reports_exact_fact_inactive_without_blocking_manifest_injection()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new_with_inactive_exact_fact_paths(
+            root.clone(),
+            vec![root.clone()],
+        );
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
+
+        let actual = ProjectContextInjection::new(setup, agent)
+            .explain(Some("find automatic injection needle".to_string()))
+            .await;
+        let actual_readiness = actual.selected_targets[0]
+            .exact_fact_readiness
+            .as_ref()
+            .unwrap();
+        let expected = (true, false, "accepted_but_no_graph_edges");
+
+        assert_eq!(
+            (
+                actual.would_inject,
+                actual_readiness.exact_facts_active,
+                actual_readiness.status_label.as_str(),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_model_context_injection_renders_exact_fact_readiness_metadata() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root.clone());
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let conversation = Conversation::generate().context(Context::default().add_message(
+            ContextMessage::user("find automatic injection needle", Some(model_id)),
+        ));
+
+        let actual = ProjectContextInjection::new(setup.clone(), agent)
+            .inject(conversation)
+            .await;
+        let actual_context = actual
+            .context
+            .unwrap()
+            .messages
+            .into_iter()
+            .filter_map(|message| message.content().map(str::to_string))
+            .find(|content| content.contains("<project_model_context"))
+            .unwrap();
+        let expected = (true, true, true, false);
+
+        assert_eq!(
+            (
+                actual_context.contains("exact_fact_readiness=\"evaluated\""),
+                actual_context.contains("exact_fact_status=\"active\""),
+                actual_context
+                    .contains("manifest_external_facts_fingerprint=\"fixture-external-facts\""),
+                actual_context.contains("local_manifest_available\"")
+                    && !actual_context.contains("exact_fact_readiness"),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn project_model_context_exact_fact_readiness_does_not_change_can_inject() {
+        let setup = WorkspaceContextManifestDiagnostic {
+            workspace_root: PathBuf::from("/workspace"),
+            manifest_path: PathBuf::from("/workspace/.forge_project_model/project_manifest.json"),
+            manifest_found: true,
+            freshness: WorkspaceContextFreshness::Fresh,
+            exact_fact_readiness: Some(WorkspaceExactFactReadinessDiagnostic {
+                status_label: "accepted_but_no_graph_edges".to_string(),
+                exact_facts_active: false,
+                issue_count: 1,
+                issue_summaries: vec!["inactive".to_string()],
+                manifest_hash: Some("hash".to_string()),
+                manifest_external_facts_fingerprint: Some("fingerprint".to_string()),
+                reference_edge_count: 0,
+                exact_compiler_reference_edge_count: 0,
+            }),
+        };
+        let actual = setup.can_inject();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn exact_fact_readiness_checks_stay_inside_existing_target_resolution_budget()
+    -> Result<()> {
+        let fixture = TempDir::new()?;
+        let cwd = fixture.path().join("workspace");
+        create_indexed_workspace(&cwd)?;
+        let setup = ProjectContextHarness::new(cwd.clone());
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let mentions = (0..64)
+            .map(|index| {
+                fixture
+                    .path()
+                    .join(format!("unindexed-{index}/src/lib.rs"))
+                    .display()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let actual = ProjectContextInjection::new(setup.clone(), agent)
+            .explain(Some(format!(
+                "find automatic injection needle in {mentions}"
+            )))
+            .await;
+        let expected = (32usize, 1usize, 1usize);
+
+        assert_eq!(
+            (
+                setup.index_checks.load(Ordering::SeqCst),
+                actual.selected_targets.len(),
+                actual
+                    .candidates
+                    .iter()
+                    .filter(|candidate| candidate.skip_reason.as_deref()
+                        == Some("candidate limit reached"))
+                    .count(),
+            ),
+            expected,
         );
         Ok(())
     }

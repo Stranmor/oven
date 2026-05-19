@@ -19,6 +19,7 @@ use forge_config::ForgeConfig;
 use forge_display::MarkdownFormat;
 use forge_domain::{
     AuthMethod, ChatResponseContent, ConsoleWriter, ContextMessage, Role, TitleFormat, UserCommand,
+    WorkspaceExactFactReadinessDiagnostic,
 };
 use forge_fs::ForgeFS;
 use forge_select::{ForgeWidget, SelectRow};
@@ -5573,13 +5574,34 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             info = info.add_key_value(
                 "Target",
                 format!(
-                    "workspace={} manifest_found={} manifest_path={} freshness={}",
+                    "workspace={} manifest_found={} manifest_path={} freshness={} exact_fact_readiness={}",
                     target.workspace_root.display(),
                     target.manifest_found,
                     target.manifest_path.display(),
-                    target.freshness.label()
+                    target.freshness.label(),
+                    Self::format_exact_fact_readiness(target.exact_fact_readiness.as_ref())
                 ),
             );
+        }
+
+        if !explanation.nearest_skipped_manifest_candidates.is_empty() {
+            info = info.add_title(format!(
+                "Nearest Skipped Manifest Candidates [{}]",
+                explanation.nearest_skipped_manifest_candidates.len()
+            ));
+            for target in &explanation.nearest_skipped_manifest_candidates {
+                info = info.add_key_value(
+                    "Skipped Manifest",
+                    format!(
+                        "workspace={} manifest_found={} manifest_path={} freshness={} exact_fact_readiness={}",
+                        target.workspace_root.display(),
+                        target.manifest_found,
+                        target.manifest_path.display(),
+                        target.freshness.label(),
+                        Self::format_exact_fact_readiness(target.exact_fact_readiness.as_ref())
+                    ),
+                );
+            }
         }
 
         if !explanation.retrieval_empty_targets.is_empty() {
@@ -5590,6 +5612,29 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         }
 
         self.writeln(info)
+    }
+
+    fn format_exact_fact_readiness(
+        readiness: Option<&WorkspaceExactFactReadinessDiagnostic>,
+    ) -> String {
+        readiness.map_or_else(
+            || "not_evaluated".to_string(),
+            |readiness| {
+                format!(
+                    "status={} active={} issues={} manifest_hash={} external_facts_fingerprint={} reference_edges={} exact_compiler_reference_edges={}",
+                    readiness.status_label,
+                    readiness.exact_facts_active,
+                    readiness.issue_count,
+                    readiness.manifest_hash.as_deref().unwrap_or("unknown"),
+                    readiness
+                        .manifest_external_facts_fingerprint
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                    readiness.reference_edge_count,
+                    readiness.exact_compiler_reference_edge_count,
+                )
+            },
+        )
     }
 
     /// Displays sync status for all files in the workspace.

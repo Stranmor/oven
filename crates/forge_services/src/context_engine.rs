@@ -9,7 +9,8 @@ use forge_domain::{
     AuthCredential, AuthDetails, FileChunk, Node, NodeData, NodeId, ProviderId, ProviderRepository,
     SearchParams, SyncProgress, UserId, WorkspaceContextFreshness,
     WorkspaceContextManifestDiagnostic, WorkspaceExactFactBoundedLoss,
-    WorkspaceExactFactIngestionSummary, WorkspaceExactFactIssue, WorkspaceExactFactReferenceReport,
+    WorkspaceExactFactIngestionSummary, WorkspaceExactFactIssue,
+    WorkspaceExactFactReadinessDiagnostic, WorkspaceExactFactReferenceReport,
     WorkspaceExactFactReferenceStatus, WorkspaceExactFactStatusReport, WorkspaceId,
     WorkspaceIndexRepository,
 };
@@ -33,6 +34,7 @@ use crate::sync::{WorkspaceSyncEngine, canonicalize_path};
 const PROJECT_MODEL_SEARCH_TOOL: &str = "project_model_search";
 const PROJECT_MODEL_SEARCH_SUCCESS: &str = "success";
 const PROJECT_MODEL_SEARCH_PROVENANCE_SOURCE: &str = "WorkspaceService::query_workspace";
+const EXACT_FACT_READINESS_MAX_ISSUES: usize = 8;
 
 /// Service for indexing workspaces and performing semantic search.
 ///
@@ -523,6 +525,27 @@ fn unavailable_report(
     }
 }
 
+fn workspace_exact_fact_readiness_diagnostic(
+    report: forge_project_model::ExactFactStatusReport,
+) -> WorkspaceExactFactReadinessDiagnostic {
+    let issue_count = report.issue_summaries.len();
+    let issue_summaries = report
+        .issue_summaries
+        .into_iter()
+        .take(EXACT_FACT_READINESS_MAX_ISSUES)
+        .collect();
+    WorkspaceExactFactReadinessDiagnostic {
+        status_label: report.status.label().to_string(),
+        exact_facts_active: report.exact_facts_active,
+        issue_count,
+        issue_summaries,
+        manifest_hash: report.manifest_hash,
+        manifest_external_facts_fingerprint: report.manifest_external_facts_fingerprint,
+        reference_edge_count: report.reference_edge_count,
+        exact_compiler_reference_edge_count: report.exact_compiler_reference_edge_count,
+    }
+}
+
 fn workspace_exact_fact_status_report(
     report: forge_project_model::ExactFactStatusReport,
 ) -> WorkspaceExactFactStatusReport {
@@ -644,6 +667,22 @@ fn workspace_exact_fact_issue(issue: &ExternalFactIngestionIssue) -> WorkspaceEx
     }
 }
 
+fn evaluate_exact_fact_readiness(path: &Path) -> Option<WorkspaceExactFactReadinessDiagnostic> {
+    match read_exact_fact_status(path) {
+        Ok(report) => Some(workspace_exact_fact_readiness_diagnostic(report)),
+        Err(error) => Some(WorkspaceExactFactReadinessDiagnostic {
+            status_label: "status_unreadable".to_string(),
+            exact_facts_active: false,
+            issue_count: 1,
+            issue_summaries: vec![format!("status_unreadable: {error}")],
+            manifest_hash: None,
+            manifest_external_facts_fingerprint: None,
+            reference_edge_count: 0,
+            exact_compiler_reference_edge_count: 0,
+        }),
+    }
+}
+
 fn evaluate_project_model_context(path: &Path) -> WorkspaceContextManifestDiagnostic {
     let manifest_path = local_project_model_manifest(path);
     if !path.is_dir() || !manifest_path.is_file() {
@@ -654,8 +693,10 @@ fn evaluate_project_model_context(path: &Path) -> WorkspaceContextManifestDiagno
             freshness: WorkspaceContextFreshness::Unknown {
                 reason: "project-model manifest not found".to_string(),
             },
+            exact_fact_readiness: None,
         };
     }
+    let exact_fact_readiness = evaluate_exact_fact_readiness(path);
 
     let indexer = ProjectIndexer::new(path, local_project_model_dir(path));
     let freshness = match indexer
@@ -679,6 +720,7 @@ fn evaluate_project_model_context(path: &Path) -> WorkspaceContextManifestDiagno
         manifest_path,
         manifest_found: true,
         freshness,
+        exact_fact_readiness,
     }
 }
 
@@ -916,6 +958,7 @@ mod tests {
         WorkspaceFiles, WorkspaceInfo,
     };
     use forge_project_model::{
+        ExactFactArtifactStoreState, ExactFactStatus, ExactFactStatusReport,
         ExternalFactArtifactIngestionReport, ExternalFactBatch, ExternalFactBatchMetadata,
         ExternalFactIngestionIssueCode, ExternalFactProductionReport, ExternalFactProductionStatus,
         ExternalFactSource, FreshnessState, GraphEdgeKind, NativeLspReferenceRequest,
@@ -1345,6 +1388,82 @@ mod tests {
         let setup = ProjectIndexer::new(root, local_project_model_dir(root));
         let manifest = setup.index()?;
         setup.write_manifest(&manifest)
+    }
+
+    #[test]
+    fn service_maps_exact_fact_readiness_active_and_inactive_issue_summaries() {
+        let setup = ExactFactStatusReport {
+            status: ExactFactStatus::AcceptedButNoGraphEdges,
+            manifest_path: PathBuf::from("/workspace/.forge_project_model/project_manifest.json"),
+            manifest_hash: Some("manifest-hash".to_string()),
+            manifest_freshness_proof_level: None,
+            ingestion_report_path: PathBuf::from(
+                "/workspace/.forge_project_model/external_fact_ingestion_report.json",
+            ),
+            artifact_store_state: ExactFactArtifactStoreState::Present,
+            inspected_artifact_count: 3,
+            accepted_artifact_count: 1,
+            accepted_batch_fingerprints: vec!["batch".to_string()],
+            manifest_external_fact_batch_count: 1,
+            manifest_external_facts_fingerprint: Some("external-fingerprint".to_string()),
+            reference_edge_count: 2,
+            exact_compiler_reference_edge_count: 0,
+            issue_summaries: (0..12).map(|index| format!("safe_issue_{index}")).collect(),
+            exact_facts_active: false,
+        };
+
+        let actual = workspace_exact_fact_readiness_diagnostic(setup);
+        let expected = (
+            "accepted_but_no_graph_edges",
+            false,
+            12usize,
+            8usize,
+            Some("manifest-hash"),
+            Some("external-fingerprint"),
+            2usize,
+            0usize,
+        );
+
+        assert_eq!(
+            (
+                actual.status_label.as_str(),
+                actual.exact_facts_active,
+                actual.issue_count,
+                actual.issue_summaries.len(),
+                actual.manifest_hash.as_deref(),
+                actual.manifest_external_facts_fingerprint.as_deref(),
+                actual.reference_edge_count,
+                actual.exact_compiler_reference_edge_count,
+            ),
+            expected,
+        );
+    }
+
+    #[test]
+    fn exact_fact_readiness_diagnostic_does_not_invoke_producer_or_write_path() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let model_dir = local_project_model_dir(&root);
+        let external_facts_dir = model_dir.join("external_facts");
+        let ingestion_report = forge_project_model::local_project_model_external_fact_report(&root);
+
+        let actual = evaluate_project_model_context(&root);
+        let expected = (true, false, false, false);
+
+        assert_eq!(
+            (
+                actual.exact_fact_readiness.is_some(),
+                external_facts_dir.exists(),
+                ingestion_report.exists(),
+                actual
+                    .exact_fact_readiness
+                    .as_ref()
+                    .unwrap()
+                    .exact_facts_active,
+            ),
+            expected,
+        );
+        Ok(())
     }
 
     #[tokio::test]

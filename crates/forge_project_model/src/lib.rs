@@ -70,7 +70,7 @@ pub use producer::{
 };
 pub use render::{
     DEFAULT_RENDERED_SOURCE_LIMIT, ProjectModelContextRenderBudget, ProjectModelContextSource,
-    render_project_model_context,
+    ProjectModelExactFactReadinessMetadata, render_project_model_context,
 };
 pub use retrieval::{plan_retrieval, retrieve, retrieve_with_boundaries};
 pub use status::{
