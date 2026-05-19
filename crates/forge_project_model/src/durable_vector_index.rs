@@ -362,11 +362,13 @@ impl DurableVectorIndex {
             .artifact
             .entries
             .iter()
-            .map(|entry| VectorSearchHit {
-                id: entry.id.clone(),
-                score: cosine_similarity_unchecked(&query.embedding, &entry.embedding),
+            .map(|entry| {
+                Ok(VectorSearchHit {
+                    id: entry.id.clone(),
+                    score: cosine_similarity_checked(&query.embedding, &entry.embedding)?,
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         hits.sort_by(|left, right| {
             right
                 .score
@@ -390,23 +392,64 @@ fn validate_embedding_values(values: &[f32]) -> Result<()> {
     if values.iter().any(|value| !value.is_finite()) {
         bail!("embedding values must be finite");
     }
-    let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
-    if norm <= 0.0 {
+    let squared_norm = values.iter().try_fold(0.0f32, |sum, value| {
+        let square = value * value;
+        if !square.is_finite() {
+            bail!("embedding norm arithmetic must be finite");
+        }
+        let next = sum + square;
+        if !next.is_finite() {
+            bail!("embedding norm arithmetic must be finite");
+        }
+        Ok(next)
+    })?;
+    if squared_norm <= 0.0 {
         bail!("embedding norm must be non-zero");
     }
     Ok(())
 }
 
-fn cosine_similarity_unchecked(left: &[f32], right: &[f32]) -> f32 {
+fn cosine_similarity_checked(left: &[f32], right: &[f32]) -> Result<f32> {
     let mut dot = 0.0f32;
     let mut left_norm = 0.0f32;
     let mut right_norm = 0.0f32;
     for (left_value, right_value) in left.iter().zip(right) {
-        dot += left_value * right_value;
-        left_norm += left_value * left_value;
-        right_norm += right_value * right_value;
+        let product = left_value * right_value;
+        if !product.is_finite() {
+            bail!("vector similarity dot product arithmetic must be finite");
+        }
+        dot += product;
+        if !dot.is_finite() {
+            bail!("vector similarity dot product arithmetic must be finite");
+        }
+
+        let left_square = left_value * left_value;
+        if !left_square.is_finite() {
+            bail!("vector similarity norm arithmetic must be finite");
+        }
+        left_norm += left_square;
+        if !left_norm.is_finite() {
+            bail!("vector similarity norm arithmetic must be finite");
+        }
+
+        let right_square = right_value * right_value;
+        if !right_square.is_finite() {
+            bail!("vector similarity norm arithmetic must be finite");
+        }
+        right_norm += right_square;
+        if !right_norm.is_finite() {
+            bail!("vector similarity norm arithmetic must be finite");
+        }
     }
-    dot / (left_norm.sqrt() * right_norm.sqrt())
+    let denominator = left_norm.sqrt() * right_norm.sqrt();
+    if denominator <= 0.0 || !denominator.is_finite() {
+        bail!("vector similarity denominator must be finite and non-zero");
+    }
+    let score = dot / denominator;
+    if !score.is_finite() {
+        bail!("vector similarity score must be finite");
+    }
+    Ok(score)
 }
 
 /// Creates vector entries for tests and offline callers from manifest source evidence.
@@ -555,6 +598,14 @@ mod tests {
             .embedding = vec![f32::NAN, 0.0];
         non_finite.index_fingerprint = non_finite.compute_index_fingerprint()?;
 
+        let mut overflowing_norm = artifact.clone();
+        overflowing_norm
+            .entries
+            .first_mut()
+            .expect("fixture artifact should include entries")
+            .embedding = vec![f32::MAX, f32::MAX];
+        overflowing_norm.index_fingerprint = overflowing_norm.compute_index_fingerprint()?;
+
         let mut empty_model = artifact.clone();
         empty_model.embedding_model_id = String::new();
         empty_model.index_fingerprint = empty_model.compute_index_fingerprint()?;
@@ -571,10 +622,11 @@ mod tests {
             empty.validate(&manifest).is_err(),
             zero_norm.validate(&manifest).is_err(),
             non_finite.validate(&manifest).is_err(),
+            overflowing_norm.validate(&manifest).is_err(),
             empty_model.validate(&manifest).is_err(),
             empty_entries.validate(&manifest).is_err(),
         ];
-        let expected = vec![true, true, true, true, true, true, true, true, true];
+        let expected = vec![true, true, true, true, true, true, true, true, true, true];
         assert_eq!(actual, expected);
         Ok(())
     }
@@ -681,9 +733,20 @@ mod tests {
         );
         assert!(
             setup
+                .search_validated(&VectorQuery { embedding: vec![f32::MAX, f32::MAX] })
+                .is_err()
+        );
+        assert!(
+            setup
+                .search(&VectorQuery { embedding: vec![f32::MAX, f32::MAX] })
+                .is_empty()
+        );
+        assert!(
+            setup
                 .search_validated(&VectorQuery { embedding: vec![0.0, 0.0] })
                 .is_err()
         );
+        assert!(actual.iter().all(|hit| hit.score.is_finite()));
         Ok(())
     }
 }
