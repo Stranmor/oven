@@ -395,11 +395,14 @@ impl RedactedLearningSummary {
     pub fn from_raw(raw: impl AsRef<str>) -> Self {
         let mut status = LearningRedactionStatus::Clean;
         let mut redacted_words = Vec::new();
+        let mut redact_next = false;
         for word in raw.as_ref().split_whitespace() {
-            if looks_sensitive(word) {
+            if redact_next || looks_sensitive(word) {
                 status = LearningRedactionStatus::Redacted;
                 redacted_words.push("[REDACTED]".to_string());
+                redact_next = !redact_next && introduces_secret_value(word);
             } else {
+                redact_next = introduces_secret_value(word);
                 redacted_words.push(word.to_string());
             }
         }
@@ -407,6 +410,16 @@ impl RedactedLearningSummary {
         let fingerprint = digest_hex(&summary);
         Self { summary, fingerprint, status }
     }
+}
+
+fn introduces_secret_value(word: &str) -> bool {
+    let lower = word
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "secret" | "token" | "password" | "apikey" | "api_key" | "bearer"
+    )
 }
 
 fn looks_sensitive(word: &str) -> bool {
