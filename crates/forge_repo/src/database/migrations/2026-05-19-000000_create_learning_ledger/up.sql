@@ -2,7 +2,7 @@ CREATE TABLE IF NOT EXISTS learning_ledger_events (
     event_seq INTEGER PRIMARY KEY,
     event_id TEXT NOT NULL UNIQUE,
     record_id TEXT NOT NULL,
-    idempotency_key TEXT NOT NULL UNIQUE,
+    idempotency_key TEXT NOT NULL,
     workspace_id BIGINT NOT NULL,
     event_kind TEXT NOT NULL,
     summary TEXT NOT NULL,
@@ -19,6 +19,9 @@ CREATE TABLE IF NOT EXISTS learning_ledger_events (
     created_at TIMESTAMP NOT NULL,
     schema_version INTEGER NOT NULL
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_learning_ledger_workspace_idempotency
+ON learning_ledger_events(workspace_id, idempotency_key);
 
 CREATE INDEX IF NOT EXISTS idx_learning_ledger_workspace_record_seq
 ON learning_ledger_events(workspace_id, record_id, event_seq DESC);

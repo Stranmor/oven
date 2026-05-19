@@ -8,7 +8,7 @@ use forge_domain::{
     ConversationId, LearningEventId, LearningEventKind, LearningLedgerEvent,
     LearningLedgerFreshness, LearningProvenance, LearningRecordId, LearningRecordProjection,
     LearningRedactionStatus, LearningRepository, LearningReviewState, LearningSourceKind,
-    SubagentTaskId, WorkspaceHash,
+    RedactedLearningSummary, SubagentTaskId, WorkspaceHash,
 };
 use sha2::{Digest, Sha256};
 
@@ -196,6 +196,15 @@ impl LearningRepository for LearningRepositoryImpl {
 impl LearningLedgerEventRecord {
     fn new(event: LearningLedgerEvent, workspace_id: i64) -> anyhow::Result<Self> {
         let source_id = event.provenance.source_id()?;
+        let redacted = RedactedLearningSummary::from_raw(&event.summary);
+        let redaction_status = match (event.redaction_status, redacted.status) {
+            (LearningRedactionStatus::Redacted, _) | (_, LearningRedactionStatus::Redacted) => {
+                LearningRedactionStatus::Redacted
+            }
+            (LearningRedactionStatus::Clean, LearningRedactionStatus::Clean) => {
+                LearningRedactionStatus::Clean
+            }
+        };
         Ok(Self {
             event_seq: 0,
             event_id: event.event_id.into_string(),
@@ -203,9 +212,9 @@ impl LearningLedgerEventRecord {
             idempotency_key: event.idempotency_key,
             workspace_id,
             event_kind: event.event_kind.to_string(),
-            summary: event.summary,
-            content_fingerprint: event.content_fingerprint,
-            redaction_status: event.redaction_status.to_string(),
+            summary: redacted.summary,
+            content_fingerprint: redacted.fingerprint,
+            redaction_status: redaction_status.to_string(),
             source_kind: event.provenance.source_kind.to_string(),
             source_id,
             source_event_id: event.provenance.source_event_id,
@@ -534,6 +543,76 @@ mod tests {
             projection.redaction_status,
         );
         let expected = (false, false, LearningRedactionStatus::Redacted);
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_insert_rejects_or_redacts_explicit_raw_secret_event() -> anyhow::Result<()> {
+        let fixture = fixture_repo(8)?;
+        let conversation_id = ConversationId::generate();
+        let raw_secret = "token sk-123456789012345678901234";
+        let event = LearningLedgerEvent {
+            event_id: LearningEventId::generate(),
+            record_id: LearningRecordId::generate(),
+            idempotency_key: "explicit-raw-secret".to_string(),
+            event_kind: LearningEventKind::CandidateCaptured,
+            summary: raw_secret.to_string(),
+            content_fingerprint: "raw-secret-fingerprint".to_string(),
+            redaction_status: LearningRedactionStatus::Clean,
+            provenance: LearningProvenance::conversation(
+                conversation_id,
+                "event-raw-secret",
+                "source-fingerprint-raw-secret",
+            ),
+            created_at: Utc::now(),
+            schema_version: LEARNING_LEDGER_SCHEMA_VERSION,
+        };
+
+        let actual = match fixture.insert_learning_event(event).await {
+            Ok(_) => fixture
+                .list_learning_records(None, 10)
+                .await?
+                .iter()
+                .any(|projection| projection.summary.contains("sk-")),
+            Err(_) => false,
+        };
+        let expected = false;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_idempotency_is_workspace_scoped_on_shared_database() -> anyhow::Result<()> {
+        let pool = Arc::new(DatabasePool::in_memory()?);
+        let left = LearningRepositoryImpl::new(pool.clone(), WorkspaceHash::new(9));
+        let right = LearningRepositoryImpl::new(pool, WorkspaceHash::new(10));
+        let conversation_id = ConversationId::generate();
+        let created_at = Utc::now();
+        left.insert_learning_event(fixture_event(
+            conversation_id,
+            "event-1",
+            "same source across isolated workspaces",
+            created_at,
+        )?)
+        .await?;
+
+        let right_result = right
+            .insert_learning_event(fixture_event(
+                conversation_id,
+                "event-1",
+                "same source across isolated workspaces",
+                created_at,
+            )?)
+            .await;
+        let actual = (
+            right_result.is_ok(),
+            left.list_learning_records(None, 10).await?.len(),
+            right.list_learning_records(None, 10).await?.len(),
+        );
+        let expected = (true, 1usize, 1usize);
 
         assert_eq!(actual, expected);
         Ok(())

@@ -5,7 +5,7 @@ use chrono::Utc;
 use forge_app::LearningService;
 use forge_app::domain::{
     ConversationId, LearningLedgerEvent, LearningLedgerFreshness, LearningProvenance,
-    LearningRecordProjection, LearningRepository, LearningReviewState,
+    LearningRecordProjection, LearningRepository, LearningReviewState, RedactedLearningSummary,
 };
 
 /// Domain service for capture/query operations over the append-only learning
@@ -33,12 +33,13 @@ impl<R: LearningRepository> LearningService for ForgeLearningService<R> {
         source_event_id: String,
         summary: String,
     ) -> Result<LearningLedgerEvent> {
+        let redacted = RedactedLearningSummary::from_raw(&summary);
         let event = LearningLedgerEvent::capture_candidate(
             summary,
             LearningProvenance::conversation(
                 conversation_id,
                 source_event_id,
-                "conversation-source-redacted",
+                redacted.fingerprint,
             ),
             Utc::now(),
         )?;
