@@ -1708,7 +1708,8 @@ mod tests {
     #[test]
     fn test_conversation_branch_parse() {
         let conversation_id = ConversationId::generate();
-        let message_id = MessageId::parse("00000000-0000-5000-8000-000000000001").unwrap();
+        let message_id = MessageId::parse("00000000-0000-5000-8000-000000000001")
+            .expect("fixture branch message id should parse");
         let fixture = Cli::parse_from([
             "forge",
             "conversation",
@@ -1724,13 +1725,15 @@ mod tests {
                 }
                 _ => (
                     ConversationId::default(),
-                    MessageId::parse("00000000-0000-5000-8000-000000000000").unwrap(),
+                    MessageId::parse("00000000-0000-5000-8000-000000000000")
+                        .expect("fixture fallback message id should parse"),
                     false,
                 ),
             },
             _ => (
                 ConversationId::default(),
-                MessageId::parse("00000000-0000-5000-8000-000000000000").unwrap(),
+                MessageId::parse("00000000-0000-5000-8000-000000000000")
+                    .expect("fixture fallback message id should parse"),
                 false,
             ),
         };
@@ -1742,7 +1745,8 @@ mod tests {
     #[test]
     fn test_conversation_revert_parse_as_branch_only_alias() {
         let conversation_id = ConversationId::generate();
-        let message_id = MessageId::parse("00000000-0000-5000-8000-000000000002").unwrap();
+        let message_id = MessageId::parse("00000000-0000-5000-8000-000000000002")
+            .expect("fixture revert message id should parse");
         let fixture = Cli::parse_from([
             "forge",
             "conversation",
@@ -1758,13 +1762,15 @@ mod tests {
                 }
                 _ => (
                     ConversationId::default(),
-                    MessageId::parse("00000000-0000-5000-8000-000000000000").unwrap(),
+                    MessageId::parse("00000000-0000-5000-8000-000000000000")
+                        .expect("fixture fallback message id should parse"),
                     false,
                 ),
             },
             _ => (
                 ConversationId::default(),
-                MessageId::parse("00000000-0000-5000-8000-000000000000").unwrap(),
+                MessageId::parse("00000000-0000-5000-8000-000000000000")
+                    .expect("fixture fallback message id should parse"),
                 false,
             ),
         };
