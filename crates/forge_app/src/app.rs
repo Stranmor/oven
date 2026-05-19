@@ -798,12 +798,11 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig> + SteerS
 
                     // Always save conversation using get_conversation()
                     let conversation = orch.get_conversation().clone();
-                    let save_result = services.upsert_conversation(conversation.clone()).await;
-                    if save_result.is_ok() {
-                        LearningCapture::new(services.clone())
-                            .capture_saved_conversation(&conversation)
-                            .await;
-                    }
+                    let save_result = save_conversation_and_capture_learning(
+                        services.clone(),
+                        conversation.clone(),
+                    )
+                    .await;
 
                     // Send any error to the stream (prioritize dispatch error over save error)
                     let final_err = match (dispatch_result, save_result) {
@@ -1060,9 +1059,23 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig> + SteerS
     }
 }
 
+async fn save_conversation_and_capture_learning<S>(
+    services: Arc<S>,
+    conversation: Conversation,
+) -> anyhow::Result<()>
+where
+    S: ConversationService + LearningService + Send + Sync + 'static,
+{
+    services.upsert_conversation(conversation.clone()).await?;
+    LearningCapture::new(services)
+        .capture_saved_conversation(&conversation)
+        .await;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -1070,13 +1083,15 @@ mod tests {
 
     use anyhow::Result;
     use forge_domain::{
-        Agent, AgentId, ChatCompletionMessage, Content, Context, ContextMessage, Conversation,
-        Environment, FileChunk, FileStatus, FinishReason, LearningLedgerEvent,
-        LearningLedgerFreshness, LearningRecordId, LearningRecordProjection,
-        LearningRedactionStatus, LearningReviewState, Model, ModelId, Node, NodeData, NodeId,
-        ProviderId, ResultStream, SearchParams, SteerMessage, SyncProgress, ToolCallContext,
-        ToolCallFull, ToolResult, WorkspaceAuth, WorkspaceContextFreshness,
-        WorkspaceContextManifestDiagnostic, WorkspaceId, WorkspaceInfo,
+        Agent, AgentId, AnyProvider, AuthContextRequest, AuthContextResponse, AuthMethod,
+        ChatCompletionMessage, Content, Context, ContextMessage, Conversation, ConversationId,
+        Environment, FileChunk, FileStatus, FinishReason, LEARNING_LEDGER_SCHEMA_VERSION,
+        LearningEventKind, LearningLedgerEvent, LearningLedgerFreshness, LearningProvenance,
+        LearningRecordId, LearningRecordProjection, LearningRedactionStatus, LearningReviewState,
+        McpConfig, McpServers, Model, ModelId, Node, NodeData, NodeId, PermissionOperation,
+        Provider, ProviderId, ProviderType, ResultStream, Scope, SearchParams, SteerMessage,
+        SyncProgress, ToolCallContext, ToolCallFull, ToolOutput, ToolResult, WorkspaceAuth,
+        WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic, WorkspaceId, WorkspaceInfo,
     };
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
@@ -1085,6 +1100,840 @@ mod tests {
     use super::*;
     use crate::agent::AgentService;
     use crate::orch::Orchestrator;
+    use crate::{
+        AppConfigService, AttachmentService, AuthService, CommandLoaderService,
+        CustomInstructionsService, FileDiscoveryService, FollowUpService, FsPatchService,
+        FsReadService, FsRemoveService, FsSearchService, FsUndoService, FsWriteService,
+        ImageReadService, McpConfigManager, McpService, NetFetchService, PlanCreateService,
+        PolicyService, ProviderAuthService, ShellService, SkillFetchService, TemplateService, User,
+        UserUsage, Walker,
+    };
+
+    #[derive(Clone)]
+    struct ChatFlowLearningHarness {
+        state: Arc<ChatFlowLearningState>,
+    }
+
+    struct ChatFlowLearningState {
+        cwd: PathBuf,
+        conversations: Mutex<HashMap<ConversationId, Conversation>>,
+        learning_events: Mutex<Vec<LearningLedgerEvent>>,
+        learning_records: Mutex<Vec<LearningRecordProjection>>,
+        captured_provider_context: Mutex<Option<Context>>,
+        agent: Agent,
+        model: Model,
+        provider: Provider<Url>,
+    }
+
+    impl ChatFlowLearningHarness {
+        fn new(cwd: PathBuf) -> Arc<Self> {
+            let model_id = ModelId::new("runtime-proof-model");
+            let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone())
+                .tool_supported(false)
+                .tools(Vec::<forge_domain::ToolName>::new())
+                .max_requests_per_turn(1usize);
+            let model = Model::new(ProviderId::OPENAI, model_id).context_length(200_000_u64);
+            let provider = Provider {
+                id: ProviderId::OPENAI,
+                provider_type: ProviderType::Llm,
+                response: None,
+                url: Url::parse("http://127.0.0.1/runtime-proof").unwrap(),
+                models: None,
+                auth_methods: Vec::new(),
+                url_params: Vec::new(),
+                credential: None,
+                custom_headers: None,
+            };
+            Arc::new(Self {
+                state: Arc::new(ChatFlowLearningState {
+                    cwd,
+                    conversations: Mutex::new(HashMap::new()),
+                    learning_events: Mutex::new(Vec::new()),
+                    learning_records: Mutex::new(Vec::new()),
+                    captured_provider_context: Mutex::new(None),
+                    agent,
+                    model,
+                    provider,
+                }),
+            })
+        }
+
+        async fn set_learning_records(&self, records: Vec<LearningRecordProjection>) {
+            *self.state.learning_records.lock().await = records;
+        }
+    }
+
+    impl EnvironmentInfra for ChatFlowLearningHarness {
+        type Config = ForgeConfig;
+
+        fn get_env_var(&self, _key: &str) -> Option<String> {
+            None
+        }
+
+        fn get_env_vars(&self) -> BTreeMap<String, String> {
+            BTreeMap::new()
+        }
+
+        fn get_environment(&self) -> Environment {
+            Environment {
+                os: "test".to_string(),
+                cwd: self.state.cwd.clone(),
+                home: None,
+                shell: "sh".to_string(),
+                base_path: self.state.cwd.join(".forge"),
+            }
+        }
+
+        fn get_config(&self) -> Result<Self::Config> {
+            Ok(ForgeConfig::default())
+        }
+
+        async fn update_environment(&self, _ops: Vec<forge_domain::ConfigOperation>) -> Result<()> {
+            anyhow::bail!("unused environment update")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ConversationService for ChatFlowLearningState {
+        async fn find_conversation(&self, id: &ConversationId) -> Result<Option<Conversation>> {
+            Ok(self.conversations.lock().await.get(id).cloned())
+        }
+
+        async fn upsert_conversation(&self, conversation: Conversation) -> Result<()> {
+            self.conversations
+                .lock()
+                .await
+                .insert(conversation.id, conversation);
+            Ok(())
+        }
+
+        async fn ensure_delegated_conversation(
+            &self,
+            id: &ConversationId,
+            parent_id: Option<ConversationId>,
+        ) -> Result<Conversation> {
+            let mut conversations = self.conversations.lock().await;
+            let conversation = conversations
+                .get_mut(id)
+                .ok_or_else(|| forge_domain::Error::ConversationNotFound(*id))?;
+            conversation.ensure_delegated(parent_id);
+            Ok(conversation.clone())
+        }
+
+        async fn resolve_root_conversation_id(
+            &self,
+            parent_id: Option<ConversationId>,
+        ) -> Result<Option<ConversationId>> {
+            Ok(parent_id)
+        }
+
+        async fn modify_conversation<F, T>(&self, id: &ConversationId, f: F) -> Result<T>
+        where
+            F: FnOnce(&mut Conversation) -> T + Send,
+            T: Send,
+        {
+            let mut conversations = self.conversations.lock().await;
+            let conversation = conversations
+                .get_mut(id)
+                .ok_or_else(|| forge_domain::Error::ConversationNotFound(*id))?;
+            Ok(f(conversation))
+        }
+
+        async fn branch_conversation(
+            &self,
+            _conversation_id: &ConversationId,
+            _target_id: forge_domain::MessageId,
+        ) -> Result<Conversation> {
+            anyhow::bail!("unused branch conversation")
+        }
+
+        async fn get_conversations(&self) -> Result<Vec<Conversation>> {
+            Ok(self.conversations.lock().await.values().cloned().collect())
+        }
+
+        async fn get_conversations_including_agent(&self) -> Result<Vec<Conversation>> {
+            self.get_conversations().await
+        }
+
+        async fn get_sub_conversations(
+            &self,
+            parent_id: &ConversationId,
+        ) -> Result<Vec<Conversation>> {
+            Ok(self
+                .conversations
+                .lock()
+                .await
+                .values()
+                .filter(|conversation| conversation.parent_id == Some(*parent_id))
+                .cloned()
+                .collect())
+        }
+
+        async fn upsert_subagent_task_session(
+            &self,
+            _session: forge_domain::SubagentTaskSession,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn get_subagent_task_session(
+            &self,
+            _task_id: &forge_domain::SubagentTaskId,
+        ) -> Result<Option<forge_domain::SubagentTaskSession>> {
+            Ok(None)
+        }
+
+        async fn get_subagent_task_session_by_conversation(
+            &self,
+            _conversation_id: &ConversationId,
+        ) -> Result<Option<forge_domain::SubagentTaskSession>> {
+            Ok(None)
+        }
+
+        async fn list_subagent_task_sessions(
+            &self,
+            _filter: forge_domain::SubagentTaskSessionFilter,
+        ) -> Result<Vec<forge_domain::SubagentTaskSession>> {
+            Ok(Vec::new())
+        }
+
+        async fn last_conversation(&self) -> Result<Option<Conversation>> {
+            Ok(self.conversations.lock().await.values().next().cloned())
+        }
+
+        async fn delete_conversation(&self, conversation_id: &ConversationId) -> Result<()> {
+            self.conversations.lock().await.remove(conversation_id);
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LearningService for ChatFlowLearningState {
+        async fn capture_candidate_from_conversation(
+            &self,
+            conversation_id: ConversationId,
+            source_event_id: String,
+            summary: String,
+        ) -> Result<LearningLedgerEvent> {
+            let event = LearningLedgerEvent::capture_candidate(
+                summary,
+                LearningProvenance::conversation(
+                    conversation_id,
+                    source_event_id,
+                    "runtime-proof-source-fingerprint",
+                ),
+                chrono::Utc::now(),
+            )?;
+            let mut events = self.learning_events.lock().await;
+            let event = events
+                .iter()
+                .find(|existing| existing.idempotency_key == event.idempotency_key)
+                .cloned()
+                .unwrap_or_else(|| {
+                    events.push(event.clone());
+                    event
+                });
+            Ok(event)
+        }
+
+        async fn insert_learning_event(
+            &self,
+            event: LearningLedgerEvent,
+        ) -> Result<LearningLedgerEvent> {
+            self.learning_events.lock().await.push(event.clone());
+            Ok(event)
+        }
+
+        async fn list_learning_records(
+            &self,
+            review_state: Option<LearningReviewState>,
+            limit: usize,
+        ) -> Result<Vec<LearningRecordProjection>> {
+            let mut records = self.learning_records.lock().await.clone();
+            if let Some(review_state) = review_state {
+                records.retain(|record| record.review_state == review_state);
+            }
+            records.truncate(limit);
+            Ok(records)
+        }
+
+        async fn learning_freshness(
+            &self,
+            _review_state: Option<LearningReviewState>,
+        ) -> Result<LearningLedgerFreshness> {
+            Ok(LearningLedgerFreshness {
+                ledger_cursor: self.learning_records.lock().await.len() as i64,
+                projection_version: 1,
+                review_state_fingerprint: "runtime-proof-learning".to_string(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderService for ChatFlowLearningState {
+        async fn chat(
+            &self,
+            _model_id: &ModelId,
+            context: Context,
+            _provider: Provider<Url>,
+        ) -> ResultStream<ChatCompletionMessage, anyhow::Error> {
+            *self.captured_provider_context.lock().await = Some(context);
+            let message = ChatCompletionMessage::assistant(Content::full("runtime proof response"))
+                .finish_reason(FinishReason::Stop);
+            Ok(Box::pin(tokio_stream::iter(std::iter::once(Ok(message)))))
+        }
+
+        async fn models(&self, _provider: Provider<Url>) -> Result<Vec<Model>> {
+            Ok(vec![self.model.clone()])
+        }
+
+        async fn get_provider(&self, id: ProviderId) -> Result<Provider<Url>> {
+            assert_eq!(id, self.provider.id);
+            Ok(self.provider.clone())
+        }
+
+        async fn get_all_providers(&self) -> Result<Vec<AnyProvider>> {
+            Ok(vec![AnyProvider::Url(self.provider.clone())])
+        }
+
+        async fn upsert_credential(&self, _credential: forge_domain::AuthCredential) -> Result<()> {
+            anyhow::bail!("unused credential upsert")
+        }
+
+        async fn remove_credential(&self, _id: &ProviderId) -> Result<()> {
+            anyhow::bail!("unused credential removal")
+        }
+
+        async fn migrate_env_credentials(&self) -> Result<Option<forge_domain::MigrationResult>> {
+            Ok(None)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AppConfigService for ChatFlowLearningState {
+        async fn get_session_config(&self) -> Option<forge_domain::ModelConfig> {
+            Some(forge_domain::ModelConfig::new(
+                self.provider.id.clone(),
+                self.model.id.clone(),
+            ))
+        }
+
+        async fn get_commit_config(&self) -> Result<Option<forge_domain::ModelConfig>> {
+            Ok(None)
+        }
+
+        async fn get_suggest_config(&self) -> Result<Option<forge_domain::ModelConfig>> {
+            Ok(None)
+        }
+
+        async fn get_reasoning_effort(&self) -> Result<Option<forge_domain::Effort>> {
+            Ok(None)
+        }
+
+        async fn update_config(&self, _ops: Vec<forge_domain::ConfigOperation>) -> Result<()> {
+            anyhow::bail!("unused config update")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRegistry for ChatFlowLearningState {
+        async fn get_active_agent_id(&self) -> Result<Option<AgentId>> {
+            Ok(Some(self.agent.id.clone()))
+        }
+
+        async fn set_active_agent_id(&self, _agent_id: AgentId) -> Result<()> {
+            anyhow::bail!("unused active agent update")
+        }
+
+        async fn get_agents(&self) -> Result<Vec<Agent>> {
+            Ok(vec![self.agent.clone()])
+        }
+
+        async fn get_agent_infos(&self) -> Result<Vec<forge_domain::AgentInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_agent(&self, agent_id: &AgentId) -> Result<Option<Agent>> {
+            Ok((agent_id == &self.agent.id).then(|| self.agent.clone()))
+        }
+
+        async fn reload_agents(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderAuthService for ChatFlowLearningState {
+        async fn init_provider_auth(
+            &self,
+            _provider_id: ProviderId,
+            _method: AuthMethod,
+        ) -> Result<AuthContextRequest> {
+            anyhow::bail!("unused provider auth init")
+        }
+
+        async fn complete_provider_auth(
+            &self,
+            _provider_id: ProviderId,
+            _context: AuthContextResponse,
+            _timeout: std::time::Duration,
+        ) -> Result<()> {
+            anyhow::bail!("unused provider auth completion")
+        }
+
+        async fn refresh_provider_credential(
+            &self,
+            provider: Provider<Url>,
+        ) -> Result<Provider<Url>> {
+            Ok(provider)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CustomInstructionsService for ChatFlowLearningState {
+        async fn get_custom_instructions(&self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl McpService for ChatFlowLearningState {
+        async fn get_mcp_servers(&self) -> Result<McpServers> {
+            Ok(McpServers::default())
+        }
+
+        async fn execute_mcp(&self, _call: ToolCallFull) -> Result<ToolOutput> {
+            anyhow::bail!("unused mcp execution")
+        }
+
+        async fn reload_mcp(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WorkspaceService for ChatFlowLearningState {
+        async fn sync_workspace(
+            &self,
+            _path: PathBuf,
+        ) -> Result<forge_stream::MpscStream<Result<SyncProgress>>> {
+            anyhow::bail!("unused workspace sync")
+        }
+
+        async fn query_workspace(
+            &self,
+            _path: PathBuf,
+            _params: SearchParams<'_>,
+        ) -> Result<Vec<Node>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_workspaces(&self) -> Result<Vec<WorkspaceInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_workspace_info(&self, _path: PathBuf) -> Result<Option<WorkspaceInfo>> {
+            Ok(None)
+        }
+
+        async fn is_indexed(&self, _path: &Path) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn delete_workspace(&self, _workspace_id: &WorkspaceId) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete_workspaces(&self, _workspace_ids: &[WorkspaceId]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn project_model_context_diagnostic(
+            &self,
+            path: &Path,
+        ) -> Result<WorkspaceContextManifestDiagnostic> {
+            Ok(WorkspaceContextManifestDiagnostic {
+                workspace_root: path.to_path_buf(),
+                manifest_found: false,
+                manifest_path: path.join(".forge_project_model/project_manifest.json"),
+                freshness: WorkspaceContextFreshness::Unknown {
+                    reason: "runtime proof does not index workspace".to_string(),
+                },
+            })
+        }
+
+        async fn get_workspace_status(&self, _path: PathBuf) -> Result<Vec<FileStatus>> {
+            Ok(Vec::new())
+        }
+
+        async fn is_authenticated(&self) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn init_auth_credentials(&self) -> Result<WorkspaceAuth> {
+            anyhow::bail!("unused workspace auth")
+        }
+
+        async fn init_workspace(&self, _path: PathBuf) -> Result<WorkspaceId> {
+            anyhow::bail!("unused workspace init")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SteerService for ChatFlowLearningState {
+        async fn enqueue_steer(
+            &self,
+            _conversation_id: &ConversationId,
+            _message: SteerMessage,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn clear_steer(&self, _conversation_id: &ConversationId) -> Result<()> {
+            Ok(())
+        }
+
+        async fn drain_steer(
+            &self,
+            _conversation_id: &ConversationId,
+        ) -> Result<Vec<SteerMessage>> {
+            Ok(Vec::new())
+        }
+    }
+
+    macro_rules! impl_unused_service_traits {
+        ($type:ty) => {
+            #[async_trait::async_trait]
+            impl TemplateService for $type {
+                async fn register_template(&self, _path: PathBuf) -> Result<()> {
+                    anyhow::bail!("unused template registration")
+                }
+
+                async fn render_template<V: serde::Serialize + Send + Sync>(
+                    &self,
+                    _template: forge_domain::Template<V>,
+                    _object: &V,
+                ) -> Result<String> {
+                    anyhow::bail!("unused template rendering")
+                }
+            }
+
+            #[async_trait::async_trait]
+            impl AttachmentService for $type {
+                async fn attachments(&self, _url: &str) -> Result<Vec<forge_domain::Attachment>> {
+                    Ok(Vec::new())
+                }
+            }
+
+            #[async_trait::async_trait]
+            impl FileDiscoveryService for $type {
+                async fn collect_files(&self, _config: Walker) -> Result<Vec<forge_domain::File>> {
+                    Ok(Vec::new())
+                }
+
+                async fn list_current_directory(&self) -> Result<Vec<forge_domain::File>> {
+                    Ok(Vec::new())
+                }
+            }
+
+            #[async_trait::async_trait]
+            impl McpConfigManager for $type {
+                async fn read_mcp_config(&self, _scope: Option<&Scope>) -> Result<McpConfig> {
+                    anyhow::bail!("unused mcp config read")
+                }
+
+                async fn write_mcp_config(
+                    &self,
+                    _config: &McpConfig,
+                    _scope: &Scope,
+                ) -> Result<()> {
+                    anyhow::bail!("unused mcp config write")
+                }
+            }
+
+            #[async_trait::async_trait]
+            impl FsWriteService for $type {
+                async fn write(
+                    &self,
+                    _path: String,
+                    _content: String,
+                    _overwrite: bool,
+                ) -> Result<crate::FsWriteOutput> {
+                    anyhow::bail!("unused fs write")
+                }
+            }
+
+            #[async_trait::async_trait]
+            impl PlanCreateService for $type {
+                async fn create_plan(
+                    &self,
+                    _plan_name: String,
+                    _version: String,
+                    _content: String,
+                ) -> Result<crate::PlanCreateOutput> {
+                    anyhow::bail!("unused plan create")
+                }
+            }
+
+            #[async_trait::async_trait]
+            impl FsPatchService for $type {
+                async fn patch(
+                    &self,
+                    _path: String,
+                    _search: String,
+                    _content: String,
+                    _replace_all: bool,
+                ) -> Result<crate::PatchOutput> {
+                    anyhow::bail!("unused fs patch")
+                }
+
+                async fn multi_patch(
+                    &self,
+                    _path: String,
+                    _edits: Vec<forge_domain::PatchEdit>,
+                ) -> Result<crate::PatchOutput> {
+                    anyhow::bail!("unused fs multi patch")
+                }
+            }
+
+            #[async_trait::async_trait]
+            impl FsReadService for $type {
+                async fn read(
+                    &self,
+                    _path: String,
+                    _start_line: Option<u64>,
+                    _end_line: Option<u64>,
+                ) -> Result<crate::ReadOutput> {
+                    anyhow::bail!("unused fs read")
+                }
+            }
+
+            #[async_trait::async_trait]
+            impl ImageReadService for $type {
+                async fn read_image(&self, _path: String) -> Result<forge_domain::Image> {
+                    anyhow::bail!("unused image read")
+                }
+            }
+
+            #[async_trait::async_trait]
+            impl FsRemoveService for $type {
+                async fn remove(&self, _path: String) -> Result<crate::FsRemoveOutput> {
+                    anyhow::bail!("unused fs remove")
+                }
+            }
+
+            #[async_trait::async_trait]
+            impl FsSearchService for $type {
+                async fn search(
+                    &self,
+                    _params: forge_domain::FSSearch,
+                ) -> Result<Option<crate::SearchResult>> {
+                    Ok(None)
+                }
+            }
+
+            #[async_trait::async_trait]
+            impl FollowUpService for $type {
+                async fn follow_up(
+                    &self,
+                    _question: String,
+                    _options: Vec<String>,
+                    _multiple: Option<bool>,
+                ) -> Result<Option<String>> {
+                    Ok(None)
+                }
+            }
+
+            #[async_trait::async_trait]
+            impl FsUndoService for $type {
+                async fn undo(&self, _path: String) -> Result<crate::FsUndoOutput> {
+                    anyhow::bail!("unused fs undo")
+                }
+            }
+
+            #[async_trait::async_trait]
+            impl NetFetchService for $type {
+                async fn fetch(
+                    &self,
+                    _url: String,
+                    _raw: Option<bool>,
+                ) -> Result<crate::HttpResponse> {
+                    anyhow::bail!("unused net fetch")
+                }
+            }
+
+            #[async_trait::async_trait]
+            impl ShellService for $type {
+                async fn execute(
+                    &self,
+                    _request: crate::ShellExecuteRequest,
+                ) -> Result<crate::ShellOutput> {
+                    anyhow::bail!("unused shell execute")
+                }
+            }
+
+            #[async_trait::async_trait]
+            impl AuthService for $type {
+                async fn user_info(&self, _api_key: &str) -> Result<User> {
+                    anyhow::bail!("unused auth user info")
+                }
+
+                async fn user_usage(&self, _api_key: &str) -> Result<UserUsage> {
+                    anyhow::bail!("unused auth user usage")
+                }
+            }
+
+            #[async_trait::async_trait]
+            impl CommandLoaderService for $type {
+                async fn get_commands(&self) -> Result<Vec<forge_domain::Command>> {
+                    Ok(Vec::new())
+                }
+            }
+
+            #[async_trait::async_trait]
+            impl PolicyService for $type {
+                async fn check_operation_permission(
+                    &self,
+                    _operation: &PermissionOperation,
+                ) -> Result<crate::PolicyDecision> {
+                    Ok(crate::PolicyDecision { allowed: true, path: None })
+                }
+            }
+
+            #[async_trait::async_trait]
+            impl SkillFetchService for $type {
+                async fn fetch_skill(&self, _skill_name: String) -> Result<forge_domain::Skill> {
+                    anyhow::bail!("unused skill fetch")
+                }
+
+                async fn list_skills(&self) -> Result<Vec<forge_domain::Skill>> {
+                    Ok(Vec::new())
+                }
+            }
+        };
+    }
+
+    impl_unused_service_traits!(ChatFlowLearningState);
+
+    impl Services for ChatFlowLearningHarness {
+        type ProviderService = ChatFlowLearningState;
+        type AppConfigService = ChatFlowLearningState;
+        type ConversationService = ChatFlowLearningState;
+        type LearningService = ChatFlowLearningState;
+        type SteerService = ChatFlowLearningState;
+        type TemplateService = ChatFlowLearningState;
+        type AttachmentService = ChatFlowLearningState;
+        type CustomInstructionsService = ChatFlowLearningState;
+        type FileDiscoveryService = ChatFlowLearningState;
+        type McpConfigManager = ChatFlowLearningState;
+        type FsWriteService = ChatFlowLearningState;
+        type PlanCreateService = ChatFlowLearningState;
+        type FsPatchService = ChatFlowLearningState;
+        type FsReadService = ChatFlowLearningState;
+        type ImageReadService = ChatFlowLearningState;
+        type FsRemoveService = ChatFlowLearningState;
+        type FsSearchService = ChatFlowLearningState;
+        type FollowUpService = ChatFlowLearningState;
+        type FsUndoService = ChatFlowLearningState;
+        type NetFetchService = ChatFlowLearningState;
+        type ShellService = ChatFlowLearningState;
+        type McpService = ChatFlowLearningState;
+        type AuthService = ChatFlowLearningState;
+        type AgentRegistry = ChatFlowLearningState;
+        type CommandLoaderService = ChatFlowLearningState;
+        type PolicyService = ChatFlowLearningState;
+        type ProviderAuthService = ChatFlowLearningState;
+        type WorkspaceService = ChatFlowLearningState;
+        type SkillFetchService = ChatFlowLearningState;
+
+        fn provider_service(&self) -> &Self::ProviderService {
+            &self.state
+        }
+        fn config_service(&self) -> &Self::AppConfigService {
+            &self.state
+        }
+        fn conversation_service(&self) -> &Self::ConversationService {
+            &self.state
+        }
+        fn learning_service(&self) -> &Self::LearningService {
+            &self.state
+        }
+        fn steer_service(&self) -> &Self::SteerService {
+            &self.state
+        }
+        fn template_service(&self) -> &Self::TemplateService {
+            &self.state
+        }
+        fn attachment_service(&self) -> &Self::AttachmentService {
+            &self.state
+        }
+        fn file_discovery_service(&self) -> &Self::FileDiscoveryService {
+            &self.state
+        }
+        fn mcp_config_manager(&self) -> &Self::McpConfigManager {
+            &self.state
+        }
+        fn fs_create_service(&self) -> &Self::FsWriteService {
+            &self.state
+        }
+        fn plan_create_service(&self) -> &Self::PlanCreateService {
+            &self.state
+        }
+        fn fs_patch_service(&self) -> &Self::FsPatchService {
+            &self.state
+        }
+        fn fs_read_service(&self) -> &Self::FsReadService {
+            &self.state
+        }
+        fn image_read_service(&self) -> &Self::ImageReadService {
+            &self.state
+        }
+        fn fs_remove_service(&self) -> &Self::FsRemoveService {
+            &self.state
+        }
+        fn fs_search_service(&self) -> &Self::FsSearchService {
+            &self.state
+        }
+        fn follow_up_service(&self) -> &Self::FollowUpService {
+            &self.state
+        }
+        fn fs_undo_service(&self) -> &Self::FsUndoService {
+            &self.state
+        }
+        fn net_fetch_service(&self) -> &Self::NetFetchService {
+            &self.state
+        }
+        fn shell_service(&self) -> &Self::ShellService {
+            &self.state
+        }
+        fn mcp_service(&self) -> &Self::McpService {
+            &self.state
+        }
+        fn custom_instructions_service(&self) -> &Self::CustomInstructionsService {
+            &self.state
+        }
+        fn auth_service(&self) -> &Self::AuthService {
+            &self.state
+        }
+        fn agent_registry(&self) -> &Self::AgentRegistry {
+            &self.state
+        }
+        fn command_loader_service(&self) -> &Self::CommandLoaderService {
+            &self.state
+        }
+        fn policy_service(&self) -> &Self::PolicyService {
+            &self.state
+        }
+        fn provider_auth_service(&self) -> &Self::ProviderAuthService {
+            &self.state
+        }
+        fn workspace_service(&self) -> &Self::WorkspaceService {
+            &self.state
+        }
+        fn skill_fetch_service(&self) -> &Self::SkillFetchService {
+            &self.state
+        }
+    }
 
     struct ProjectContextHarness {
         cwd: PathBuf,
@@ -1492,6 +2341,127 @@ mod tests {
             updated_at: chrono::Utc::now(),
             schema_version: LEARNING_LEDGER_SCHEMA_VERSION,
         }
+    }
+
+    #[tokio::test]
+    async fn chat_flow_saves_conversation_then_captures_learning_candidate() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ChatFlowLearningHarness::new(root);
+        let conversation =
+            Conversation::generate().context(Context::default().add_message(ContextMessage::user(
+                "runtime self-learning proof request",
+                Some(setup.state.model.id.clone()),
+            )));
+        let mut orch = Orchestrator::new(
+            setup.clone(),
+            conversation,
+            setup.state.agent.clone(),
+            ForgeConfig::default(),
+        )
+        .models(vec![setup.state.model.clone()])
+        .active_provider(setup.state.provider.clone())
+        .tool_definitions(Vec::new());
+
+        orch.run().await?;
+        let conversation = orch.get_conversation().clone();
+        save_conversation_and_capture_learning(setup.clone(), conversation.clone()).await?;
+
+        let saved = setup
+            .find_conversation(&conversation.id)
+            .await?
+            .expect("conversation should be saved after chat flow");
+        let events = setup.state.learning_events.lock().await.clone();
+        let actual = events.first().map(|event| {
+            (
+                events.len(),
+                event.event_kind,
+                event.provenance.conversation_id,
+                event.summary.contains("conversation_saved"),
+                event
+                    .summary
+                    .contains("runtime self-learning proof request"),
+                saved
+                    .context
+                    .as_ref()
+                    .is_some_and(|context| context.messages.len() >= 2),
+            )
+        });
+        let expected = Some((
+            1usize,
+            LearningEventKind::CandidateCaptured,
+            Some(conversation.id),
+            true,
+            true,
+            true,
+        ));
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chat_flow_injects_only_accepted_learning_into_provider_context() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ChatFlowLearningHarness::new(root);
+        setup
+            .set_learning_records(vec![
+                fixture_learning_projection(
+                    LearningReviewState::Candidate,
+                    "candidate runtime learning must stay out",
+                ),
+                fixture_learning_projection(
+                    LearningReviewState::Accepted,
+                    "accepted runtime learning reaches provider context",
+                ),
+            ])
+            .await;
+        let conversation =
+            Conversation::generate().context(Context::default().add_message(ContextMessage::user(
+                "runtime accepted learning proof",
+                Some(setup.state.model.id.clone()),
+            )));
+        let conversation = ProjectContextInjection::new(setup.clone(), setup.state.agent.clone())
+            .inject_learning(conversation)
+            .await;
+        let mut orch = Orchestrator::new(
+            setup.clone(),
+            conversation,
+            setup.state.agent.clone(),
+            ForgeConfig::default(),
+        )
+        .models(vec![setup.state.model.clone()])
+        .active_provider(setup.state.provider.clone())
+        .tool_definitions(Vec::new());
+
+        orch.run().await?;
+
+        let captured_context = setup
+            .state
+            .captured_provider_context
+            .lock()
+            .await
+            .clone()
+            .expect("provider context should be captured by fake provider");
+        let learning_message = captured_context
+            .messages
+            .iter()
+            .find_map(|message| match &message.message {
+                ContextMessage::Text(text) if text.is_learning_context() => Some(text),
+                _ => None,
+            })
+            .expect("accepted learning context should be injected before provider call");
+        let actual = vec![
+            learning_message
+                .content
+                .contains("accepted runtime learning reaches provider context"),
+            learning_message
+                .content
+                .contains("candidate runtime learning must stay out"),
+            learning_message.droppable,
+            learning_message.is_cache_eligible(),
+        ];
+        let expected = vec![true, false, true, false];
+        assert_eq!(actual, expected);
+        Ok(())
     }
 
     #[tokio::test]
