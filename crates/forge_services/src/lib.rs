@@ -24,6 +24,7 @@ mod fd_git;
 mod fd_walker;
 mod forge_services;
 mod instructions;
+mod learning;
 mod mcp;
 mod policy;
 
@@ -45,6 +46,7 @@ pub use error::*;
 pub use forge_services::*;
 pub use forge_snaps::SnapshotService;
 pub use instructions::*;
+pub use learning::*;
 pub use policy::*;
 pub use provider_auth::*;
 pub use steer::*;

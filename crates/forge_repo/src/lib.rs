@@ -17,6 +17,7 @@ mod database;
 mod forge_repo;
 mod fs_snap;
 mod fuzzy_search;
+mod learning;
 mod provider;
 mod skill;
 mod validation;

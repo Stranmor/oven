@@ -6,7 +6,8 @@ use derive_setters::Setters;
 use forge_domain::{
     AgentId, AnyProvider, Attachment, AuthContextRequest, AuthContextResponse, AuthMethod,
     ChatCompletionMessage, CommandOutput, Context, Conversation, ConversationId, File, FileInfo,
-    FileStatus, Image, McpConfig, McpServers, Model, ModelId, Node, ProcessId, ProcessReadCursor,
+    FileStatus, Image, LearningLedgerEvent, LearningLedgerFreshness, LearningRecordProjection,
+    LearningReviewState, McpConfig, McpServers, Model, ModelId, Node, ProcessId, ProcessReadCursor,
     ProcessReadOutput, ProcessStartOutput, ProcessStatus, Provider, ProviderId, ResultStream,
     Scope, SearchParams, SteerMessage, SubagentTaskId, SubagentTaskSession,
     SubagentTaskSessionFilter, SyncProgress, SyntaxError, Template, ToolCallFull, ToolOutput,
@@ -402,6 +403,63 @@ pub trait ConversationService: Send + Sync {
 }
 
 #[async_trait::async_trait]
+pub trait LearningService: Send + Sync {
+    /// Captures a redacted candidate learning event from conversation evidence.
+    ///
+    /// # Arguments
+    /// * `conversation_id` - Source conversation identifier.
+    /// * `source_event_id` - Stable source event identifier.
+    /// * `summary` - Candidate summary to redact before persistence.
+    ///
+    /// # Errors
+    /// Returns an error if validation or persistence fails.
+    async fn capture_candidate_from_conversation(
+        &self,
+        conversation_id: ConversationId,
+        source_event_id: String,
+        summary: String,
+    ) -> anyhow::Result<LearningLedgerEvent>;
+
+    /// Inserts an append-only learning event.
+    ///
+    /// # Arguments
+    /// * `event` - Event to append or deduplicate.
+    ///
+    /// # Errors
+    /// Returns an error if validation or persistence fails.
+    async fn insert_learning_event(
+        &self,
+        event: LearningLedgerEvent,
+    ) -> anyhow::Result<LearningLedgerEvent>;
+
+    /// Lists projected learning records.
+    ///
+    /// # Arguments
+    /// * `review_state` - Optional review-state filter.
+    /// * `limit` - Maximum number of records.
+    ///
+    /// # Errors
+    /// Returns an error if query fails.
+    async fn list_learning_records(
+        &self,
+        review_state: Option<LearningReviewState>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<LearningRecordProjection>>;
+
+    /// Returns learning ledger freshness for invalidating late-bound context.
+    ///
+    /// # Arguments
+    /// * `review_state` - Optional review-state filter.
+    ///
+    /// # Errors
+    /// Returns an error if query fails.
+    async fn learning_freshness(
+        &self,
+        review_state: Option<LearningReviewState>,
+    ) -> anyhow::Result<LearningLedgerFreshness>;
+}
+
+#[async_trait::async_trait]
 pub trait SteerService: Send + Sync {
     /// Enqueues a typed steer message for delayed main-conversation delivery.
     ///
@@ -772,6 +830,7 @@ pub trait Services: Send + Sync + 'static + Clone + EnvironmentInfra {
     type ProviderService: ProviderService;
     type AppConfigService: AppConfigService;
     type ConversationService: ConversationService;
+    type LearningService: LearningService;
     type SteerService: SteerService;
     type TemplateService: TemplateService;
     type AttachmentService: AttachmentService;
@@ -801,6 +860,7 @@ pub trait Services: Send + Sync + 'static + Clone + EnvironmentInfra {
     fn provider_service(&self) -> &Self::ProviderService;
     fn config_service(&self) -> &Self::AppConfigService;
     fn conversation_service(&self) -> &Self::ConversationService;
+    fn learning_service(&self) -> &Self::LearningService;
     fn steer_service(&self) -> &Self::SteerService;
     fn template_service(&self) -> &Self::TemplateService;
     fn attachment_service(&self) -> &Self::AttachmentService;
@@ -926,6 +986,46 @@ impl<I: Services> ConversationService for I {
     async fn delete_conversation(&self, conversation_id: &ConversationId) -> anyhow::Result<()> {
         self.conversation_service()
             .delete_conversation(conversation_id)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl<I: Services> LearningService for I {
+    async fn capture_candidate_from_conversation(
+        &self,
+        conversation_id: ConversationId,
+        source_event_id: String,
+        summary: String,
+    ) -> anyhow::Result<LearningLedgerEvent> {
+        self.learning_service()
+            .capture_candidate_from_conversation(conversation_id, source_event_id, summary)
+            .await
+    }
+
+    async fn insert_learning_event(
+        &self,
+        event: LearningLedgerEvent,
+    ) -> anyhow::Result<LearningLedgerEvent> {
+        self.learning_service().insert_learning_event(event).await
+    }
+
+    async fn list_learning_records(
+        &self,
+        review_state: Option<LearningReviewState>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<LearningRecordProjection>> {
+        self.learning_service()
+            .list_learning_records(review_state, limit)
+            .await
+    }
+
+    async fn learning_freshness(
+        &self,
+        review_state: Option<LearningReviewState>,
+    ) -> anyhow::Result<LearningLedgerFreshness> {
+        self.learning_service()
+            .learning_freshness(review_state)
             .await
     }
 }
@@ -1622,6 +1722,40 @@ mod tests {
     struct NoopService;
 
     #[async_trait::async_trait]
+    impl LearningService for NoopService {
+        async fn capture_candidate_from_conversation(
+            &self,
+            _conversation_id: ConversationId,
+            _source_event_id: String,
+            _summary: String,
+        ) -> anyhow::Result<LearningLedgerEvent> {
+            anyhow::bail!("unused learning service")
+        }
+
+        async fn insert_learning_event(
+            &self,
+            _event: LearningLedgerEvent,
+        ) -> anyhow::Result<LearningLedgerEvent> {
+            anyhow::bail!("unused learning service")
+        }
+
+        async fn list_learning_records(
+            &self,
+            _review_state: Option<LearningReviewState>,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<LearningRecordProjection>> {
+            anyhow::bail!("unused learning service")
+        }
+
+        async fn learning_freshness(
+            &self,
+            _review_state: Option<LearningReviewState>,
+        ) -> anyhow::Result<LearningLedgerFreshness> {
+            anyhow::bail!("unused learning service")
+        }
+    }
+
+    #[async_trait::async_trait]
     impl ProviderService for NoopService {
         async fn chat(
             &self,
@@ -2076,6 +2210,7 @@ mod tests {
         type ProviderService = NoopService;
         type AppConfigService = NoopService;
         type ConversationService = RawConversationService;
+        type LearningService = NoopService;
         type SteerService = RawSteerService;
         type TemplateService = NoopService;
         type AttachmentService = NoopService;
@@ -2112,6 +2247,10 @@ mod tests {
 
         fn conversation_service(&self) -> &Self::ConversationService {
             &self.conversation
+        }
+
+        fn learning_service(&self) -> &Self::LearningService {
+            &self.noop
         }
 
         fn steer_service(&self) -> &Self::SteerService {

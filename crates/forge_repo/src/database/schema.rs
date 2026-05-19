@@ -15,6 +15,30 @@ diesel::table! {
 }
 
 diesel::table! {
+    learning_ledger_events (event_seq) {
+        event_seq -> BigInt,
+        event_id -> Text,
+        record_id -> Text,
+        idempotency_key -> Text,
+        workspace_id -> BigInt,
+        event_kind -> Text,
+        summary -> Text,
+        content_fingerprint -> Text,
+        redaction_status -> Text,
+        source_kind -> Text,
+        source_id -> Text,
+        source_event_id -> Text,
+        source_fingerprint -> Text,
+        conversation_id -> Nullable<Text>,
+        task_id -> Nullable<Text>,
+        tool_name -> Nullable<Text>,
+        eval_id -> Nullable<Text>,
+        created_at -> Timestamp,
+        schema_version -> Integer,
+    }
+}
+
+diesel::table! {
     subagent_task_sessions (task_id) {
         task_id -> Text,
         agent_id -> Text,

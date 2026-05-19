@@ -13,9 +13,10 @@ use forge_config::ForgeConfig;
 use forge_domain::{
     AnyProvider, AuthCredential, ChatCompletionMessage, ChatRepository, CommandExecutionOutput,
     Context, Conversation, ConversationId, ConversationRepository, Environment, FileInfo,
-    FuzzySearchRepository, McpServerConfig, MigrationResult, Model, ModelId, ProcessId,
-    ProcessReadCursor, ProcessReadOutput, ProcessStartOutput, ProcessStatus, Provider, ProviderId,
-    ProviderRepository, ResultStream, SearchMatch, Skill, SkillRepository, Snapshot,
+    FuzzySearchRepository, LearningLedgerEvent, LearningLedgerFreshness, LearningRecordProjection,
+    LearningRepository, LearningReviewState, McpServerConfig, MigrationResult, Model, ModelId,
+    ProcessId, ProcessReadCursor, ProcessReadOutput, ProcessStartOutput, ProcessStatus, Provider,
+    ProviderId, ProviderRepository, ResultStream, SearchMatch, Skill, SkillRepository, Snapshot,
     SnapshotRepository, SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter,
     TextPatchBlock, TextPatchRepository,
 };
@@ -32,6 +33,7 @@ use crate::conversation::ConversationRepositoryImpl;
 use crate::database::{DatabasePool, PoolConfig};
 use crate::fs_snap::ForgeFileSnapshotService;
 use crate::fuzzy_search::ForgeFuzzySearchRepository;
+use crate::learning::LearningRepositoryImpl;
 use crate::provider::{ForgeChatRepository, ForgeProviderRepository};
 use crate::skill::ForgeSkillRepository;
 use crate::validation::ForgeValidationRepository;
@@ -45,6 +47,7 @@ pub struct ForgeRepo<F> {
     infra: Arc<F>,
     file_snapshot_service: Arc<ForgeFileSnapshotService>,
     conversation_repository: Arc<ConversationRepositoryImpl>,
+    learning_repository: Arc<LearningRepositoryImpl>,
     mcp_cache_repository: Arc<CacacheStorage>,
     provider_repository: Arc<ForgeProviderRepository<F>>,
     chat_repository: Arc<ForgeChatRepository<F>>,
@@ -73,6 +76,10 @@ impl<
             db_pool.clone(),
             env.workspace_hash(),
         ));
+        let learning_repository = Arc::new(LearningRepositoryImpl::new(
+            db_pool.clone(),
+            env.workspace_hash(),
+        ));
 
         let mcp_cache_repository = Arc::new(CacacheStorage::new(
             env.cache_dir().join("mcp_cache"),
@@ -91,6 +98,7 @@ impl<
             infra,
             file_snapshot_service,
             conversation_repository,
+            learning_repository,
             mcp_cache_repository,
             provider_repository,
             chat_repository,
@@ -197,6 +205,35 @@ impl<F: Send + Sync> ConversationRepository for ForgeRepo<F> {
     async fn delete_conversation(&self, conversation_id: &ConversationId) -> anyhow::Result<()> {
         self.conversation_repository
             .delete_conversation(conversation_id)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl<F: Send + Sync> LearningRepository for ForgeRepo<F> {
+    async fn insert_learning_event(
+        &self,
+        event: LearningLedgerEvent,
+    ) -> anyhow::Result<LearningLedgerEvent> {
+        self.learning_repository.insert_learning_event(event).await
+    }
+
+    async fn list_learning_records(
+        &self,
+        review_state: Option<LearningReviewState>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<LearningRecordProjection>> {
+        self.learning_repository
+            .list_learning_records(review_state, limit)
+            .await
+    }
+
+    async fn learning_freshness(
+        &self,
+        review_state: Option<LearningReviewState>,
+    ) -> anyhow::Result<LearningLedgerFreshness> {
+        self.learning_repository
+            .learning_freshness(review_state)
             .await
     }
 }

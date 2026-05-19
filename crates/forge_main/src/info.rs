@@ -767,19 +767,14 @@ impl From<&Conversation> for Info {
             .context
             .iter()
             .flat_map(|ctx| ctx.messages.iter())
-            .filter(|message| message.has_role(Role::User));
+            .filter(|message| message.has_role(Role::User))
+            .filter_map(|message| format_user_message(message));
 
-        let task = user_messages.next();
-
-        if let Some(task) = task
-            && let Some(task) = format_user_message(task)
-        {
+        if let Some(task) = user_messages.next() {
             info = info.add_key_value("Tasks", task);
 
             for feedback in user_messages {
-                if let Some(feedback) = format_user_message(feedback) {
-                    info = info.add_value(feedback);
-                }
+                info = info.add_value(feedback);
             }
         }
 
@@ -1172,6 +1167,43 @@ mod tests {
         let actual =
             String::from_utf8(stripped).expect("stripped ANSI output should remain valid UTF-8");
         let expected = "tasks   First line\n        Second line  ";
+
+        assert!(actual.contains(expected));
+    }
+
+    #[test]
+    fn test_conversation_info_skips_blank_user_prompt_before_task() {
+        use chrono::Utc;
+        use forge_api::{Context, ContextMessage, ConversationId, Role};
+
+        use super::{Conversation, Metrics};
+
+        let conversation_id = ConversationId::generate();
+        let metrics = Metrics::default().started_at(Utc::now());
+        let context = Context::default()
+            .add_message(ContextMessage::Text(
+                forge_domain::TextMessage::new(Role::User, "   \n\t  ")
+                    .raw_content(EventValue::text("   \n\t  ")),
+            ))
+            .add_message(ContextMessage::Text(
+                forge_domain::TextMessage::new(Role::User, "Actual task")
+                    .raw_content(EventValue::text("Actual task")),
+            ));
+        let fixture = Conversation {
+            id: conversation_id,
+            parent_id: None,
+            title: Some("Test Task".to_string()),
+            initiator: forge_domain::Initiator::User,
+            context: Some(context),
+            metrics,
+            metadata: forge_domain::MetaData::new(Utc::now()),
+        };
+
+        let actual = super::Info::from(&fixture).to_string();
+        let stripped = strip_ansi_escapes::strip(&actual);
+        let actual =
+            String::from_utf8(stripped).expect("stripped ANSI output should remain valid UTF-8");
+        let expected = "tasks Actual task";
 
         assert!(actual.contains(expected));
     }

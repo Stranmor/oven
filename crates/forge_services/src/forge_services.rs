@@ -6,9 +6,9 @@ use forge_app::{
     McpServerInfra, PdfRenderInfra, Services, StrategyFactory, UserInfra, WalkerInfra,
 };
 use forge_domain::{
-    ChatRepository, ConversationRepository, FuzzySearchRepository, ProviderRepository,
-    SkillRepository, SnapshotRepository, TextPatchRepository, ValidationRepository,
-    WorkspaceIndexRepository,
+    ChatRepository, ConversationRepository, FuzzySearchRepository, LearningRepository,
+    ProviderRepository, SkillRepository, SnapshotRepository, TextPatchRepository,
+    ValidationRepository, WorkspaceIndexRepository,
 };
 
 use crate::agent_registry::ForgeAgentRegistryService;
@@ -20,6 +20,7 @@ use crate::conversation::ForgeConversationService;
 use crate::discovery::ForgeDiscoveryService;
 use crate::fd::FdDefault;
 use crate::instructions::ForgeCustomInstructionsService;
+use crate::learning::ForgeLearningService;
 use crate::mcp::{ForgeMcpManager, ForgeMcpService};
 use crate::policy::ForgePolicyService;
 use crate::provider_service::ForgeProviderService;
@@ -48,6 +49,7 @@ pub struct ForgeServices<
         + WalkerInfra
         + SnapshotRepository
         + ConversationRepository
+        + LearningRepository
         + KVStore
         + ChatRepository
         + ProviderRepository
@@ -59,6 +61,7 @@ pub struct ForgeServices<
     chat_service: Arc<ForgeProviderService<F>>,
     config_service: Arc<ForgeAppConfigService<F>>,
     conversation_service: Arc<ForgeConversationService<F>>,
+    learning_service: Arc<ForgeLearningService<F>>,
     steer_service: Arc<ForgeSteerService>,
     template_service: Arc<ForgeTemplateService<F>>,
     attachment_service: Arc<ForgeChatRequest<F>>,
@@ -101,6 +104,7 @@ impl<
         + UserInfra
         + SnapshotRepository
         + ConversationRepository
+        + LearningRepository
         + ChatRepository
         + ProviderRepository
         + KVStore
@@ -117,6 +121,7 @@ impl<
         let attachment_service = Arc::new(ForgeChatRequest::new(infra.clone()));
         let suggestion_service = Arc::new(ForgeDiscoveryService::new(infra.clone()));
         let conversation_service = Arc::new(ForgeConversationService::new(infra.clone()));
+        let learning_service = Arc::new(ForgeLearningService::new(infra.clone()));
         let steer_service = ForgeSteerService::new();
         let auth_service = Arc::new(ForgeAuthService::new(infra.clone()));
         let chat_service = Arc::new(ForgeProviderService::new(infra.clone()));
@@ -147,6 +152,7 @@ impl<
 
         Self {
             conversation_service,
+            learning_service,
             steer_service,
             attachment_service,
             template_service,
@@ -196,6 +202,7 @@ impl<
         + Clone
         + SnapshotRepository
         + ConversationRepository
+        + LearningRepository
         + KVStore
         + ChatRepository
         + ProviderRepository
@@ -212,6 +219,7 @@ impl<
 {
     type AppConfigService = ForgeAppConfigService<F>;
     type ConversationService = ForgeConversationService<F>;
+    type LearningService = ForgeLearningService<F>;
     type SteerService = ForgeSteerService;
     type TemplateService = ForgeTemplateService<F>;
     type ProviderAuthService = ForgeProviderAuthService<F>;
@@ -249,6 +257,10 @@ impl<
 
     fn conversation_service(&self) -> &Self::ConversationService {
         &self.conversation_service
+    }
+
+    fn learning_service(&self) -> &Self::LearningService {
+        &self.learning_service
     }
 
     fn steer_service(&self) -> &Self::SteerService {
@@ -358,6 +370,7 @@ impl<
         + WalkerInfra
         + SnapshotRepository
         + ConversationRepository
+        + LearningRepository
         + KVStore
         + ChatRepository
         + ProviderRepository

@@ -6,6 +6,7 @@ mod extraction;
 mod freshness;
 mod indexer;
 mod ingestion;
+mod learning;
 mod lexical;
 mod policy;
 mod render;
@@ -29,6 +30,11 @@ pub use extraction::{
 pub use freshness::compare_freshness;
 pub use indexer::ProjectIndexer;
 pub use ingestion::{ingest_external_facts, ingest_typed_external_facts};
+pub use learning::{
+    LearningContextPayload, LearningContextRecord, LearningContextTransport,
+    LearningLedgerFreshness, LearningProvenance, LearningRedactionStatus, LearningReviewState,
+    LearningSourceKind, learning_records_to_graph,
+};
 pub use lexical::{LexicalIndex, documents_from_manifest};
 pub use policy::{
     ProjectContextTarget, TargetResolutionBudget, directory_path_filter, local_project_model_dir,

@@ -5,6 +5,7 @@ use url::Url;
 
 use crate::{
     AnyProvider, AuthCredential, ChatCompletionMessage, Context, Conversation, ConversationId,
+    LearningLedgerEvent, LearningLedgerFreshness, LearningRecordProjection, LearningReviewState,
     MigrationResult, Model, ModelId, Provider, ProviderId, ProviderTemplate, ResultStream,
     SearchMatch, Skill, Snapshot, SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter,
     WorkspaceAuth, WorkspaceId,
@@ -160,6 +161,49 @@ pub trait ConversationRepository: Send + Sync {
     /// # Errors
     /// Returns an error if the operation fails
     async fn delete_conversation(&self, conversation_id: &ConversationId) -> Result<()>;
+}
+
+#[async_trait::async_trait]
+pub trait LearningRepository: Send + Sync {
+    /// Inserts one append-only learning ledger event idempotently.
+    ///
+    /// # Arguments
+    /// * `event` - Event to append or deduplicate by idempotency key.
+    ///
+    /// # Errors
+    /// Returns an error if validation or persistence fails.
+    async fn insert_learning_event(
+        &self,
+        event: LearningLedgerEvent,
+    ) -> Result<LearningLedgerEvent>;
+
+    /// Lists projected learning records for the current workspace.
+    ///
+    /// # Arguments
+    /// * `review_state` - Optional review-state filter.
+    /// * `limit` - Maximum records to return.
+    ///
+    /// # Errors
+    /// Returns an error if projection query fails.
+    async fn list_learning_records(
+        &self,
+        review_state: Option<LearningReviewState>,
+        limit: usize,
+    ) -> Result<Vec<LearningRecordProjection>>;
+
+    /// Returns ledger freshness for the current workspace and optional review
+    /// state.
+    ///
+    /// # Arguments
+    /// * `review_state` - Optional review-state filter used for the projection
+    ///   fingerprint.
+    ///
+    /// # Errors
+    /// Returns an error if the freshness query fails.
+    async fn learning_freshness(
+        &self,
+        review_state: Option<LearningReviewState>,
+    ) -> Result<LearningLedgerFreshness>;
 }
 
 #[async_trait::async_trait]
