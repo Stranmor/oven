@@ -1234,12 +1234,18 @@ pub struct ExternalFactBatch {
 pub enum ExternalFactIngestionIssueCode {
     /// Batch metadata is missing source, artifact, workspace, or baseline data.
     IncompleteBatchMetadata,
+    /// Batch workspace identity does not match the current manifest workspace.
+    WorkspaceRootMismatch,
     /// Batch metadata baseline does not match the current manifest baseline.
     ManifestBaselineMismatch,
     /// Batch fingerprint does not match deterministic recomputation.
     BatchFingerprintMismatch,
+    /// A symbol fact repeats a symbol identifier inside the same batch.
+    DuplicateSymbolId,
     /// A symbol fact points at a file not present in the manifest.
     MissingSymbolFileEndpoint,
+    /// A reference provenance path is absent from the manifest file set.
+    MissingReferenceFileEndpoint,
     /// A reference or call edge source is absent from accepted file, symbol, or shard endpoints.
     MissingReferenceSourceEndpoint,
     /// A reference or call edge target is absent from accepted file, symbol, or shard endpoints.

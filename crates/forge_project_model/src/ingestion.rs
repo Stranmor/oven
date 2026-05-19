@@ -154,8 +154,17 @@ pub fn validate_external_fact_batch(
     validate_batch_metadata(manifest, batch, &mut issues);
     validate_source_contract(batch, &mut issues);
     let mut endpoints = manifest_endpoints(manifest);
+    let file_endpoints = manifest_file_endpoints(manifest);
+    let mut batch_symbol_ids = BTreeSet::new();
     for symbol in &batch.facts.symbols {
-        if !endpoints.contains(&symbol.path) {
+        if !batch_symbol_ids.insert(symbol.id.clone()) {
+            issues.push(issue(
+                ExternalFactIngestionIssueCode::DuplicateSymbolId,
+                Some(symbol.id.clone()),
+                format!("duplicate_symbol_id:{}", symbol.id),
+            ));
+        }
+        if !file_endpoints.contains(&symbol.path) {
             issues.push(issue(
                 ExternalFactIngestionIssueCode::MissingSymbolFileEndpoint,
                 Some(symbol.path.clone()),
@@ -165,6 +174,16 @@ pub fn validate_external_fact_batch(
         endpoints.insert(symbol.id.clone());
     }
     for reference in &batch.facts.references {
+        if !file_endpoints.contains(&reference.path) {
+            issues.push(issue(
+                ExternalFactIngestionIssueCode::MissingReferenceFileEndpoint,
+                Some(reference.path.clone()),
+                format!(
+                    "reference_file_missing:{}->{}",
+                    reference.from, reference.to
+                ),
+            ));
+        }
         if !endpoints.contains(&reference.from) {
             issues.push(issue(
                 ExternalFactIngestionIssueCode::MissingReferenceSourceEndpoint,
@@ -288,6 +307,16 @@ fn validate_batch_metadata(
             "batch_metadata_incomplete".to_string(),
         ));
     }
+    let current_workspace_root = manifest.root.to_string_lossy().to_string();
+    if !metadata.workspace_root.trim().is_empty()
+        && metadata.workspace_root != current_workspace_root
+    {
+        issues.push(issue(
+            ExternalFactIngestionIssueCode::WorkspaceRootMismatch,
+            Some(metadata.workspace_root.clone()),
+            format!("workspace_root_mismatch:current={current_workspace_root}"),
+        ));
+    }
     if metadata.manifest_hash_input != manifest.manifest_hash {
         issues.push(issue(
             ExternalFactIngestionIssueCode::ManifestBaselineMismatch,
@@ -341,12 +370,18 @@ fn validate_source_contract(
 }
 
 fn manifest_endpoints(manifest: &ProjectManifest) -> BTreeSet<String> {
+    manifest_file_endpoints(manifest)
+        .into_iter()
+        .chain(manifest.symbols.iter().map(|symbol| symbol.id.clone()))
+        .chain(manifest.shards.iter().map(|shard| shard.id.clone()))
+        .collect()
+}
+
+fn manifest_file_endpoints(manifest: &ProjectManifest) -> BTreeSet<String> {
     manifest
         .files
         .iter()
         .map(|file| file.path.clone())
-        .chain(manifest.symbols.iter().map(|symbol| symbol.id.clone()))
-        .chain(manifest.shards.iter().map(|shard| shard.id.clone()))
         .collect()
 }
 
@@ -805,6 +840,106 @@ mod tests {
 
         assert_eq!(heuristic_after, heuristic_before);
         assert_eq!(exact_after > 0, true);
+        Ok(())
+    }
+
+    #[test]
+    fn external_reference_path_outside_manifest_is_rejected() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let mut manifest = setup.index()?;
+        let before_edges = manifest.edges.clone();
+        let mut batch = fixture_batch(&manifest, &fingerprint("snapshot-a"));
+        batch
+            .facts
+            .references
+            .first_mut()
+            .expect("fixture batch should include references")
+            .path = "src/missing.rs".to_string();
+        batch.metadata.batch_fingerprint =
+            external_fact_batch_fingerprint(&batch.metadata, &batch.facts);
+
+        let actual = ingest_external_fact_batch(&mut manifest, batch).is_err();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+        assert_eq!(manifest.edges, before_edges);
+        Ok(())
+    }
+
+    #[test]
+    fn external_batch_workspace_root_mismatch_is_rejected() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let mut manifest = setup.index()?;
+        let before_edges = manifest.edges.clone();
+        let mut batch = fixture_batch(&manifest, &fingerprint("snapshot-a"));
+        batch.metadata.workspace_root = "/different/workspace".to_string();
+        batch.metadata.batch_fingerprint =
+            external_fact_batch_fingerprint(&batch.metadata, &batch.facts);
+
+        let issues = validate_external_fact_batch(&manifest, &batch);
+        let actual = ingest_external_fact_batch(&mut manifest, batch).is_err();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+        assert_eq!(
+            issues
+                .iter()
+                .any(|issue| issue.code == ExternalFactIngestionIssueCode::WorkspaceRootMismatch),
+            true
+        );
+        assert_eq!(manifest.edges, before_edges);
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_external_symbol_ids_are_rejected_before_manifest_mutation() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let mut manifest = setup.index()?;
+        let before_symbols = manifest.symbols.clone();
+        let facts = TypedExternalFacts {
+            symbols: vec![
+                TypedExternalSymbolFact {
+                    id: "lsp:src/lib.rs:Root::new".to_string(),
+                    name: "new".to_string(),
+                    kind: SymbolKind::Method,
+                    path: "src/lib.rs".to_string(),
+                    start_line: 10,
+                    end_line: 12,
+                    source: ExternalFactSource::Lsp,
+                },
+                TypedExternalSymbolFact {
+                    id: "lsp:src/lib.rs:Root::new".to_string(),
+                    name: "conflicting_new".to_string(),
+                    kind: SymbolKind::Method,
+                    path: "src/lib.rs".to_string(),
+                    start_line: 11,
+                    end_line: 13,
+                    source: ExternalFactSource::Lsp,
+                },
+            ],
+            references: Vec::new(),
+        };
+        let batch = ExternalFactBatch::new(
+            ExternalFactBatchMetadata {
+                source: ExternalFactSource::Lsp,
+                source_label: "rust-analyzer".to_string(),
+                tool_version: Some("fixture-1".to_string()),
+                workspace_root: manifest.root.to_string_lossy().to_string(),
+                source_artifact_fingerprint: fingerprint("duplicate-symbol-id"),
+                manifest_hash_input: manifest.manifest_hash.clone(),
+                batch_fingerprint: String::new(),
+            },
+            facts,
+        );
+
+        let actual = ingest_external_fact_batch(&mut manifest, batch).is_err();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+        assert_eq!(manifest.symbols, before_symbols);
         Ok(())
     }
 
