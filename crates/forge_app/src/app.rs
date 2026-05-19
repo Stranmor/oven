@@ -660,7 +660,7 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig> + SteerS
             .ok_or_else(|| forge_domain::Error::ConversationNotFound(chat.conversation_id))?;
 
         // Discover files using the discovery service
-        let forge_config = self.services.get_config()?;
+        let app_config = self.services.get_config()?;
         let environment = services.get_environment();
 
         let custom_instructions = services.get_custom_instructions().await;
@@ -674,7 +674,7 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig> + SteerS
             .get_agent(&agent_id)
             .await?
             .ok_or(crate::Error::AgentNotFound(agent_id.clone()))?
-            .apply_config(&forge_config)
+            .apply_config(&app_config)
             .set_compact_model_if_none();
 
         let agent_provider = agent_provider_resolver
@@ -711,8 +711,8 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig> + SteerS
                 .custom_instructions(custom_instructions.clone())
                 .tool_definitions(tool_definitions.clone())
                 .models(models.clone())
-                .max_extensions(forge_config.max_extensions)
-                .template_config(build_template_config(&forge_config))
+                .max_extensions(app_config.max_extensions)
+                .template_config(build_template_config(&app_config))
                 .add_system_message(conversation)
                 .await?;
 
@@ -755,7 +755,7 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig> + SteerS
 
         // Build the on_end hook, conditionally adding PendingTodosHandler based on
         // config
-        let on_end_hook = if forge_config.verify_todos {
+        let on_end_hook = if app_config.verify_todos {
             tracing_handler
                 .clone()
                 .and(title_handler.clone())
@@ -1084,15 +1084,17 @@ mod tests {
     use anyhow::Result;
     use forge_domain::{
         Agent, AgentId, AnyProvider, AuthContextRequest, AuthContextResponse, AuthMethod,
-        ChatCompletionMessage, Content, Context, ContextMessage, Conversation, ConversationId,
-        Environment, FileChunk, FileStatus, FinishReason, LEARNING_LEDGER_SCHEMA_VERSION,
-        LearningEventKind, LearningLedgerEvent, LearningLedgerFreshness, LearningProvenance,
-        LearningRecordId, LearningRecordProjection, LearningRedactionStatus, LearningReviewState,
-        McpConfig, McpServers, Model, ModelId, Node, NodeData, NodeId, PermissionOperation,
-        Provider, ProviderId, ProviderType, ResultStream, Scope, SearchParams, SteerMessage,
-        SyncProgress, ToolCallContext, ToolCallFull, ToolOutput, ToolResult, WorkspaceAuth,
-        WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic, WorkspaceId, WorkspaceInfo,
+        ChatCompletionMessage, ChatRequest, Content, Context, ContextMessage, Conversation,
+        ConversationId, Environment, Event, FileChunk, FileStatus, FinishReason,
+        LEARNING_LEDGER_SCHEMA_VERSION, LearningEventKind, LearningLedgerEvent,
+        LearningLedgerFreshness, LearningProvenance, LearningRecordId, LearningRecordProjection,
+        LearningRedactionStatus, LearningReviewState, McpConfig, McpServers, Model, ModelId, Node,
+        NodeData, NodeId, PermissionOperation, Provider, ProviderId, ProviderType, ResultStream,
+        Scope, SearchParams, SteerMessage, SyncProgress, ToolCallContext, ToolCallFull, ToolOutput,
+        ToolResult, WorkspaceAuth, WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
+        WorkspaceId, WorkspaceInfo,
     };
+    use futures::StreamExt;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
     use tokio::sync::Mutex;
@@ -1161,6 +1163,10 @@ mod tests {
         async fn set_learning_records(&self, records: Vec<LearningRecordProjection>) {
             *self.state.learning_records.lock().await = records;
         }
+
+        async fn upsert_conversation(&self, conversation: Conversation) -> Result<()> {
+            self.state.upsert_conversation(conversation).await
+        }
     }
 
     impl EnvironmentInfra for ChatFlowLearningHarness {
@@ -1185,7 +1191,7 @@ mod tests {
         }
 
         fn get_config(&self) -> Result<Self::Config> {
-            Ok(ForgeConfig::default())
+            Ok(ForgeConfig { max_parallel_file_reads: 4, ..Default::default() })
         }
 
         async fn update_environment(&self, _ops: Vec<forge_domain::ConfigOperation>) -> Result<()> {
@@ -2347,27 +2353,37 @@ mod tests {
     async fn chat_flow_saves_conversation_then_captures_learning_candidate() -> Result<()> {
         let (_fixture, root) = fixture_workspace()?;
         let setup = ChatFlowLearningHarness::new(root);
-        let conversation =
-            Conversation::generate().context(Context::default().add_message(ContextMessage::user(
-                "runtime self-learning proof request",
-                Some(setup.state.model.id.clone()),
-            )));
-        let mut orch = Orchestrator::new(
-            setup.clone(),
-            conversation,
-            setup.state.agent.clone(),
-            ForgeConfig::default(),
+        let conversation = Conversation::generate();
+        let conversation_id = conversation.id;
+        setup.upsert_conversation(conversation).await?;
+        let app = ForgeApp::new(setup.clone());
+        let mut stream = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            app.chat(
+                setup.state.agent.id.clone(),
+                ChatRequest::new(
+                    Event::new("runtime self-learning proof request"),
+                    conversation_id,
+                ),
+            ),
         )
-        .models(vec![setup.state.model.clone()])
-        .active_provider(setup.state.provider.clone())
-        .tool_definitions(Vec::new());
+        .await??;
 
-        orch.run().await?;
-        let conversation = orch.get_conversation().clone();
-        save_conversation_and_capture_learning(setup.clone(), conversation.clone()).await?;
+        for _ in 0..32 {
+            if !setup.state.learning_events.lock().await.is_empty() {
+                break;
+            }
+            match tokio::time::timeout(std::time::Duration::from_millis(250), stream.next()).await {
+                Ok(Some(response)) => {
+                    response?;
+                }
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
 
         let saved = setup
-            .find_conversation(&conversation.id)
+            .find_conversation(&conversation_id)
             .await?
             .expect("conversation should be saved after chat flow");
         let events = setup.state.learning_events.lock().await.clone();
@@ -2389,7 +2405,7 @@ mod tests {
         let expected = Some((
             1usize,
             LearningEventKind::CandidateCaptured,
-            Some(conversation.id),
+            Some(conversation_id),
             true,
             true,
             true,
@@ -2414,25 +2430,34 @@ mod tests {
                 ),
             ])
             .await;
-        let conversation =
-            Conversation::generate().context(Context::default().add_message(ContextMessage::user(
-                "runtime accepted learning proof",
-                Some(setup.state.model.id.clone()),
-            )));
-        let conversation = ProjectContextInjection::new(setup.clone(), setup.state.agent.clone())
-            .inject_learning(conversation)
-            .await;
-        let mut orch = Orchestrator::new(
-            setup.clone(),
-            conversation,
-            setup.state.agent.clone(),
-            ForgeConfig::default(),
+        let conversation = Conversation::generate();
+        let conversation_id = conversation.id;
+        setup.upsert_conversation(conversation).await?;
+        let app = ForgeApp::new(setup.clone());
+        let mut stream = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            app.chat(
+                setup.state.agent.id.clone(),
+                ChatRequest::new(
+                    Event::new("runtime accepted learning proof"),
+                    conversation_id,
+                ),
+            ),
         )
-        .models(vec![setup.state.model.clone()])
-        .active_provider(setup.state.provider.clone())
-        .tool_definitions(Vec::new());
+        .await??;
 
-        orch.run().await?;
+        for _ in 0..32 {
+            if setup.state.captured_provider_context.lock().await.is_some() {
+                break;
+            }
+            match tokio::time::timeout(std::time::Duration::from_millis(250), stream.next()).await {
+                Ok(Some(response)) => {
+                    response?;
+                }
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
 
         let captured_context = setup
             .state
