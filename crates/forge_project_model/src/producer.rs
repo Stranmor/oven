@@ -407,6 +407,24 @@ fn derive_native_endpoint_positions(
             symbol.id.clone(),
         ));
     }
+    let mut files = manifest
+        .files
+        .iter()
+        .filter(|file| file.language == Language::Rust)
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    for file in files {
+        let source_text = source_texts.get(&file.path)?;
+        if fingerprint(source_text) != file.content_hash {
+            return None;
+        }
+        positions.push(NativeLspEndpointPosition::new(
+            file.path.clone(),
+            0,
+            0,
+            file.path.clone(),
+        ));
+    }
     Some(positions)
 }
 
@@ -1026,19 +1044,15 @@ impl NativeLspReferenceNormalizer {
         for item in items {
             let (path, start_line, start_character, end_line) =
                 parse_native_location(manifest, item)?;
-            let endpoint = request
-                .endpoint_positions
-                .iter()
-                .find(|position| {
-                    position.path == path
-                        && position.line == start_line
-                        && position.character == start_character
-                })
-                .ok_or_else(|| {
-                    anyhow::anyhow!("native lsp location has no explicit endpoint mapping")
-                })?;
+            let endpoint = native_lsp_reference_site_endpoint(
+                manifest,
+                request,
+                &path,
+                start_line,
+                start_character,
+            )?;
             references.push(LspReferenceFact::new(
-                endpoint.endpoint.clone(),
+                endpoint,
                 request.queried_endpoint.clone(),
                 GraphEdgeKind::References,
                 path,
@@ -1048,6 +1062,25 @@ impl NativeLspReferenceNormalizer {
         }
         Ok(references)
     }
+}
+
+fn native_lsp_reference_site_endpoint(
+    manifest: &ProjectManifest,
+    request: &NativeLspReferenceNormalizationRequest,
+    path: &str,
+    start_line: u32,
+    start_character: u32,
+) -> Result<String> {
+    if let Some(position) = request.endpoint_positions.iter().find(|position| {
+        position.path == path
+            && position.line == start_line
+            && position.character == start_character
+    }) {
+        return Ok(position.endpoint.clone());
+    }
+    ensure_manifest_file_line_range(manifest, path, start_line, start_line)?;
+    ensure_manifest_endpoint(manifest, path)?;
+    Ok(path.to_string())
 }
 
 /// Bounded JSON-RPC parser for typed LSP reference candidates.
@@ -2685,6 +2718,18 @@ mod tests {
                             "symbol:src/model.rs:symbol:src/model.rs:Impl:impl Named for Widget:Method:name"
                                 .to_string(),
                         ),
+                        (
+                            "src/lib.rs".to_string(),
+                            0,
+                            0,
+                            "src/lib.rs".to_string(),
+                        ),
+                        (
+                            "src/model.rs".to_string(),
+                            0,
+                            0,
+                            "src/model.rs".to_string(),
+                        ),
                     ]
                 );
             }
@@ -2714,6 +2759,46 @@ mod tests {
             "src/model.rs",
             Some(1),
             Some(1),
+        )];
+
+        assert_eq!(actual, expected);
+        assert_eq!(setup.model_dir().join("external_facts").exists(), false);
+        Ok(())
+    }
+
+    #[test]
+    fn native_lsp_reference_location_without_symbol_mapping_falls_back_to_file_endpoint()
+    -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model-native-file-fallback"));
+        let manifest = setup.index()?;
+        let uri_path = root
+            .join("src/lib.rs")
+            .to_string_lossy()
+            .replace(' ', "%20");
+        let response = native_response(&format!(
+            r#"{{"jsonrpc":"2.0","id":7,"result":[{{"uri":"file://{uri_path}","range":{{"start":{{"line":1,"character":23}},"end":{{"line":1,"character":29}}}}}}]}}"#,
+        ));
+        let request = NativeLspReferenceNormalizationRequest::new(
+            7,
+            "symbol:src/lib.rs:Struct:Root",
+            vec![NativeLspEndpointPosition::new(
+                "src/model.rs",
+                0,
+                0,
+                "symbol:src/model.rs:Enum:Widget",
+            )],
+            Default::default(),
+        );
+
+        let actual = NativeLspReferenceNormalizer::normalize(&manifest, &response, &request)?;
+        let expected = vec![LspReferenceFact::new(
+            "src/lib.rs",
+            "symbol:src/lib.rs:Struct:Root",
+            GraphEdgeKind::References,
+            "src/lib.rs",
+            Some(2),
+            Some(2),
         )];
 
         assert_eq!(actual, expected);
@@ -2807,7 +2892,7 @@ mod tests {
     }
 
     #[test]
-    fn native_lsp_unknown_position_mapping_fails_without_artifact() -> Result<()> {
+    fn native_lsp_unknown_symbol_position_mapping_falls_back_to_file_endpoint() -> Result<()> {
         let (fixture, root) = fixture_project()?;
         let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
         let manifest = setup.index()?;
@@ -2827,10 +2912,17 @@ mod tests {
             &manifest,
             &native_location_response(&root, 7, "src/model.rs"),
             &request,
-        )
-        .is_err();
+        )?;
+        let expected = vec![LspReferenceFact::new(
+            "src/model.rs",
+            "symbol:src/lib.rs:Struct:Root",
+            GraphEdgeKind::References,
+            "src/model.rs",
+            Some(1),
+            Some(1),
+        )];
 
-        assert_eq!(actual, true);
+        assert_eq!(actual, expected);
         assert_eq!(setup.model_dir().join("external_facts").exists(), false);
         Ok(())
     }
@@ -3132,7 +3224,7 @@ mod tests {
         );
         let manifest = setup.index()?;
         let sensor = FakeNativeLspSensor {
-            references: process_output(native_location_response(&root, 7, "src/lib.rs")),
+            references: process_output(native_location_response(&root, 99, "src/lib.rs")),
         };
         let producer = NativeLspReferenceProducer::new(sensor, available_probe());
 
