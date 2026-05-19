@@ -1242,6 +1242,8 @@ pub enum ExternalFactIngestionIssueCode {
     BatchFingerprintMismatch,
     /// A symbol fact repeats a symbol identifier inside the same batch.
     DuplicateSymbolId,
+    /// A symbol fact would overwrite an existing manifest-owned symbol identifier.
+    ConflictingManifestSymbolId,
     /// A symbol fact points at a file not present in the manifest.
     MissingSymbolFileEndpoint,
     /// A reference provenance path is absent from the manifest file set.

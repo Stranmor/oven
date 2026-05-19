@@ -155,6 +155,7 @@ pub fn validate_external_fact_batch(
     validate_source_contract(batch, &mut issues);
     let mut endpoints = manifest_endpoints(manifest);
     let file_endpoints = manifest_file_endpoints(manifest);
+    let manifest_symbol_ids = manifest_symbol_ids(manifest);
     let mut batch_symbol_ids = BTreeSet::new();
     for symbol in &batch.facts.symbols {
         if !batch_symbol_ids.insert(symbol.id.clone()) {
@@ -162,6 +163,13 @@ pub fn validate_external_fact_batch(
                 ExternalFactIngestionIssueCode::DuplicateSymbolId,
                 Some(symbol.id.clone()),
                 format!("duplicate_symbol_id:{}", symbol.id),
+            ));
+        }
+        if manifest_symbol_ids.contains(&symbol.id) {
+            issues.push(issue(
+                ExternalFactIngestionIssueCode::ConflictingManifestSymbolId,
+                Some(symbol.id.clone()),
+                format!("manifest_symbol_id_conflict:{}", symbol.id),
             ));
         }
         if !file_endpoints.contains(&symbol.path) {
@@ -374,6 +382,14 @@ fn manifest_endpoints(manifest: &ProjectManifest) -> BTreeSet<String> {
         .into_iter()
         .chain(manifest.symbols.iter().map(|symbol| symbol.id.clone()))
         .chain(manifest.shards.iter().map(|shard| shard.id.clone()))
+        .collect()
+}
+
+fn manifest_symbol_ids(manifest: &ProjectManifest) -> BTreeSet<String> {
+    manifest
+        .symbols
+        .iter()
+        .map(|symbol| symbol.id.clone())
         .collect()
 }
 
@@ -944,7 +960,54 @@ mod tests {
     }
 
     #[test]
-    fn legacy_external_facts_reject_unresolved_endpoints() -> Result<()> {
+    fn external_symbol_id_conflicting_with_manifest_symbol_is_rejected_before_manifest_mutation()
+    -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let mut manifest = setup.index()?;
+        let existing_symbol = manifest
+            .symbols
+            .iter()
+            .find(|symbol| symbol.id == "symbol:src/lib.rs:Struct:Root")
+            .expect("fixture should include Root symbol")
+            .clone();
+        let before_symbols = manifest.symbols.clone();
+        let facts = TypedExternalFacts {
+            symbols: vec![TypedExternalSymbolFact {
+                id: existing_symbol.id.clone(),
+                name: "conflicting_external_root".to_string(),
+                kind: SymbolKind::Method,
+                path: existing_symbol.path.clone(),
+                start_line: existing_symbol.start_line,
+                end_line: existing_symbol.end_line,
+                source: ExternalFactSource::Lsp,
+            }],
+            references: Vec::new(),
+        };
+        let batch = ExternalFactBatch::new(
+            ExternalFactBatchMetadata {
+                source: ExternalFactSource::Lsp,
+                source_label: "rust-analyzer".to_string(),
+                tool_version: Some("fixture-1".to_string()),
+                workspace_root: manifest.root.to_string_lossy().to_string(),
+                source_artifact_fingerprint: fingerprint("manifest-symbol-id-conflict"),
+                manifest_hash_input: manifest.manifest_hash.clone(),
+                batch_fingerprint: String::new(),
+            },
+            facts,
+        );
+
+        let issues = validate_external_fact_batch(&manifest, &batch);
+        let actual = ingest_external_fact_batch(&mut manifest, batch).is_err();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+        assert_eq!(
+            issues.iter().any(|issue| issue.code
+                == ExternalFactIngestionIssueCode::ConflictingManifestSymbolId),
+            true
+        );
+        assert_eq!(manifest.symbols, before_symbols);
         let (fixture, root) = fixture_project()?;
         let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
         let mut manifest = setup.index()?;

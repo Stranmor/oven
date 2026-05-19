@@ -1024,16 +1024,15 @@ mod tests {
             .first()
             .expect("successful query should append search episode")
             .clone();
-        assert_eq!(first_nodes.is_empty(), false);
-        assert_eq!(second_nodes.is_empty(), false);
+        assert!(!first_nodes.is_empty());
+        assert!(!second_nodes.is_empty());
         assert_eq!(indexer.list_context_pack_artifacts()?.len(), 1usize);
         assert_eq!(second_bytes, first_bytes);
-        assert_eq!(pack.evidence.is_empty(), false);
-        assert_eq!(
+        assert!(!pack.evidence.is_empty());
+        assert!(
             pack.provenance
                 .iter()
-                .all(|provenance| provenance.is_complete()),
-            true
+                .all(|provenance| provenance.is_complete())
         );
         assert_eq!(first_episodes.len(), 1usize);
         assert_eq!(second_episodes.len(), 2usize);
@@ -1047,9 +1046,9 @@ mod tests {
             episode.provenance.source,
             PROJECT_MODEL_SEARCH_PROVENANCE_SOURCE.to_string()
         );
-        assert_eq!(episode.input_fingerprint.is_empty(), false);
-        assert_eq!(episode.output_fingerprint.is_empty(), false);
-        assert_eq!(episode.provenance.fingerprint.is_empty(), false);
+        assert!(!episode.input_fingerprint.is_empty());
+        assert!(!episode.output_fingerprint.is_empty());
+        assert!(!episode.provenance.fingerprint.is_empty());
         let artifact = fs::read_to_string(artifact_path)?;
         let episode_json =
             fs::read_to_string(local_project_model_dir(&root).join("tool_episodes.jsonl"))?;
@@ -1280,7 +1279,7 @@ mod tests {
             added: Vec::new(),
         };
         assert_eq!(actual.freshness, expected);
-        assert_eq!(actual.can_inject(), false);
+        assert!(!actual.can_inject());
         Ok(())
     }
 
