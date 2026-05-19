@@ -198,6 +198,7 @@ impl LearningLedgerEventRecord {
         let source_kind = event.provenance.source_kind;
         let raw_source_id = event.provenance.source_id()?;
         let redacted = RedactedLearningSummary::from_raw(&event.summary);
+        let redacted_source_id = RedactedLearningSummary::from_raw(raw_source_id);
         let redacted_source_event_id =
             RedactedLearningSummary::from_raw(&event.provenance.source_event_id);
         let redacted_source_fingerprint =
@@ -213,19 +214,22 @@ impl LearningLedgerEventRecord {
             .as_ref()
             .map(RedactedLearningSummary::from_raw);
         let source_id = match source_kind {
-            LearningSourceKind::Conversation | LearningSourceKind::Task => raw_source_id,
+            LearningSourceKind::Conversation | LearningSourceKind::Task => {
+                redacted_source_id.summary.clone()
+            }
             LearningSourceKind::Tool => redacted_tool_name
                 .as_ref()
                 .map(|redacted| redacted.summary.clone())
-                .unwrap_or(raw_source_id),
+                .unwrap_or_else(|| redacted_source_id.summary.clone()),
             LearningSourceKind::Eval => redacted_eval_id
                 .as_ref()
                 .map(|redacted| redacted.summary.clone())
-                .unwrap_or(raw_source_id),
+                .unwrap_or_else(|| redacted_source_id.summary.clone()),
         };
         let redaction_status = [
             event.redaction_status,
             redacted.status,
+            redacted_source_id.status,
             redacted_source_event_id.status,
             redacted_source_fingerprint.status,
             redacted_tool_name
