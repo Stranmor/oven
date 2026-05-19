@@ -316,6 +316,7 @@ pub fn validate_external_fact_batch(
     validate_source_contract(batch, &mut issues);
     let mut endpoints = manifest_endpoints(manifest);
     let file_endpoints = manifest_file_endpoints(manifest);
+    let file_line_counts = manifest_file_line_counts(manifest);
     let manifest_symbol_ids = manifest_symbol_ids(manifest);
     let mut batch_symbol_ids = BTreeSet::new();
     for symbol in &batch.facts.symbols {
@@ -340,7 +341,14 @@ pub fn validate_external_fact_batch(
                 format!("symbol_file_missing:{}", symbol.id),
             ));
         }
-        if !valid_required_line_range(symbol.start_line, symbol.end_line) {
+        if !valid_required_line_range(symbol.start_line, symbol.end_line)
+            || !required_line_range_within_file(
+                &file_line_counts,
+                &symbol.path,
+                symbol.start_line,
+                symbol.end_line,
+            )
+        {
             issues.push(issue(
                 ExternalFactIngestionIssueCode::InvalidSymbolLineRange,
                 Some(symbol.id.clone()),
@@ -353,7 +361,14 @@ pub fn validate_external_fact_batch(
         endpoints.insert(symbol.id.clone());
     }
     for reference in &batch.facts.references {
-        if !valid_optional_line_range(reference.start_line, reference.end_line) {
+        if !valid_optional_line_range(reference.start_line, reference.end_line)
+            || !optional_line_range_within_file(
+                &file_line_counts,
+                &reference.path,
+                reference.start_line,
+                reference.end_line,
+            )
+        {
             issues.push(issue(
                 ExternalFactIngestionIssueCode::InvalidReferenceLineRange,
                 Some(reference.path.clone()),
@@ -405,6 +420,32 @@ fn valid_required_line_range(start_line: u32, end_line: u32) -> bool {
 fn valid_optional_line_range(start_line: Option<u32>, end_line: Option<u32>) -> bool {
     match (start_line, end_line) {
         (Some(start_line), Some(end_line)) => valid_required_line_range(start_line, end_line),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn required_line_range_within_file(
+    file_line_counts: &BTreeMap<String, u32>,
+    path: &str,
+    start_line: u32,
+    end_line: u32,
+) -> bool {
+    file_line_counts
+        .get(path)
+        .is_none_or(|line_count| start_line <= *line_count && end_line <= *line_count)
+}
+
+fn optional_line_range_within_file(
+    file_line_counts: &BTreeMap<String, u32>,
+    path: &str,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
+) -> bool {
+    match (start_line, end_line) {
+        (Some(start_line), Some(end_line)) => {
+            required_line_range_within_file(file_line_counts, path, start_line, end_line)
+        }
         (None, None) => true,
         _ => false,
     }
@@ -609,6 +650,14 @@ fn manifest_file_endpoints(manifest: &ProjectManifest) -> BTreeSet<String> {
         .files
         .iter()
         .map(|file| file.path.clone())
+        .collect()
+}
+
+fn manifest_file_line_counts(manifest: &ProjectManifest) -> BTreeMap<String, u32> {
+    manifest
+        .files
+        .iter()
+        .map(|file| (file.path.clone(), file.lines))
         .collect()
 }
 
@@ -1337,6 +1386,64 @@ mod tests {
 
         assert_eq!(actual, expected);
         assert_eq!(manifest.symbols, before_symbols);
+        Ok(())
+    }
+
+    #[test]
+    fn external_symbol_line_range_past_file_end_is_rejected_before_manifest_mutation() -> Result<()>
+    {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let mut manifest = setup.index()?;
+        let before_symbols = manifest.symbols.clone();
+        let mut batch = fixture_batch(&manifest, &fingerprint("out-of-bounds-line-range"));
+        let symbol = batch
+            .facts
+            .symbols
+            .first_mut()
+            .expect("fixture batch should include symbols");
+        symbol.start_line = 10_000;
+        symbol.end_line = 10_001;
+        batch.metadata.batch_fingerprint =
+            external_fact_batch_fingerprint(&batch.metadata, &batch.facts);
+
+        let actual = ingest_external_fact_batch(&mut manifest, batch).is_err();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+        assert_eq!(manifest.symbols, before_symbols);
+        Ok(())
+    }
+
+    #[test]
+    fn external_reference_line_range_past_file_end_is_rejected_before_manifest_mutation()
+    -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let mut manifest = setup.index()?;
+        let before_edges = manifest.edges.clone();
+        let mut batch = fixture_batch(&manifest, &fingerprint("out-of-bounds-reference-range"));
+        let reference = batch
+            .facts
+            .references
+            .first_mut()
+            .expect("fixture batch should include references");
+        reference.start_line = Some(10_000);
+        reference.end_line = Some(10_001);
+        batch.metadata.batch_fingerprint =
+            external_fact_batch_fingerprint(&batch.metadata, &batch.facts);
+
+        let issues = validate_external_fact_batch(&manifest, &batch);
+        let actual = ingest_external_fact_batch(&mut manifest, batch).is_err();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+        assert_eq!(
+            issues.iter().any(|issue| issue.code
+                == ExternalFactIngestionIssueCode::InvalidReferenceLineRange),
+            true
+        );
+        assert_eq!(manifest.edges, before_edges);
         Ok(())
     }
 
