@@ -1,5 +1,6 @@
 //! Typed exact-fact producer boundary for fixture-backed LSP facts.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -14,8 +15,8 @@ use crate::ingestion::{
 };
 use crate::types::{
     ExternalFactBatch, ExternalFactBatchMetadata, ExternalFactIngestionIssue,
-    ExternalFactIngestionIssueCode, ExternalFactSource, GraphEdgeKind, ProjectManifest,
-    TypedExternalFacts, TypedExternalReferenceFact,
+    ExternalFactIngestionIssueCode, ExternalFactSource, GraphEdgeKind, Language, ProjectManifest,
+    SymbolKind, TypedExternalFacts, TypedExternalReferenceFact,
 };
 use crate::util::fingerprint;
 
@@ -215,6 +216,265 @@ impl NativeLspReferenceRequest {
             bounds,
         }
     }
+}
+
+/// Typed result of deterministic native LSP reference request derivation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeLspReferenceRequestDerivation {
+    /// Exactly one manifest-owned request was derived.
+    Request(NativeLspReferenceRequest),
+    /// No eligible endpoint could be proven without guessing.
+    NoEligibleEndpoint(NativeLspNoEligibleEndpoint),
+}
+
+/// Typed no-op reason for native LSP reference request derivation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeLspNoEligibleEndpoint {
+    /// Manifest has no Rust symbol whose identifier token can be proven in
+    /// manifest-owned source text.
+    NoRustSymbolWithExactIdentifierToken,
+    /// Source text was missing for all candidate Rust symbol files.
+    MissingManifestOwnedSourceText,
+    /// Source text content did not match manifest file hashes.
+    SourceTextHashMismatch,
+    /// The request or endpoint mapping would exceed configured bounds.
+    BoundsExceeded,
+}
+
+/// Deterministically derives at most one native LSP `textDocument/references` request.
+///
+/// The helper reads only caller-supplied manifest-owned source text. It selects
+/// the first eligible Rust symbol in deterministic `(path, start_line, id)` order,
+/// proves the symbol identifier token occurs on the manifest symbol start line,
+/// computes the zero-based UTF-16 LSP character offset, and builds an explicit
+/// response-location endpoint mapping from manifest symbol positions. It returns
+/// a typed no-op when any position cannot be proven exactly.
+///
+/// # Arguments
+///
+/// * `manifest` - Frozen project manifest that owns files and symbols.
+/// * `source_texts` - Complete source text keyed by manifest-relative path.
+/// * `production` - External fact production metadata and fact bound.
+/// * `bounds` - Native LSP transport and normalization bounds.
+pub fn derive_native_lsp_reference_request(
+    manifest: &ProjectManifest,
+    source_texts: &BTreeMap<String, String>,
+    production: ExternalFactProductionRequest,
+    bounds: RustAnalyzerBounds,
+) -> NativeLspReferenceRequestDerivation {
+    let mut hash_mismatch_observed = false;
+    let mut missing_text_observed = false;
+    let mut candidates = manifest
+        .symbols
+        .iter()
+        .filter(|symbol| is_native_lsp_reference_symbol_kind(&symbol.kind))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.start_line.cmp(&right.start_line))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    for symbol in candidates {
+        let Some(file) = manifest.files.iter().find(|file| file.path == symbol.path) else {
+            continue;
+        };
+        if file.language != Language::Rust {
+            continue;
+        }
+        let Some(source_text) = source_texts.get(&symbol.path) else {
+            missing_text_observed = true;
+            continue;
+        };
+        if fingerprint(source_text) != file.content_hash {
+            hash_mismatch_observed = true;
+            continue;
+        }
+        let Some((line, character)) = exact_symbol_identifier_position(source_text, symbol) else {
+            continue;
+        };
+        let Some(endpoint_positions) = derive_native_endpoint_positions(manifest, source_texts)
+        else {
+            continue;
+        };
+        let Some(open_plan) = derive_native_open_plan(manifest, source_texts) else {
+            continue;
+        };
+        if endpoint_positions.len() > bounds.max_endpoints
+            || open_plan.len() > bounds.max_files
+            || production.max_reference_facts > bounds.max_references
+            || bounds.max_files == 0
+        {
+            return NativeLspReferenceRequestDerivation::NoEligibleEndpoint(
+                NativeLspNoEligibleEndpoint::BoundsExceeded,
+            );
+        }
+        let request = NativeLspReferenceRequest::new(
+            production,
+            NativeLspSourceEndpoint::new(symbol.path.clone(), symbol.id.clone(), line, character),
+            endpoint_positions,
+            open_plan,
+            7,
+            bounds,
+        );
+        return NativeLspReferenceRequestDerivation::Request(request);
+    }
+    if hash_mismatch_observed {
+        NativeLspReferenceRequestDerivation::NoEligibleEndpoint(
+            NativeLspNoEligibleEndpoint::SourceTextHashMismatch,
+        )
+    } else if missing_text_observed {
+        NativeLspReferenceRequestDerivation::NoEligibleEndpoint(
+            NativeLspNoEligibleEndpoint::MissingManifestOwnedSourceText,
+        )
+    } else {
+        NativeLspReferenceRequestDerivation::NoEligibleEndpoint(
+            NativeLspNoEligibleEndpoint::NoRustSymbolWithExactIdentifierToken,
+        )
+    }
+}
+
+fn is_native_lsp_reference_symbol_kind(kind: &SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Struct
+            | SymbolKind::Enum
+            | SymbolKind::Trait
+            | SymbolKind::Function
+            | SymbolKind::Method
+            | SymbolKind::Test
+            | SymbolKind::Module
+    )
+}
+
+fn derive_native_open_plan(
+    manifest: &ProjectManifest,
+    source_texts: &BTreeMap<String, String>,
+) -> Option<Vec<NativeLspFileOpenPlan>> {
+    let mut files = manifest
+        .files
+        .iter()
+        .filter(|file| file.language == Language::Rust)
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut open_plan = Vec::new();
+    for file in files {
+        let source_text = source_texts.get(&file.path)?;
+        if fingerprint(source_text) != file.content_hash {
+            return None;
+        }
+        open_plan.push(NativeLspFileOpenPlan::new(
+            file.path.clone(),
+            source_text.clone(),
+        ));
+    }
+    Some(open_plan)
+}
+
+fn derive_native_endpoint_positions(
+    manifest: &ProjectManifest,
+    source_texts: &BTreeMap<String, String>,
+) -> Option<Vec<NativeLspEndpointPosition>> {
+    let mut positions = Vec::new();
+    let mut symbols = manifest
+        .symbols
+        .iter()
+        .filter(|symbol| is_native_lsp_reference_symbol_kind(&symbol.kind))
+        .collect::<Vec<_>>();
+    symbols.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.start_line.cmp(&right.start_line))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    for symbol in symbols {
+        let file = manifest
+            .files
+            .iter()
+            .find(|file| file.path == symbol.path)?;
+        if file.language != Language::Rust {
+            continue;
+        }
+        let source_text = source_texts.get(&symbol.path)?;
+        if fingerprint(source_text) != file.content_hash {
+            return None;
+        }
+        let (line, character) = exact_symbol_identifier_position(source_text, symbol)?;
+        positions.push(NativeLspEndpointPosition::new(
+            symbol.path.clone(),
+            line,
+            character,
+            symbol.id.clone(),
+        ));
+    }
+    Some(positions)
+}
+
+fn exact_symbol_identifier_position(
+    source_text: &str,
+    symbol: &crate::types::SymbolNode,
+) -> Option<(u32, u32)> {
+    let zero_based_line = symbol.start_line.checked_sub(1)?;
+    let line_text = source_text
+        .lines()
+        .nth(usize::try_from(zero_based_line).ok()?)?;
+    let byte_start = exact_identifier_token_byte_start(line_text, &symbol.name)?;
+    let character = utf16_character_offset(line_text, byte_start)?;
+    Some((zero_based_line, character))
+}
+
+fn exact_identifier_token_byte_start(line_text: &str, identifier: &str) -> Option<usize> {
+    if identifier.is_empty() || !is_rust_identifier(identifier) {
+        return None;
+    }
+    let mut matches = line_text
+        .match_indices(identifier)
+        .filter_map(|(start, _)| {
+            let end = start.checked_add(identifier.len())?;
+            if is_identifier_boundary(line_text, start, end) {
+                Some(start)
+            } else {
+                None
+            }
+        });
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        None
+    } else {
+        Some(first)
+    }
+}
+
+fn is_identifier_boundary(line_text: &str, start: usize, end: usize) -> bool {
+    let before = line_text[..start]
+        .chars()
+        .next_back()
+        .is_none_or(|value| !is_rust_identifier_continue(value));
+    let after = line_text[end..]
+        .chars()
+        .next()
+        .is_none_or(|value| !is_rust_identifier_continue(value));
+    before && after
+}
+
+fn is_rust_identifier(identifier: &str) -> bool {
+    let mut chars = identifier.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_alphabetic())
+        && chars.all(|value| value == '_' || value.is_alphanumeric())
+}
+
+fn is_rust_identifier_continue(value: char) -> bool {
+    value == '_' || value.is_alphanumeric()
+}
+
+fn utf16_character_offset(line_text: &str, byte_start: usize) -> Option<u32> {
+    if !line_text.is_char_boundary(byte_start) {
+        return None;
+    }
+    u32::try_from(line_text[..byte_start].encode_utf16().count()).ok()
 }
 
 /// Bounded rust-analyzer reference production request.
@@ -687,8 +947,8 @@ impl NativeLspEndpointPosition {
 pub struct NativeLspReferenceNormalizationRequest {
     /// Expected JSON-RPC response identifier.
     pub response_id: u64,
-    /// Manifest-owned endpoint that requested references.
-    pub from_endpoint: String,
+    /// Manifest-owned endpoint whose references were requested.
+    pub queried_endpoint: String,
     /// Explicit manifest-owned mapping from native response locations to
     /// endpoints.
     pub endpoint_positions: Vec<NativeLspEndpointPosition>,
@@ -702,19 +962,20 @@ impl NativeLspReferenceNormalizationRequest {
     /// # Arguments
     ///
     /// * `response_id` - Expected JSON-RPC response identifier.
-    /// * `from_endpoint` - Manifest-owned endpoint that requested references.
+    /// * `queried_endpoint` - Manifest-owned endpoint whose references were
+    ///   requested.
     /// * `endpoint_positions` - Explicit manifest-owned endpoint position
     ///   mapping.
     /// * `bounds` - Parser and result bounds.
     pub fn new(
         response_id: u64,
-        from_endpoint: impl Into<String>,
+        queried_endpoint: impl Into<String>,
         endpoint_positions: Vec<NativeLspEndpointPosition>,
         bounds: RustAnalyzerBounds,
     ) -> Self {
         Self {
             response_id,
-            from_endpoint: from_endpoint.into(),
+            queried_endpoint: queried_endpoint.into(),
             endpoint_positions,
             bounds,
         }
@@ -777,8 +1038,8 @@ impl NativeLspReferenceNormalizer {
                     anyhow::anyhow!("native lsp location has no explicit endpoint mapping")
                 })?;
             references.push(LspReferenceFact::new(
-                request.from_endpoint.clone(),
                 endpoint.endpoint.clone(),
+                request.queried_endpoint.clone(),
                 GraphEdgeKind::References,
                 path,
                 Some(start_line.saturating_add(1)),
@@ -1288,7 +1549,7 @@ fn validate_native_lsp_mapping(
     if request.endpoint_positions.len() > request.bounds.max_endpoints {
         bail!("native lsp endpoint mapping exceeds endpoint bound");
     }
-    ensure_manifest_endpoint(manifest, &request.from_endpoint)?;
+    ensure_manifest_endpoint(manifest, &request.queried_endpoint)?;
     for position in &request.endpoint_positions {
         if !manifest.files.iter().any(|file| file.path == position.path) {
             bail!("native lsp mapping path is not manifest-owned");
@@ -2046,7 +2307,7 @@ impl ExternalFactProducer for LspFixtureExactFactProducer {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::time::Duration;
 
@@ -2056,7 +2317,8 @@ mod tests {
     use super::*;
     use crate::indexer::tests::fixture_project;
     use crate::{
-        EdgeConfidence, ExternalFactIngestionIssueCode, ProjectIndexer, RetrievalQuery, retrieve,
+        EdgeConfidence, ExternalFactIngestionIssueCode, ProjectIndexer, RetrievalQuery, SourceFile,
+        retrieve,
     };
 
     fn fixture_request() -> ExternalFactProductionRequest {
@@ -2186,6 +2448,22 @@ mod tests {
         ))
     }
 
+    fn manifest_source_texts(
+        root: &Path,
+        manifest: &ProjectManifest,
+    ) -> Result<BTreeMap<String, String>> {
+        let mut source_texts = BTreeMap::new();
+        for file in &manifest.files {
+            if file.language == Language::Rust {
+                source_texts.insert(
+                    file.path.clone(),
+                    fs::read_to_string(root.join(&file.path))?,
+                );
+            }
+        }
+        Ok(source_texts)
+    }
+
     fn native_request(bounds: RustAnalyzerBounds) -> NativeLspReferenceNormalizationRequest {
         NativeLspReferenceNormalizationRequest::new(
             7,
@@ -2220,6 +2498,227 @@ mod tests {
             7,
             bounds,
         )
+    }
+
+    #[test]
+    fn native_lsp_request_derivation_computes_utf16_character_after_non_ascii_source() {
+        let source = "const 🦀: usize = 0; pub struct Widget;\n";
+        let manifest = ProjectManifest {
+            root: PathBuf::from("/tmp/native-lsp-utf16"),
+            files: vec![SourceFile {
+                path: "src/lib.rs".to_string(),
+                language: Language::Rust,
+                bytes: source.len() as u64,
+                lines: 1,
+                content_hash: fingerprint(source),
+                provenance: Default::default(),
+            }],
+            symbols: vec![crate::types::SymbolNode {
+                id: "symbol:src/lib.rs:Struct:Widget".to_string(),
+                name: "Widget".to_string(),
+                kind: SymbolKind::Struct,
+                path: "src/lib.rs".to_string(),
+                parent: None,
+                start_line: 1,
+                end_line: 1,
+                provenance: Default::default(),
+            }],
+            manifest_hash: fingerprint(source),
+            ..Default::default()
+        };
+        let mut source_texts = BTreeMap::new();
+        source_texts.insert("src/lib.rs".to_string(), source.to_string());
+
+        let actual = derive_native_lsp_reference_request(
+            &manifest,
+            &source_texts,
+            fixture_request(),
+            Default::default(),
+        );
+        let expected_character = "const 🦀: usize = 0; pub struct ".encode_utf16().count() as u32;
+
+        match actual {
+            NativeLspReferenceRequestDerivation::Request(request) => {
+                assert_eq!(request.source.line, 0);
+                assert_eq!(request.source.character, expected_character);
+                assert_eq!(request.source.endpoint, "symbol:src/lib.rs:Struct:Widget");
+            }
+            NativeLspReferenceRequestDerivation::NoEligibleEndpoint(reason) => {
+                panic!("expected request, got no-op: {reason:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn native_lsp_request_derivation_returns_typed_noop_without_eligible_symbol() {
+        let source = "pub struct Different;\n";
+        let manifest = ProjectManifest {
+            root: PathBuf::from("/tmp/native-lsp-noop"),
+            files: vec![SourceFile {
+                path: "src/lib.rs".to_string(),
+                language: Language::Rust,
+                bytes: source.len() as u64,
+                lines: 1,
+                content_hash: fingerprint(source),
+                provenance: Default::default(),
+            }],
+            symbols: vec![crate::types::SymbolNode {
+                id: "symbol:src/lib.rs:Struct:Missing".to_string(),
+                name: "Missing".to_string(),
+                kind: SymbolKind::Struct,
+                path: "src/lib.rs".to_string(),
+                parent: None,
+                start_line: 1,
+                end_line: 1,
+                provenance: Default::default(),
+            }],
+            manifest_hash: fingerprint(source),
+            ..Default::default()
+        };
+        let mut source_texts = BTreeMap::new();
+        source_texts.insert("src/lib.rs".to_string(), source.to_string());
+
+        let actual = derive_native_lsp_reference_request(
+            &manifest,
+            &source_texts,
+            fixture_request(),
+            Default::default(),
+        );
+        let expected = NativeLspReferenceRequestDerivation::NoEligibleEndpoint(
+            NativeLspNoEligibleEndpoint::NoRustSymbolWithExactIdentifierToken,
+        );
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn native_lsp_request_derivation_builds_deterministic_manifest_owned_mapping() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model-native-derive"));
+        let manifest = setup.index()?;
+        let source_texts = manifest_source_texts(&root, &manifest)?;
+
+        let actual = derive_native_lsp_reference_request(
+            &manifest,
+            &source_texts,
+            fixture_request(),
+            Default::default(),
+        );
+
+        match actual {
+            NativeLspReferenceRequestDerivation::Request(request) => {
+                let paths = request
+                    .open_plan
+                    .iter()
+                    .map(|file| file.path.clone())
+                    .collect::<Vec<_>>();
+                let endpoint_positions = request
+                    .endpoint_positions
+                    .iter()
+                    .map(|position| {
+                        (
+                            position.path.clone(),
+                            position.line,
+                            position.character,
+                            position.endpoint.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+
+                assert_eq!(
+                    paths,
+                    vec!["src/lib.rs".to_string(), "src/model.rs".to_string()]
+                );
+                assert_eq!(request.response_id, 7);
+                assert_eq!(request.source.path, "src/lib.rs");
+                assert_eq!(
+                    endpoint_positions,
+                    vec![
+                        (
+                            "src/lib.rs".to_string(),
+                            2,
+                            4,
+                            "symbol:src/lib.rs:Module:model".to_string(),
+                        ),
+                        (
+                            "src/lib.rs".to_string(),
+                            5,
+                            11,
+                            "symbol:src/lib.rs:Struct:Root".to_string(),
+                        ),
+                        (
+                            "src/lib.rs".to_string(),
+                            10,
+                            11,
+                            "symbol:src/lib.rs:symbol:src/lib.rs:Impl:impl Root:Method:new"
+                                .to_string(),
+                        ),
+                        (
+                            "src/lib.rs".to_string(),
+                            16,
+                            3,
+                            "symbol:src/lib.rs:Test:root_test".to_string(),
+                        ),
+                        (
+                            "src/model.rs".to_string(),
+                            0,
+                            9,
+                            "symbol:src/model.rs:Enum:Widget".to_string(),
+                        ),
+                        (
+                            "src/model.rs".to_string(),
+                            4,
+                            10,
+                            "symbol:src/model.rs:Trait:Named".to_string(),
+                        ),
+                        (
+                            "src/model.rs".to_string(),
+                            5,
+                            7,
+                            "symbol:src/model.rs:symbol:src/model.rs:Trait:Named:Method:name"
+                                .to_string(),
+                        ),
+                        (
+                            "src/model.rs".to_string(),
+                            9,
+                            7,
+                            "symbol:src/model.rs:symbol:src/model.rs:Impl:impl Named for Widget:Method:name"
+                                .to_string(),
+                        ),
+                    ]
+                );
+            }
+            NativeLspReferenceRequestDerivation::NoEligibleEndpoint(reason) => {
+                panic!("expected request, got no-op: {reason:?}")
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_lsp_reference_edges_point_from_reference_site_to_queried_symbol() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model-native-direction"));
+        let manifest = setup.index()?;
+        let request = native_request(Default::default());
+
+        let actual = NativeLspReferenceNormalizer::normalize(
+            &manifest,
+            &native_location_response(&root, 7, "src/model.rs"),
+            &request,
+        )?;
+        let expected = vec![LspReferenceFact::new(
+            "symbol:src/model.rs:Enum:Widget",
+            "symbol:src/lib.rs:Struct:Root",
+            GraphEdgeKind::References,
+            "src/model.rs",
+            Some(1),
+            Some(1),
+        )];
+
+        assert_eq!(actual, expected);
+        assert_eq!(setup.model_dir().join("external_facts").exists(), false);
+        Ok(())
     }
 
     #[test]
@@ -2294,8 +2793,8 @@ mod tests {
             &request,
         )?;
         let expected = vec![LspReferenceFact::new(
-            "symbol:src/lib.rs:Struct:Root",
             "symbol:src/model.rs:Enum:Widget",
+            "symbol:src/lib.rs:Struct:Root",
             GraphEdgeKind::References,
             "src/model.rs",
             Some(1),
@@ -2592,8 +3091,8 @@ mod tests {
     }
 
     #[test]
-    fn native_lsp_out_of_order_non_error_response_does_not_mask_later_reference_response() -> Result<()>
-    {
+    fn native_lsp_out_of_order_non_error_response_does_not_mask_later_reference_response()
+    -> Result<()> {
         let (fixture, root) = fixture_project()?;
         let setup = ProjectIndexer::new(&root, fixture.path().join("model-native-out-of-order"));
         let manifest = setup.index()?;
@@ -2611,8 +3110,8 @@ mod tests {
             &native_request(Default::default()),
         )?;
         let expected = vec![LspReferenceFact::new(
-            "symbol:src/lib.rs:Struct:Root",
             "symbol:src/model.rs:Enum:Widget",
+            "symbol:src/lib.rs:Struct:Root",
             GraphEdgeKind::References,
             "src/model.rs",
             Some(1),
