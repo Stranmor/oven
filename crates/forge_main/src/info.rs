@@ -744,7 +744,11 @@ fn format_user_message(msg: &forge_api::ContextMessage) -> Option<String> {
         .as_value()
         .and_then(|v| v.as_user_prompt())
         .map(|p| p.as_str())?;
-    Some(content.trim().to_string())
+    if content.trim().is_empty() {
+        None
+    } else {
+        Some(content.to_string())
+    }
 }
 
 impl From<&Conversation> for Info {
@@ -1136,6 +1140,38 @@ mod tests {
         let actual =
             String::from_utf8(stripped).expect("stripped ANSI output should remain valid UTF-8");
         let expected = "tasks First line\n        Second line";
+
+        assert!(actual.contains(expected));
+    }
+
+    #[test]
+    fn test_conversation_info_preserves_task_edge_whitespace() {
+        use chrono::Utc;
+        use forge_api::{Context, ContextMessage, ConversationId, Role};
+
+        use super::{Conversation, Metrics};
+
+        let conversation_id = ConversationId::generate();
+        let metrics = Metrics::default().started_at(Utc::now());
+        let context = Context::default().add_message(ContextMessage::Text(
+            forge_domain::TextMessage::new(Role::User, "  First line\nSecond line  ")
+                .raw_content(EventValue::text("  First line\nSecond line  ")),
+        ));
+        let fixture = Conversation {
+            id: conversation_id,
+            parent_id: None,
+            title: Some("Test Task".to_string()),
+            initiator: forge_domain::Initiator::User,
+            context: Some(context),
+            metrics,
+            metadata: forge_domain::MetaData::new(Utc::now()),
+        };
+
+        let actual = super::Info::from(&fixture).to_string();
+        let stripped = strip_ansi_escapes::strip(&actual);
+        let actual =
+            String::from_utf8(stripped).expect("stripped ANSI output should remain valid UTF-8");
+        let expected = "tasks   First line\n        Second line  ";
 
         assert!(actual.contains(expected));
     }
