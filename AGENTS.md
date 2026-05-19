@@ -154,6 +154,8 @@ Drift protection is required for this architecture. Tests or fixtures must prote
 
 Mnemonic: TUI is a renderer, not the product core. Events become a typed UI model; stdout and `ratatui` render the same semantics; the fork stays the installed truth.
 
+Current status: the renderer-neutral projection layer is active in `forge_ui_model`, `forge_tui` consumes those projections, stale tool detail/output ordering is regression-covered, and interactive TUI interrupt continuation now uses a suspend/resume boundary that preserves renderer-native session behavior. Implemented in `94efd29dac41f6390a249a3cedc5a74d7ebedcbc`, `33edcc2e81da4fe39250ec2666e77712a0ac4270`, `8c5db80738c843eec68c8827a94cb02e9dd530b8`, `e29f6991f2bf23ccf90c99a6770a85be3b1dfec8`, and `3bc309fe4295c28efe19014ce9c4acab148ee872`. Verified with focused `forge_ui_model`, `forge_tui`, `forge_main` TUI/conversation, and `forge_project_model` tests; focused check/clippy suites; `git diff --check`; and critic PASS. Full `cargo insta` package commands remain pending local `cargo-nextest` availability.
+
 ## Service Implementation Guidelines
 
 Services should follow clean architecture principles and maintain clear separation of concerns:
