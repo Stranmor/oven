@@ -23,6 +23,48 @@ impl fmt::Display for Line {
     }
 }
 
+/// Controls how diff lines and inline segments are rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffRenderMode {
+    /// Render every changed line with one line-level style.
+    Line,
+    /// Render changed lines with line-level style plus stronger inline emphasis.
+    Inline,
+}
+
+/// Rendering options for textual diffs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiffRenderOptions {
+    mode: DiffRenderMode,
+}
+
+impl DiffRenderOptions {
+    /// Creates diff rendering options for the provided mode.
+    ///
+    /// # Arguments
+    /// * `mode` - Rendering mode used for changed line segments.
+    pub fn new(mode: DiffRenderMode) -> Self {
+        Self { mode }
+    }
+
+    /// Returns options that render only line-level diff styles.
+    pub fn line() -> Self {
+        Self::new(DiffRenderMode::Line)
+    }
+
+    /// Returns options that render inline emphasis inside changed lines.
+    pub fn inline() -> Self {
+        Self::new(DiffRenderMode::Inline)
+    }
+}
+
+impl Default for DiffRenderOptions {
+    fn default() -> Self {
+        Self::inline()
+    }
+}
+
+/// Rendered textual diff and line-change counters.
 #[derive(Debug, Clone)]
 pub struct DiffResult {
     result: String,
@@ -31,23 +73,42 @@ pub struct DiffResult {
 }
 
 impl DiffResult {
+    /// Returns the rendered diff text.
     pub fn diff(&self) -> &str {
         &self.result
     }
 
+    /// Returns the number of inserted lines in the diff.
     pub fn lines_added(&self) -> u64 {
         self.lines_added
     }
 
+    /// Returns the number of deleted lines in the diff.
     pub fn lines_removed(&self) -> u64 {
         self.lines_removed
     }
 }
 
+/// Formats textual diffs for terminal and stripped tool-output consumers.
 pub struct DiffFormat;
 
 impl DiffFormat {
+    /// Formats a line diff with inline emphasis enabled by default.
+    ///
+    /// # Arguments
+    /// * `old` - Previous text content.
+    /// * `new` - Updated text content.
     pub fn format(old: &str, new: &str) -> DiffResult {
+        Self::format_with_options(old, new, DiffRenderOptions::default())
+    }
+
+    /// Formats a line diff using explicit rendering options.
+    ///
+    /// # Arguments
+    /// * `old` - Previous text content.
+    /// * `new` - Updated text content.
+    /// * `options` - Rendering options that control inline emphasis.
+    pub fn format_with_options(old: &str, new: &str, options: DiffRenderOptions) -> DiffResult {
         let diff = TextDiff::from_lines(old, new);
         let ops = diff.grouped_ops(3);
         let mut output = String::new();
@@ -108,8 +169,12 @@ impl DiffFormat {
                         s.apply_to(sign),
                     ));
 
-                    for (_, value) in change.iter_strings_lossy() {
-                        output.push_str(&format!("{}", s.apply_to(value)));
+                    for (emphasized, value) in change.iter_strings_lossy() {
+                        output.push_str(&format!(
+                            "{}",
+                            segment_style(&s, emphasized, change.tag(), options.mode)
+                                .apply_to(value)
+                        ));
                     }
                     if change.missing_newline() {
                         output.push('\n');
@@ -122,10 +187,56 @@ impl DiffFormat {
     }
 }
 
+fn segment_style(
+    line_style: &Style,
+    emphasized: bool,
+    tag: ChangeTag,
+    mode: DiffRenderMode,
+) -> Style {
+    if mode == DiffRenderMode::Line || !emphasized {
+        return line_style.clone();
+    }
+
+    match tag {
+        ChangeTag::Delete => Style::new().red().bold().underlined(),
+        ChangeTag::Insert => Style::new().yellow().bold().underlined(),
+        ChangeTag::Equal => line_style.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use console::strip_ansi_codes;
+    use std::sync::Mutex;
+
+    use console::{
+        colors_enabled, colors_enabled_stderr, set_colors_enabled, set_colors_enabled_stderr,
+        strip_ansi_codes,
+    };
     use insta::assert_snapshot;
+
+    static ANSI_STYLE_LOCK: Mutex<()> = Mutex::new(());
+
+    struct ColorStateGuard {
+        stdout: bool,
+        stderr: bool,
+    }
+
+    impl ColorStateGuard {
+        fn force_enabled() -> Self {
+            let stdout = colors_enabled();
+            let stderr = colors_enabled_stderr();
+            set_colors_enabled(true);
+            set_colors_enabled_stderr(true);
+            Self { stdout, stderr }
+        }
+    }
+
+    impl Drop for ColorStateGuard {
+        fn drop(&mut self) {
+            set_colors_enabled(self.stdout);
+            set_colors_enabled_stderr(self.stderr);
+        }
+    }
 
     use super::*;
 
@@ -169,6 +280,61 @@ mod tests {
         assert_eq!(diff.lines_added(), 1);
         assert_eq!(diff.lines_removed(), 1);
         assert_snapshot!(clean_diff);
+    }
+
+    #[test]
+    fn test_inline_mode_emphasizes_changed_segments() {
+        let _lock = ANSI_STYLE_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _guard = ColorStateGuard::force_enabled();
+        let fixture = ("let color = red;\n", "let color = yellow;\n");
+
+        let actual = DiffFormat::format(fixture.0, fixture.1).diff().to_string();
+        let line_only =
+            DiffFormat::format_with_options(fixture.0, fixture.1, DiffRenderOptions::line())
+                .diff()
+                .to_string();
+
+        assert!(actual.contains("\u{1b}[31m\u{1b}[1m\u{1b}[4mred"));
+        assert!(actual.contains("\u{1b}[33m\u{1b}[1m\u{1b}[4myellow"));
+        assert!(!line_only.contains("\u{1b}[31m\u{1b}[1m\u{1b}[4mred"));
+        assert!(!line_only.contains("\u{1b}[33m\u{1b}[1m\u{1b}[4myellow"));
+    }
+
+    #[test]
+    fn test_inline_mode_keeps_stripped_diff_readable() {
+        let fixture = ("let color = red;\n", "let color = yellow;\n");
+
+        let actual = strip_ansi_codes(DiffFormat::format(fixture.0, fixture.1).diff()).to_string();
+        let expected = strip_ansi_codes(
+            DiffFormat::format_with_options(fixture.0, fixture.1, DiffRenderOptions::line()).diff(),
+        )
+        .to_string();
+
+        assert_eq!(actual, expected);
+        assert!(actual.contains("1   |-let color = red;"));
+        assert!(actual.contains("  1 |+let color = yellow;"));
+    }
+
+    #[test]
+    fn test_inline_mode_handles_punctuation_subword_and_whitespace_changes() {
+        let _lock = ANSI_STYLE_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _guard = ColorStateGuard::force_enabled();
+        let old = "call(foo_bar, value)\nindent  two\n";
+        let new = "call(foo_baz, value);\nindent two\n";
+
+        let actual = DiffFormat::format(old, new).diff().to_string();
+        let clean_diff = strip_ansi_codes(&actual).to_string();
+
+        assert!(actual.contains("\u{1b}[31m\u{1b}[1m\u{1b}[4m"));
+        assert!(actual.contains("\u{1b}[33m\u{1b}[1m\u{1b}[4m"));
+        assert!(clean_diff.contains("-call(foo_bar, value)"));
+        assert!(clean_diff.contains("+call(foo_baz, value);"));
+        assert!(clean_diff.contains("-indent  two"));
+        assert!(clean_diff.contains("+indent two"));
     }
 
     #[test]

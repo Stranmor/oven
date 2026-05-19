@@ -302,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fs_patch_success() {
+    fn test_fs_patch_success_routes_through_readable_stripped_inline_diff() {
         let after_content = "Hello universe\nThis is a test\nNew line";
         let fixture = ToolOperation::FsPatch {
             input: forge_domain::FSPatch {
@@ -321,7 +321,70 @@ mod tests {
         let env = fixture_environment();
         let actual = fixture.to_content(&env).unwrap();
         let actual = strip_ansi_codes(actual.as_str());
-        assert_snapshot!(actual)
+        assert!(actual.contains("Hello world"));
+        assert!(actual.contains("Hello universe"));
+        assert!(!actual.contains("\u{1b}"));
+        assert_snapshot!("fs_patch_success", actual)
+    }
+
+    #[test]
+    fn test_fs_write_patch_and_multi_patch_route_diff_output() {
+        let env = fixture_environment();
+
+        let write_fixture = ToolOperation::FsWrite {
+            input: forge_domain::FSWrite {
+                file_path: "/home/user/project/write.txt".to_string(),
+                content: "let color = yellow;\n".to_string(),
+                overwrite: true,
+            },
+            output: FsWriteOutput {
+                path: "/home/user/project/write.txt".to_string(),
+                before: Some("let color = red;\n".to_string()),
+                errors: vec![],
+                content_hash: crate::compute_hash("let color = yellow;\n"),
+            },
+        };
+        let patch_fixture = ToolOperation::FsPatch {
+            input: forge_domain::FSPatch {
+                file_path: "/home/user/project/patch.txt".to_string(),
+                old_string: "red".to_string(),
+                new_string: "yellow".to_string(),
+                replace_all: false,
+            },
+            output: PatchOutput {
+                errors: vec![],
+                before: "let color = red;\n".to_string(),
+                after: "let color = yellow;\n".to_string(),
+                content_hash: crate::compute_hash("let color = yellow;\n"),
+            },
+        };
+        let multi_patch_fixture = ToolOperation::FsMultiPatch {
+            input: forge_domain::FSMultiPatch {
+                file_path: "/home/user/project/multi_patch.txt".to_string(),
+                edits: vec![forge_domain::PatchEdit {
+                    old_string: "red".to_string(),
+                    new_string: "yellow".to_string(),
+                    replace_all: false,
+                }],
+            },
+            output: PatchOutput {
+                errors: vec![],
+                before: "let color = red;\n".to_string(),
+                after: "let color = yellow;\n".to_string(),
+                content_hash: crate::compute_hash("let color = yellow;\n"),
+            },
+        };
+
+        let write_output = write_fixture.to_content(&env).unwrap();
+        let patch_output = patch_fixture.to_content(&env).unwrap();
+        let multi_patch_output = multi_patch_fixture.to_content(&env).unwrap();
+
+        for actual in [write_output, patch_output, multi_patch_output] {
+            let actual = strip_ansi_codes(actual.as_str()).to_string();
+            assert!(actual.contains("let color = red;"));
+            assert!(actual.contains("let color = yellow;"));
+            assert!(!actual.contains("\u{1b}"));
+        }
     }
 
     #[test]

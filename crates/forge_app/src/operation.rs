@@ -2218,6 +2218,109 @@ mod tests {
     }
 
     #[test]
+    fn test_write_patch_and_multi_patch_metrics_preserve_line_counts_with_inline_diff() {
+        let env = fixture_environment();
+        let config = fixture_config();
+
+        let mut write_metrics = Metrics::default();
+        let write_fixture = ToolOperation::FsWrite {
+            input: forge_domain::FSWrite {
+                file_path: "/home/user/write.txt".to_string(),
+                content: "let color = yellow;\n".to_string(),
+                overwrite: true,
+            },
+            output: FsWriteOutput {
+                path: "/home/user/write.txt".to_string(),
+                before: Some("let color = red;\n".to_string()),
+                errors: vec![],
+                content_hash: compute_hash("let color = yellow;\n"),
+            },
+        };
+        let write_output = write_fixture.into_tool_output(
+            ToolKind::Write,
+            TempContentFiles::default(),
+            &env,
+            &config,
+            &mut write_metrics,
+        );
+
+        let mut patch_metrics = Metrics::default();
+        let patch_fixture = ToolOperation::FsPatch {
+            input: forge_domain::FSPatch {
+                file_path: "/home/user/patch.txt".to_string(),
+                old_string: "red".to_string(),
+                new_string: "yellow".to_string(),
+                replace_all: false,
+            },
+            output: PatchOutput {
+                errors: vec![],
+                before: "let color = red;\n".to_string(),
+                after: "let color = yellow;\n".to_string(),
+                content_hash: compute_hash("let color = yellow;\n"),
+            },
+        };
+        let patch_output = patch_fixture.into_tool_output(
+            ToolKind::Patch,
+            TempContentFiles::default(),
+            &env,
+            &config,
+            &mut patch_metrics,
+        );
+
+        let mut multi_patch_metrics = Metrics::default();
+        let multi_patch_fixture = ToolOperation::FsMultiPatch {
+            input: forge_domain::FSMultiPatch {
+                file_path: "/home/user/multi_patch.txt".to_string(),
+                edits: vec![forge_domain::PatchEdit {
+                    old_string: "red".to_string(),
+                    new_string: "yellow".to_string(),
+                    replace_all: false,
+                }],
+            },
+            output: PatchOutput {
+                errors: vec![],
+                before: "let color = red;\n".to_string(),
+                after: "let color = yellow;\n".to_string(),
+                content_hash: compute_hash("let color = yellow;\n"),
+            },
+        };
+        let multi_patch_output = multi_patch_fixture.into_tool_output(
+            ToolKind::MultiPatch,
+            TempContentFiles::default(),
+            &env,
+            &config,
+            &mut multi_patch_metrics,
+        );
+
+        let write_operation = write_metrics
+            .file_operations
+            .get("/home/user/write.txt")
+            .expect("write metrics should be recorded");
+        let patch_operation = patch_metrics
+            .file_operations
+            .get("/home/user/patch.txt")
+            .expect("patch metrics should be recorded");
+        let multi_patch_operation = multi_patch_metrics
+            .file_operations
+            .get("/home/user/multi_patch.txt")
+            .expect("multi-patch metrics should be recorded");
+
+        assert_eq!(write_operation.lines_added, 1);
+        assert_eq!(write_operation.lines_removed, 1);
+        assert_eq!(patch_operation.lines_added, 1);
+        assert_eq!(patch_operation.lines_removed, 1);
+        assert_eq!(multi_patch_operation.lines_added, 1);
+        assert_eq!(multi_patch_operation.lines_removed, 1);
+
+        for actual in [write_output, patch_output, multi_patch_output] {
+            let actual = to_value(actual);
+            assert!(actual.contains("let color = red;"));
+            assert!(actual.contains("let color = yellow;"));
+            assert!(!actual.contains("\u{1b}"));
+        }
+    }
+
+    #[test]
     fn test_fs_patch_with_warning() {
         let after_content = "line1\nnew line\nline2";
         let fixture = ToolOperation::FsPatch {
