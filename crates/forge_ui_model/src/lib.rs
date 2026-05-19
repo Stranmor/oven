@@ -353,21 +353,15 @@ fn tool_activity_items(model: &UiModel) -> Vec<UiToolActivityItem> {
 }
 
 fn tool_detail_view(model: &UiModel) -> UiToolDetailView {
-    if let Some(detail) = model.blocks.iter().rev().find_map(|block| match block {
-        UiBlock::ToolDetail(detail) => Some(detail),
-        _ => None,
-    }) {
-        return UiToolDetailView::Detail(detail.clone());
-    }
-
-    if let Some(output) = model.blocks.iter().rev().find_map(|block| match block {
-        UiBlock::ToolOutput(output) => Some(output),
-        _ => None,
-    }) {
-        return UiToolDetailView::Output {
+    if let Some(view) = model.blocks.iter().rev().find_map(|block| match block {
+        UiBlock::ToolDetail(detail) => Some(UiToolDetailView::Detail(detail.clone())),
+        UiBlock::ToolOutput(output) => Some(UiToolDetailView::Output {
             title: "Latest tool output".to_string(),
             output: output.clone(),
-        };
+        }),
+        _ => None,
+    }) {
+        return view;
     }
 
     UiToolDetailView::Empty {
@@ -1020,6 +1014,28 @@ mod tests {
                 is_error: false,
             })
         );
+    }
+
+    #[test]
+    fn test_projection_tool_detail_view_uses_latest_payload_by_event_order() {
+        let fixture = UiModel::new(vec![
+            UiBlock::ToolDetail(UiToolDetail {
+                call_id: Some("call-older".to_string()),
+                name: "shell".to_string(),
+                arguments: Some("{\"command\":\"old\"}".to_string()),
+                output: Some("older detail output".to_string()),
+                is_error: false,
+            }),
+            UiBlock::ToolOutput("newer raw output".to_string()),
+        ]);
+
+        let actual = project_conversation(&fixture).tool_detail;
+
+        let expected = UiToolDetailView::Output {
+            title: "Latest tool output".to_string(),
+            output: "newer raw output".to_string(),
+        };
+        assert_eq!(actual, expected);
     }
 
     #[test]
