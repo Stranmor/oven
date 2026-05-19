@@ -198,7 +198,7 @@ impl LearningLedgerEventRecord {
         let source_kind = event.provenance.source_kind;
         let raw_source_id = event.provenance.source_id()?;
         let redacted = RedactedLearningSummary::from_raw(&event.summary);
-        let redacted_source_id = RedactedLearningSummary::from_raw(raw_source_id);
+        let redacted_source_id = RedactedLearningSummary::from_raw(&raw_source_id);
         let redacted_source_event_id =
             RedactedLearningSummary::from_raw(&event.provenance.source_event_id);
         let redacted_source_fingerprint =
@@ -214,9 +214,7 @@ impl LearningLedgerEventRecord {
             .as_ref()
             .map(RedactedLearningSummary::from_raw);
         let source_id = match source_kind {
-            LearningSourceKind::Conversation | LearningSourceKind::Task => {
-                redacted_source_id.summary.clone()
-            }
+            LearningSourceKind::Conversation | LearningSourceKind::Task => raw_source_id,
             LearningSourceKind::Tool => redacted_tool_name
                 .as_ref()
                 .map(|redacted| redacted.summary.clone())
@@ -226,10 +224,16 @@ impl LearningLedgerEventRecord {
                 .map(|redacted| redacted.summary.clone())
                 .unwrap_or_else(|| redacted_source_id.summary.clone()),
         };
+        let source_id_redaction_status = match source_kind {
+            LearningSourceKind::Conversation | LearningSourceKind::Task => {
+                LearningRedactionStatus::Clean
+            }
+            LearningSourceKind::Tool | LearningSourceKind::Eval => redacted_source_id.status,
+        };
         let redaction_status = [
             event.redaction_status,
             redacted.status,
-            redacted_source_id.status,
+            source_id_redaction_status,
             redacted_source_event_id.status,
             redacted_source_fingerprint.status,
             redacted_tool_name
@@ -694,6 +698,36 @@ mod tests {
             projection.redaction_status,
         );
         let expected = (false, false, LearningRedactionStatus::Redacted);
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_insert_preserves_clean_typed_conversation_identity() -> anyhow::Result<()> {
+        let fixture = fixture_repo(10)?;
+        let conversation_id = ConversationId::generate();
+        let event = LearningLedgerEvent::capture_candidate(
+            "clean typed identity",
+            LearningProvenance::conversation(conversation_id, "event-1", "safe-source"),
+            Utc::now(),
+        )?;
+
+        fixture.insert_learning_event(event).await?;
+
+        let persisted_event = fixture
+            .run_with_connection(move |connection, wid| {
+                learning_ledger_events::table
+                    .filter(learning_ledger_events::workspace_id.eq(workspace_db_id(wid)))
+                    .first::<LearningLedgerEventRecord>(connection)
+                    .map_err(Into::into)
+            })
+            .await?;
+        let actual = (persisted_event.source_id, persisted_event.redaction_status);
+        let expected = (
+            conversation_id.into_string(),
+            LearningRedactionStatus::Clean.to_string(),
+        );
 
         assert_eq!(actual, expected);
         Ok(())
