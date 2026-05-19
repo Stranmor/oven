@@ -177,10 +177,15 @@ fn retain_path_scope(results: &mut BTreeMap<String, RetrievalResult>, query: &Re
 }
 
 fn matches_path_scope(path: &str, query: &RetrievalQuery) -> bool {
-    query
+    let exact_path_matches = query
+        .path
+        .as_deref()
+        .is_none_or(|exact_path| path == exact_path);
+    let prefix_matches = query
         .path_prefix
         .as_deref()
-        .is_none_or(|prefix| path.starts_with(prefix))
+        .is_none_or(|prefix| path.starts_with(prefix));
+    exact_path_matches && prefix_matches
 }
 
 fn exact_results(
@@ -423,6 +428,43 @@ mod tests {
         let expected = Some("Root".to_string());
         assert_eq!(
             actual.first().and_then(|result| result.symbol.clone()),
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_path_scope_filters_lexical_results_before_truncation() -> Result<()> {
+        let fixture = tempfile::TempDir::new()?;
+        let root = fixture.path().join("project");
+        std::fs::create_dir_all(root.join("src").join("in"))?;
+        std::fs::create_dir_all(root.join("src").join("out"))?;
+        std::fs::write(
+            root.join("src").join("in").join("target.rs"),
+            "pub fn target() {\n    let _ = \"exactneedle\";\n}\n",
+        )?;
+        std::fs::write(
+            root.join("src").join("out").join("loud.rs"),
+            "pub fn loud() {\n    let _ = \"exactneedle exactneedle exactneedle exactneedle exactneedle\";\n}\n",
+        )?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let query = RetrievalQuery {
+            text: Some("exactneedle".to_string()),
+            path: Some("src/in/target.rs".to_string()),
+            path_prefix: None,
+            symbol: None,
+            limit: 1,
+            include_graph_expansion: true,
+        };
+
+        let actual = retrieve(&manifest, &query);
+        let expected = vec!["src/in/target.rs".to_string()];
+        assert_eq!(
+            actual
+                .into_iter()
+                .map(|result| result.path)
+                .collect::<Vec<_>>(),
             expected
         );
         Ok(())
