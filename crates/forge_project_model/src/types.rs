@@ -1362,6 +1362,10 @@ pub struct ExternalFactBatchMetadata {
     pub source_label: String,
     /// Optional producer version when supplied by the caller.
     pub tool_version: Option<String>,
+    /// Redaction-safe producer snapshot identity used to prove deterministic
+    /// fixture or endpoint output without persisting raw producer payloads.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub producer_snapshot_fingerprint: String,
     /// Workspace root identity used by the producer.
     pub workspace_root: String,
     /// Redaction-safe fingerprint for the source artifact or source snapshot.

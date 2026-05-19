@@ -141,6 +141,10 @@ pub(crate) fn external_facts_fingerprint(batches: &[ExternalFactBatchMetadata]) 
         content.push('\0');
         content.push_str(batch.tool_version.as_deref().unwrap_or_default());
         content.push('\0');
+        if !batch.producer_snapshot_fingerprint.is_empty() {
+            content.push_str(&batch.producer_snapshot_fingerprint);
+            content.push('\0');
+        }
         content.push_str(&batch.workspace_root);
         content.push('\0');
         content.push_str(&batch.source_artifact_fingerprint);

@@ -53,6 +53,14 @@ impl ProjectIndexer {
         Self { root, model_dir }
     }
 
+    /// Returns the project-model storage directory used by this indexer.
+    ///
+    /// The returned path is useful for typed artifact producers that must write
+    /// through crate-owned persistence helpers without mutating a manifest.
+    pub fn model_dir(&self) -> &Path {
+        &self.model_dir
+    }
+
     /// Builds a deterministic project manifest from the configured root.
     ///
     /// # Errors
@@ -930,6 +938,7 @@ pub(crate) mod tests {
                 source: ExternalFactSource::Lsp,
                 source_label: source_label.to_string(),
                 tool_version: Some("fixture-1".to_string()),
+                producer_snapshot_fingerprint: fingerprint("indexer-fixture-1"),
                 workspace_root: manifest.root.to_string_lossy().to_string(),
                 source_artifact_fingerprint: String::new(),
                 manifest_hash_input: manifest.manifest_hash.clone(),

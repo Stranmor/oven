@@ -95,8 +95,12 @@ pub fn prepared_external_fact_artifact_batch(
     {
         bail!("external fact artifact source label must be explicit");
     }
-    batch.metadata.workspace_root = frozen_manifest.root.to_string_lossy().to_string();
-    batch.metadata.manifest_hash_input = frozen_manifest.manifest_hash.clone();
+    if batch.metadata.workspace_root.trim().is_empty() {
+        batch.metadata.workspace_root = frozen_manifest.root.to_string_lossy().to_string();
+    }
+    if batch.metadata.manifest_hash_input.trim().is_empty() {
+        batch.metadata.manifest_hash_input = frozen_manifest.manifest_hash.clone();
+    }
     batch.metadata.source_artifact_fingerprint.clear();
     batch.metadata.batch_fingerprint.clear();
     batch.metadata.source_artifact_fingerprint = external_fact_artifact_fingerprint(&batch);
@@ -292,6 +296,7 @@ pub fn ingest_typed_external_facts(
         source: source.clone(),
         source_label: source.provenance_label(),
         tool_version: None,
+        producer_snapshot_fingerprint: fingerprint(&legacy_fact_payload_identity(&facts)),
         workspace_root: manifest.root.to_string_lossy().to_string(),
         source_artifact_fingerprint: fingerprint(&legacy_fact_payload_identity(&facts)),
         manifest_hash_input: manifest.manifest_hash.clone(),
@@ -585,6 +590,12 @@ pub fn external_fact_batch_fingerprint(
         "tool_version:{}\n",
         metadata.tool_version.as_deref().unwrap_or_default()
     ));
+    if !metadata.producer_snapshot_fingerprint.is_empty() {
+        content.push_str(&format!(
+            "producer_snapshot_fingerprint:{}\n",
+            metadata.producer_snapshot_fingerprint
+        ));
+    }
     content.push_str(&format!("workspace_root:{}\n", metadata.workspace_root));
     content.push_str(&format!(
         "source_artifact_fingerprint:{}\n",
@@ -1225,6 +1236,7 @@ mod tests {
                 source: ExternalFactSource::Lsp,
                 source_label: "rust-analyzer".to_string(),
                 tool_version: Some("fixture-1".to_string()),
+                producer_snapshot_fingerprint: source_artifact_fingerprint.to_string(),
                 workspace_root: manifest.root.to_string_lossy().to_string(),
                 source_artifact_fingerprint: source_artifact_fingerprint.to_string(),
                 manifest_hash_input: manifest.manifest_hash.clone(),
@@ -1345,6 +1357,7 @@ mod tests {
                 source: ExternalFactSource::Lsp,
                 source_label: "rust-analyzer".to_string(),
                 tool_version: Some("fixture-1".to_string()),
+                producer_snapshot_fingerprint: fingerprint("duplicate-lines"),
                 workspace_root: manifest.root.to_string_lossy().to_string(),
                 source_artifact_fingerprint: fingerprint("duplicate-lines"),
                 manifest_hash_input: manifest.manifest_hash.clone(),
@@ -1652,6 +1665,7 @@ mod tests {
                 source: ExternalFactSource::Lsp,
                 source_label: "rust-analyzer".to_string(),
                 tool_version: Some("fixture-1".to_string()),
+                producer_snapshot_fingerprint: fingerprint("duplicate-symbol-id"),
                 workspace_root: manifest.root.to_string_lossy().to_string(),
                 source_artifact_fingerprint: fingerprint("duplicate-symbol-id"),
                 manifest_hash_input: manifest.manifest_hash.clone(),
@@ -1698,6 +1712,7 @@ mod tests {
                 source: ExternalFactSource::Lsp,
                 source_label: "rust-analyzer".to_string(),
                 tool_version: Some("fixture-1".to_string()),
+                producer_snapshot_fingerprint: fingerprint("manifest-symbol-id-conflict"),
                 workspace_root: manifest.root.to_string_lossy().to_string(),
                 source_artifact_fingerprint: fingerprint("manifest-symbol-id-conflict"),
                 manifest_hash_input: manifest.manifest_hash.clone(),

@@ -10,6 +10,7 @@ mod ingestion;
 mod learning;
 mod lexical;
 mod policy;
+mod producer;
 mod render;
 mod retrieval;
 mod types;
@@ -52,6 +53,11 @@ pub use policy::{
     ProjectContextTarget, TargetResolutionBudget, directory_path_filter, local_project_model_dir,
     local_project_model_external_fact_report, local_project_model_manifest, mentioned_paths,
     resolve_mentioned_path,
+};
+pub use producer::{
+    ExternalFactProducer, ExternalFactProducerCapability, ExternalFactProducerProbe,
+    ExternalFactProductionReport, ExternalFactProductionRequest, ExternalFactProductionStatus,
+    LspFixtureExactFactProducer, LspReferenceFact,
 };
 pub use render::{
     DEFAULT_RENDERED_SOURCE_LIMIT, ProjectModelContextRenderBudget, ProjectModelContextSource,
