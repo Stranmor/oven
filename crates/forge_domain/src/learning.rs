@@ -536,10 +536,13 @@ impl LearningSensorReviewInput {
         if let Some(observation) = &self.fixture_observation {
             ensure_learning_sensor_text("fixture_observation", observation, 1_024)?;
         }
-        if self.evidence_kind == LearningSensorEvidenceKind::ConversationMetadata
-            && self.provenance_marker != LearningSensorProvenanceMarker::RuntimeConversationSaved
-        {
-            anyhow::bail!("conversation metadata input requires runtime provenance marker");
+        if self.evidence_kind == LearningSensorEvidenceKind::ConversationMetadata {
+            if self.provenance_marker != LearningSensorProvenanceMarker::RuntimeConversationSaved {
+                anyhow::bail!("conversation metadata input requires runtime provenance marker");
+            }
+            if self.fixture_title.is_some() || self.fixture_observation.is_some() {
+                anyhow::bail!("conversation metadata input cannot include fixture payload");
+            }
         }
         if self.evidence_kind == LearningSensorEvidenceKind::TypedFixtureObservation {
             if self.provenance_marker != LearningSensorProvenanceMarker::FakeReviewerFixture {
@@ -1515,6 +1518,19 @@ mod tests {
                 .is_err(),
         );
         let expected = (true, true);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn conversation_metadata_sensor_input_rejects_fixture_payload_smuggling() {
+        let projection = fixture_learning_projection(LearningReviewState::Candidate);
+        let mut input = LearningSensorReviewInput::from_candidate_projection(&projection);
+        input.fixture_title = Some("Hidden fixture title".to_string());
+        input.fixture_observation = Some("Hidden fixture observation".to_string());
+
+        let actual = input.validate().is_err();
+        let expected = true;
 
         assert_eq!(actual, expected);
     }
