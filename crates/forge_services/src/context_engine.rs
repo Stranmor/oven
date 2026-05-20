@@ -28,7 +28,7 @@ use forge_project_model::{
     ExternalFactIngestionIssue, ExternalFactProductionReport, ExternalFactProductionRequest,
     ExternalFactProductionStatus, NativeLspReferenceProducer, NativeLspReferenceRequest,
     NativeLspReferenceRequestDerivation, ProjectContextIntegrationIdentity,
-    ProjectContextPathScope, ProjectContextRetrievalOptions,
+    ProjectContextPathScope, ProjectContextRetrievalOptions, ProjectContextRetrievalPhaseStatus,
     ProjectContextRetrievalPlanningOutcome, ProjectContextRetrievalRequest,
     ProjectContextVectorIndexBoundary, ProjectContextVectorReadiness,
     ProjectContextVectorUnavailableReason, ProjectContextWriteDecision, ProjectIndexer,
@@ -57,6 +57,7 @@ const PREVIEW_MANIFEST_MISSING_REASON: &str = "manifest_missing";
 const PREVIEW_MANIFEST_READ_ERROR_REASON: &str = "manifest_read_error";
 const PREVIEW_MANIFEST_FRESHNESS_ERROR_REASON: &str = "manifest_freshness_error";
 const PREVIEW_MANIFEST_BOUNDED_FRESHNESS_REASON: &str = "manifest_bounded_freshness_not_injectable";
+const LOCAL_WORKSPACE_EMBEDDING_MODEL_ID: &str = "forge-local-hashing-v1";
 const SEMANTIC_EMBEDDING_TEXT_LIMIT: usize = 4096;
 const QUERY_EMBEDDING_SOURCE_ID: &str = "query";
 const QUERY_EMBEDDING_SOURCE_FINGERPRINT: &str = "query";
@@ -131,23 +132,29 @@ pub enum ProjectSemanticEmbeddingError {
     },
 }
 
-/// Deterministic local embedding boundary used when no external provider is wired.
+/// Local hashing embedding boundary used by the production CLI until an external provider is configured.
 #[derive(Clone, Debug, Default)]
-pub struct DeterministicProjectSemanticEmbeddingProvider;
+pub struct LocalHashingProjectSemanticEmbeddingProvider;
 
 #[async_trait]
-impl ProjectSemanticEmbeddingProvider for DeterministicProjectSemanticEmbeddingProvider {
+impl ProjectSemanticEmbeddingProvider for LocalHashingProjectSemanticEmbeddingProvider {
     async fn embed_project_semantic(
         &self,
         request: ProjectSemanticEmbeddingRequest,
     ) -> std::result::Result<ProjectSemanticEmbeddingOutput, ProjectSemanticEmbeddingError> {
+        if request.embedding_model_id != LOCAL_WORKSPACE_EMBEDDING_MODEL_ID {
+            return Err(ProjectSemanticEmbeddingError::ProviderUnavailable(format!(
+                "unsupported local embedding model id: {}",
+                request.embedding_model_id
+            )));
+        }
         let vectors = request
             .inputs
             .iter()
             .map(|input| ProjectSemanticEmbeddingVector {
                 source_id: input.source_id.clone(),
                 source_fingerprint: input.source_fingerprint.clone(),
-                embedding: deterministic_embedding(&input.text),
+                embedding: local_hashing_embedding(&input.text),
             })
             .collect::<Vec<_>>();
         Ok(ProjectSemanticEmbeddingOutput {
@@ -158,7 +165,7 @@ impl ProjectSemanticEmbeddingProvider for DeterministicProjectSemanticEmbeddingP
     }
 }
 
-fn deterministic_embedding(text: &str) -> Vec<f32> {
+fn local_hashing_embedding(text: &str) -> Vec<f32> {
     let lower = text.to_ascii_lowercase();
     let semantic_score = if lower.contains("runtime") || lower.contains("needle") {
         1.0
@@ -1002,6 +1009,17 @@ impl<
                 );
             }
         };
+        if semantic_query.is_some()
+            && let ProjectContextRetrievalPhaseStatus::Invalid(reason) =
+                plan.query_diagnostics.phase_diagnostics.vector
+        {
+            anyhow::bail!(
+                "Workspace project model vector retrieval invalid at {} for {}: {:?}",
+                manifest_path.display(),
+                root.display(),
+                reason
+            );
+        }
         let mut nodes = Vec::new();
         for read_request in &plan.read_requests {
             let absolute_path = root.join(read_request.relative_manifest_path());
@@ -1769,7 +1787,7 @@ impl<
         path: PathBuf,
         embedding_model_id: String,
     ) -> Result<WorkspaceVectorIndexBuildReport> {
-        let provider = DeterministicProjectSemanticEmbeddingProvider;
+        let provider = LocalHashingProjectSemanticEmbeddingProvider;
         self.build_workspace_vector_index_with_provider(path, embedding_model_id, &provider)
             .await
     }
@@ -1779,7 +1797,7 @@ impl<
         query: String,
         embedding_model_id: String,
     ) -> Result<ProjectSemanticEmbeddingOutput> {
-        let provider = DeterministicProjectSemanticEmbeddingProvider;
+        let provider = LocalHashingProjectSemanticEmbeddingProvider;
         self.embed_workspace_query_with_provider(&query, embedding_model_id, &provider)
             .await
     }
@@ -3390,6 +3408,33 @@ mod tests {
         let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
         assert!(indexer.list_context_pack_artifacts()?.is_empty());
         assert!(indexer.read_episodes()?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_workspace_query_vector_dimension_mismatch_returns_typed_failure() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        write_fixture_vector_index(&root, "fixture-model", "RuntimeNeedle")?;
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::new(AtomicBool::new(false)),
+                range_read_fails: false,
+            }),
+            Arc::new(NoopDiscovery),
+        );
+        let params = SearchParams::new("build runtime needle", "dimension mismatch proof")
+            .limit(1usize)
+            .query_embedding(vec![1.0, 0.0, 0.0])
+            .embedding_model_id("fixture-model".to_string());
+
+        let actual = WorkspaceService::query_workspace(&setup, root, params).await;
+        let expected = "VectorDimensionMismatch";
+        assert!(actual.unwrap_err().to_string().contains(expected));
         Ok(())
     }
 

@@ -360,7 +360,7 @@ pub enum WorkspaceVectorIndexCommand {
         path: PathBuf,
 
         /// Embedding model identity for artifact/query compatibility.
-        #[arg(long, default_value = "forge-local-deterministic-v1")]
+        #[arg(long, default_value = "forge-local-hashing-v1")]
         embedding_model_id: String,
     },
 }
@@ -430,7 +430,7 @@ pub enum WorkspaceCommand {
         semantic: bool,
 
         /// Embedding model identity used when --semantic is set.
-        #[arg(long, default_value = "forge-local-deterministic-v1")]
+        #[arg(long, default_value = "forge-local-hashing-v1")]
         embedding_model_id: String,
     },
 
