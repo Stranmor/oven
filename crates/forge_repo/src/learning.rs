@@ -185,6 +185,11 @@ impl LearningRepository for LearningRepositoryImpl {
                     .optional()?;
                 let event = if let Some(existing) = existing {
                     ensure_learning_event_idempotency_replay(&existing, &record)?;
+                    anyhow::ensure!(
+                        projection.review_state == target_state,
+                        "learning review idempotency replay is stale for current projection state {}",
+                        projection.review_state
+                    );
                     existing.try_into_event()?
                 } else {
                     diesel::insert_into(learning_ledger_events::table)
@@ -228,6 +233,11 @@ impl LearningRepository for LearningRepositoryImpl {
                     .ok_or_else(|| {
                         anyhow::anyhow!("learning review projection not found after append")
                     })?;
+                anyhow::ensure!(
+                    projection.review_state == target_state,
+                    "learning review did not transition projection to target state {}",
+                    target_state
+                );
                 Ok(LearningReviewOutcome { event, projection })
             })
         })
@@ -992,6 +1002,41 @@ mod tests {
             .await?
             .expect("candidate projection should exist");
         let actual = (colliding.is_err(), projection.review_state);
+        let expected = (true, LearningReviewState::Candidate);
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_review_rejects_stale_pre_candidate_exact_replay_without_projection_transition()
+    -> anyhow::Result<()> {
+        let fixture = fixture_repo(22)?;
+        let conversation_id = ConversationId::generate();
+        let created_at = Utc::now();
+        let candidate_event = fixture_event(
+            conversation_id,
+            "event-1",
+            "pre candidate exact stale replay candidate",
+            created_at,
+        )?;
+        let stale_review = LearningLedgerEvent::review(
+            candidate_event.record_id,
+            LearningEventKind::ReviewAccepted,
+            "stale accepted review inserted before candidate",
+            LearningProvenance::conversation(conversation_id, "review-1", "review-fingerprint-1"),
+            created_at - Duration::seconds(1),
+        )?;
+        fixture.insert_learning_event(stale_review.clone()).await?;
+        let candidate = fixture.insert_learning_event(candidate_event).await?.event;
+        let exact_replay = LearningLedgerEvent { record_id: candidate.record_id, ..stale_review };
+
+        let replay = fixture.review_learning_candidate_event(exact_replay).await;
+        let projection = fixture
+            .get_learning_record(candidate.record_id)
+            .await?
+            .expect("candidate projection should exist");
+        let actual = (replay.is_err(), projection.review_state);
         let expected = (true, LearningReviewState::Candidate);
 
         assert_eq!(actual, expected);
