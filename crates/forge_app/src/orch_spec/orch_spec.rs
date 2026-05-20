@@ -651,6 +651,7 @@ async fn test_doom_loop_reminder_is_not_duplicated_without_new_tool_evidence() {
             droppable: false,
             phase: None,
             cacheable: None,
+            cache_class: None,
             kind: None,
         })
         .into()

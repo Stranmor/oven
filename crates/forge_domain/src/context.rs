@@ -326,6 +326,7 @@ impl ContextMessage {
             droppable: false,
             phase: None,
             cacheable: None,
+            cache_class: None,
             kind: None,
         }
         .into()
@@ -343,6 +344,7 @@ impl ContextMessage {
             droppable: false,
             phase: None,
             cacheable: None,
+            cache_class: None,
             kind: None,
         }
         .into()
@@ -366,6 +368,7 @@ impl ContextMessage {
             droppable: false,
             phase: None,
             cacheable: None,
+            cache_class: None,
             kind: None,
         }
         .into()
@@ -398,6 +401,15 @@ impl ContextMessage {
             ContextMessage::Text(message) => message.is_cache_eligible(),
             ContextMessage::Tool(_) => true,
             ContextMessage::Image(_) => true,
+        }
+    }
+
+    /// Returns typed semantic cache class for provider cache translation.
+    pub fn cache_partition_class(&self) -> MessageCacheClass {
+        match self {
+            ContextMessage::Text(message) => message.cache_partition_class(),
+            ContextMessage::Tool(_) => MessageCacheClass::Conversation,
+            ContextMessage::Image(_) => MessageCacheClass::Conversation,
         }
     }
 
@@ -462,12 +474,32 @@ fn reasoning_content_char_count(text_message: &TextMessage) -> usize {
         })
 }
 
+/// Semantic cache partition class for provider prompt-cache translation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageCacheClass {
+    /// Ordinary conversation content may participate in the provider's rolling cache strategy.
+    Conversation,
+    /// Cache-eligible stable project-model context sealed by the project-model layer.
+    StableProjectModel,
+    /// Volatile project-model sidecar must never be cache-marked.
+    VolatileProjectModelSidecar,
+    /// Runtime context must never be cache-marked.
+    Runtime,
+    /// Explicitly uncached internal or diagnostic content.
+    Uncached,
+}
+
 /// Semantic category for internal text messages that need typed handling.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TextMessageKind {
     /// Live request-scoped runtime context message.
     RuntimeContext,
+    /// Stable project-model context injected as a cache-eligible internal payload.
+    StableProjectModelContext,
+    /// Volatile project-model sidecar injected as an uncached internal payload.
+    ProjectModelVolatileSidecar,
     /// Project-model context injected as an internal user-scoped payload.
     ProjectModelContext,
     /// Reviewed self-learning context injected as an internal user-scoped payload.
@@ -505,6 +537,9 @@ pub struct TextMessage {
     /// Overrides provider prompt-cache eligibility for volatile context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cacheable: Option<bool>,
+    /// Semantic cache partition class for provider prompt-cache translation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_class: Option<MessageCacheClass>,
     /// Semantic kind for agent-internal context messages that must be
     /// distinguished from real user text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -525,6 +560,7 @@ impl TextMessage {
             droppable: false,
             phase: None,
             cacheable: None,
+            cache_class: None,
             kind: None,
         }
     }
@@ -551,11 +587,41 @@ impl TextMessage {
             self.kind,
             Some(
                 TextMessageKind::RuntimeContext
+                    | TextMessageKind::StableProjectModelContext
+                    | TextMessageKind::ProjectModelVolatileSidecar
                     | TextMessageKind::ProjectModelContext
                     | TextMessageKind::LearningContext
                     | TextMessageKind::CompactionSummary
             )
         )
+    }
+
+    /// Returns whether this message is stable project-model context.
+    pub fn is_stable_project_model_context(&self) -> bool {
+        self.kind == Some(TextMessageKind::StableProjectModelContext)
+    }
+
+    /// Marks this message as a stable cache-eligible project-model context payload.
+    pub fn stable_project_model_context(role: Role, content: impl Into<String>) -> Self {
+        Self::new(role, content)
+            .kind(TextMessageKind::StableProjectModelContext)
+            .droppable(true)
+            .cacheable(true)
+            .cache_class(MessageCacheClass::StableProjectModel)
+    }
+
+    /// Returns whether this message is a volatile project-model sidecar.
+    pub fn is_project_model_volatile_sidecar(&self) -> bool {
+        self.kind == Some(TextMessageKind::ProjectModelVolatileSidecar)
+    }
+
+    /// Marks this message as an uncached volatile project-model sidecar payload.
+    pub fn project_model_volatile_sidecar(role: Role, content: impl Into<String>) -> Self {
+        Self::new(role, content)
+            .kind(TextMessageKind::ProjectModelVolatileSidecar)
+            .droppable(true)
+            .cacheable(false)
+            .cache_class(MessageCacheClass::VolatileProjectModelSidecar)
     }
 
     /// Returns whether this message is the live project-model context payload.
@@ -569,6 +635,7 @@ impl TextMessage {
             .kind(TextMessageKind::ProjectModelContext)
             .droppable(true)
             .cacheable(false)
+            .cache_class(MessageCacheClass::Uncached)
     }
 
     /// Returns whether this message is reviewed self-learning context.
@@ -582,6 +649,7 @@ impl TextMessage {
             .kind(TextMessageKind::LearningContext)
             .droppable(true)
             .cacheable(false)
+            .cache_class(MessageCacheClass::Uncached)
     }
 
     /// Returns whether this message is a compacted conversation summary.
@@ -597,15 +665,36 @@ impl TextMessage {
         Self::new(Role::User, content).kind(TextMessageKind::CompactionSummary)
     }
 
+    /// Returns the typed semantic cache class for provider cache translation.
+    pub fn cache_partition_class(&self) -> MessageCacheClass {
+        self.cache_class.unwrap_or_else(|| {
+            if self.is_runtime_context() {
+                MessageCacheClass::Runtime
+            } else if self.is_stable_project_model_context() {
+                MessageCacheClass::StableProjectModel
+            } else if self.is_project_model_volatile_sidecar() {
+                MessageCacheClass::VolatileProjectModelSidecar
+            } else if self.cacheable == Some(false) {
+                MessageCacheClass::Uncached
+            } else {
+                MessageCacheClass::Conversation
+            }
+        })
+    }
+
     /// Returns whether this message is eligible for provider prompt-cache
     /// markers.
     pub fn is_cache_eligible(&self) -> bool {
-        self.cacheable.unwrap_or(true)
+        matches!(
+            self.cache_partition_class(),
+            MessageCacheClass::Conversation | MessageCacheClass::StableProjectModel
+        )
     }
 
     /// Marks this message as ineligible for provider prompt-cache markers.
     pub fn cache_ineligible(mut self) -> Self {
         self.cacheable = Some(false);
+        self.cache_class = Some(MessageCacheClass::Uncached);
         self
     }
 
@@ -625,6 +714,7 @@ impl TextMessage {
             droppable: false,
             phase: None,
             cacheable: None,
+            cache_class: None,
             kind: None,
         }
     }

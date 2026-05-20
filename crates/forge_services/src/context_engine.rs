@@ -347,6 +347,8 @@ fn workspace_evidence_replay_diagnostic(
         manifest_path: manifest_path.clone(),
         manifest_found: true,
         freshness: freshness.clone(),
+        manifest_hash: matches!(freshness, WorkspaceContextFreshness::Fresh)
+            .then_some(manifest.manifest_hash.clone()),
         exact_fact_readiness: None,
         evidence_readiness: None,
         evidence_ledger_activation: None,
@@ -2179,6 +2181,7 @@ fn evaluate_project_model_context(path: &Path) -> WorkspaceContextManifestDiagno
             freshness: WorkspaceContextFreshness::Unknown {
                 reason: "project-model manifest not found".to_string(),
             },
+            manifest_hash: None,
             exact_fact_readiness: None,
             evidence_readiness: None,
             evidence_ledger_activation: None,
@@ -2194,9 +2197,15 @@ fn evaluate_project_model_context(path: &Path) -> WorkspaceContextManifestDiagno
     ));
 
     let indexer = ProjectIndexer::new(path, local_project_model_dir(path));
-    let freshness = match indexer
-        .read_manifest()
-        .and_then(|manifest| indexer.evaluate_manifest_freshness(&manifest))
+    let manifest_read = indexer.read_manifest();
+    let manifest_hash = manifest_read
+        .as_ref()
+        .ok()
+        .map(|manifest| manifest.manifest_hash.clone());
+    let freshness = match manifest_read
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+        .and_then(|manifest| indexer.evaluate_manifest_freshness(manifest))
     {
         Ok(evaluation) if evaluation.can_inject() => WorkspaceContextFreshness::Fresh,
         Ok(evaluation) if evaluation.state.fresh => WorkspaceContextFreshness::Unknown {
@@ -2214,7 +2223,10 @@ fn evaluate_project_model_context(path: &Path) -> WorkspaceContextManifestDiagno
         workspace_root: path.to_path_buf(),
         manifest_path,
         manifest_found: true,
-        freshness,
+        freshness: freshness.clone(),
+        manifest_hash: matches!(freshness, WorkspaceContextFreshness::Fresh)
+            .then(|| manifest_hash)
+            .flatten(),
         exact_fact_readiness,
         evidence_readiness,
         evidence_ledger_activation,

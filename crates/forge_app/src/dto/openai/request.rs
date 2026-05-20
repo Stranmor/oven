@@ -10,8 +10,9 @@ use url::Url;
 use super::response::{ExtraContent, FunctionCall, ToolCall};
 use super::tool_choice::ToolChoice;
 use crate::domain::{
-    Context, ContextMessage, ContextWindowBudget, ModelId, Provider, ToolCallFull, ToolCallId,
-    ToolCatalog, ToolDefinition, ToolName, ToolResult, ToolValue, Transformer,
+    Context, ContextMessage, ContextWindowBudget, MessageCacheClass, ModelId, Provider,
+    ToolCallFull, ToolCallId, ToolCatalog, ToolDefinition, ToolName, ToolResult, ToolValue,
+    Transformer,
 };
 use crate::dto::openai::ReasoningDetail;
 use crate::dto::openai::transformers::ProviderPipeline;
@@ -371,6 +372,8 @@ pub struct Request {
     #[serde(skip)]
     pub message_cache_eligibility: Vec<bool>,
     #[serde(skip)]
+    pub message_cache_classes: Vec<MessageCacheClass>,
+    #[serde(skip)]
     pub context_window: Option<u64>,
 }
 
@@ -527,6 +530,17 @@ impl Request {
             .unwrap_or(true)
     }
 
+    /// Returns the typed cache class for the provider message at `index`.
+    ///
+    /// # Arguments
+    /// * `index` - Provider message index.
+    pub fn message_cache_class(&self, index: usize) -> MessageCacheClass {
+        self.message_cache_classes
+            .get(index)
+            .copied()
+            .unwrap_or(MessageCacheClass::Conversation)
+    }
+
     /// Returns the output-token reservation encoded by this provider request.
     pub fn output_token_reservation(&self) -> usize {
         self.max_completion_tokens
@@ -653,6 +667,11 @@ impl From<Context> for Request {
             .iter()
             .map(|message| message.is_cache_eligible())
             .collect::<Vec<_>>();
+        let message_cache_classes = context
+            .messages
+            .iter()
+            .map(|message| message.cache_partition_class())
+            .collect::<Vec<_>>();
 
         Request {
             messages: {
@@ -724,6 +743,7 @@ impl From<Context> for Request {
             max_completion_tokens: Default::default(),
             thinking: Default::default(),
             message_cache_eligibility,
+            message_cache_classes,
             context_window: context.model_context_length,
         }
     }

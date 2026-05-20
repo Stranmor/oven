@@ -1,5 +1,5 @@
 use derive_setters::Setters;
-use forge_domain::{ContextMessage, Image};
+use forge_domain::{ContextMessage, Image, MessageCacheClass};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_THINKING_BUDGET_TOKENS: u64 = 10_000;
@@ -43,6 +43,8 @@ pub struct Request {
     pub presence_penalty: Option<f32>,
     #[serde(skip)]
     pub message_cache_eligibility: Vec<bool>,
+    #[serde(skip)]
+    pub message_cache_classes: Vec<MessageCacheClass>,
 }
 
 #[derive(Serialize, Default)]
@@ -138,6 +140,12 @@ impl TryFrom<forge_domain::Context> for Request {
             .iter()
             .filter(|message| !message.has_role(forge_domain::Role::System))
             .map(|message| message.is_cache_eligible())
+            .collect::<Vec<_>>();
+        let message_cache_classes = request
+            .messages
+            .iter()
+            .filter(|message| !message.has_role(forge_domain::Role::System))
+            .map(|message| message.cache_partition_class())
             .collect::<Vec<_>>();
 
         // Gate on the domain rule so inherited configs with `enabled: None` but
@@ -259,6 +267,7 @@ impl TryFrom<forge_domain::Context> for Request {
             frequency_penalty: request.frequency_penalty.map(|f| f as f32),
             presence_penalty: request.presence_penalty.map(|f| f as f32),
             message_cache_eligibility,
+            message_cache_classes,
             ..Default::default()
         })
     }
@@ -282,6 +291,17 @@ impl Request {
             .get(index)
             .copied()
             .unwrap_or(true)
+    }
+
+    /// Returns the typed cache class for the provider message at `index`.
+    ///
+    /// # Arguments
+    /// * `index` - Provider message index.
+    pub fn message_cache_class(&self, index: usize) -> MessageCacheClass {
+        self.message_cache_classes
+            .get(index)
+            .copied()
+            .unwrap_or(MessageCacheClass::Conversation)
     }
 }
 

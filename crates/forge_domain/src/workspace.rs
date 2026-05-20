@@ -738,6 +738,8 @@ pub struct WorkspaceContextManifestDiagnostic {
     pub manifest_found: bool,
     /// Freshness classification for the manifest when present.
     pub freshness: WorkspaceContextFreshness,
+    /// Fresh manifest hash when freshness is proven.
+    pub manifest_hash: Option<String>,
     /// Read-only exact-fact readiness for this manifest root, when evaluated.
     pub exact_fact_readiness: Option<WorkspaceExactFactReadinessDiagnostic>,
     /// Read-only evidence readiness for context-pack artifacts and tool episodes, when evaluated.

@@ -1,4 +1,4 @@
-use forge_domain::Transformer;
+use forge_domain::{MessageCacheClass, Transformer};
 
 use crate::dto::openai::Request;
 
@@ -18,9 +18,17 @@ impl Transformer for SetCache {
     ///    messages.len() - 2)
     fn transform(&mut self, mut request: Self::Value) -> Self::Value {
         let len = request.message_count();
-        let first_cache_eligible = (0..len).find(|index| request.is_message_cache_eligible(*index));
+        let stable_cache_indices = (0..len)
+            .filter(|index| {
+                request.message_cache_class(*index) == MessageCacheClass::StableProjectModel
+            })
+            .collect::<Vec<_>>();
+        let first_cache_eligible = (0..len)
+            .filter(|index| request.message_cache_class(*index) == MessageCacheClass::Conversation)
+            .find(|index| request.is_message_cache_eligible(*index));
         let last_cache_eligible = (0..len)
             .rev()
+            .filter(|index| request.message_cache_class(*index) == MessageCacheClass::Conversation)
             .find(|index| request.is_message_cache_eligible(*index));
 
         if let Some(messages) = request.messages.as_mut() {
@@ -31,6 +39,14 @@ impl Transformer for SetCache {
             for message in messages.iter_mut() {
                 if let Some(ref content) = message.content {
                     message.content = Some(content.clone().cached(false));
+                }
+            }
+
+            for index in stable_cache_indices {
+                if let Some(message) = messages.get_mut(index)
+                    && let Some(ref content) = message.content
+                {
+                    message.content = Some(content.clone().cached(true));
                 }
             }
 
@@ -182,9 +198,9 @@ mod tests {
                 TextMessage::new(Role::User, "real user").model(ModelId::new("gpt-4")),
             ))
             .add_message(ContextMessage::Text(
-                TextMessage::project_model_context(
+                TextMessage::stable_project_model_context(
                     Role::User,
-                    "<project_model_context>dynamic</project_model_context>",
+                    "<project_model_context cache=\"stable\">stable</project_model_context>",
                 )
                 .model(ModelId::new("gpt-4")),
             ));
@@ -193,13 +209,78 @@ mod tests {
         let actual = transformer.transform(Request::from(fixture));
         let messages = actual.messages.unwrap();
 
-        let expected = (true, false, true);
+        let expected = (true, true, true);
         assert_eq!(
             (
-                matches!(messages[1].content.as_ref().unwrap(), crate::dto::openai::MessageContent::Text(text) if text.contains("project_model_context")),
+                serde_json::to_string(messages[1].content.as_ref().unwrap())
+                    .unwrap()
+                    .contains("project_model_context"),
                 messages[1].content.as_ref().unwrap().is_cached(),
                 messages[0].content.as_ref().unwrap().is_cached(),
             ),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_project_model_volatile_sidecar_is_not_cached_between_stable_and_user_messages() {
+        let fixture = Context::default()
+            .add_message(ContextMessage::Text(
+                TextMessage::new(Role::User, "real user").model(ModelId::new("gpt-4")),
+            ))
+            .add_message(ContextMessage::Text(
+                TextMessage::stable_project_model_context(
+                    Role::User,
+                    "<project_model_context cache=\"stable\">stable</project_model_context>",
+                )
+                .model(ModelId::new("gpt-4")),
+            ))
+            .add_message(ContextMessage::Text(
+                TextMessage::project_model_volatile_sidecar(
+                    Role::User,
+                    "<project_model_volatile_sidecar cache=\"uncached\">time</project_model_volatile_sidecar>",
+                )
+                .model(ModelId::new("gpt-4")),
+            ));
+        let mut transformer = SetCache;
+
+        let actual = transformer.transform(Request::from(fixture));
+        let messages = actual.messages.unwrap();
+
+        let expected = vec![true, true, false];
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.content.as_ref().unwrap().is_cached())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_cache_class_not_inferred_from_message_position_or_role_alone() {
+        let fixture = Context::default()
+            .add_message(ContextMessage::Text(
+                TextMessage::new(Role::User, "uncached first")
+                    .model(ModelId::new("gpt-4"))
+                    .cache_ineligible(),
+            ))
+            .add_message(ContextMessage::Text(
+                TextMessage::new(Role::User, "uncached last")
+                    .model(ModelId::new("gpt-4"))
+                    .cache_ineligible(),
+            ));
+        let mut transformer = SetCache;
+
+        let actual = transformer.transform(Request::from(fixture));
+        let messages = actual.messages.unwrap();
+
+        let expected = vec![false, false];
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.content.as_ref().unwrap().is_cached())
+                .collect::<Vec<_>>(),
             expected
         );
     }

@@ -8,8 +8,9 @@ use chrono::Local;
 use forge_config::ForgeConfig;
 use forge_domain::*;
 use forge_project_model::{
-    AcceptedLearningSummary as ProjectAcceptedLearningSummary, LearningContextPayload,
-    LearningContextRecord, LearningLedgerFreshness as ProjectLearningLedgerFreshness,
+    AcceptedLearningSummary as ProjectAcceptedLearningSummary, CACHE_PARTITION_SCHEMA_VERSION,
+    LearningContextPayload, LearningContextRecord,
+    LearningLedgerFreshness as ProjectLearningLedgerFreshness,
     LearningProvenance as ProjectLearningProvenance,
     LearningRedactionStatus as ProjectLearningRedactionStatus,
     LearningReviewState as ProjectLearningReviewState,
@@ -19,9 +20,11 @@ use forge_project_model::{
     ProjectContextRetrievalPhaseUnavailableReason, ProjectContextRetrievalPlanDiagnostic,
     ProjectContextRetrievalReadRequestSummary, ProjectContextRetrievalRequest,
     ProjectContextRetrievalSelectedSummary, ProjectContextTarget, ProjectContextWriteDecision,
-    ProjectIndexer, ProjectModelContextReadinessMetadata, ProjectModelContextRenderBudget,
-    ProjectModelEvidenceLedgerActivationMetadata, ProjectModelEvidenceReadinessMetadata,
-    ProjectModelExactFactReadinessMetadata, ProjectModelSourceNode, TargetResolutionBudget,
+    ProjectIndexer, ProjectModelCachePartitionIdentity, ProjectModelCachePartitionInput,
+    ProjectModelCachePartitionSource, ProjectModelContextReadinessMetadata,
+    ProjectModelContextRenderBudget, ProjectModelEvidenceLedgerActivationMetadata,
+    ProjectModelEvidenceReadinessMetadata, ProjectModelExactFactReadinessMetadata,
+    ProjectModelSourceNode, ProjectModelVolatileSidecarInput, TargetResolutionBudget,
     directory_path_filter, local_project_model_dir, local_project_model_manifest, mentioned_paths,
     plan_project_context_retrieval, render_project_model_context, render_sources_from_nodes,
 };
@@ -79,6 +82,11 @@ fn bounded_semantic_embedding_query(query: &str) -> String {
 struct ProjectContextTargetDiagnostic {
     target: ProjectContextTarget,
     diagnostic: WorkspaceContextManifestDiagnostic,
+}
+
+struct ProjectContextRenderedPartition {
+    stable_payload: String,
+    volatile_sidecar: String,
 }
 
 struct ProjectContextInjection<S> {
@@ -295,29 +303,37 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
             if nodes.is_empty() {
                 continue;
             }
-            rendered_contexts.push(Self::render_context(
+            if let Some(rendered_context) = Self::render_context(
                 &target.workspace_root,
-                target_diagnostic.diagnostic.exact_fact_readiness.as_ref(),
-                target_diagnostic.diagnostic.evidence_readiness.as_ref(),
-                target_diagnostic
-                    .diagnostic
-                    .evidence_ledger_activation
-                    .as_ref(),
+                &target_diagnostic.diagnostic,
                 semantic_diagnostic.as_deref(),
                 nodes,
-            ));
+            ) {
+                rendered_contexts.push(rendered_context);
+            }
         }
         if rendered_contexts.is_empty() {
             return conversation;
         }
 
         let mut context = conversation.context.take().unwrap_or_default();
-        for content in rendered_contexts {
-            let message = TextMessage::project_model_context(Role::User, content)
-                .model(self.agent.model.clone())
-                .droppable(true)
-                .cacheable(false);
-            context = context.add_message(ContextMessage::Text(message));
+        for rendered_context in rendered_contexts {
+            let stable_message = TextMessage::stable_project_model_context(
+                Role::User,
+                rendered_context.stable_payload,
+            )
+            .model(self.agent.model.clone())
+            .droppable(true)
+            .cacheable(true);
+            context = context.add_message(ContextMessage::Text(stable_message));
+            let sidecar_message = TextMessage::project_model_volatile_sidecar(
+                Role::User,
+                rendered_context.volatile_sidecar,
+            )
+            .model(self.agent.model.clone())
+            .droppable(true)
+            .cacheable(false);
+            context = context.add_message(ContextMessage::Text(sidecar_message));
         }
         conversation.context(context)
     }
@@ -528,6 +544,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
                 freshness: WorkspaceContextFreshness::Unknown {
                     reason: "project-model manifest not found".to_string(),
                 },
+                manifest_hash: None,
                 exact_fact_readiness: None,
                 evidence_readiness: None,
                 evidence_ledger_activation: None,
@@ -1176,39 +1193,165 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
 
     fn render_context(
         workspace_root: &std::path::Path,
-        exact_fact_readiness: Option<&WorkspaceExactFactReadinessDiagnostic>,
-        evidence_readiness: Option<&WorkspaceEvidenceReadinessDiagnostic>,
-        evidence_ledger_activation: Option<&WorkspaceEvidenceLedgerActivationDiagnostic>,
+        diagnostic: &WorkspaceContextManifestDiagnostic,
         semantic_diagnostic: Option<&str>,
         nodes: Vec<Node>,
-    ) -> String {
+    ) -> Option<ProjectContextRenderedPartition> {
+        let manifest_hash = diagnostic.manifest_hash.clone()?;
         let manifest_path = local_project_model_manifest(workspace_root);
         let source_nodes = nodes
             .into_iter()
             .map(Self::source_node_from_node)
             .collect::<Vec<_>>();
+        let stable_sources = source_nodes
+            .iter()
+            .filter_map(Self::stable_partition_source_from_node)
+            .collect::<Vec<_>>();
         let sources = render_sources_from_nodes(source_nodes);
-        let exact_fact_readiness = exact_fact_readiness.map(Self::exact_fact_readiness_metadata);
-        let evidence_readiness = evidence_readiness.map(Self::evidence_readiness_metadata);
-        let evidence_ledger_activation =
-            evidence_ledger_activation.map(Self::evidence_ledger_activation_metadata);
+        let exact_fact_readiness = diagnostic
+            .exact_fact_readiness
+            .as_ref()
+            .map(Self::exact_fact_readiness_metadata);
+        let evidence_readiness = diagnostic
+            .evidence_readiness
+            .as_ref()
+            .map(Self::evidence_readiness_metadata);
+        let evidence_ledger_activation = diagnostic
+            .evidence_ledger_activation
+            .as_ref()
+            .map(Self::evidence_ledger_activation_metadata);
         let readiness = ProjectModelContextReadinessMetadata {
             exact_fact_readiness,
             evidence_readiness,
             evidence_ledger_activation,
         };
+        let render_budget = ProjectModelContextRenderBudget::default();
         let rendered = render_project_model_context(
             &workspace_root.display().to_string(),
             &manifest_path.display().to_string(),
             "local_manifest_available",
             "WorkspaceService::query_workspace",
-            Some(&readiness),
+            None,
             &sources,
-            &ProjectModelContextRenderBudget::default(),
+            &render_budget,
         );
-        match semantic_diagnostic {
-            Some(diagnostic) => format!("{rendered}\n<!-- {diagnostic} -->"),
-            None => rendered,
+        if rendered.contains("rendered_context_budget_exceeded") {
+            tracing::debug!(path = %workspace_root.display(), "Skipping stable project-model context because render budget overflow was unclassified");
+            return None;
+        }
+        let identity = ProjectModelCachePartitionIdentity {
+            canonical_project_identity: workspace_root.display().to_string(),
+            manifest_schema_version: 1,
+            manifest_hash,
+            retrieval_plan_version: "automatic-project-context-retrieval-v1".to_string(),
+            renderer_template_version: "project-model-context-render-v1".to_string(),
+            agents_project_rules_digest: None,
+            render_budget: render_budget.max_rendered_chars as u32,
+            truncation_policy: "bounded-source-preview-v1".to_string(),
+            cache_partition_schema_version: CACHE_PARTITION_SCHEMA_VERSION,
+        };
+        let stable = match (ProjectModelCachePartitionInput { identity })
+            .manifest_known()
+            .and_then(|partition| partition.select_sources(stable_sources))
+            .and_then(|partition| partition.verify_readback())
+            .and_then(|partition| partition.seal_stable_payload())
+        {
+            Ok(partition) => partition,
+            Err(error) => {
+                tracing::debug!(error = ?error, path = %workspace_root.display(), "Skipping stable project-model context injection because cache partition proof failed");
+                return None;
+            }
+        };
+        let stable_identity = stable.stable_payload().identity.clone();
+        let stable_payload = format!(
+            "<project_model_context cache=\"stable\" stable_identity=\"{}\">\n{}\n</project_model_context>",
+            stable_identity, rendered
+        );
+        let mut diagnostics = Vec::new();
+        diagnostics.push(format!("freshness={}", diagnostic.freshness.label()));
+        if let Some(semantic_diagnostic) = semantic_diagnostic {
+            diagnostics.push(semantic_diagnostic.to_string());
+        }
+        if let Some(readiness) = &readiness.exact_fact_readiness {
+            diagnostics.push(format!("exact_fact_status={}", readiness.status_label));
+            if let Some(fingerprint) = &readiness.manifest_external_facts_fingerprint {
+                diagnostics.push(format!("manifest_external_facts_fingerprint={fingerprint}"));
+            }
+            diagnostics.extend(readiness.issue_summaries.clone());
+        }
+        if let Some(readiness) = &readiness.evidence_readiness {
+            diagnostics.push(format!(
+                "context_pack_issue_count={}",
+                readiness.context_pack_issue_count
+            ));
+            diagnostics.push(format!(
+                "tool_episode_issue_count={}",
+                readiness.tool_episode_issue_count
+            ));
+            diagnostics.push(format!(
+                "episode_artifact_link_valid={}",
+                readiness.episode_artifact_link_valid
+            ));
+            diagnostics.extend(readiness.issue_summaries.clone());
+        }
+        if let Some(activation) = &readiness.evidence_ledger_activation {
+            diagnostics.extend(activation.issue_summaries.clone());
+        }
+        let sidecar = ProjectModelVolatileSidecarInput {
+            diagnostics,
+            readiness_warnings: Vec::new(),
+            mutable_file_freshness: Vec::new(),
+            transient_errors: Vec::new(),
+            ..Default::default()
+        };
+        let sidecar_json = serde_json::to_string(&sidecar).unwrap_or_else(|_| "{}".to_string());
+        Some(ProjectContextRenderedPartition {
+            stable_payload,
+            volatile_sidecar: format!(
+                "<project_model_volatile_sidecar cache=\"uncached\">{sidecar_json}</project_model_volatile_sidecar>"
+            ),
+        })
+    }
+
+    fn stable_partition_source_from_node(
+        node: &ProjectModelSourceNode,
+    ) -> Option<ProjectModelCachePartitionSource> {
+        match node {
+            ProjectModelSourceNode::FileChunk {
+                path,
+                start_line,
+                end_line,
+                node_id,
+                content,
+                ..
+            } => Some(
+                ProjectModelCachePartitionSource::new(
+                    path.clone(),
+                    node_id.clone(),
+                    content.clone(),
+                )
+                .line_range(*start_line, *end_line),
+            ),
+            ProjectModelSourceNode::File { path, node_id, content_hash, content, .. } => {
+                Some(ProjectModelCachePartitionSource::new(
+                    path.clone(),
+                    node_id.clone(),
+                    content.clone().unwrap_or_else(|| content_hash.clone()),
+                ))
+            }
+            ProjectModelSourceNode::FileRef { path, node_id, content_hash, .. } => {
+                Some(ProjectModelCachePartitionSource::new(
+                    path.clone(),
+                    node_id.clone(),
+                    content_hash.clone(),
+                ))
+            }
+            ProjectModelSourceNode::Note { node_id, content, .. } => Some(
+                ProjectModelCachePartitionSource::new("note", node_id.clone(), content.clone()),
+            ),
+            ProjectModelSourceNode::Task { node_id, content, .. } => Some(
+                ProjectModelCachePartitionSource::new("task", node_id.clone(), content.clone()),
+            ),
         }
     }
 
@@ -2628,6 +2771,7 @@ mod tests {
                 freshness: WorkspaceContextFreshness::Unknown {
                     reason: "runtime proof does not index workspace".to_string(),
                 },
+                manifest_hash: None,
                 exact_fact_readiness: None,
                 evidence_readiness: None,
                 evidence_ledger_activation: None,
@@ -3743,6 +3887,10 @@ mod tests {
                 manifest_found,
                 manifest_path,
                 freshness,
+                manifest_hash: exact_fact_readiness
+                    .as_ref()
+                    .and_then(|readiness| readiness.manifest_hash.clone())
+                    .or_else(|| manifest_found.then_some("fixture-manifest-hash".to_string())),
                 exact_fact_readiness,
                 evidence_readiness: evidence_readiness.clone(),
                 evidence_ledger_activation: evidence_readiness.as_ref().map(|readiness| {
@@ -5789,27 +5937,29 @@ mod tests {
         let actual = ProjectContextInjection::new(setup.clone(), agent)
             .inject(conversation)
             .await;
-        let actual_context = actual
-            .context
-            .unwrap()
-            .messages
-            .into_iter()
+        let messages = actual.context.unwrap().messages;
+        let actual_context = messages
+            .iter()
             .filter_map(|message| message.content().map(str::to_string))
             .find(|content| content.contains("<project_model_context"))
             .unwrap();
-        let expected = (true, true, true, true, true, true, false);
+        let actual_sidecar = messages
+            .iter()
+            .filter_map(|message| message.content().map(str::to_string))
+            .find(|content| content.contains("<project_model_volatile_sidecar"))
+            .unwrap();
+        let expected = (true, true, true, true, true, true, false, true);
 
         assert_eq!(
             (
+                actual_sidecar.contains("exact_fact_status=active"),
+                actual_sidecar.contains("fixture-external-facts"),
+                actual_sidecar.contains("context_pack_issue_count=0"),
+                actual_sidecar.contains("tool_episode_issue_count=0"),
+                actual_sidecar.contains("episode_artifact_link_valid=true"),
+                actual_context.contains("local_manifest_available"),
                 actual_context.contains("exact_fact_readiness=\"evaluated\""),
-                actual_context.contains("exact_fact_status=\"active\""),
-                actual_context
-                    .contains("manifest_external_facts_fingerprint=\"fixture-external-facts\""),
-                actual_context.contains("evidence_readiness=\"evaluated\""),
-                actual_context.contains("context_pack_artifact_count=\"1\""),
-                actual_context.contains("episode_artifact_link_valid=\"true\""),
-                actual_context.contains("local_manifest_available\"")
-                    && !actual_context.contains("exact_fact_readiness"),
+                actual_context.contains("cache=\"stable\""),
             ),
             expected,
         );
@@ -5823,6 +5973,7 @@ mod tests {
             manifest_path: PathBuf::from("/workspace/.forge_project_model/project_manifest.json"),
             manifest_found: true,
             freshness: WorkspaceContextFreshness::Fresh,
+            manifest_hash: Some("hash".to_string()),
             exact_fact_readiness: Some(WorkspaceExactFactReadinessDiagnostic {
                 status_label: "accepted_but_no_graph_edges".to_string(),
                 exact_facts_active: false,
@@ -6238,7 +6389,7 @@ mod tests {
                 .any(|tool| tool.name.as_str().eq_ignore_ascii_case("sem_search")),
         ];
         let expected_flags = vec![
-            true, true, true, true, true, true, true, false, false, false, false,
+            true, true, true, true, true, true, true, false, false, true, false,
         ];
         assert_eq!(actual_flags, expected_flags);
         assert_eq!(actual.matches("<source").count(), 3usize);

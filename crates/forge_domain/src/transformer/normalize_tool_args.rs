@@ -79,6 +79,7 @@ mod tests {
                 droppable: false,
                 phase: None,
                 cacheable: None,
+                cache_class: None,
                 kind: None,
             }));
 
@@ -172,6 +173,7 @@ mod tests {
                 droppable: false,
                 phase: None,
                 cacheable: None,
+                cache_class: None,
                 kind: None,
             }));
 

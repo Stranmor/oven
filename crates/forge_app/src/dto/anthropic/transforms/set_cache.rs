@@ -1,4 +1,4 @@
-use forge_domain::Transformer;
+use forge_domain::{MessageCacheClass, Transformer};
 
 use crate::dto::anthropic::Request;
 
@@ -40,13 +40,27 @@ impl Transformer for SetCache {
             }
         }
 
-        let first_cache_eligible = (0..len).find(|index| request.is_message_cache_eligible(*index));
+        let stable_cache_indices = (0..len)
+            .filter(|index| {
+                request.message_cache_class(*index) == MessageCacheClass::StableProjectModel
+            })
+            .collect::<Vec<_>>();
+        let first_cache_eligible = (0..len)
+            .filter(|index| request.message_cache_class(*index) == MessageCacheClass::Conversation)
+            .find(|index| request.is_message_cache_eligible(*index));
         let last_cache_eligible = (0..len)
             .rev()
+            .filter(|index| request.message_cache_class(*index) == MessageCacheClass::Conversation)
             .find(|index| request.is_message_cache_eligible(*index));
 
         for message in request.get_messages_mut().iter_mut() {
             *message = std::mem::take(message).cached(false);
+        }
+
+        for index in stable_cache_indices {
+            if let Some(message) = request.get_messages_mut().get_mut(index) {
+                *message = std::mem::take(message).cached(true);
+            }
         }
 
         if !has_system_prompt
@@ -298,9 +312,9 @@ mod tests {
                     .model(ModelId::new("claude-3-5-sonnet-20241022")),
             ))
             .add_message(ContextMessage::Text(
-                TextMessage::project_model_context(
+                TextMessage::stable_project_model_context(
                     Role::User,
-                    "<project_model_context>dynamic</project_model_context>",
+                    "<project_model_context cache=\"stable\">stable</project_model_context>",
                 )
                 .model(ModelId::new("claude-3-5-sonnet-20241022")),
             ));
@@ -308,7 +322,7 @@ mod tests {
 
         let actual = transformer.transform(Request::try_from(fixture).unwrap());
 
-        let expected = (true, false, true);
+        let expected = (true, true, true);
         assert_eq!(
             (
                 actual.get_messages()[1]
@@ -318,6 +332,70 @@ mod tests {
                 actual.get_messages()[1].is_cached(),
                 actual.get_messages()[0].is_cached(),
             ),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_project_model_volatile_sidecar_is_not_cached_between_stable_and_user_messages() {
+        let fixture = Context::default()
+            .add_message(ContextMessage::Text(
+                TextMessage::new(Role::User, "real user")
+                    .model(ModelId::new("claude-3-5-sonnet-20241022")),
+            ))
+            .add_message(ContextMessage::Text(
+                TextMessage::stable_project_model_context(
+                    Role::User,
+                    "<project_model_context cache=\"stable\">stable</project_model_context>",
+                )
+                .model(ModelId::new("claude-3-5-sonnet-20241022")),
+            ))
+            .add_message(ContextMessage::Text(
+                TextMessage::project_model_volatile_sidecar(
+                    Role::User,
+                    "<project_model_volatile_sidecar cache=\"uncached\">time</project_model_volatile_sidecar>",
+                )
+                .model(ModelId::new("claude-3-5-sonnet-20241022")),
+            ));
+        let mut transformer = SetCache;
+
+        let actual = transformer.transform(Request::try_from(fixture).unwrap());
+
+        let expected = vec![true, true, false];
+        assert_eq!(
+            actual
+                .get_messages()
+                .iter()
+                .map(|message| message.is_cached())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_cache_class_not_inferred_from_message_position_or_role_alone() {
+        let fixture = Context::default()
+            .add_message(ContextMessage::Text(
+                TextMessage::new(Role::User, "uncached first")
+                    .model(ModelId::new("claude-3-5-sonnet-20241022"))
+                    .cache_ineligible(),
+            ))
+            .add_message(ContextMessage::Text(
+                TextMessage::new(Role::User, "uncached last")
+                    .model(ModelId::new("claude-3-5-sonnet-20241022"))
+                    .cache_ineligible(),
+            ));
+        let mut transformer = SetCache;
+
+        let actual = transformer.transform(Request::try_from(fixture).unwrap());
+
+        let expected = vec![false, false];
+        assert_eq!(
+            actual
+                .get_messages()
+                .iter()
+                .map(|message| message.is_cached())
+                .collect::<Vec<_>>(),
             expected
         );
     }

@@ -104,6 +104,7 @@ impl<S: AttachmentService + EnvironmentInfra<Config = forge_config::ForgeConfig>
                 droppable: true, // Droppable so it can be removed during context compression
                 phase: None,
                 cacheable: Some(false),
+                cache_class: Some(MessageCacheClass::Uncached),
                 kind: None,
             };
             context = context.add_message(ContextMessage::Text(todo_message));
@@ -152,6 +153,7 @@ impl<S: AttachmentService + EnvironmentInfra<Config = forge_config::ForgeConfig>
                 droppable: true, // Piped input is droppable
                 phase: None,
                 cacheable: Some(false),
+                cache_class: Some(MessageCacheClass::Uncached),
                 kind: None,
             };
             context = context.add_message(ContextMessage::Text(piped_message));
@@ -242,6 +244,7 @@ impl<S: AttachmentService + EnvironmentInfra<Config = forge_config::ForgeConfig>
                 droppable: false,
                 phase: None,
                 cacheable: None,
+                cache_class: None,
                 kind: None,
             };
             context = context.add_message(ContextMessage::Text(message));

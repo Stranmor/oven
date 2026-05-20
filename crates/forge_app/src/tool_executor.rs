@@ -1235,6 +1235,7 @@ mod tests {
                 manifest_path: path.join(".forge_project_model/project_manifest.json"),
                 manifest_found: true,
                 freshness: WorkspaceContextFreshness::Fresh,
+                manifest_hash: Some("fixture-manifest-hash".to_string()),
                 exact_fact_readiness: None,
                 evidence_readiness: None,
                 evidence_ledger_activation: None,

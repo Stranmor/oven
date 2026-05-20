@@ -1,5 +1,6 @@
 //! Project model primitives, indexing, retrieval, graph, and episodic storage.
 
+mod cache_partition;
 mod context_adapter;
 mod durable_vector_index;
 mod eval;
@@ -20,6 +21,15 @@ mod types;
 mod util;
 mod vector;
 
+pub use cache_partition::{
+    CACHE_PARTITION_SCHEMA_VERSION, CachePartitionError, CachePartitionManifestKnown,
+    CachePartitionReadbackVerified, CachePartitionSourcesSelected,
+    CachePartitionStablePayloadSealed, CachePartitionVolatileSidecarAttached,
+    ProjectModelCachePartitionIdentity, ProjectModelCachePartitionInput,
+    ProjectModelCachePartitionSource, ProjectModelStablePayload,
+    ProjectModelStablePayloadWhitelistedFields, ProjectModelVolatileSidecar,
+    ProjectModelVolatileSidecarInput, StableProjectModelContextMessage,
+};
 pub use context_adapter::{
     EvidenceReplayPreviewError, ManifestEvidenceTarget, ProjectModelContextRenderRoot,
     ProjectModelSourceNode, cargo_dependency_evidence_id, cargo_feature_evidence_id,
