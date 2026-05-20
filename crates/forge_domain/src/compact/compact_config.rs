@@ -35,16 +35,19 @@ pub struct Compact {
     #[merge(strategy = crate::merge::option)]
     pub max_tokens: Option<usize>,
 
-    /// Maximum number of tokens before triggering compaction. This acts as an
-    /// absolute cap and is combined with
-    /// `token_threshold_percentage` by taking the lower value.
+    /// Maximum number of tokens before triggering compaction. This is an
+    /// explicit absolute threshold. It is preserved as-is unless
+    /// `token_threshold_percentage` is also configured, in which case the lower
+    /// effective threshold is used when the model context window is known.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[merge(strategy = crate::merge::option)]
     pub token_threshold: Option<usize>,
 
     /// Maximum percentage of the model context window used to derive the token
-    /// threshold before triggering compaction. This is combined with
-    /// `token_threshold` by taking the lower value.
+    /// threshold before triggering compaction. When `token_threshold` is absent,
+    /// this derives the threshold from the model context window. When
+    /// `token_threshold` is present, it acts as an explicit cap and the lower
+    /// effective threshold is used.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
