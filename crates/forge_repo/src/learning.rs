@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -174,6 +174,14 @@ impl LearningRepository for LearningRepositoryImpl {
                     ensure_learning_event_idempotency_replay(&existing, &record)?;
                     let event = existing.try_into_event()?;
                     return Ok(LearningReviewOutcome { event, projection });
+                }
+                if record.event_kind == LearningEventKind::ReviewAccepted.to_string()
+                    && record.eval_id.as_deref()
+                        == Some(SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REVIEWER_ID)
+                {
+                    anyhow::bail!(
+                        "sensor promotion ReviewAccepted requires repository promotion proof transaction"
+                    );
                 }
                 if projection.review_state != LearningReviewState::Candidate {
                     anyhow::bail!(
@@ -707,8 +715,32 @@ fn project_records(
     records: Vec<LearningLedgerEventRecord>,
 ) -> anyhow::Result<Vec<LearningRecordProjection>> {
     let mut projections: BTreeMap<String, ProjectionBuilder> = BTreeMap::new();
+    let mut promotion_audits: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut event_records = Vec::new();
     for record in records {
+        let event_seq = record.event_seq;
         let event = record.try_into_event()?;
+        event_records.push((event_seq, event));
+    }
+    let proposal_events = event_records
+        .iter()
+        .filter_map(|(event_seq, event)| {
+            (event.event_kind == LearningEventKind::SensorLessonProposed)
+                .then_some((*event_seq, event.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for (_, event) in event_records
+        .iter()
+        .filter(|(_, event)| event.event_kind == LearningEventKind::PromotionAudit)
+    {
+        if let Some(audit_key) = promotion_audit_key_from_event(event, &proposal_events)? {
+            promotion_audits
+                .entry(event.record_id.into_string())
+                .or_default()
+                .insert(audit_key);
+        }
+    }
+    for (_, event) in event_records {
         let record_key = event.record_id.into_string();
         match event.event_kind {
             LearningEventKind::CandidateCaptured => {
@@ -728,7 +760,24 @@ fn project_records(
             LearningEventKind::ReviewAccepted => {
                 if let Some(projection) = projections.get_mut(&record_key) {
                     projection.review_state = LearningReviewState::Accepted;
-                    projection.accepted_summary = accepted_summary_from_review_event(&event)?;
+                    if let Some((accepted_summary, required_audit_key)) =
+                        accepted_summary_from_review_event(&event)?
+                    {
+                        let has_audit = promotion_audits.get(&record_key).is_some_and(|audits| {
+                            if required_audit_key == "*" {
+                                !audits.is_empty()
+                            } else {
+                                audits.contains(&required_audit_key)
+                            }
+                        });
+                        anyhow::ensure!(
+                            has_audit,
+                            "sensor promotion review lacks paired promotion audit proof"
+                        );
+                        projection.accepted_summary = Some(accepted_summary);
+                    } else {
+                        projection.accepted_summary = None;
+                    }
                     projection.updated_at = event.created_at;
                 }
             }
@@ -738,10 +787,20 @@ fn project_records(
                     projection.updated_at = event.created_at;
                 }
             }
+            LearningEventKind::PromotionAudit => {
+                if let Some(audit_key) = promotion_audit_key_from_event(&event, &proposal_events)? {
+                    promotion_audits
+                        .entry(record_key.clone())
+                        .or_default()
+                        .insert(audit_key);
+                }
+                if let Some(projection) = projections.get_mut(&record_key) {
+                    projection.updated_at = event.created_at;
+                }
+            }
             LearningEventKind::SensorLessonProposed
             | LearningEventKind::SensorReviewPending
-            | LearningEventKind::SensorReviewRejected
-            | LearningEventKind::PromotionAudit => {
+            | LearningEventKind::SensorReviewRejected => {
                 if let Some(projection) = projections.get_mut(&record_key) {
                     projection.updated_at = event.created_at;
                 }
@@ -771,31 +830,195 @@ fn project_records(
         .collect())
 }
 
-fn accepted_summary_from_review_event(
-    event: &LearningLedgerEvent,
-) -> anyhow::Result<Option<String>> {
-    if event.provenance.eval_id.as_deref()
-        != Some(SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REVIEWER_ID)
-    {
-        return Ok(None);
-    }
-    if !event
-        .summary
-        .contains(SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REASON)
-        || !event.summary.contains(
-            "accepted_summary=sanctioned_sanitized_observation:validated_counters_and_fingerprints",
-        )
-    {
-        anyhow::bail!("sensor promotion review summary is not canonical");
-    }
-    Ok(Some(
-        AcceptedLearningSummary::new(
-            "sanctioned_sanitized_observation:validated_counters_and_fingerprints",
-        )?
-        .into_string(),
-    ))
+fn is_sanctioned_promotion_reviewer(eval_id: Option<&str>) -> bool {
+    eval_id == Some(SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REVIEWER_ID)
+        || eval_id
+            == Some(
+                RedactedLearningSummary::from_raw(
+                    SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REVIEWER_ID,
+                )
+                .summary
+                .as_str(),
+            )
 }
 
+fn promotion_audit_key_from_event(
+    event: &LearningLedgerEvent,
+    proposal_events: &BTreeMap<i64, LearningLedgerEvent>,
+) -> anyhow::Result<Option<String>> {
+    if !is_sanctioned_promotion_reviewer(event.provenance.eval_id.as_deref()) {
+        if event.summary.contains(
+            "accepted_summary=sanctioned_sanitized_observation:validated_counters_and_fingerprints",
+        ) {
+            anyhow::bail!("sensor promotion audit summary appears without sanctioned reviewer");
+        }
+        return Ok(None);
+    }
+    let proposal_seq = promotion_proof_proposal_seq(event)?;
+    let observed_cursor = promotion_proof_cursor(event)?;
+    let proposal_seq_value = proposal_seq.parse::<i64>()?;
+    let proposal_event = proposal_events
+        .get(&proposal_seq_value)
+        .ok_or_else(|| anyhow::anyhow!("sensor promotion audit proposal event missing"))?;
+    anyhow::ensure!(
+        proposal_event.record_id == event.record_id,
+        "sensor promotion audit proposal record mismatch"
+    );
+    let expected_summary_payload = format!(
+        "proposal_seq={} cursor={} accepted_summary={}",
+        proposal_seq,
+        observed_cursor,
+        "sanctioned_sanitized_observation:validated_counters_and_fingerprints"
+    );
+    anyhow::ensure!(
+        event.summary.contains(&expected_summary_payload),
+        "sensor promotion audit summary is not canonical"
+    );
+    let expected_source_fingerprint = forge_domain::learning_digest_hex(format!(
+        "{}:{}:{}:{}:{}:{}",
+        forge_domain::SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_AUDIT_KIND,
+        event.record_id.into_string(),
+        proposal_event.event_id.into_string(),
+        proposal_seq,
+        observed_cursor,
+        proposal_event.provenance.source_fingerprint
+    ));
+    let expected_source_fingerprint =
+        RedactedLearningSummary::from_raw(expected_source_fingerprint).fingerprint;
+    anyhow::ensure!(
+        event.provenance.source_fingerprint == expected_source_fingerprint,
+        "sensor promotion audit source fingerprint mismatch"
+    );
+    let expected_idempotency_key = forge_domain::learning_digest_hex(format!(
+        "promotion-audit:v{}:candidate={}:proposal_seq={}:cursor={}:summary={}",
+        forge_domain::SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REVIEWER_VERSION,
+        event.record_id.into_string(),
+        proposal_seq,
+        observed_cursor,
+        "sanctioned_sanitized_observation:validated_counters_and_fingerprints"
+    ));
+    anyhow::ensure!(
+        event.idempotency_key == expected_idempotency_key,
+        "sensor promotion audit idempotency key mismatch"
+    );
+    Ok(Some(event.idempotency_key.clone()))
+}
+
+fn promotion_proof_proposal_seq(event: &LearningLedgerEvent) -> anyhow::Result<&str> {
+    event
+        .provenance
+        .source_event_id
+        .split(":proposal-seq:")
+        .nth(1)
+        .and_then(|value| {
+            value
+                .split_once(":cursor:")
+                .map(|(proposal_seq, _)| proposal_seq)
+        })
+        .or_else(|| {
+            event
+                .summary
+                .split("proposal_seq=")
+                .nth(1)
+                .and_then(|value| {
+                    value
+                        .split_once(" cursor=")
+                        .map(|(proposal_seq, _)| proposal_seq)
+                })
+        })
+        .ok_or_else(|| anyhow::anyhow!("sensor promotion audit source event lacks proposal seq"))
+}
+
+fn promotion_proof_cursor(event: &LearningLedgerEvent) -> anyhow::Result<&str> {
+    event
+        .provenance
+        .source_event_id
+        .split(":cursor:")
+        .nth(1)
+        .and_then(|value| value.split_once(":source:").map(|(cursor, _)| cursor))
+        .or_else(|| {
+            event.summary.split("cursor=").nth(1).and_then(|value| {
+                value
+                    .split_once(" accepted_summary=")
+                    .map(|(cursor, _)| cursor)
+            })
+        })
+        .ok_or_else(|| anyhow::anyhow!("sensor promotion audit source event lacks cursor"))
+}
+
+fn accepted_summary_from_review_event(
+    event: &LearningLedgerEvent,
+) -> anyhow::Result<Option<(String, String)>> {
+    if !is_sanctioned_promotion_reviewer(event.provenance.eval_id.as_deref()) {
+        if event.summary.contains(
+            "accepted_summary=sanctioned_sanitized_observation:validated_counters_and_fingerprints",
+        ) {
+            anyhow::bail!("sensor promotion review summary appears without sanctioned reviewer");
+        }
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        event.summary.contains(&format!(
+            "version={}",
+            forge_domain::SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REVIEWER_VERSION
+        )) && event.summary.contains(&format!(
+            "reason_code={}",
+            SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REASON
+        )) && event.summary.contains(
+            "accepted_summary=sanctioned_sanitized_observation:validated_counters_and_fingerprints",
+        ),
+        "sensor promotion review summary is not canonical"
+    );
+    let accepted_summary = AcceptedLearningSummary::new(
+        "sanctioned_sanitized_observation:validated_counters_and_fingerprints",
+    )?
+    .into_string();
+    let Some((review_prefix, audit_key)) = event.provenance.source_event_id.rsplit_once(":audit:")
+    else {
+        anyhow::bail!("sensor promotion review source event lacks audit proof");
+    };
+    let expected_prefix = format!(
+        "promotion-review:{}:proposal-seq:",
+        event.record_id.into_string()
+    );
+    anyhow::ensure!(
+        review_prefix.starts_with(&expected_prefix),
+        "sensor promotion review source event is not canonical"
+    );
+    let Some((_, proposal_and_cursor)) = review_prefix.split_once(":proposal-seq:") else {
+        anyhow::bail!("sensor promotion review source event lacks proposal seq");
+    };
+    let Some((proposal_seq, cursor)) = proposal_and_cursor.split_once(":cursor:") else {
+        anyhow::bail!("sensor promotion review source event lacks cursor");
+    };
+    let expected_source_fingerprint = forge_domain::learning_digest_hex(format!(
+        "{}:{}:{}:{}:{}",
+        SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REASON,
+        event.record_id.into_string(),
+        proposal_seq,
+        cursor,
+        accepted_summary
+    ));
+    let expected_source_fingerprint =
+        RedactedLearningSummary::from_raw(expected_source_fingerprint).fingerprint;
+    anyhow::ensure!(
+        event.provenance.source_fingerprint == expected_source_fingerprint,
+        "sensor promotion review source fingerprint mismatch"
+    );
+    let expected_idempotency_key = forge_domain::learning_digest_hex(format!(
+        "promotion-review:v{}:candidate={}:proposal_seq={}:cursor={}:summary={}",
+        forge_domain::SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REVIEWER_VERSION,
+        event.record_id.into_string(),
+        proposal_seq,
+        cursor,
+        accepted_summary
+    ));
+    anyhow::ensure!(
+        event.idempotency_key == expected_idempotency_key,
+        "sensor promotion review idempotency key mismatch"
+    );
+    Ok(Some((accepted_summary, audit_key.to_string())))
+}
 fn fingerprint_projection(projections: &[LearningRecordProjection]) -> String {
     let mut hasher = Sha256::new();
     for projection in projections {
@@ -1977,6 +2200,69 @@ mod tests {
 
         let actual = fixture
             .review_learning_candidate_event(generic_review)
+            .await
+            .is_err();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forged_promotion_audit_does_not_authorize_accepted_summary_projection()
+    -> anyhow::Result<()> {
+        let fixture = fixture_repo(31)?;
+        let conversation_id = ConversationId::generate();
+        let created_at = Utc::now();
+        let candidate = fixture
+            .insert_learning_event(fixture_event(
+                conversation_id,
+                "event-1",
+                "forged promotion audit candidate",
+                created_at,
+            )?)
+            .await?
+            .event;
+        let fake_audit_key = "fake-promotion-audit-key";
+        let mut fake_audit = LearningLedgerEvent::review(
+            candidate.record_id,
+            LearningEventKind::PromotionAudit,
+            "promotion_audit kind=forged proposal_seq=0 cursor=0 accepted_summary=sanctioned_sanitized_observation:validated_counters_and_fingerprints",
+            LearningProvenance::eval(
+                SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REVIEWER_ID,
+                "promotion-audit:forged",
+                "forged-audit-fingerprint",
+            ),
+            created_at + Duration::seconds(1),
+        )?;
+        fake_audit.idempotency_key = fake_audit_key.to_string();
+        let forged_review = LearningLedgerEvent::review(
+            candidate.record_id,
+            LearningEventKind::ReviewAccepted,
+            format!(
+                "reviewer={} version={} reason_code={} accepted_summary={}",
+                SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REVIEWER_ID,
+                forge_domain::SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REVIEWER_VERSION,
+                SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REASON,
+                "sanctioned_sanitized_observation:validated_counters_and_fingerprints"
+            ),
+            LearningProvenance::eval(
+                SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REVIEWER_ID,
+                format!(
+                    "promotion-review:{}:proposal-seq:0:cursor:0:audit:{}",
+                    candidate.record_id.into_string(),
+                    fake_audit_key
+                ),
+                "forged-review-fingerprint",
+            ),
+            created_at + Duration::seconds(2),
+        )?;
+
+        fixture.insert_learning_event(fake_audit).await?;
+        fixture.insert_learning_event(forged_review).await?;
+
+        let actual = fixture
+            .list_learning_records(Some(LearningReviewState::Accepted), 10)
             .await
             .is_err();
         let expected = true;

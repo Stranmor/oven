@@ -1608,7 +1608,9 @@ fn ensure_canonical_sanctioned_sensor_proposal_event(
         LearningSensorDecisionKind::ProposeLesson,
         payload_fingerprint
     ));
-    if event.provenance.source_fingerprint != expected_source_fingerprint {
+    if event.provenance.source_fingerprint != expected_source_fingerprint
+        && event.provenance.source_fingerprint != learning_digest_hex(&expected_source_fingerprint)
+    {
         anyhow::bail!("sanctioned sensor proposal source fingerprint mismatch");
     }
     let expected_idempotency_key = learning_digest_hex(format!(
@@ -2051,12 +2053,42 @@ fn looks_sensitive(word: &str) -> bool {
 }
 
 fn is_known_learning_fingerprint_word(word: &str) -> bool {
+    if word.len() == 64 && word.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return true;
+    }
+    if is_known_learning_proof_source_word(word) {
+        return true;
+    }
     let Some((key, value)) = word.split_once('=') else {
         return false;
     };
     key == "context_fingerprint"
         && value.len() == 64
         && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn is_known_learning_proof_source_word(word: &str) -> bool {
+    let segments: Vec<&str> = word.split(':').collect();
+    let [
+        "sensor",
+        _,
+        "candidate",
+        _,
+        "input",
+        input_fingerprint,
+        "decision",
+        _,
+        "payload",
+        payload_fingerprint,
+    ] = segments.as_slice()
+    else {
+        return false;
+    };
+
+    input_fingerprint.len() == 64
+        && input_fingerprint.chars().all(|ch| ch.is_ascii_hexdigit())
+        && payload_fingerprint.len() == 64
+        && payload_fingerprint.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
 fn stable_learning_key(
