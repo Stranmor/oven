@@ -763,13 +763,9 @@ fn project_records(
                     if let Some((accepted_summary, required_audit_key)) =
                         accepted_summary_from_review_event(&event)?
                     {
-                        let has_audit = promotion_audits.get(&record_key).is_some_and(|audits| {
-                            if required_audit_key == "*" {
-                                !audits.is_empty()
-                            } else {
-                                audits.contains(&required_audit_key)
-                            }
-                        });
+                        let has_audit = promotion_audits
+                            .get(&record_key)
+                            .is_some_and(|audits| audits.contains(&required_audit_key));
                         anyhow::ensure!(
                             has_audit,
                             "sensor promotion review lacks paired promotion audit proof"
@@ -973,7 +969,7 @@ fn accepted_summary_from_review_event(
         "sanctioned_sanitized_observation:validated_counters_and_fingerprints",
     )?
     .into_string();
-    let Some((review_prefix, audit_key)) = event.provenance.source_event_id.rsplit_once(":audit:")
+    let Some((review_prefix, audit_key)) = event.provenance.source_event_id.rsplit_once(":proof:")
     else {
         anyhow::bail!("sensor promotion review source event lacks audit proof");
     };
@@ -991,6 +987,18 @@ fn accepted_summary_from_review_event(
     let Some((proposal_seq, cursor)) = proposal_and_cursor.split_once(":cursor:") else {
         anyhow::bail!("sensor promotion review source event lacks cursor");
     };
+    let expected_audit_key = forge_domain::learning_digest_hex(format!(
+        "promotion-audit:v{}:candidate={}:proposal_seq={}:cursor={}:summary={}",
+        forge_domain::SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REVIEWER_VERSION,
+        event.record_id.into_string(),
+        proposal_seq,
+        cursor,
+        accepted_summary
+    ));
+    anyhow::ensure!(
+        audit_key == expected_audit_key,
+        "sensor promotion review audit key mismatch"
+    );
     let expected_source_fingerprint = forge_domain::learning_digest_hex(format!(
         "{}:{}:{}:{}:{}",
         SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REASON,
@@ -1019,6 +1027,7 @@ fn accepted_summary_from_review_event(
     );
     Ok(Some((accepted_summary, audit_key.to_string())))
 }
+
 fn fingerprint_projection(projections: &[LearningRecordProjection]) -> String {
     let mut hasher = Sha256::new();
     for projection in projections {

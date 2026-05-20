@@ -1385,7 +1385,7 @@ impl SensorLessonPromotionRequest {
         ));
 
         let review_source_event_id = format!(
-            "promotion-review:{}:proposal-seq:{}:cursor:{}:audit:{}",
+            "promotion-review:{}:proposal-seq:{}:cursor:{}:proof:{}",
             proposal.candidate_id.into_string(),
             proposal.proposal_event_seq.get(),
             proposal.observed_ledger_cursor.get(),
@@ -2042,6 +2042,10 @@ fn looks_sensitive(word: &str) -> bool {
     if is_known_learning_fingerprint_word(word) {
         return false;
     }
+    looks_secret_shaped(word)
+}
+
+fn looks_secret_shaped(word: &str) -> bool {
     let lower = word.to_ascii_lowercase();
     lower.contains("secret")
         || lower.contains("token")
@@ -2068,16 +2072,21 @@ fn is_known_learning_fingerprint_word(word: &str) -> bool {
 }
 
 fn is_known_learning_proof_source_word(word: &str) -> bool {
+    is_known_sensor_review_proof_source_word(word)
+        || is_known_promotion_review_proof_source_word(word)
+}
+
+fn is_known_sensor_review_proof_source_word(word: &str) -> bool {
     let segments: Vec<&str> = word.split(':').collect();
     let [
         "sensor",
-        _,
+        reviewer_id,
         "candidate",
-        _,
+        candidate_id,
         "input",
         input_fingerprint,
         "decision",
-        _,
+        decision,
         "payload",
         payload_fingerprint,
     ] = segments.as_slice()
@@ -2085,10 +2094,36 @@ fn is_known_learning_proof_source_word(word: &str) -> bool {
         return false;
     };
 
-    input_fingerprint.len() == 64
+    !looks_secret_shaped(reviewer_id)
+        && LearningRecordId::parse(*candidate_id).is_ok()
+        && input_fingerprint.len() == 64
         && input_fingerprint.chars().all(|ch| ch.is_ascii_hexdigit())
+        && !looks_secret_shaped(decision)
         && payload_fingerprint.len() == 64
         && payload_fingerprint.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn is_known_promotion_review_proof_source_word(word: &str) -> bool {
+    let segments: Vec<&str> = word.split(':').collect();
+    let [
+        "promotion-review",
+        candidate_id,
+        "proposal-seq",
+        proposal_seq,
+        "cursor",
+        cursor,
+        "proof",
+        proof_key,
+    ] = segments.as_slice()
+    else {
+        return false;
+    };
+
+    LearningRecordId::parse(*candidate_id).is_ok()
+        && proposal_seq.parse::<i64>().is_ok()
+        && cursor.parse::<i64>().is_ok()
+        && proof_key.len() == 64
+        && proof_key.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
 fn stable_learning_key(
@@ -2197,6 +2232,33 @@ mod tests {
 
         let actual = left.idempotency_key == right.idempotency_key;
         let expected = false;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn promotion_review_proof_source_word_does_not_bypass_secret_redaction() {
+        let secret_shaped_source_event = format!(
+            "promotion-review:sk-123456789012345678901234:proposal-seq:1:cursor:1:proof:{}",
+            "a".repeat(64)
+        );
+
+        let actual = RedactedLearningSummary::from_raw(secret_shaped_source_event).status;
+        let expected = LearningRedactionStatus::Redacted;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn sensor_review_proof_source_word_does_not_bypass_secret_redaction() {
+        let secret_shaped_source_event = format!(
+            "sensor:fake_learning_sensor_reviewer:candidate:sk-123456789012345678901234:input:{}:decision:propose_lesson:payload:{}",
+            "a".repeat(64),
+            "b".repeat(64)
+        );
+
+        let actual = RedactedLearningSummary::from_raw(secret_shaped_source_event).status;
+        let expected = LearningRedactionStatus::Redacted;
 
         assert_eq!(actual, expected);
     }
