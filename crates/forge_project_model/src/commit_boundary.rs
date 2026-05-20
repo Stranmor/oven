@@ -474,6 +474,17 @@ impl ProjectContextPackCommit<ReadRequestsSelected> {
             .difference(&verified_replay_ids)
             .cloned()
             .collect::<BTreeSet<_>>();
+        let has_stale_context_pack_evidence = context_pack
+            .evidence
+            .iter()
+            .any(|evidence| is_stale_context_pack_freshness(&evidence.freshness));
+        if has_stale_context_pack_evidence {
+            return Ok(ProjectContextPackReadbackDecision::NoWrite(
+                ProjectContextPackNoWrite {
+                    reason: ProjectContextPackNoWriteReason::RequiredReadbackFailed,
+                },
+            ));
+        }
         let filtered_context_pack = filter_context_pack_to_verified_evidence(
             context_pack,
             &context_pack_evidence_ids,
@@ -578,6 +589,13 @@ impl ProjectContextPackPersistedProof {
             },
         }
     }
+}
+
+fn is_stale_context_pack_freshness(freshness: &crate::types::EvidenceFreshness) -> bool {
+    matches!(
+        freshness,
+        crate::types::EvidenceFreshness::Changed | crate::types::EvidenceFreshness::Deleted
+    )
 }
 
 fn filter_context_pack_to_verified_evidence(
@@ -810,6 +828,30 @@ mod tests {
         };
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn context_pack_stale_evidence_is_rejected_at_commit_boundary() {
+        let mut stale = evidence("stale", "src/stale.rs");
+        stale.freshness = EvidenceFreshness::Changed;
+        let setup = plan(
+            Some(pack(vec![stale])),
+            vec![request("stale", "src/stale.rs")],
+            ProjectContextWriteDecision::WriteContextPackAfterReadback,
+        );
+        let actual =
+            ProjectContextPackCommit::from_retrieval_plan(&setup, replay_boundary(Vec::new()))
+                .unwrap()
+                .verify_readbacks(vec![ProjectContextReadbackOutcome::succeeded(
+                    &setup.read_requests[0],
+                )])
+                .unwrap();
+        let ProjectContextPackReadbackDecision::NoWrite(actual) = actual else {
+            panic!("stale context-pack evidence must not produce a write decision")
+        };
+        let expected = ProjectContextPackNoWriteReason::RequiredReadbackFailed;
+
+        assert_eq!(actual.reason(), &expected);
     }
 
     #[test]
