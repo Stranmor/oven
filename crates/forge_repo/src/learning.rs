@@ -800,15 +800,10 @@ fn project_records(
         let event = record.try_into_event()?;
         event_records.push((event_seq, event));
     }
-    let proposal_events = event_records
-        .iter()
-        .filter_map(|(event_seq, event)| {
-            (event.event_kind == LearningEventKind::SensorLessonProposed)
-                .then_some((*event_seq, event.clone()))
-        })
-        .collect::<BTreeMap<_, _>>();
+    event_records.sort_by_key(|(event_seq, _)| *event_seq);
+    let mut processed_proposal_events = BTreeMap::new();
     let mut sensor_derived_record_keys = BTreeSet::new();
-    for (_, event) in event_records {
+    for (event_seq, event) in event_records {
         let record_key = event.record_id.into_string();
         match event.event_kind {
             LearningEventKind::CandidateCaptured => {
@@ -861,7 +856,9 @@ fn project_records(
                 }
             }
             LearningEventKind::PromotionAudit => {
-                if let Some(audit_key) = promotion_audit_key_from_event(&event, &proposal_events)? {
+                if let Some(audit_key) =
+                    promotion_audit_key_from_event(&event, &processed_proposal_events)?
+                {
                     promotion_audits
                         .entry(record_key.clone())
                         .or_default()
@@ -872,6 +869,7 @@ fn project_records(
                 }
             }
             LearningEventKind::SensorLessonProposed => {
+                processed_proposal_events.insert(event_seq, event.clone());
                 sensor_derived_record_keys.insert(record_key.clone());
                 if let Some(projection) = projections.get_mut(&record_key) {
                     projection.updated_at = event.created_at;
@@ -2489,6 +2487,60 @@ mod tests {
             LearningLedgerEventRecord::new(request.audit_event().clone(), workspace_id)?;
         audit_record.event_seq = next_audit_seq;
         records.push(audit_record);
+
+        let actual = project_records(records).is_err();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projection_rejects_promotion_audit_that_references_future_sensor_proposal()
+    -> anyhow::Result<()> {
+        let fixture = fixture_repo(36)?;
+        let conversation_id = ConversationId::generate();
+        let created_at = Utc::now();
+        let candidate = fixture
+            .insert_learning_event(fixture_event(
+                conversation_id,
+                "event-1",
+                "future proposal audit candidate",
+                created_at,
+            )?)
+            .await?
+            .event;
+        let projection = fixture
+            .get_learning_record(candidate.record_id)
+            .await?
+            .expect("candidate projection should exist");
+        let input = LearningSensorReviewInput::from_sanitized_chat_observation(
+            &projection,
+            fixture_sanitized_observation().validate()?,
+        );
+        let output = FakeLearningSensorReviewer.review(input.clone())?;
+        let sensor_event = output.into_sensor_event(&input, created_at + Duration::seconds(3))?;
+        let workspace_id = workspace_db_id(fixture.wid);
+        let mut sensor_record = LearningLedgerEventRecord::new(sensor_event, workspace_id)?;
+        sensor_record.event_seq = 4;
+        let future_proposal_view = LearningLedgerEventView {
+            event_seq: LearningEventSeq::new(sensor_record.event_seq)?,
+            ledger_cursor: LearningLedgerCursor::new(sensor_record.event_seq)?,
+            event: sensor_record.clone().try_into_event()?,
+        };
+        let future_proposal =
+            SensorLessonPromotionProposal::new(&future_proposal_view, &projection)?;
+        let request =
+            SensorLessonPromotionRequest::new(future_proposal, created_at + Duration::seconds(1))?;
+        let mut candidate_record = LearningLedgerEventRecord::new(candidate, workspace_id)?;
+        candidate_record.event_seq = 1;
+        let mut audit_record =
+            LearningLedgerEventRecord::new(request.audit_event().clone(), workspace_id)?;
+        audit_record.event_seq = 2;
+        let mut review_record =
+            LearningLedgerEventRecord::new(request.review_event().clone(), workspace_id)?;
+        review_record.event_seq = 3;
+        let records = vec![candidate_record, audit_record, review_record, sensor_record];
 
         let actual = project_records(records).is_err();
         let expected = true;
