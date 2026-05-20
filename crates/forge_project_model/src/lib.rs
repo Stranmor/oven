@@ -95,6 +95,8 @@ pub use render::{
 };
 pub use retrieval::{plan_retrieval, retrieve, retrieve_with_boundaries};
 pub use retrieval_plan::{
+    ExactCompilerReferenceEvidence, ProjectContextExactFactActiveSummary,
+    ProjectContextExactFactInactiveReason, ProjectContextExactFactPhaseStatus,
     ProjectContextIntegrationIdentity, ProjectContextPathScope, ProjectContextReadRequest,
     ProjectContextRerankerBoundary, ProjectContextRerankerReadiness,
     ProjectContextRerankerUnavailableReason, ProjectContextRetrievalOptions,

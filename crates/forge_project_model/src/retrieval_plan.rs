@@ -8,13 +8,17 @@ use anyhow::{Result, bail};
 use crate::context_adapter::resolve_manifest_evidence_target;
 use crate::retrieval::retrieve_with_boundaries;
 use crate::types::{
-    ContextPack, ContextPackEvidence, ContextPackSelection, FreshnessProofLevel,
-    ManifestFreshnessEvaluation, ProjectManifest, RetrievalQuery, RetrievalResult,
-    RetrievalScoringWeights, StaleEvidencePolicy, VectorQuery,
+    ContextPack, ContextPackEvidence, ContextPackSelection, EdgeConfidence, FreshnessProofLevel,
+    GraphEdge, GraphEdgeKind, ManifestFreshnessEvaluation, ProjectManifest, RetrievalQuery,
+    RetrievalResult, RetrievalScoringWeights, StaleEvidencePolicy, VectorQuery,
 };
 use crate::vector::{Reranker, VectorIndex};
+use crate::{ExactFactStatus, ExactFactStatusReport};
 
 const MAX_DIAGNOSTIC_SUMMARIES: usize = 8;
+const EXACT_FACT_REFERENCE_FANOUT_CAP: usize = 8;
+const EXACT_FACT_REFERENCE_SCORE: f32 = 25.0;
+const EXACT_FACT_REFERENCE_SCORE_PART: &str = "exact_fact_reference";
 
 /// Query request accepted by the project-model retrieval planner.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -124,6 +128,8 @@ pub struct ProjectContextRetrievalOptions<'a> {
     pub reranker: Option<ProjectContextRerankerBoundary<'a>>,
     /// Optional semantic unavailable reason from a runtime artifact selector.
     pub vector_unavailable_reason: Option<ProjectContextVectorUnavailableReason>,
+    /// Optional exact-fact activation status supplied by a read-only status boundary.
+    pub exact_fact_status: Option<&'a ExactFactStatusReport>,
 }
 
 /// Validated vector index boundary plus redaction-safe metadata.
@@ -228,6 +234,122 @@ pub struct ProjectContextRetrievalPhaseDiagnostics {
     pub vector: ProjectContextRetrievalPhaseStatus,
     /// Reranking phase status.
     pub rerank: ProjectContextRetrievalPhaseStatus,
+    /// Exact compiler reference activation phase status.
+    pub exact_fact: ProjectContextExactFactPhaseStatus,
+}
+
+/// Typed redaction-safe exact-fact retrieval phase status.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProjectContextExactFactPhaseStatus {
+    /// Exact-fact phase selected eligible exact compiler references.
+    Active(ProjectContextExactFactActiveSummary),
+    /// Exact-fact phase was inactive or unsafe and selected nothing.
+    Inactive(ProjectContextExactFactInactiveReason),
+}
+
+impl Default for ProjectContextExactFactPhaseStatus {
+    fn default() -> Self {
+        Self::Inactive(ProjectContextExactFactInactiveReason::StatusUnavailable)
+    }
+}
+
+/// Bounded exact-fact activation summary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProjectContextExactFactActiveSummary {
+    /// Count of exact compiler reference edges considered before eligibility filters.
+    pub candidate_count: usize,
+    /// Count of eligible exact references selected under deterministic cap.
+    pub selected_count: usize,
+    /// Deterministic fanout cap for exact references.
+    pub fanout_cap: usize,
+}
+
+/// Deterministic redaction-safe reason exact facts did not participate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProjectContextExactFactInactiveReason {
+    /// No exact-fact status report was supplied to retrieval.
+    StatusUnavailable,
+    /// Status report says exact facts are inactive.
+    StatusInactive(ExactFactStatus),
+    /// Status report says exact facts are active but manifest hash readback is absent.
+    MissingManifestHash,
+    /// Status report was produced for a different manifest snapshot.
+    WorkspaceSnapshotMismatch,
+    /// Manifest freshness was not proven for full injection/readback.
+    ManifestNotFresh,
+    /// Active status contains no eligible exact compiler reference evidence.
+    NoEligibleEvidence,
+    /// Eligible exact evidence existed, but ranking/path filters selected zero.
+    SelectedZero,
+}
+
+/// Exact compiler reference evidence constructed only after all activation guards pass.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExactCompilerReferenceEvidence {
+    edge: GraphEdge,
+    read_request: ProjectContextReadRequest,
+}
+
+impl ExactCompilerReferenceEvidence {
+    /// Constructs exact compiler reference evidence behind the activation boundary.
+    ///
+    /// # Arguments
+    ///
+    /// * `manifest` - Project manifest owning the graph edge and readback target.
+    /// * `freshness` - Freshness evaluation for injection/readback eligibility.
+    /// * `status` - Read-only exact-fact status report.
+    /// * `edge` - Candidate graph edge.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the edge or activation state is not exact, active,
+    /// fresh, snapshot-identical, and readback-eligible.
+    pub fn new(
+        manifest: &ProjectManifest,
+        freshness: &ManifestFreshnessEvaluation,
+        status: &ExactFactStatusReport,
+        edge: &GraphEdge,
+    ) -> Result<Self> {
+        if status.status != ExactFactStatus::Active || !status.exact_facts_active {
+            bail!("exact fact status is not active");
+        }
+        if status.manifest_hash.as_deref() != Some(manifest.manifest_hash.as_str()) {
+            bail!("exact fact manifest snapshot mismatch");
+        }
+        if !freshness.can_inject() {
+            bail!("exact fact manifest is not fresh for injection");
+        }
+        if edge.kind != GraphEdgeKind::References {
+            bail!("exact fact edge kind is not references");
+        }
+        if edge.confidence_kind != EdgeConfidence::ExactCompiler {
+            bail!("exact fact edge confidence is not exact compiler");
+        }
+        let target = resolve_manifest_evidence_target(manifest, &edge.to)
+            .ok_or_else(|| anyhow::anyhow!("exact fact referenced evidence target is missing"))?;
+        let (start_line, end_line) = target
+            .line_range
+            .ok_or_else(|| anyhow::anyhow!("exact fact evidence line range is missing"))?;
+        let read_request =
+            ProjectContextReadRequest::new(target.path, edge.to.clone(), start_line, end_line)?;
+        Ok(Self { edge: edge.clone(), read_request })
+    }
+
+    fn into_retrieval_result(self) -> RetrievalResult {
+        let mut score_parts = std::collections::BTreeMap::new();
+        score_parts.insert(
+            EXACT_FACT_REFERENCE_SCORE_PART.to_string(),
+            EXACT_FACT_REFERENCE_SCORE,
+        );
+        RetrievalResult {
+            id: self.edge.to,
+            path: self.read_request.relative_manifest_path().to_string(),
+            symbol: None,
+            score: EXACT_FACT_REFERENCE_SCORE,
+            score_parts,
+            provenance: self.edge.provenance,
+        }
+    }
 }
 
 /// Typed redaction-safe status for one retrieval phase.
@@ -663,6 +785,7 @@ pub fn plan_project_context_retrieval_with_options(
         graph: graph_phase_status(request.include_graph_expansion),
         vector: ProjectContextRetrievalPhaseStatus::default(),
         rerank: ProjectContextRetrievalPhaseStatus::default(),
+        exact_fact: ProjectContextExactFactPhaseStatus::default(),
     };
     let diagnostics = ProjectContextRetrievalQueryDiagnostics {
         query_text: Some(request.query_text.clone()),
@@ -705,11 +828,16 @@ pub fn plan_project_context_retrieval_with_options(
         vector_activation.vector_index,
         reranker_activation.reranker,
         &RetrievalScoringWeights::default(),
-    )
-    .into_iter()
-    .filter(|result| request.path_scope.matches(&result.path))
-    .collect::<Vec<_>>();
+    );
+    let exact_fact_activation =
+        exact_fact_activation(manifest, freshness, options.exact_fact_status);
+    selected_results.extend(exact_fact_activation.results.iter().cloned());
+    selected_results = selected_results
+        .into_iter()
+        .filter(|result| request.path_scope.matches(&result.path))
+        .collect::<Vec<_>>();
     selected_results.sort_by(compare_retrieval_results_for_return);
+    selected_results.dedup_by(|left, right| left.id == right.id);
     selected_results.truncate(effective_limit);
 
     let mut diagnostics = diagnostics;
@@ -719,6 +847,7 @@ pub fn plan_project_context_retrieval_with_options(
         lexical_phase_status_with_results(&request.query_text, &selected_results);
     diagnostics.phase_diagnostics.graph =
         graph_phase_status_with_results(request.include_graph_expansion, &selected_results);
+    diagnostics.phase_diagnostics.exact_fact = exact_fact_activation.status(&selected_results);
 
     if selected_results.is_empty() {
         return ProjectContextRetrievalPlanningOutcome::Plan(Box::new(
@@ -807,6 +936,116 @@ pub fn plan_project_context_retrieval_with_options(
         write_decision: ProjectContextWriteDecision::WriteContextPackAfterReadback,
         return_order,
     }))
+}
+
+struct ProjectContextExactFactActivation {
+    results: Vec<RetrievalResult>,
+    initial_status: ProjectContextExactFactPhaseStatus,
+}
+
+impl ProjectContextExactFactActivation {
+    fn status(&self, selected_results: &[RetrievalResult]) -> ProjectContextExactFactPhaseStatus {
+        match &self.initial_status {
+            ProjectContextExactFactPhaseStatus::Active(summary) => {
+                let selected_count = selected_results
+                    .iter()
+                    .filter(|result| {
+                        result
+                            .score_parts
+                            .contains_key(EXACT_FACT_REFERENCE_SCORE_PART)
+                    })
+                    .count();
+                if selected_count == 0 {
+                    ProjectContextExactFactPhaseStatus::Inactive(
+                        ProjectContextExactFactInactiveReason::SelectedZero,
+                    )
+                } else {
+                    ProjectContextExactFactPhaseStatus::Active(
+                        ProjectContextExactFactActiveSummary {
+                            candidate_count: summary.candidate_count,
+                            selected_count,
+                            fanout_cap: summary.fanout_cap,
+                        },
+                    )
+                }
+            }
+            status => status.clone(),
+        }
+    }
+}
+
+fn exact_fact_activation(
+    manifest: &ProjectManifest,
+    freshness: &ManifestFreshnessEvaluation,
+    status: Option<&ExactFactStatusReport>,
+) -> ProjectContextExactFactActivation {
+    let Some(status) = status else {
+        return inactive_exact_fact(ProjectContextExactFactInactiveReason::StatusUnavailable);
+    };
+    if status.status != ExactFactStatus::Active || !status.exact_facts_active {
+        return inactive_exact_fact(ProjectContextExactFactInactiveReason::StatusInactive(
+            status.status.clone(),
+        ));
+    }
+    let Some(status_manifest_hash) = status.manifest_hash.as_deref() else {
+        return inactive_exact_fact(ProjectContextExactFactInactiveReason::MissingManifestHash);
+    };
+    if status_manifest_hash != manifest.manifest_hash {
+        return inactive_exact_fact(
+            ProjectContextExactFactInactiveReason::WorkspaceSnapshotMismatch,
+        );
+    }
+    if !freshness.can_inject()
+        || !freshness.state.changed.is_empty()
+        || !freshness.state.deleted.is_empty()
+        || !freshness.state.added.is_empty()
+    {
+        return inactive_exact_fact(ProjectContextExactFactInactiveReason::ManifestNotFresh);
+    }
+
+    let candidate_count = manifest
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.kind == GraphEdgeKind::References
+                && edge.confidence_kind == EdgeConfidence::ExactCompiler
+        })
+        .count();
+    let mut results = manifest
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            ExactCompilerReferenceEvidence::new(manifest, freshness, status, edge)
+                .ok()
+                .map(ExactCompilerReferenceEvidence::into_retrieval_result)
+        })
+        .collect::<Vec<_>>();
+    results.sort_by(compare_retrieval_results_for_return);
+    results.dedup_by(|left, right| left.id == right.id);
+    results.truncate(EXACT_FACT_REFERENCE_FANOUT_CAP);
+    if results.is_empty() {
+        return inactive_exact_fact(ProjectContextExactFactInactiveReason::NoEligibleEvidence);
+    }
+    let selected_count = results.len();
+    ProjectContextExactFactActivation {
+        results,
+        initial_status: ProjectContextExactFactPhaseStatus::Active(
+            ProjectContextExactFactActiveSummary {
+                candidate_count,
+                selected_count,
+                fanout_cap: EXACT_FACT_REFERENCE_FANOUT_CAP,
+            },
+        ),
+    }
+}
+
+fn inactive_exact_fact(
+    reason: ProjectContextExactFactInactiveReason,
+) -> ProjectContextExactFactActivation {
+    ProjectContextExactFactActivation {
+        results: Vec::new(),
+        initial_status: ProjectContextExactFactPhaseStatus::Inactive(reason),
+    }
 }
 
 fn lexical_phase_status(query_text: &str) -> ProjectContextRetrievalPhaseStatus {
@@ -1594,6 +1833,7 @@ mod tests {
                 vector_index: Some(ready_vector_boundary(&vector_index, 2)),
                 reranker: None,
                 vector_unavailable_reason: None,
+                exact_fact_status: None,
             },
         );
         let plan = expect_plan(actual);
@@ -1640,6 +1880,7 @@ mod tests {
                 vector_index: Some(ready_vector_boundary(&vector_index, 2)),
                 reranker: None,
                 vector_unavailable_reason: None,
+                exact_fact_status: None,
             },
         );
         let actual_plan = expect_plan(actual);
@@ -1683,6 +1924,7 @@ mod tests {
                 vector_index: None,
                 reranker: None,
                 vector_unavailable_reason: None,
+                exact_fact_status: None,
             },
         );
         let actual_plan = expect_plan(actual);
@@ -1727,6 +1969,7 @@ mod tests {
                 vector_index: Some(ready_vector_boundary(&vector_index, 3)),
                 reranker: None,
                 vector_unavailable_reason: None,
+                exact_fact_status: None,
             },
         );
         let actual_plan = expect_plan(actual);
@@ -1776,6 +2019,7 @@ mod tests {
                 vector_index: None,
                 reranker: None,
                 vector_unavailable_reason: None,
+                exact_fact_status: None,
             },
         );
         let actual_plan = expect_plan(actual);
@@ -1818,6 +2062,7 @@ mod tests {
                 vector_index: Some(ready_vector_boundary(&vector_index, 2)),
                 reranker: None,
                 vector_unavailable_reason: None,
+                exact_fact_status: None,
             },
         );
         let actual_plan = expect_plan(actual);
@@ -1861,6 +2106,7 @@ mod tests {
                 vector_index: Some(ready_vector_boundary(&vector_index, 2)),
                 reranker: None,
                 vector_unavailable_reason: None,
+                exact_fact_status: None,
             },
         );
         let actual_plan = expect_plan(actual);
@@ -1904,6 +2150,7 @@ mod tests {
                 vector_index: Some(ready_vector_boundary(&vector_index, 2)),
                 reranker: None,
                 vector_unavailable_reason: None,
+                exact_fact_status: None,
             },
         );
         let actual_plan = expect_plan(actual);
@@ -1940,6 +2187,7 @@ mod tests {
                 vector_unavailable_reason: Some(
                     ProjectContextVectorUnavailableReason::AmbiguousVectorIndex,
                 ),
+                exact_fact_status: None,
             },
         );
         let actual_plan = expect_plan(actual);
@@ -2027,6 +2275,7 @@ mod tests {
                 vector_index: Some(ready_vector_boundary(&vector_index, 2)),
                 reranker: None,
                 vector_unavailable_reason: None,
+                exact_fact_status: None,
             },
         );
         let actual_plan = expect_plan(actual);
@@ -2218,6 +2467,451 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn active_fresh_exact_status_selects_only_eligible_exact_compiler_reference_evidence() {
+        let setup = exact_fact_manifest();
+        let request = ProjectContextRetrievalRequest::new(
+            "lexicalmissneedle",
+            5,
+            ProjectContextPathScope::default(),
+            false,
+        );
+
+        let actual = plan_project_context_retrieval_with_options(
+            &setup,
+            &freshness(&setup),
+            request,
+            ProjectContextRetrievalOptions {
+                exact_fact_status: Some(&exact_status(&setup, ExactFactStatus::Active)),
+                ..ProjectContextRetrievalOptions::default()
+            },
+        );
+        let plan = expect_plan(actual);
+        let actual = (
+            plan.selected_results
+                .iter()
+                .map(|result| result.id.clone())
+                .collect::<Vec<_>>(),
+            plan.query_diagnostics.phase_diagnostics.exact_fact,
+            plan.read_requests
+                .iter()
+                .map(|request| request.evidence_id.clone())
+                .collect::<Vec<_>>(),
+        );
+        let expected = (
+            vec!["symbol:src/exact.rs:Function:eligible".to_string()],
+            ProjectContextExactFactPhaseStatus::Active(ProjectContextExactFactActiveSummary {
+                candidate_count: 1,
+                selected_count: 1,
+                fanout_cap: EXACT_FACT_REFERENCE_FANOUT_CAP,
+            }),
+            vec!["symbol:src/exact.rs:Function:eligible".to_string()],
+        );
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn exact_fact_inactive_statuses_emit_deterministic_diagnostics_and_select_nothing() {
+        let setup = exact_fact_manifest();
+        let cases = vec![
+            (
+                None,
+                ProjectContextExactFactPhaseStatus::Inactive(
+                    ProjectContextExactFactInactiveReason::StatusUnavailable,
+                ),
+            ),
+            (
+                Some(exact_status(&setup, ExactFactStatus::NoArtifactStore)),
+                ProjectContextExactFactPhaseStatus::Inactive(
+                    ProjectContextExactFactInactiveReason::StatusInactive(
+                        ExactFactStatus::NoArtifactStore,
+                    ),
+                ),
+            ),
+            (
+                Some(exact_status(
+                    &setup,
+                    ExactFactStatus::ReportMissingOrCorrupt,
+                )),
+                ProjectContextExactFactPhaseStatus::Inactive(
+                    ProjectContextExactFactInactiveReason::StatusInactive(
+                        ExactFactStatus::ReportMissingOrCorrupt,
+                    ),
+                ),
+            ),
+            (
+                Some(exact_status(&setup, ExactFactStatus::StaleManifest)),
+                ProjectContextExactFactPhaseStatus::Inactive(
+                    ProjectContextExactFactInactiveReason::StatusInactive(
+                        ExactFactStatus::StaleManifest,
+                    ),
+                ),
+            ),
+            (
+                Some(exact_status(
+                    &setup,
+                    ExactFactStatus::ArtifactsPresentNoneAccepted,
+                )),
+                ProjectContextExactFactPhaseStatus::Inactive(
+                    ProjectContextExactFactInactiveReason::StatusInactive(
+                        ExactFactStatus::ArtifactsPresentNoneAccepted,
+                    ),
+                ),
+            ),
+            (
+                Some(exact_status(
+                    &setup,
+                    ExactFactStatus::AcceptedButNoGraphEdges,
+                )),
+                ProjectContextExactFactPhaseStatus::Inactive(
+                    ProjectContextExactFactInactiveReason::StatusInactive(
+                        ExactFactStatus::AcceptedButNoGraphEdges,
+                    ),
+                ),
+            ),
+        ];
+
+        let actual = cases
+            .into_iter()
+            .map(|(status, expected_status)| {
+                let request = ProjectContextRetrievalRequest::new(
+                    "lexicalmissneedle",
+                    5,
+                    ProjectContextPathScope::default(),
+                    false,
+                );
+                let outcome = plan_project_context_retrieval_with_options(
+                    &setup,
+                    &freshness(&setup),
+                    request,
+                    ProjectContextRetrievalOptions {
+                        exact_fact_status: status.as_ref(),
+                        ..ProjectContextRetrievalOptions::default()
+                    },
+                );
+                let plan = expect_plan(outcome);
+                (
+                    plan.selected_results.iter().any(|result| {
+                        result
+                            .score_parts
+                            .contains_key(EXACT_FACT_REFERENCE_SCORE_PART)
+                    }),
+                    plan.query_diagnostics.phase_diagnostics.exact_fact,
+                    expected_status,
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = actual
+            .iter()
+            .map(|(_, _, expected_status)| {
+                (false, expected_status.clone(), expected_status.clone())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn exact_fact_active_but_unsafe_branches_are_diagnostic_only() {
+        let setup = exact_fact_manifest();
+        let mut missing_hash = exact_status(&setup, ExactFactStatus::Active);
+        missing_hash.manifest_hash = None;
+        let mut mismatch = exact_status(&setup, ExactFactStatus::Active);
+        mismatch.manifest_hash = Some(fingerprint("different-snapshot"));
+        let mut no_eligible = exact_fact_manifest();
+        no_eligible.edges.clear();
+        let selected_zero_request = ProjectContextRetrievalRequest::new(
+            "lexicalmissneedle",
+            5,
+            ProjectContextPathScope::new(Some("src/other/".to_string()), Vec::new()),
+            false,
+        );
+        let stale_status = exact_status(&setup, ExactFactStatus::StaleManifest);
+        let stale_status_plan = expect_plan(plan_project_context_retrieval_with_options(
+            &setup,
+            &freshness(&setup),
+            ProjectContextRetrievalRequest::new(
+                "lexicalmissneedle",
+                5,
+                ProjectContextPathScope::default(),
+                false,
+            ),
+            ProjectContextRetrievalOptions {
+                exact_fact_status: Some(&stale_status),
+                ..ProjectContextRetrievalOptions::default()
+            },
+        ));
+        assert_eq!(
+            stale_status_plan
+                .query_diagnostics
+                .phase_diagnostics
+                .exact_fact,
+            ProjectContextExactFactPhaseStatus::Inactive(
+                ProjectContextExactFactInactiveReason::StatusInactive(
+                    ExactFactStatus::StaleManifest
+                ),
+            ),
+        );
+
+        let stale = ManifestFreshnessEvaluation {
+            state: FreshnessState {
+                changed: vec!["src/exact.rs".to_string()],
+                fresh: true,
+                ..fresh_state(&setup)
+            },
+            proof_level: FreshnessProofLevel::FullFilesystem,
+        };
+        let cases = vec![
+            (
+                &setup,
+                freshness(&setup),
+                ProjectContextRetrievalRequest::new(
+                    "lexicalmissneedle",
+                    5,
+                    ProjectContextPathScope::default(),
+                    false,
+                ),
+                missing_hash,
+                ProjectContextExactFactInactiveReason::MissingManifestHash,
+            ),
+            (
+                &setup,
+                freshness(&setup),
+                ProjectContextRetrievalRequest::new(
+                    "lexicalmissneedle",
+                    5,
+                    ProjectContextPathScope::default(),
+                    false,
+                ),
+                mismatch,
+                ProjectContextExactFactInactiveReason::WorkspaceSnapshotMismatch,
+            ),
+            (
+                &setup,
+                stale,
+                ProjectContextRetrievalRequest::new(
+                    "lexicalmissneedle",
+                    5,
+                    ProjectContextPathScope::default(),
+                    false,
+                ),
+                exact_status(&setup, ExactFactStatus::Active),
+                ProjectContextExactFactInactiveReason::ManifestNotFresh,
+            ),
+            (
+                &no_eligible,
+                freshness(&no_eligible),
+                ProjectContextRetrievalRequest::new(
+                    "lexicalmissneedle",
+                    5,
+                    ProjectContextPathScope::default(),
+                    false,
+                ),
+                exact_status(&no_eligible, ExactFactStatus::Active),
+                ProjectContextExactFactInactiveReason::NoEligibleEvidence,
+            ),
+            (
+                &setup,
+                freshness(&setup),
+                selected_zero_request,
+                exact_status(&setup, ExactFactStatus::Active),
+                ProjectContextExactFactInactiveReason::SelectedZero,
+            ),
+        ];
+
+        let actual = cases
+            .into_iter()
+            .map(|(manifest, freshness, request, status, expected_reason)| {
+                let plan = expect_plan(plan_project_context_retrieval_with_options(
+                    manifest,
+                    &freshness,
+                    request,
+                    ProjectContextRetrievalOptions {
+                        exact_fact_status: Some(&status),
+                        ..ProjectContextRetrievalOptions::default()
+                    },
+                ));
+                (
+                    plan.selected_results.iter().any(|result| {
+                        result
+                            .score_parts
+                            .contains_key(EXACT_FACT_REFERENCE_SCORE_PART)
+                    }),
+                    plan.query_diagnostics.phase_diagnostics.exact_fact,
+                    ProjectContextExactFactPhaseStatus::Inactive(expected_reason),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = actual
+            .iter()
+            .map(|(_, _, expected_status)| {
+                (false, expected_status.clone(), expected_status.clone())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn exact_fact_constructor_enforces_references_exact_compiler_and_readback_eligibility() {
+        let setup = exact_fact_manifest();
+        let status = exact_status(&setup, ExactFactStatus::Active);
+        let actual = setup
+            .edges
+            .iter()
+            .map(|edge| {
+                ExactCompilerReferenceEvidence::new(&setup, &freshness(&setup), &status, edge)
+                    .is_ok()
+            })
+            .collect::<Vec<_>>();
+        let expected = vec![false, false, true];
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn exact_fact_edges_with_unresolvable_reference_target_are_diagnostic_only() {
+        let mut setup = exact_fact_manifest();
+        setup.edges = vec![GraphEdge {
+            from: "symbol:src/exact.rs:Function:root".to_string(),
+            to: "symbol:src/exact.rs:Function:missing".to_string(),
+            kind: GraphEdgeKind::References,
+            confidence: 1.0,
+            confidence_kind: EdgeConfidence::ExactCompiler,
+            provenance: provenance("src/exact.rs", Some(1), Some(1), "exact-test", "missing"),
+        }];
+        let request = ProjectContextRetrievalRequest::new(
+            "lexicalmissneedle",
+            5,
+            ProjectContextPathScope::default(),
+            false,
+        );
+
+        let actual = plan_project_context_retrieval_with_options(
+            &setup,
+            &freshness(&setup),
+            request,
+            ProjectContextRetrievalOptions {
+                exact_fact_status: Some(&exact_status(&setup, ExactFactStatus::Active)),
+                ..ProjectContextRetrievalOptions::default()
+            },
+        );
+        let plan = expect_plan(actual);
+        let expected = (
+            Vec::<String>::new(),
+            ProjectContextExactFactPhaseStatus::Inactive(
+                ProjectContextExactFactInactiveReason::NoEligibleEvidence,
+            ),
+            ProjectContextWriteDecision::NoWriteEmptyRetrieval,
+        );
+
+        assert_eq!(
+            (
+                plan.selected_results
+                    .iter()
+                    .map(|result| result.id.clone())
+                    .collect::<Vec<_>>(),
+                plan.query_diagnostics.phase_diagnostics.exact_fact,
+                plan.write_decision,
+            ),
+            expected,
+        );
+    }
+
+    #[test]
+    fn exact_fact_fanout_caps_and_ordering_are_deterministic() {
+        let setup = capped_exact_fact_manifest();
+        let request = ProjectContextRetrievalRequest::new(
+            "lexicalmissneedle",
+            20,
+            ProjectContextPathScope::default(),
+            false,
+        );
+
+        let plan = expect_plan(plan_project_context_retrieval_with_options(
+            &setup,
+            &freshness(&setup),
+            request,
+            ProjectContextRetrievalOptions {
+                exact_fact_status: Some(&exact_status(&setup, ExactFactStatus::Active)),
+                ..ProjectContextRetrievalOptions::default()
+            },
+        ));
+        let actual = (
+            plan.selected_results
+                .iter()
+                .filter(|result| {
+                    result
+                        .score_parts
+                        .contains_key(EXACT_FACT_REFERENCE_SCORE_PART)
+                })
+                .map(|result| result.id.clone())
+                .collect::<Vec<_>>(),
+            plan.query_diagnostics.phase_diagnostics.exact_fact,
+        );
+        let expected = (
+            (0..EXACT_FACT_REFERENCE_FANOUT_CAP)
+                .map(|index| format!("symbol:src/exact.rs:Function:target_{index:02}"))
+                .collect::<Vec<_>>(),
+            ProjectContextExactFactPhaseStatus::Active(ProjectContextExactFactActiveSummary {
+                candidate_count: 12,
+                selected_count: EXACT_FACT_REFERENCE_FANOUT_CAP,
+                fanout_cap: EXACT_FACT_REFERENCE_FANOUT_CAP,
+            }),
+        );
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn exact_fact_activation_preserves_lexical_vector_graph_fallback_baseline() {
+        let setup = exact_fact_manifest();
+        let request = ProjectContextRetrievalRequest::new(
+            "eligible Function",
+            5,
+            ProjectContextPathScope::default(),
+            true,
+        );
+
+        let fallback = plan_project_context_retrieval(&setup, &freshness(&setup), request.clone());
+        let active = plan_project_context_retrieval_with_options(
+            &setup,
+            &freshness(&setup),
+            request,
+            ProjectContextRetrievalOptions {
+                exact_fact_status: Some(&exact_status(&setup, ExactFactStatus::Active)),
+                ..ProjectContextRetrievalOptions::default()
+            },
+        );
+        let fallback_ids = expect_plan(fallback)
+            .selected_results
+            .iter()
+            .map(|result| result.id.clone())
+            .collect::<Vec<_>>();
+        let active_ids = expect_plan(active)
+            .selected_results
+            .iter()
+            .map(|result| result.id.clone())
+            .collect::<Vec<_>>();
+        assert!(fallback_ids.iter().all(|id| active_ids.contains(id)));
+    }
+
+    #[test]
+    fn retrieval_plan_path_has_no_exact_fact_producer_invocation_surface() {
+        let setup = std::include_str!("retrieval_plan.rs");
+        let forbidden = [
+            concat!("produce_workspace_exact_fact_reference", "_with_driver("),
+            concat!("NativeLspReference", "Producer"),
+            concat!("derive_native_lsp", "_reference_request"),
+            concat!("RustAnalyzerCapability", "Probe"),
+            concat!("write_external_fact", "_artifact("),
+            concat!("ingest_external_fact", "_artifacts("),
+        ];
+        let actual = forbidden
+            .iter()
+            .filter(|pattern| setup.contains(**pattern))
+            .copied()
+            .collect::<Vec<_>>();
+        let expected: Vec<&str> = Vec::new();
+        assert_eq!(actual, expected);
+    }
+
     fn expect_plan(
         outcome: ProjectContextRetrievalPlanningOutcome,
     ) -> Box<ProjectContextRetrievalPlan> {
@@ -2389,6 +3083,138 @@ mod tests {
             }],
             manifest_hash: fingerprint("manifest"),
             ..ProjectManifest::default()
+        }
+    }
+
+    fn exact_status(manifest: &ProjectManifest, status: ExactFactStatus) -> ExactFactStatusReport {
+        ExactFactStatusReport {
+            exact_facts_active: status == ExactFactStatus::Active,
+            status,
+            manifest_path: std::path::PathBuf::from("project_model_manifest"),
+            manifest_hash: Some(manifest.manifest_hash.clone()),
+            manifest_freshness_proof_level: Some(FreshnessProofLevel::FullFilesystem),
+            ingestion_report_path: std::path::PathBuf::from("external_fact_report"),
+            artifact_store_state: crate::ExactFactArtifactStoreState::Present,
+            inspected_artifact_count: 1,
+            accepted_artifact_count: 1,
+            accepted_batch_fingerprints: vec![fingerprint("batch")],
+            manifest_external_fact_batch_count: 1,
+            manifest_external_facts_fingerprint: Some(fingerprint("external-facts")),
+            reference_edge_count: manifest
+                .edges
+                .iter()
+                .filter(|edge| edge.kind == GraphEdgeKind::References)
+                .count(),
+            exact_compiler_reference_edge_count: manifest
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == GraphEdgeKind::References
+                        && edge.confidence_kind == EdgeConfidence::ExactCompiler
+                })
+                .count(),
+            issue_summaries: Vec::new(),
+        }
+    }
+
+    fn exact_fact_manifest() -> ProjectManifest {
+        let mut manifest = manual_manifest();
+        manifest.files = vec![SourceFile {
+            path: "src/exact.rs".to_string(),
+            language: Language::Rust,
+            bytes: 100,
+            lines: 20,
+            content_hash: fingerprint("exact-file"),
+            provenance: provenance("src/exact.rs", Some(1), Some(20), "test", "exact-file"),
+        }];
+        manifest.symbols = vec![
+            exact_symbol("root", 1),
+            exact_symbol("calls_exact", 2),
+            exact_symbol("heuristic", 3),
+            exact_symbol("eligible", 4),
+        ];
+        manifest.edges = vec![
+            exact_edge(
+                "root",
+                "calls_exact",
+                GraphEdgeKind::Calls,
+                EdgeConfidence::ExactCompiler,
+            ),
+            exact_edge(
+                "root",
+                "heuristic",
+                GraphEdgeKind::References,
+                EdgeConfidence::HeuristicHigh,
+            ),
+            exact_edge(
+                "root",
+                "eligible",
+                GraphEdgeKind::References,
+                EdgeConfidence::ExactCompiler,
+            ),
+        ];
+        manifest.manifest_hash = fingerprint("exact-manifest");
+        manifest
+    }
+
+    fn capped_exact_fact_manifest() -> ProjectManifest {
+        let mut manifest = manual_manifest();
+        manifest.files = vec![SourceFile {
+            path: "src/exact.rs".to_string(),
+            language: Language::Rust,
+            bytes: 100,
+            lines: 40,
+            content_hash: fingerprint("capped-exact-file"),
+            provenance: provenance("src/exact.rs", Some(1), Some(40), "test", "capped-file"),
+        }];
+        manifest.symbols.push(exact_symbol("root", 1));
+        for index in (0..12).rev() {
+            manifest
+                .symbols
+                .push(exact_symbol(&format!("target_{index:02}"), index + 2));
+            manifest.edges.push(exact_edge(
+                "root",
+                &format!("target_{index:02}"),
+                GraphEdgeKind::References,
+                EdgeConfidence::ExactCompiler,
+            ));
+        }
+        manifest.manifest_hash = fingerprint("capped-exact-manifest");
+        manifest
+    }
+
+    fn exact_symbol(name: &str, line: usize) -> SymbolNode {
+        SymbolNode {
+            id: format!("symbol:src/exact.rs:Function:{name}"),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            path: "src/exact.rs".to_string(),
+            parent: None,
+            start_line: u32::try_from(line).unwrap(),
+            end_line: u32::try_from(line).unwrap(),
+            provenance: provenance(
+                "src/exact.rs",
+                Some(u32::try_from(line).unwrap()),
+                Some(u32::try_from(line).unwrap()),
+                "test",
+                name,
+            ),
+        }
+    }
+
+    fn exact_edge(
+        from: &str,
+        to: &str,
+        kind: GraphEdgeKind,
+        confidence_kind: EdgeConfidence,
+    ) -> GraphEdge {
+        GraphEdge {
+            from: format!("symbol:src/exact.rs:Function:{from}"),
+            to: format!("symbol:src/exact.rs:Function:{to}"),
+            kind,
+            confidence: 1.0,
+            confidence_kind,
+            provenance: provenance("src/exact.rs", Some(1), Some(1), "exact-test", to),
         }
     }
 

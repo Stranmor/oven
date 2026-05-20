@@ -1306,6 +1306,7 @@ impl<
             );
         }
         let reranker_selection = self.select_project_context_reranker_boundary();
+        let exact_fact_status = read_exact_fact_status(&root).ok();
         let plan = match plan_project_context_retrieval_with_options(
             &manifest,
             &freshness,
@@ -1315,6 +1316,7 @@ impl<
                 vector_index: durable_vector_selection.boundary(),
                 reranker: reranker_selection,
                 vector_unavailable_reason: durable_vector_selection.unavailable_reason(),
+                exact_fact_status: exact_fact_status.as_ref(),
             },
         ) {
             ProjectContextRetrievalPlanningOutcome::Plan(plan) => plan,
@@ -3025,6 +3027,17 @@ mod tests {
         Ok((fixture, root))
     }
 
+    fn write_fixture_project_model_with_exact_facts(root: &Path) -> Result<PathBuf> {
+        let setup = ProjectIndexer::new(root, local_project_model_dir(root));
+        let base = setup.index()?;
+        let batch =
+            runtime_external_artifact_batch(&base, "rust-analyzer", "lsp:src/lib.rs:runtime_query");
+        write_external_fact_artifact(&local_project_model_dir(root), &base, batch)?;
+        let (manifest, report) = setup.index_with_external_fact_report()?;
+        setup.write_external_fact_artifact_ingestion_report(&report)?;
+        setup.write_manifest(&manifest)
+    }
+
     fn write_fixture_project_model(root: &Path) -> Result<PathBuf> {
         let setup = ProjectIndexer::new(root, local_project_model_dir(root));
         let manifest = setup.index()?;
@@ -4340,6 +4353,88 @@ mod tests {
             ),
             expected,
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_workspace_benefits_from_active_exact_facts_without_invoking_producer()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model_with_exact_facts(&root)?;
+        let exact_fact_file_count_before =
+            fs::read_dir(local_project_model_dir(&root).join("external_facts"))?
+                .filter_map(|entry| entry.ok())
+                .count();
+        let range_read_called = Arc::new(AtomicBool::new(false));
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::clone(&range_read_called),
+                range_read_fails: false,
+            }),
+            Arc::new(NoopDiscovery),
+        );
+        let params =
+            SearchParams::new("lexicalmissneedle", "exact facts query proof").limit(1usize);
+
+        let actual = WorkspaceService::query_workspace(&setup, root.clone(), params).await?;
+        let exact_fact_file_count_after =
+            fs::read_dir(local_project_model_dir(&root).join("external_facts"))?
+                .filter_map(|entry| entry.ok())
+                .count();
+        let chunk = actual.iter().find_map(|node| match &node.node {
+            NodeData::FileChunk(chunk) => Some((node.node_id.as_str().to_string(), chunk.clone())),
+            _ => None,
+        });
+        let expected = (
+            exact_fact_file_count_before,
+            true,
+            exact_fact_file_count_before,
+            Some("src/lib.rs".to_string()),
+            true,
+        );
+
+        assert_eq!(
+            (
+                exact_fact_file_count_before,
+                range_read_called.load(Ordering::SeqCst),
+                exact_fact_file_count_after,
+                chunk.as_ref().map(|(_, chunk)| chunk.file_path.clone()),
+                chunk
+                    .as_ref()
+                    .is_some_and(|(id, chunk)| id == "symbol:src/lib.rs:Struct:RuntimeNeedle"
+                        && chunk.content.contains("RuntimeNeedle")),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_workspace_without_active_exact_facts_keeps_empty_lexical_miss_fallback()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::new(AtomicBool::new(false)),
+                range_read_fails: false,
+            }),
+            Arc::new(NoopDiscovery),
+        );
+        let params = SearchParams::new("lexicalmissneedle", "inactive exact facts fallback proof")
+            .limit(1usize);
+
+        let actual = WorkspaceService::query_workspace(&setup, root, params).await?;
+        let expected = Vec::<Node>::new();
+        assert_eq!(actual, expected);
         Ok(())
     }
 
