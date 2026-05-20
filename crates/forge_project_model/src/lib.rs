@@ -25,10 +25,14 @@ pub use cache_partition::{
     CACHE_PARTITION_SCHEMA_VERSION, CachePartitionError, CachePartitionManifestKnown,
     CachePartitionReadbackVerified, CachePartitionSourcesSelected,
     CachePartitionStablePayloadSealed, CachePartitionVolatileSidecarAttached,
-    ProjectModelCachePartitionIdentity, ProjectModelCachePartitionInput,
-    ProjectModelCachePartitionSource, ProjectModelStablePayload,
+    PROJECT_MODEL_CONTEXT_RENDERER_TEMPLATE_VERSION, PROJECT_MODEL_CONTEXT_RETRIEVAL_PLAN_VERSION,
+    PROJECT_MODEL_CONTEXT_TRUNCATION_POLICY, ProjectModelCachePartitionIdentity,
+    ProjectModelCachePartitionInput, ProjectModelCachePartitionSource, ProjectModelContextEnvelope,
+    ProjectModelContextEnvelopeInput, ProjectModelContextEnvelopeRefusal,
+    ProjectModelEnvelopeCacheClass, ProjectModelManifestFreshnessProof, ProjectModelStablePayload,
     ProjectModelStablePayloadWhitelistedFields, ProjectModelVolatileSidecar,
     ProjectModelVolatileSidecarInput, StableProjectModelContextMessage,
+    build_project_model_context_envelope, stable_cache_partition_sources_from_nodes,
 };
 pub use context_adapter::{
     EvidenceReplayPreviewError, ManifestEvidenceTarget, ProjectModelContextRenderRoot,
@@ -103,9 +107,10 @@ pub use producer::{
 };
 pub use render::{
     DEFAULT_RENDERED_SOURCE_LIMIT, ProjectModelContextReadinessMetadata,
-    ProjectModelContextRenderBudget, ProjectModelContextSource,
+    ProjectModelContextRenderBudget, ProjectModelContextRenderOverflow, ProjectModelContextSource,
     ProjectModelEvidenceLedgerActivationMetadata, ProjectModelEvidenceReadinessMetadata,
     ProjectModelExactFactReadinessMetadata, render_project_model_context,
+    render_project_model_context_checked,
 };
 pub use retrieval::{plan_retrieval, retrieve, retrieve_with_boundaries};
 pub use retrieval_plan::{

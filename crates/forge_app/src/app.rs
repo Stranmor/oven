@@ -8,9 +8,8 @@ use chrono::Local;
 use forge_config::ForgeConfig;
 use forge_domain::*;
 use forge_project_model::{
-    AcceptedLearningSummary as ProjectAcceptedLearningSummary, CACHE_PARTITION_SCHEMA_VERSION,
-    LearningContextPayload, LearningContextRecord,
-    LearningLedgerFreshness as ProjectLearningLedgerFreshness,
+    AcceptedLearningSummary as ProjectAcceptedLearningSummary, LearningContextPayload,
+    LearningContextRecord, LearningLedgerFreshness as ProjectLearningLedgerFreshness,
     LearningProvenance as ProjectLearningProvenance,
     LearningRedactionStatus as ProjectLearningRedactionStatus,
     LearningReviewState as ProjectLearningReviewState,
@@ -20,13 +19,13 @@ use forge_project_model::{
     ProjectContextRetrievalPhaseUnavailableReason, ProjectContextRetrievalPlanDiagnostic,
     ProjectContextRetrievalReadRequestSummary, ProjectContextRetrievalRequest,
     ProjectContextRetrievalSelectedSummary, ProjectContextTarget, ProjectContextWriteDecision,
-    ProjectIndexer, ProjectModelCachePartitionIdentity, ProjectModelCachePartitionInput,
-    ProjectModelCachePartitionSource, ProjectModelContextReadinessMetadata,
-    ProjectModelContextRenderBudget, ProjectModelEvidenceLedgerActivationMetadata,
-    ProjectModelEvidenceReadinessMetadata, ProjectModelExactFactReadinessMetadata,
+    ProjectIndexer, ProjectModelContextEnvelopeInput, ProjectModelContextReadinessMetadata,
+    ProjectModelContextRenderBudget, ProjectModelContextRenderRoot,
+    ProjectModelEvidenceLedgerActivationMetadata, ProjectModelEvidenceReadinessMetadata,
+    ProjectModelExactFactReadinessMetadata, ProjectModelManifestFreshnessProof,
     ProjectModelSourceNode, ProjectModelVolatileSidecarInput, TargetResolutionBudget,
-    directory_path_filter, local_project_model_dir, local_project_model_manifest, mentioned_paths,
-    plan_project_context_retrieval, render_project_model_context, render_sources_from_nodes,
+    build_project_model_context_envelope, directory_path_filter, local_project_model_dir,
+    local_project_model_manifest, mentioned_paths, plan_project_context_retrieval,
 };
 use forge_stream::MpscStream;
 use url::Url;
@@ -87,6 +86,7 @@ struct ProjectContextTargetDiagnostic {
 struct ProjectContextRenderedPartition {
     stable_payload: String,
     volatile_sidecar: String,
+    stable_identity: String,
 }
 
 struct ProjectContextInjection<S> {
@@ -325,6 +325,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
             .model(self.agent.model.clone())
             .droppable(true)
             .cacheable(true);
+            tracing::debug!(stable_identity = %rendered_context.stable_identity, "Injecting stable project-model context envelope");
             context = context.add_message(ContextMessage::Text(stable_message));
             let sidecar_message = TextMessage::project_model_volatile_sidecar(
                 Role::User,
@@ -1197,17 +1198,11 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
         semantic_diagnostic: Option<&str>,
         nodes: Vec<Node>,
     ) -> Option<ProjectContextRenderedPartition> {
-        let manifest_hash = diagnostic.manifest_hash.clone()?;
         let manifest_path = local_project_model_manifest(workspace_root);
         let source_nodes = nodes
             .into_iter()
             .map(Self::source_node_from_node)
             .collect::<Vec<_>>();
-        let stable_sources = source_nodes
-            .iter()
-            .filter_map(Self::stable_partition_source_from_node)
-            .collect::<Vec<_>>();
-        let sources = render_sources_from_nodes(source_nodes);
         let exact_fact_readiness = diagnostic
             .exact_fact_readiness
             .as_ref()
@@ -1224,50 +1219,6 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
             exact_fact_readiness,
             evidence_readiness,
             evidence_ledger_activation,
-        };
-        let render_budget = ProjectModelContextRenderBudget::default();
-        let rendered = render_project_model_context(
-            &workspace_root.display().to_string(),
-            &manifest_path.display().to_string(),
-            "local_manifest_available",
-            "WorkspaceService::query_workspace",
-            None,
-            &sources,
-            &render_budget,
-        );
-        if rendered.contains("rendered_context_budget_exceeded") {
-            tracing::debug!(path = %workspace_root.display(), "Skipping stable project-model context because render budget overflow was unclassified");
-            return None;
-        }
-        let identity = ProjectModelCachePartitionIdentity {
-            canonical_project_identity: workspace_root.display().to_string(),
-            manifest_schema_version: 1,
-            manifest_hash,
-            retrieval_plan_version: "automatic-project-context-retrieval-v1".to_string(),
-            renderer_template_version: "project-model-context-render-v1".to_string(),
-            agents_project_rules_digest: None,
-            render_budget: render_budget.max_rendered_chars as u32,
-            truncation_policy: "bounded-source-preview-v1".to_string(),
-            cache_partition_schema_version: CACHE_PARTITION_SCHEMA_VERSION,
-        };
-        let stable = match (ProjectModelCachePartitionInput { identity })
-            .manifest_known()
-            .and_then(|partition| partition.select_sources(stable_sources))
-            .and_then(|partition| partition.verify_readback())
-            .and_then(|partition| partition.seal_stable_payload_bytes(rendered.as_bytes()))
-        {
-            Ok(partition) => partition,
-            Err(error) => {
-                tracing::debug!(error = ?error, path = %workspace_root.display(), "Skipping stable project-model context injection because cache partition proof failed");
-                return None;
-            }
-        };
-        let stable_payload = match stable.stable_payload().provider_visible_message(&rendered) {
-            Ok(stable_payload) => stable_payload,
-            Err(error) => {
-                tracing::debug!(error = ?error, path = %workspace_root.display(), "Skipping stable project-model context injection because provider-visible payload no longer matches sealed cache identity");
-                return None;
-            }
         };
         let mut diagnostics = Vec::new();
         diagnostics.push(format!("freshness={}", diagnostic.freshness.label()));
@@ -1299,62 +1250,59 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
         if let Some(activation) = &readiness.evidence_ledger_activation {
             diagnostics.extend(activation.issue_summaries.clone());
         }
-        let sidecar = ProjectModelVolatileSidecarInput {
-            diagnostics,
-            readiness_warnings: Vec::new(),
-            mutable_file_freshness: Vec::new(),
-            transient_errors: Vec::new(),
-            ..Default::default()
+        let manifest_freshness = diagnostic.manifest_hash.clone().map_or_else(
+            || ProjectModelManifestFreshnessProof::Unknown {
+                reason: "manifest hash is absent".to_string(),
+            },
+            |manifest_hash| {
+                if diagnostic.freshness.is_fresh() {
+                    ProjectModelManifestFreshnessProof::KnownFresh {
+                        schema_version: 1,
+                        manifest_hash,
+                        freshness_label: diagnostic.freshness.label().to_string(),
+                    }
+                } else {
+                    ProjectModelManifestFreshnessProof::Stale {
+                        manifest_hash: Some(manifest_hash),
+                        reason: format!("manifest freshness is {}", diagnostic.freshness.label()),
+                    }
+                }
+            },
+        );
+        let envelope = match build_project_model_context_envelope(
+            ProjectModelContextEnvelopeInput {
+                render_root: ProjectModelContextRenderRoot::new(
+                    workspace_root.display().to_string(),
+                    manifest_path.display().to_string(),
+                    diagnostic.freshness.label().to_string(),
+                    "WorkspaceService::query_workspace",
+                ),
+                manifest_freshness,
+                render_budget: ProjectModelContextRenderBudget::default(),
+                source_nodes,
+                readiness,
+                semantic_diagnostics: Vec::new(),
+                volatile: ProjectModelVolatileSidecarInput {
+                    diagnostics,
+                    readiness_warnings: Vec::new(),
+                    mutable_file_freshness: Vec::new(),
+                    transient_errors: Vec::new(),
+                    ..Default::default()
+                },
+                agents_project_rules_digest: None,
+            },
+        ) {
+            Ok(envelope) => envelope,
+            Err(refusal) => {
+                tracing::debug!(refusal = ?refusal, path = %workspace_root.display(), "Skipping project-model context injection because envelope construction refused");
+                return None;
+            }
         };
-        let sidecar_json = serde_json::to_string(&sidecar).unwrap_or_else(|_| "{}".to_string());
         Some(ProjectContextRenderedPartition {
-            stable_payload,
-            volatile_sidecar: format!(
-                "<project_model_volatile_sidecar cache=\"uncached\">{sidecar_json}</project_model_volatile_sidecar>"
-            ),
+            stable_payload: envelope.stable_provider_visible_message,
+            volatile_sidecar: envelope.volatile_sidecar_message,
+            stable_identity: envelope.stable_identity,
         })
-    }
-
-    fn stable_partition_source_from_node(
-        node: &ProjectModelSourceNode,
-    ) -> Option<ProjectModelCachePartitionSource> {
-        match node {
-            ProjectModelSourceNode::FileChunk {
-                path,
-                start_line,
-                end_line,
-                node_id,
-                content,
-                ..
-            } => Some(
-                ProjectModelCachePartitionSource::new(
-                    path.clone(),
-                    node_id.clone(),
-                    content.clone(),
-                )
-                .line_range(*start_line, *end_line),
-            ),
-            ProjectModelSourceNode::File { path, node_id, content_hash, content, .. } => {
-                Some(ProjectModelCachePartitionSource::new(
-                    path.clone(),
-                    node_id.clone(),
-                    content.clone().unwrap_or_else(|| content_hash.clone()),
-                ))
-            }
-            ProjectModelSourceNode::FileRef { path, node_id, content_hash, .. } => {
-                Some(ProjectModelCachePartitionSource::new(
-                    path.clone(),
-                    node_id.clone(),
-                    content_hash.clone(),
-                ))
-            }
-            ProjectModelSourceNode::Note { node_id, content, .. } => Some(
-                ProjectModelCachePartitionSource::new("note", node_id.clone(), content.clone()),
-            ),
-            ProjectModelSourceNode::Task { node_id, content, .. } => Some(
-                ProjectModelCachePartitionSource::new("task", node_id.clone(), content.clone()),
-            ),
-        }
     }
 
     fn exact_fact_readiness_metadata(
@@ -5950,7 +5898,7 @@ mod tests {
             .filter_map(|message| message.content().map(str::to_string))
             .find(|content| content.contains("<project_model_volatile_sidecar"))
             .unwrap();
-        let expected = (true, true, true, true, true, true, false, true);
+        let expected = (true, true, true, true, true, true, true, true, false);
 
         assert_eq!(
             (
@@ -5959,9 +5907,10 @@ mod tests {
                 actual_sidecar.contains("context_pack_issue_count=0"),
                 actual_sidecar.contains("tool_episode_issue_count=0"),
                 actual_sidecar.contains("episode_artifact_link_valid=true"),
-                actual_context.contains("local_manifest_available"),
+                actual_context.contains("freshness=\"fresh\""),
                 actual_context.contains("exact_fact_readiness=\"evaluated\""),
                 actual_context.contains("cache=\"stable\""),
+                actual_context.contains("rendered_context_budget_exceeded"),
             ),
             expected,
         );

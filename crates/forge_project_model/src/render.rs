@@ -37,6 +37,13 @@ impl Default for ProjectModelContextRenderBudget {
     }
 }
 
+/// Typed render overflow diagnostic for project-model context construction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectModelContextRenderOverflow {
+    /// Maximum provider-visible XML characters allowed by the render budget.
+    pub max_rendered_chars: usize,
+}
+
 /// Compact read-only exact-fact readiness metadata for context rendering.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectModelExactFactReadinessMetadata {
@@ -255,6 +262,72 @@ struct ProjectModelContextRenderRoot<'a> {
 /// * `sources` - Candidate evidence sources in caller-selected ranking order.
 /// * `budget` - Rendering budget that bounds sources, lines, and characters.
 pub fn render_project_model_context(
+    workspace_root: &str,
+    manifest_path: &str,
+    freshness: &str,
+    provenance: &str,
+    readiness: Option<&ProjectModelContextReadinessMetadata>,
+    sources: &[ProjectModelContextSource],
+    budget: &ProjectModelContextRenderBudget,
+) -> String {
+    render_project_model_context_lossy(
+        workspace_root,
+        manifest_path,
+        freshness,
+        provenance,
+        readiness,
+        sources,
+        budget,
+    )
+}
+
+/// Renders project-model context under a typed budget and refuses unrenderable overflow.
+///
+/// # Arguments
+///
+/// * `workspace_root` - Display path for the workspace root.
+/// * `manifest_path` - Display path for the local project-model manifest.
+/// * `freshness` - Root freshness label.
+/// * `provenance` - Root provenance label.
+/// * `readiness` - Compact read-only readiness metadata.
+/// * `sources` - Candidate evidence sources in caller-selected ranking order.
+/// * `budget` - Rendering budget that bounds sources, lines, and characters.
+///
+/// # Errors
+///
+/// Returns a typed overflow when even the metadata-only fallback cannot fit the
+/// configured maximum rendered character budget.
+pub fn render_project_model_context_checked(
+    workspace_root: &str,
+    manifest_path: &str,
+    freshness: &str,
+    provenance: &str,
+    readiness: Option<&ProjectModelContextReadinessMetadata>,
+    sources: &[ProjectModelContextSource],
+    budget: &ProjectModelContextRenderBudget,
+) -> Result<String, ProjectModelContextRenderOverflow> {
+    let root = ProjectModelContextRenderRoot {
+        workspace_root,
+        manifest_path,
+        freshness,
+        provenance,
+        exact_fact_readiness: readiness.and_then(|metadata| metadata.exact_fact_readiness.as_ref()),
+        evidence_readiness: readiness.and_then(|metadata| metadata.evidence_readiness.as_ref()),
+        evidence_ledger_activation: readiness
+            .and_then(|metadata| metadata.evidence_ledger_activation.as_ref()),
+    };
+    let rendered = render_project_model_context_inner(&root, sources, budget, false);
+    if rendered.chars().count() <= budget.max_rendered_chars {
+        return Ok(rendered);
+    }
+    let metadata_only = render_project_model_context_inner(&root, sources, budget, true);
+    if metadata_only.chars().count() <= budget.max_rendered_chars {
+        return Ok(metadata_only);
+    }
+    Err(ProjectModelContextRenderOverflow { max_rendered_chars: budget.max_rendered_chars })
+}
+
+fn render_project_model_context_lossy(
     workspace_root: &str,
     manifest_path: &str,
     freshness: &str,

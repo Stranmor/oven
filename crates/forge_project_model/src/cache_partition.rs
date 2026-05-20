@@ -5,13 +5,262 @@ use std::marker::PhantomData;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::context_adapter::{
+    ProjectModelContextRenderRoot, ProjectModelSourceNode, render_sources_from_nodes,
+};
+use crate::render::{
+    ProjectModelContextReadinessMetadata, ProjectModelContextRenderBudget,
+    ProjectModelContextRenderOverflow, render_project_model_context_checked,
+};
 use crate::{fingerprint, util::hash_bytes};
 
 /// Stable schema version for project-model cache partition payloads.
 pub const CACHE_PARTITION_SCHEMA_VERSION: u32 = 1;
 
+/// Stable renderer/template version for the project-model-owned context envelope.
+pub const PROJECT_MODEL_CONTEXT_RENDERER_TEMPLATE_VERSION: &str = "project-model-context-render-v1";
+
+/// Stable retrieval plan version used by automatic project-model context injection.
+pub const PROJECT_MODEL_CONTEXT_RETRIEVAL_PLAN_VERSION: &str =
+    "automatic-project-context-retrieval-v1";
+
+/// Stable truncation policy encoded into the cache identity.
+pub const PROJECT_MODEL_CONTEXT_TRUNCATION_POLICY: &str = "bounded-source-preview-v1";
+
+/// Explicit manifest freshness/hash proof supplied by the caller.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProjectModelManifestFreshnessProof {
+    /// Manifest hash is known and fresh enough for cache-eligible stable injection.
+    KnownFresh {
+        /// Manifest schema version.
+        schema_version: u32,
+        /// Exact manifest hash for the active project-model snapshot.
+        manifest_hash: String,
+        /// Redaction-safe freshness label rendered in the stable body.
+        freshness_label: String,
+    },
+    /// Manifest freshness or hash is unknown.
+    Unknown {
+        /// Redaction-safe reason for the unknown freshness state.
+        reason: String,
+    },
+    /// Manifest is known stale and must not produce stable provider-visible context.
+    Stale {
+        /// Optional stale manifest hash retained for diagnostics only.
+        manifest_hash: Option<String>,
+        /// Redaction-safe reason for the stale freshness state.
+        reason: String,
+    },
+}
+
+/// Typed input for project-model-owned stable/volatile context envelope construction.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectModelContextEnvelopeInput {
+    /// Typed render root and diagnostic metadata.
+    pub render_root: ProjectModelContextRenderRoot,
+    /// Explicit manifest freshness/hash proof.
+    pub manifest_freshness: ProjectModelManifestFreshnessProof,
+    /// Typed render budget.
+    pub render_budget: ProjectModelContextRenderBudget,
+    /// Typed source nodes selected by the caller.
+    pub source_nodes: Vec<ProjectModelSourceNode>,
+    /// Readiness metadata rendered into the stable provider-visible body.
+    pub readiness: ProjectModelContextReadinessMetadata,
+    /// Semantic diagnostics that must remain volatile.
+    pub semantic_diagnostics: Vec<String>,
+    /// Optional volatile fields that must not affect stable identity.
+    pub volatile: ProjectModelVolatileSidecarInput,
+    /// Optional AGENTS/project-rules digest when semantically injected.
+    pub agents_project_rules_digest: Option<String>,
+}
+
+/// Stable/volatile provider-visible context envelope produced by project-model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectModelContextEnvelope {
+    /// Cache-eligible stable provider-visible message string.
+    pub stable_provider_visible_message: String,
+    /// Uncached volatile sidecar provider-visible message string.
+    pub volatile_sidecar_message: String,
+    /// Stable cache identity derived from whitelisted stable fields.
+    pub stable_identity: String,
+    /// Semantic cache class for the stable message.
+    pub stable_cache_class: ProjectModelEnvelopeCacheClass,
+    /// Semantic cache class for the volatile sidecar message.
+    pub volatile_cache_class: ProjectModelEnvelopeCacheClass,
+}
+
+/// Provider cache class metadata owned by the project-model envelope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectModelEnvelopeCacheClass {
+    /// Stable project-model payload is cache eligible.
+    StableProjectModel,
+    /// Volatile project-model sidecar is uncached.
+    VolatileProjectModelSidecar,
+}
+
+/// Typed refusal diagnostics for project-model context envelope construction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProjectModelContextEnvelopeRefusal {
+    /// Manifest freshness/hash proof does not allow stable context injection.
+    ManifestFreshnessRejected { reason: String },
+    /// Rendering exceeded the typed budget.
+    RenderOverflow { max_rendered_chars: usize },
+    /// Cache partition typestate proof failed.
+    CachePartitionRejected { error: CachePartitionError },
+    /// Volatile sidecar serialization failed.
+    VolatileSidecarSerializationFailed { error: String },
+}
+
+impl From<ProjectModelContextRenderOverflow> for ProjectModelContextEnvelopeRefusal {
+    fn from(error: ProjectModelContextRenderOverflow) -> Self {
+        Self::RenderOverflow { max_rendered_chars: error.max_rendered_chars }
+    }
+}
+
+/// Builds a project-model-owned stable/volatile context injection envelope.
+///
+/// This function is pure construction only: it performs no filesystem IO, service
+/// calls, provider calls, persistence writes, retrieval planning, or reranking.
+///
+/// # Arguments
+///
+/// * `input` - Fully typed manifest, rendering, source, readiness, semantic, and
+///   volatile metadata for envelope construction.
+///
+/// # Errors
+///
+/// Returns a typed refusal when manifest freshness is not proven, rendering
+/// overflows, source readback/cache partition proof fails, or volatile sidecar
+/// serialization fails.
+pub fn build_project_model_context_envelope(
+    input: ProjectModelContextEnvelopeInput,
+) -> Result<ProjectModelContextEnvelope, ProjectModelContextEnvelopeRefusal> {
+    let (manifest_schema_version, manifest_hash, freshness_label) = match input.manifest_freshness {
+        ProjectModelManifestFreshnessProof::KnownFresh {
+            schema_version,
+            manifest_hash,
+            freshness_label,
+        } if !manifest_hash.trim().is_empty() && !freshness_label.trim().is_empty() => {
+            (schema_version, manifest_hash, freshness_label)
+        }
+        ProjectModelManifestFreshnessProof::KnownFresh { .. } => {
+            return Err(
+                ProjectModelContextEnvelopeRefusal::ManifestFreshnessRejected {
+                    reason: "known manifest proof is incomplete".to_string(),
+                },
+            );
+        }
+        ProjectModelManifestFreshnessProof::Unknown { reason } => {
+            return Err(ProjectModelContextEnvelopeRefusal::ManifestFreshnessRejected { reason });
+        }
+        ProjectModelManifestFreshnessProof::Stale { reason, .. } => {
+            return Err(ProjectModelContextEnvelopeRefusal::ManifestFreshnessRejected { reason });
+        }
+    };
+
+    let stable_sources = stable_cache_partition_sources_from_nodes(&input.source_nodes);
+    let sources = render_sources_from_nodes(input.source_nodes);
+    let stable_body = render_project_model_context_checked(
+        &input.render_root.workspace_root,
+        &input.render_root.manifest_path,
+        &freshness_label,
+        &input.render_root.provenance,
+        Some(&input.readiness),
+        &sources,
+        &input.render_budget,
+    )?;
+    let identity = ProjectModelCachePartitionIdentity {
+        canonical_project_identity: input.render_root.workspace_root,
+        manifest_schema_version,
+        manifest_hash,
+        retrieval_plan_version: PROJECT_MODEL_CONTEXT_RETRIEVAL_PLAN_VERSION.to_string(),
+        renderer_template_version: PROJECT_MODEL_CONTEXT_RENDERER_TEMPLATE_VERSION.to_string(),
+        agents_project_rules_digest: input.agents_project_rules_digest,
+        render_budget: input.render_budget.max_rendered_chars,
+        truncation_policy: PROJECT_MODEL_CONTEXT_TRUNCATION_POLICY.to_string(),
+        cache_partition_schema_version: CACHE_PARTITION_SCHEMA_VERSION,
+    };
+    let stable = (ProjectModelCachePartitionInput { identity })
+        .manifest_known()
+        .and_then(|partition| partition.select_sources(stable_sources))
+        .and_then(|partition| partition.verify_readback())
+        .and_then(|partition| partition.seal_stable_payload_bytes(stable_body.as_bytes()))
+        .map_err(|error| ProjectModelContextEnvelopeRefusal::CachePartitionRejected { error })?;
+    let stable_provider_visible_message = stable
+        .stable_payload()
+        .provider_visible_message(&stable_body)
+        .map_err(|error| ProjectModelContextEnvelopeRefusal::CachePartitionRejected { error })?;
+    let stable_identity = stable.stable_payload().identity().to_string();
+    let sidecar_input = merge_volatile_sidecar(input.volatile, input.semantic_diagnostics);
+    let sidecar_json = serde_json::to_string(&sidecar_input).map_err(|error| {
+        ProjectModelContextEnvelopeRefusal::VolatileSidecarSerializationFailed {
+            error: error.to_string(),
+        }
+    })?;
+    let volatile_sidecar_message = format!(
+        "<project_model_volatile_sidecar cache=\"uncached\">{sidecar_json}</project_model_volatile_sidecar>"
+    );
+
+    Ok(ProjectModelContextEnvelope {
+        stable_provider_visible_message,
+        volatile_sidecar_message,
+        stable_identity,
+        stable_cache_class: ProjectModelEnvelopeCacheClass::StableProjectModel,
+        volatile_cache_class: ProjectModelEnvelopeCacheClass::VolatileProjectModelSidecar,
+    })
+}
+
+/// Converts typed source nodes into exact-readback stable partition sources.
+///
+/// Metadata-only references without exact readback are deliberately excluded from
+/// stable verified source content; they may still be rendered as non-content
+/// identity in the provider-visible body.
+///
+/// # Arguments
+///
+/// * `nodes` - Typed source nodes selected by the adapter layer.
+pub fn stable_cache_partition_sources_from_nodes(
+    nodes: &[ProjectModelSourceNode],
+) -> Vec<ProjectModelCachePartitionSource> {
+    nodes
+        .iter()
+        .filter_map(stable_cache_partition_source_from_node)
+        .collect()
+}
+
+fn stable_cache_partition_source_from_node(
+    node: &ProjectModelSourceNode,
+) -> Option<ProjectModelCachePartitionSource> {
+    match node {
+        ProjectModelSourceNode::FileChunk {
+            path, start_line, end_line, node_id, content, ..
+        } => Some(
+            ProjectModelCachePartitionSource::new(path.clone(), node_id.clone(), content.clone())
+                .line_range(*start_line, *end_line),
+        ),
+        ProjectModelSourceNode::File { path, node_id, content: Some(content), .. } => Some(
+            ProjectModelCachePartitionSource::new(path.clone(), node_id.clone(), content.clone()),
+        ),
+        ProjectModelSourceNode::Note { node_id, content, .. } => Some(
+            ProjectModelCachePartitionSource::new("note", node_id.clone(), content.clone()),
+        ),
+        ProjectModelSourceNode::Task { node_id, content, .. } => Some(
+            ProjectModelCachePartitionSource::new("task", node_id.clone(), content.clone()),
+        ),
+        ProjectModelSourceNode::File { content: None, .. }
+        | ProjectModelSourceNode::FileRef { .. } => None,
+    }
+}
+
+fn merge_volatile_sidecar(
+    mut volatile: ProjectModelVolatileSidecarInput,
+    semantic_diagnostics: Vec<String>,
+) -> ProjectModelVolatileSidecarInput {
+    volatile.diagnostics.extend(semantic_diagnostics);
+    volatile
+}
 /// Error returned when a stable project-model cache partition cannot be proven.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
 pub enum CachePartitionError {
     /// Manifest identity was absent or not proven fresh enough for stable injection.
     #[error("project-model stable cache partition blocked: {0}")]
@@ -162,7 +411,7 @@ pub struct ProjectModelCachePartitionIdentity {
     /// Optional AGENTS/project-rules digest when rules are semantically injected.
     pub agents_project_rules_digest: Option<String>,
     /// Render budget encoded into stable identity.
-    pub render_budget: u32,
+    pub render_budget: usize,
     /// Stable truncation policy label.
     pub truncation_policy: String,
     /// Cache-partition schema version.
@@ -433,7 +682,7 @@ pub struct ProjectModelStablePayloadWhitelistedFields {
     /// Digest of the exact stable provider-visible payload bytes.
     pub stable_provider_visible_payload_digest: String,
     /// Render budget encoded into stable identity.
-    pub render_budget: u32,
+    pub render_budget: usize,
     /// Stable truncation policy label.
     pub truncation_policy: String,
 }
@@ -569,6 +818,43 @@ mod tests {
             render_budget: 4096,
             truncation_policy: "metadata-only-on-overflow".to_string(),
             cache_partition_schema_version: CACHE_PARTITION_SCHEMA_VERSION,
+        }
+    }
+
+    fn render_root() -> ProjectModelContextRenderRoot {
+        ProjectModelContextRenderRoot::new(
+            "repo://example",
+            "/workspace/.forge_project_model/project_manifest.json",
+            "fresh",
+            "fixture",
+        )
+    }
+
+    fn source_node() -> ProjectModelSourceNode {
+        ProjectModelSourceNode::FileChunk {
+            path: "src/lib.rs".to_string(),
+            start_line: 1,
+            end_line: 3,
+            node_id: "node:src/lib.rs".to_string(),
+            score: Some(0.875),
+            content: "fn main() {}".to_string(),
+        }
+    }
+
+    fn envelope_input() -> ProjectModelContextEnvelopeInput {
+        ProjectModelContextEnvelopeInput {
+            render_root: render_root(),
+            manifest_freshness: ProjectModelManifestFreshnessProof::KnownFresh {
+                schema_version: 1,
+                manifest_hash: "manifest-a".to_string(),
+                freshness_label: "fresh".to_string(),
+            },
+            render_budget: ProjectModelContextRenderBudget::default(),
+            source_nodes: vec![source_node()],
+            readiness: ProjectModelContextReadinessMetadata::default(),
+            semantic_diagnostics: vec!["semantic=ready".to_string()],
+            volatile: ProjectModelVolatileSidecarInput::default(),
+            agents_project_rules_digest: None,
         }
     }
 
@@ -863,5 +1149,124 @@ mod tests {
             actual,
             Err(CachePartitionError::ReadbackDigestMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn envelope_refuses_unknown_manifest_without_stable_message() {
+        let mut setup = envelope_input();
+        setup.manifest_freshness = ProjectModelManifestFreshnessProof::Unknown {
+            reason: "manifest freshness unknown".to_string(),
+        };
+
+        let actual = build_project_model_context_envelope(setup);
+        let expected = Err(
+            ProjectModelContextEnvelopeRefusal::ManifestFreshnessRejected {
+                reason: "manifest freshness unknown".to_string(),
+            },
+        );
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn envelope_refuses_stale_manifest_without_stable_message() {
+        let mut setup = envelope_input();
+        setup.manifest_freshness = ProjectModelManifestFreshnessProof::Stale {
+            manifest_hash: Some("manifest-a".to_string()),
+            reason: "manifest freshness is stale".to_string(),
+        };
+
+        let actual = build_project_model_context_envelope(setup);
+        let expected = Err(
+            ProjectModelContextEnvelopeRefusal::ManifestFreshnessRejected {
+                reason: "manifest freshness is stale".to_string(),
+            },
+        );
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn envelope_refuses_render_overflow_without_substring_sentinel_policy() {
+        let mut setup = envelope_input();
+        setup.render_budget = ProjectModelContextRenderBudget {
+            max_sources: 1,
+            max_source_content_chars: 1,
+            max_total_content_chars: 1,
+            max_source_lines: 1,
+            max_rendered_chars: 8,
+            max_metadata_attr_chars: 1,
+        };
+
+        let actual = build_project_model_context_envelope(setup);
+        let expected =
+            Err(ProjectModelContextEnvelopeRefusal::RenderOverflow { max_rendered_chars: 8 });
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn envelope_volatile_only_changes_do_not_change_stable_identity() {
+        let mut first = envelope_input();
+        first.volatile.current_time = Some("2026-05-21T01:00:00+03:00".to_string());
+        first.volatile.model_provider_route = Some("route-a".to_string());
+        let mut second = envelope_input();
+        second.volatile.current_time = Some("2026-05-21T02:00:00+03:00".to_string());
+        second.volatile.model_provider_route = Some("route-b".to_string());
+
+        let actual = (
+            build_project_model_context_envelope(first).unwrap(),
+            build_project_model_context_envelope(second).unwrap(),
+        );
+        let expected = (true, false);
+
+        assert_eq!(
+            (
+                actual.0.stable_identity == actual.1.stable_identity,
+                actual.0.volatile_sidecar_message == actual.1.volatile_sidecar_message,
+            ),
+            expected,
+        );
+    }
+
+    #[test]
+    fn source_mapping_lives_in_project_model_and_excludes_metadata_only_refs() {
+        let setup = vec![
+            source_node(),
+            ProjectModelSourceNode::FileRef {
+                path: "src/ref.rs".to_string(),
+                node_id: "node:src/ref.rs".to_string(),
+                score: Some(0.5),
+                content_hash: "metadata-hash".to_string(),
+            },
+        ];
+
+        let actual = stable_cache_partition_sources_from_nodes(&setup);
+        let expected = vec![
+            ProjectModelCachePartitionSource::new("src/lib.rs", "node:src/lib.rs", "fn main() {}")
+                .line_range(1, 3),
+        ];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn envelope_stable_identity_uses_full_rendered_char_budget_without_u32_truncation() {
+        let first = envelope_input();
+        let mut second = envelope_input();
+        second.render_budget.max_rendered_chars =
+            u32::MAX as usize + 1 + first.render_budget.max_rendered_chars;
+
+        let actual = (
+            build_project_model_context_envelope(first)
+                .unwrap()
+                .stable_identity,
+            build_project_model_context_envelope(second)
+                .unwrap()
+                .stable_identity,
+        );
+
+        assert_ne!(actual.0, actual.1);
     }
 }
