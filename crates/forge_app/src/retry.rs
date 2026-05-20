@@ -109,9 +109,20 @@ fn error_response_has_strict_context_length_exceeded(error: &ErrorResponse) -> b
 
 fn text_has_context_length_exceeded_signal(text: &str) -> bool {
     let normalized = text.to_lowercase();
+    if text_has_quota_plan_or_tier_signal(&normalized) {
+        return false;
+    }
+
     normalized.contains("context_length_exceeded")
-        || normalized.contains("maximum context length")
+        || normalized.contains("maximum context length") && normalized.contains("exceed")
         || normalized.contains("context length") && normalized.contains("exceed")
+}
+
+fn text_has_quota_plan_or_tier_signal(normalized: &str) -> bool {
+    normalized.contains("quota")
+        || normalized.contains("plan")
+        || normalized.contains("tier")
+        || normalized.contains("rate limit")
 }
 
 #[cfg(test)]
@@ -195,6 +206,41 @@ mod tests {
 
         let actual = is_provider_context_window_error(&fixture);
         let expected = false;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_provider_context_window_error_rejects_typed_quota_response_with_context_length_text() {
+        let fixture = anyhow!(OpenAiError::Response(
+            ErrorResponse::default()
+                .code(ErrorCode::String("quota_exceeded".to_string()))
+                .message(
+                    "requested maximum context length tier quota exceeded for current plan"
+                        .to_string()
+                ),
+        ));
+
+        let actual = is_provider_context_window_error(&fixture);
+        let expected = false;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_provider_context_window_error_detects_typed_context_length_code_with_quota_like_message()
+     {
+        let fixture = anyhow!(OpenAiError::Response(
+            ErrorResponse::default()
+                .code(ErrorCode::String("context_length_exceeded".to_string()))
+                .message(
+                    "requested maximum context length tier quota exceeded for current plan"
+                        .to_string()
+                ),
+        ));
+
+        let actual = is_provider_context_window_error(&fixture);
+        let expected = true;
 
         assert_eq!(actual, expected);
     }
