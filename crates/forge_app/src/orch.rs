@@ -14,9 +14,7 @@ use url::Url;
 
 use crate::agent::AgentService;
 use crate::compact::Compactor;
-use crate::dto::openai::{
-    Error as OpenAiError, ErrorCode, ErrorResponse, ProviderRequestEstimate, Request,
-};
+use crate::dto::openai::{ProviderRequestEstimate, Request};
 use crate::dto::{anthropic as anthropic_dto, google as google_dto};
 use crate::transformers::{DropReasoningOnlyMessages, ModelSpecificReasoning};
 use crate::{EnvironmentInfra, TemplateEngine};
@@ -1167,67 +1165,42 @@ safety_minimum:
         }
     }
 
-    fn error_response_has_context_window_signal(error: &ErrorResponse) -> bool {
-        let code_matches = error
-            .code
-            .as_ref()
-            .and_then(ErrorCode::as_str)
-            .is_some_and(Self::text_has_context_window_signal);
-        let message_matches = error
-            .message
-            .as_deref()
-            .is_some_and(Self::text_has_context_window_signal);
-        let nested_matches = error
-            .error
-            .as_deref()
-            .is_some_and(Self::error_response_has_context_window_signal);
-
-        code_matches || message_matches || nested_matches
-    }
-
-    fn text_has_context_window_signal(text: &str) -> bool {
-        let normalized = text.to_lowercase();
-        normalized.contains("context_length_exceeded")
-            || normalized.contains("maximum context length")
-            || normalized.contains("context window")
-            || normalized.contains("context length") && normalized.contains("exceed")
-    }
-
     /// Returns true only for provider errors that explicitly indicate the
     /// request exceeded the provider-side context window.
     ///
     /// # Arguments
     /// * `error` - Error chain returned by provider dispatch.
     fn is_provider_context_window_error(error: &anyhow::Error) -> bool {
-        let has_provider_error = error
-            .chain()
-            .any(|cause| cause.downcast_ref::<OpenAiError>().is_some());
-        if !has_provider_error {
-            return false;
-        }
-
-        error.chain().any(|cause| {
-            cause
-                .downcast_ref::<OpenAiError>()
-                .is_some_and(|error| match error {
-                    OpenAiError::Response(response) => {
-                        Self::error_response_has_context_window_signal(response)
-                    }
-                    OpenAiError::InvalidStatusCode(_) => false,
-                })
-                || Self::text_has_context_window_signal(&cause.to_string())
-        })
+        crate::retry::is_provider_context_window_error(error)
     }
 
     async fn recover_provider_context_window_once(
         &mut self,
         context: Context,
+        original_outbound: &Context,
     ) -> anyhow::Result<PreflightContexts> {
+        let original_estimate = self.estimated_request(original_outbound)?;
         let recovered_context = self.max_compacted_canonical_context(context)?;
-        self.conversation.context = Some(recovered_context.clone());
+        let preflight = self
+            .preflight_context_window(recovered_context.clone())
+            .map_err(anyhow::Error::from)?;
+        let recovered_estimate = self.estimated_request(&preflight.outbound)?;
+        if recovered_estimate.estimated_input_tokens >= original_estimate.estimated_input_tokens
+            && recovered_estimate.serialized_request_bytes
+                >= original_estimate.serialized_request_bytes
+        {
+            anyhow::bail!(
+                "Provider reported a context-window overflow, but max-compaction produced no provider-request-size reduction; skipping unchanged provider retry. original_estimated_tokens={}, recovered_estimated_tokens={}, original_serialized_request_bytes={}, recovered_serialized_request_bytes={}",
+                original_estimate.estimated_input_tokens,
+                recovered_estimate.estimated_input_tokens,
+                original_estimate.serialized_request_bytes,
+                recovered_estimate.serialized_request_bytes
+            );
+        }
+
+        self.conversation.context = Some(preflight.canonical.clone());
         self.services.update(self.conversation.clone()).await?;
-        self.preflight_context_window(recovered_context)
-            .map_err(Into::into)
+        Ok(preflight)
     }
 
     async fn execute_prepared_chat_turn_with_provider_context_recovery(
@@ -1262,7 +1235,9 @@ safety_minimum:
         match first_result {
             Ok(message) => Ok((context, message)),
             Err(error) if Self::is_provider_context_window_error(&error) => {
-                let preflight = self.recover_provider_context_window_once(context).await?;
+                let preflight = self
+                    .recover_provider_context_window_once(context, &outbound_context)
+                    .await?;
                 let message = crate::retry::retry_with_config(
                     &self.config.clone().retry.unwrap_or_default(),
                     || self.execute_prepared_chat_turn_vetted(model_id, preflight.outbound.clone()),
@@ -2968,6 +2943,38 @@ mod tests {
 
         assert_eq!(requested_contexts.len(), expected);
         assert!(actual.contains("per-minute token quota"));
+    }
+
+    #[test]
+    fn test_provider_context_window_detection_rejects_quota_wrapper_false_positive() {
+        let setup = anyhow::Context::context(
+            Result::<(), anyhow::Error>::Err(anyhow::Error::from(OpenAiError::Response(
+                ErrorResponse::default().message("token quota exceeded; retry later".to_string()),
+            ))),
+            "requested context window tier quota exceeded for current plan",
+        )
+        .unwrap_err();
+
+        let actual = Orchestrator::<FixtureServices>::is_provider_context_window_error(&setup);
+        let expected = false;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_run_skips_provider_retry_when_context_window_recovery_does_not_reduce_context() {
+        let services = ProviderRecoveryFixtureServices::new(ProviderFailureKind::ContextWindow);
+        let setup = Context::default()
+            .add_message(ContextMessage::user("already minimal", None))
+            .max_tokens(512_usize);
+        let mut fixture = provider_recovery_orchestrator_fixture(services.clone(), setup);
+
+        let actual = fixture.run().await.unwrap_err().to_string();
+        let requested_contexts = services.requested_contexts().await;
+        let expected = 1;
+
+        assert_eq!(requested_contexts.len(), expected);
+        assert!(actual.contains("max-compaction produced no provider-request-size reduction"));
     }
 
     #[tokio::test]
