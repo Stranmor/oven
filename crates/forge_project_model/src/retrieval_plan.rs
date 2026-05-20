@@ -347,6 +347,8 @@ pub struct ProjectContextRetrievalPlanDiagnostic {
     pub selected_summaries: Vec<ProjectContextRetrievalSelectedSummary>,
     /// Bounded metadata-only summaries of planned read requests.
     pub read_request_summaries: Vec<ProjectContextRetrievalReadRequestSummary>,
+    /// Typed redaction-safe retrieval phase diagnostics.
+    pub phase_diagnostics: ProjectContextRetrievalPhaseDiagnostics,
     /// Whether retrieval selected no evidence.
     pub retrieval_empty: bool,
     /// Whether selected or read-request summaries were truncated.
@@ -370,6 +372,7 @@ impl ProjectContextRetrievalPlanDiagnostic {
                 write_decision: None,
                 selected_summaries: Vec::new(),
                 read_request_summaries: Vec::new(),
+                phase_diagnostics: ProjectContextRetrievalPhaseDiagnostics::default(),
                 retrieval_empty: false,
                 truncated: false,
             },
@@ -397,6 +400,7 @@ impl ProjectContextRetrievalPlanDiagnostic {
                     write_decision: Some(plan.write_decision.clone()),
                     selected_summaries,
                     read_request_summaries,
+                    phase_diagnostics: plan.query_diagnostics.phase_diagnostics.clone(),
                     retrieval_empty: selected_result_count == 0,
                     truncated: selected_result_count > MAX_DIAGNOSTIC_SUMMARIES
                         || read_request_count > MAX_DIAGNOSTIC_SUMMARIES,

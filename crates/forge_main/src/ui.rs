@@ -21,7 +21,10 @@ use forge_domain::{
     AuthMethod, ChatResponseContent, ConsoleWriter, ContextMessage, Role, TitleFormat, UserCommand,
     WorkspaceEvidenceLedgerActivationDiagnostic, WorkspaceEvidenceReadinessDiagnostic,
     WorkspaceEvidenceReplayPreviewDiagnostic, WorkspaceExactFactReadinessDiagnostic,
-    WorkspaceRetrievalPlanDiagnostic,
+    WorkspaceRetrievalPhaseDiagnostics, WorkspaceRetrievalPhaseInvalidReason,
+    WorkspaceRetrievalPhaseSkipReason, WorkspaceRetrievalPhaseStatus,
+    WorkspaceRetrievalPhaseUnavailableReason, WorkspaceRetrievalPlanDiagnostic,
+    WorkspaceSemanticReadinessDiagnostic,
 };
 use forge_fs::ForgeFS;
 use forge_select::{ForgeWidget, SelectRow};
@@ -220,6 +223,90 @@ pub struct UI<A: ConsoleWriter, F: Fn(ForgeConfig) -> A> {
     _guard: forge_tracker::Guard,
 }
 
+fn format_retrieval_phase_status(status: &WorkspaceRetrievalPhaseStatus) -> String {
+    match status {
+        WorkspaceRetrievalPhaseStatus::Active { result_count } => {
+            format!("active(result_count={result_count})")
+        }
+        WorkspaceRetrievalPhaseStatus::Skipped { reason } => {
+            format!(
+                "skipped(reason={})",
+                format_retrieval_phase_skip_reason(reason)
+            )
+        }
+        WorkspaceRetrievalPhaseStatus::Unavailable { reason } => {
+            format!(
+                "unavailable(reason={})",
+                format_retrieval_phase_unavailable_reason(reason)
+            )
+        }
+        WorkspaceRetrievalPhaseStatus::Invalid { reason } => {
+            format!(
+                "invalid(reason={})",
+                format_retrieval_phase_invalid_reason(reason)
+            )
+        }
+    }
+}
+
+fn format_retrieval_phase_skip_reason(reason: &WorkspaceRetrievalPhaseSkipReason) -> &'static str {
+    match reason {
+        WorkspaceRetrievalPhaseSkipReason::EmptyQueryText => "missing_query_text",
+        WorkspaceRetrievalPhaseSkipReason::GraphExpansionDisabled => "graph_expansion_disabled",
+    }
+}
+
+fn format_retrieval_phase_unavailable_reason(
+    reason: &WorkspaceRetrievalPhaseUnavailableReason,
+) -> &'static str {
+    match reason {
+        WorkspaceRetrievalPhaseUnavailableReason::MissingQueryEmbedding => {
+            "missing_query_embedding"
+        }
+        WorkspaceRetrievalPhaseUnavailableReason::MissingVectorIndex => "missing_vector_index",
+        WorkspaceRetrievalPhaseUnavailableReason::VectorIndexNotReady => "vector_index_not_ready",
+        WorkspaceRetrievalPhaseUnavailableReason::MissingReranker => "missing_reranker_runtime",
+        WorkspaceRetrievalPhaseUnavailableReason::RerankerNotReady => "reranker_runtime_not_ready",
+        WorkspaceRetrievalPhaseUnavailableReason::NoMatchingVectorIndex => {
+            "no_matching_vector_index"
+        }
+        WorkspaceRetrievalPhaseUnavailableReason::AmbiguousVectorIndex => "ambiguous_vector_index",
+    }
+}
+
+fn format_retrieval_phase_invalid_reason(reason: &WorkspaceRetrievalPhaseInvalidReason) -> String {
+    match reason {
+        WorkspaceRetrievalPhaseInvalidReason::VectorDimensionMismatch {
+            query_dimension,
+            index_dimension,
+        } => format!(
+            "vector_dimension_mismatch(query_dimension={query_dimension},index_dimension={index_dimension})"
+        ),
+        WorkspaceRetrievalPhaseInvalidReason::VectorIndexZeroDimension => {
+            "vector_index_zero_dimension".to_string()
+        }
+        WorkspaceRetrievalPhaseInvalidReason::EmptyQueryEmbedding => {
+            "empty_query_embedding".to_string()
+        }
+        WorkspaceRetrievalPhaseInvalidReason::NonFiniteQueryEmbedding => {
+            "non_finite_query_embedding".to_string()
+        }
+        WorkspaceRetrievalPhaseInvalidReason::ZeroQueryEmbeddingNorm => {
+            "zero_query_embedding_norm".to_string()
+        }
+    }
+}
+
+fn format_retrieval_phase_diagnostics(diagnostics: &WorkspaceRetrievalPhaseDiagnostics) -> String {
+    format!(
+        "lexical={} graph={} vector={} rerank={}",
+        format_retrieval_phase_status(&diagnostics.lexical),
+        format_retrieval_phase_status(&diagnostics.graph),
+        format_retrieval_phase_status(&diagnostics.vector),
+        format_retrieval_phase_status(&diagnostics.rerank),
+    )
+}
+
 fn format_retrieval_plan_diagnostic(diagnostic: &WorkspaceRetrievalPlanDiagnostic) -> String {
     let selected = diagnostic
         .selected_summaries
@@ -254,7 +341,7 @@ fn format_retrieval_plan_diagnostic(diagnostic: &WorkspaceRetrievalPlanDiagnosti
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "scope=query_specific_read_only_pre_readback_planner_derived workspace_label={} manifest_label={} planned={} refusal_code={} refusal_detail={} selected_results={} read_requests={} write_decision={} retrieval_empty={} truncated={} selected=[{}] planned_reads=[{}]",
+        "scope=query_specific_read_only_pre_readback_planner_derived workspace_label={} manifest_label={} planned={} refusal_code={} refusal_detail={} selected_results={} read_requests={} write_decision={} phases=\"{}\" retrieval_empty={} truncated={} selected=[{}] planned_reads=[{}]",
         diagnostic.workspace_root_label,
         diagnostic.manifest_label,
         diagnostic.planned,
@@ -263,6 +350,7 @@ fn format_retrieval_plan_diagnostic(diagnostic: &WorkspaceRetrievalPlanDiagnosti
         diagnostic.selected_result_count,
         diagnostic.read_request_count,
         diagnostic.write_decision.as_deref().unwrap_or("none"),
+        format_retrieval_phase_diagnostics(&diagnostic.phase_diagnostics),
         diagnostic.retrieval_empty,
         diagnostic.truncated,
         selected,
@@ -5892,6 +5980,27 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         }
 
         info = info.add_title(format!(
+            "Semantic Vector Readiness [{}]",
+            explanation.semantic_readiness.len()
+        ));
+        info = info.add_key_value(
+            "Semantic Readiness Scope",
+            "current durable vector artifact usability; read-only; separate from retrieval phase participation",
+        );
+        if explanation.semantic_readiness.is_empty() {
+            info = info.add_key_value(
+                "Semantic Readiness",
+                "not evaluated for any selected or skipped manifest target",
+            );
+        }
+        for diagnostic in &explanation.semantic_readiness {
+            info = info.add_key_value(
+                "Semantic Readiness",
+                Self::format_semantic_readiness_diagnostic(diagnostic),
+            );
+        }
+
+        info = info.add_title(format!(
             "Query-Specific Retrieval Plan Diagnostics [{}]",
             explanation.retrieval_plan_diagnostics.len()
         ));
@@ -5942,6 +6051,22 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         }
 
         self.writeln(info)
+    }
+
+    fn format_semantic_readiness_diagnostic(
+        diagnostic: &WorkspaceSemanticReadinessDiagnostic,
+    ) -> String {
+        format!(
+            "scope=current_durable_vector_artifact workspace_label={} evaluated={} status={:?} dimension={} not_evaluated_reason={}",
+            diagnostic.workspace_root_label,
+            diagnostic.evaluated,
+            diagnostic.status,
+            diagnostic
+                .dimension
+                .map(|dimension| dimension.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            diagnostic.not_evaluated_reason.as_deref().unwrap_or("none"),
+        )
     }
 
     fn format_replay_preview_diagnostic(
@@ -6780,6 +6905,7 @@ mod tests {
                 start_line: 1,
                 end_line: 3,
             }],
+            phase_diagnostics: WorkspaceRetrievalPhaseDiagnostics::default(),
             retrieval_empty: false,
             truncated: false,
         };

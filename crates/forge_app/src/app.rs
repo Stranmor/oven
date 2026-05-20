@@ -14,14 +14,16 @@ use forge_project_model::{
     LearningRedactionStatus as ProjectLearningRedactionStatus,
     LearningReviewState as ProjectLearningReviewState,
     LearningSourceKind as ProjectLearningSourceKind, ProjectContextPathScope,
-    ProjectContextRetrievalPlanDiagnostic, ProjectContextRetrievalReadRequestSummary,
-    ProjectContextRetrievalRequest, ProjectContextRetrievalSelectedSummary, ProjectContextTarget,
-    ProjectContextWriteDecision, ProjectIndexer, ProjectModelContextReadinessMetadata,
-    ProjectModelContextRenderBudget, ProjectModelEvidenceLedgerActivationMetadata,
-    ProjectModelEvidenceReadinessMetadata, ProjectModelExactFactReadinessMetadata,
-    ProjectModelSourceNode, TargetResolutionBudget, directory_path_filter, local_project_model_dir,
-    local_project_model_manifest, mentioned_paths, plan_project_context_retrieval,
-    render_project_model_context, render_sources_from_nodes,
+    ProjectContextRetrievalPhaseDiagnostics, ProjectContextRetrievalPhaseInvalidReason,
+    ProjectContextRetrievalPhaseSkipReason, ProjectContextRetrievalPhaseStatus,
+    ProjectContextRetrievalPhaseUnavailableReason, ProjectContextRetrievalPlanDiagnostic,
+    ProjectContextRetrievalReadRequestSummary, ProjectContextRetrievalRequest,
+    ProjectContextRetrievalSelectedSummary, ProjectContextTarget, ProjectContextWriteDecision,
+    ProjectIndexer, ProjectModelContextReadinessMetadata, ProjectModelContextRenderBudget,
+    ProjectModelEvidenceLedgerActivationMetadata, ProjectModelEvidenceReadinessMetadata,
+    ProjectModelExactFactReadinessMetadata, ProjectModelSourceNode, TargetResolutionBudget,
+    directory_path_filter, local_project_model_dir, local_project_model_manifest, mentioned_paths,
+    plan_project_context_retrieval, render_project_model_context, render_sources_from_nodes,
 };
 use forge_stream::MpscStream;
 use url::Url;
@@ -528,6 +530,9 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
             }
         }
 
+        let semantic_readiness = self
+            .semantic_readiness_diagnostics(&target_specs, &nearest_skipped_manifest_candidates)
+            .await;
         let retrieval_empty_targets = Vec::new();
         let has_query = query.as_deref().is_some_and(|query| !query.is_empty());
         let retrieval_plan_diagnostics = if has_query {
@@ -558,10 +563,123 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
             selected_targets,
             nearest_skipped_manifest_candidates,
             retrieval_empty_targets,
+            semantic_readiness,
             retrieval_plan_diagnostics,
             replay_preview_diagnostics,
             would_inject,
             skip_reason,
+        }
+    }
+
+    async fn semantic_readiness_diagnostics(
+        &self,
+        target_specs: &[ProjectContextTargetDiagnostic],
+        skipped_manifest_candidates: &[WorkspaceContextManifestDiagnostic],
+    ) -> Vec<WorkspaceSemanticReadinessDiagnostic> {
+        let embedding_model_id = self
+            .services
+            .get_config()
+            .ok()
+            .and_then(|config| config.semantic_embedding_model_id);
+        let mut diagnostics = Vec::new();
+        for target_diagnostic in target_specs.iter().take(Self::MAX_TARGETS) {
+            diagnostics.push(
+                self.semantic_readiness_diagnostic_for_workspace(
+                    &target_diagnostic.target.workspace_root,
+                    embedding_model_id.clone(),
+                )
+                .await,
+            );
+        }
+        let remaining = Self::MAX_TARGETS.saturating_sub(diagnostics.len());
+        for manifest_diagnostic in skipped_manifest_candidates.iter().take(remaining) {
+            if manifest_diagnostic.manifest_found {
+                diagnostics.push(
+                    self.semantic_readiness_diagnostic_for_workspace(
+                        &manifest_diagnostic.workspace_root,
+                        embedding_model_id.clone(),
+                    )
+                    .await,
+                );
+            } else {
+                diagnostics.push(WorkspaceSemanticReadinessDiagnostic {
+                    workspace_root_label: "workspace_root".to_string(),
+                    evaluated: false,
+                    status: WorkspaceSemanticReadinessStatus::NotEvaluated,
+                    dimension: None,
+                    not_evaluated_reason: Some("project-model manifest not found".to_string()),
+                });
+            }
+        }
+        diagnostics
+    }
+
+    async fn semantic_readiness_diagnostic_for_workspace(
+        &self,
+        workspace_root: &Path,
+        embedding_model_id: Option<String>,
+    ) -> WorkspaceSemanticReadinessDiagnostic {
+        match self
+            .services
+            .semantic_injection_readiness(workspace_root.to_path_buf(), embedding_model_id)
+            .await
+        {
+            Ok(readiness) => Self::semantic_readiness_diagnostic_from_readiness(readiness),
+            Err(error) => {
+                tracing::debug!(error = ?error, path = %workspace_root.display(), "Explain-context semantic readiness diagnostic failed for target");
+                WorkspaceSemanticReadinessDiagnostic {
+                    workspace_root_label: "workspace_root".to_string(),
+                    evaluated: true,
+                    status: WorkspaceSemanticReadinessStatus::VectorIndexCorruptOrNotReady,
+                    dimension: None,
+                    not_evaluated_reason: None,
+                }
+            }
+        }
+    }
+
+    fn semantic_readiness_diagnostic_from_readiness(
+        readiness: WorkspaceSemanticInjectionReadiness,
+    ) -> WorkspaceSemanticReadinessDiagnostic {
+        let (status, dimension) = match readiness {
+            WorkspaceSemanticInjectionReadiness::SemanticDisabledNoModelConfig => (
+                WorkspaceSemanticReadinessStatus::SemanticDisabledNoModelConfig,
+                None,
+            ),
+            WorkspaceSemanticInjectionReadiness::VectorIndexAbsentOrNoMatch => (
+                WorkspaceSemanticReadinessStatus::VectorIndexAbsentOrNoMatch,
+                None,
+            ),
+            WorkspaceSemanticInjectionReadiness::VectorIndexReady { dimension } => (
+                WorkspaceSemanticReadinessStatus::VectorIndexReady,
+                Some(dimension),
+            ),
+            WorkspaceSemanticInjectionReadiness::VectorIndexAmbiguous => {
+                (WorkspaceSemanticReadinessStatus::VectorIndexAmbiguous, None)
+            }
+            WorkspaceSemanticInjectionReadiness::VectorIndexCorruptOrNotReady => (
+                WorkspaceSemanticReadinessStatus::VectorIndexCorruptOrNotReady,
+                None,
+            ),
+            WorkspaceSemanticInjectionReadiness::VectorDimensionMismatch { .. } => (
+                WorkspaceSemanticReadinessStatus::VectorDimensionMismatch,
+                None,
+            ),
+            WorkspaceSemanticInjectionReadiness::EmbeddingProviderUnavailable => (
+                WorkspaceSemanticReadinessStatus::EmbeddingProviderUnavailable,
+                None,
+            ),
+            WorkspaceSemanticInjectionReadiness::EmbeddingProviderTimeout => (
+                WorkspaceSemanticReadinessStatus::EmbeddingProviderTimeout,
+                None,
+            ),
+        };
+        WorkspaceSemanticReadinessDiagnostic {
+            workspace_root_label: "workspace_root".to_string(),
+            evaluated: true,
+            status,
+            dimension,
+            not_evaluated_reason: None,
         }
     }
 
@@ -656,8 +774,112 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
                 .into_iter()
                 .map(Self::read_request_summary_to_domain)
                 .collect(),
+            phase_diagnostics: Self::phase_diagnostics_to_domain(diagnostic.phase_diagnostics),
             retrieval_empty: diagnostic.retrieval_empty,
             truncated: diagnostic.truncated,
+        }
+    }
+
+    fn phase_diagnostics_to_domain(
+        diagnostics: ProjectContextRetrievalPhaseDiagnostics,
+    ) -> WorkspaceRetrievalPhaseDiagnostics {
+        WorkspaceRetrievalPhaseDiagnostics {
+            lexical: Self::phase_status_to_domain(diagnostics.lexical),
+            graph: Self::phase_status_to_domain(diagnostics.graph),
+            vector: Self::phase_status_to_domain(diagnostics.vector),
+            rerank: Self::phase_status_to_domain(diagnostics.rerank),
+        }
+    }
+
+    fn phase_status_to_domain(
+        status: ProjectContextRetrievalPhaseStatus,
+    ) -> WorkspaceRetrievalPhaseStatus {
+        match status {
+            ProjectContextRetrievalPhaseStatus::Active { result_count } => {
+                WorkspaceRetrievalPhaseStatus::Active { result_count }
+            }
+            ProjectContextRetrievalPhaseStatus::Skipped(reason) => {
+                WorkspaceRetrievalPhaseStatus::Skipped {
+                    reason: Self::phase_skip_reason_to_domain(reason),
+                }
+            }
+            ProjectContextRetrievalPhaseStatus::Unavailable(reason) => {
+                WorkspaceRetrievalPhaseStatus::Unavailable {
+                    reason: Self::phase_unavailable_reason_to_domain(reason),
+                }
+            }
+            ProjectContextRetrievalPhaseStatus::Invalid(reason) => {
+                WorkspaceRetrievalPhaseStatus::Invalid {
+                    reason: Self::phase_invalid_reason_to_domain(reason),
+                }
+            }
+        }
+    }
+
+    fn phase_skip_reason_to_domain(
+        reason: ProjectContextRetrievalPhaseSkipReason,
+    ) -> WorkspaceRetrievalPhaseSkipReason {
+        match reason {
+            ProjectContextRetrievalPhaseSkipReason::EmptyQueryText => {
+                WorkspaceRetrievalPhaseSkipReason::EmptyQueryText
+            }
+            ProjectContextRetrievalPhaseSkipReason::GraphExpansionDisabled => {
+                WorkspaceRetrievalPhaseSkipReason::GraphExpansionDisabled
+            }
+        }
+    }
+
+    fn phase_unavailable_reason_to_domain(
+        reason: ProjectContextRetrievalPhaseUnavailableReason,
+    ) -> WorkspaceRetrievalPhaseUnavailableReason {
+        match reason {
+            ProjectContextRetrievalPhaseUnavailableReason::MissingQueryEmbedding => {
+                WorkspaceRetrievalPhaseUnavailableReason::MissingQueryEmbedding
+            }
+            ProjectContextRetrievalPhaseUnavailableReason::MissingVectorIndex => {
+                WorkspaceRetrievalPhaseUnavailableReason::MissingVectorIndex
+            }
+            ProjectContextRetrievalPhaseUnavailableReason::VectorIndexNotReady => {
+                WorkspaceRetrievalPhaseUnavailableReason::VectorIndexNotReady
+            }
+            ProjectContextRetrievalPhaseUnavailableReason::MissingReranker => {
+                WorkspaceRetrievalPhaseUnavailableReason::MissingReranker
+            }
+            ProjectContextRetrievalPhaseUnavailableReason::RerankerNotReady => {
+                WorkspaceRetrievalPhaseUnavailableReason::RerankerNotReady
+            }
+            ProjectContextRetrievalPhaseUnavailableReason::NoMatchingVectorIndex => {
+                WorkspaceRetrievalPhaseUnavailableReason::NoMatchingVectorIndex
+            }
+            ProjectContextRetrievalPhaseUnavailableReason::AmbiguousVectorIndex => {
+                WorkspaceRetrievalPhaseUnavailableReason::AmbiguousVectorIndex
+            }
+        }
+    }
+
+    fn phase_invalid_reason_to_domain(
+        reason: ProjectContextRetrievalPhaseInvalidReason,
+    ) -> WorkspaceRetrievalPhaseInvalidReason {
+        match reason {
+            ProjectContextRetrievalPhaseInvalidReason::VectorDimensionMismatch {
+                query_dimension,
+                index_dimension,
+            } => WorkspaceRetrievalPhaseInvalidReason::VectorDimensionMismatch {
+                query_dimension,
+                index_dimension,
+            },
+            ProjectContextRetrievalPhaseInvalidReason::VectorIndexZeroDimension => {
+                WorkspaceRetrievalPhaseInvalidReason::VectorIndexZeroDimension
+            }
+            ProjectContextRetrievalPhaseInvalidReason::EmptyQueryEmbedding => {
+                WorkspaceRetrievalPhaseInvalidReason::EmptyQueryEmbedding
+            }
+            ProjectContextRetrievalPhaseInvalidReason::NonFiniteQueryEmbedding => {
+                WorkspaceRetrievalPhaseInvalidReason::NonFiniteQueryEmbedding
+            }
+            ProjectContextRetrievalPhaseInvalidReason::ZeroQueryEmbeddingNorm => {
+                WorkspaceRetrievalPhaseInvalidReason::ZeroQueryEmbeddingNorm
+            }
         }
     }
 
@@ -2693,6 +2915,7 @@ mod tests {
         learning_records: Mutex<Vec<LearningRecordProjection>>,
         learning_freshness: LearningLedgerFreshness,
         config: ForgeConfig,
+        semantic_model_disabled: AtomicBool,
         semantic_readiness: Mutex<HashMap<PathBuf, WorkspaceSemanticInjectionReadiness>>,
         embedding_calls: AtomicUsize,
         embedding_inputs: Mutex<Vec<String>>,
@@ -2825,6 +3048,7 @@ mod tests {
                     review_state_fingerprint: "fixture-learning".to_string(),
                 },
                 config,
+                semantic_model_disabled: AtomicBool::new(false),
                 semantic_readiness: Mutex::new(HashMap::new()),
                 embedding_calls: AtomicUsize::new(0),
                 embedding_inputs: Mutex::new(Vec::new()),
@@ -2845,6 +3069,10 @@ mod tests {
         ) {
             let path = fs::canonicalize(&path).unwrap_or(path);
             self.semantic_readiness.lock().await.insert(path, readiness);
+        }
+
+        fn disable_semantic_embedding_model(&self) {
+            self.semantic_model_disabled.store(true, Ordering::SeqCst);
         }
 
         fn fail_embedding(&self) {
@@ -2882,7 +3110,11 @@ mod tests {
         }
 
         fn get_config(&self) -> Result<Self::Config> {
-            Ok(self.config.clone())
+            let mut config = self.config.clone();
+            if self.semantic_model_disabled.load(Ordering::SeqCst) {
+                config.semantic_embedding_model_id = None;
+            }
+            Ok(config)
         }
 
         async fn update_environment(&self, _ops: Vec<forge_domain::ConfigOperation>) -> Result<()> {
@@ -4754,6 +4986,237 @@ mod tests {
         );
         assert!(actual_plan.selected_result_count > 0);
         assert!(actual_plan.read_request_count > 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_context_with_query_does_not_call_embedding_provider() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root.clone());
+        setup
+            .set_semantic_readiness(
+                root,
+                WorkspaceSemanticInjectionReadiness::VectorIndexReady { dimension: 2 },
+            )
+            .await;
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
+
+        let actual = ProjectContextInjection::new(setup.clone(), agent)
+            .explain(Some("find automatic injection needle".to_string()))
+            .await;
+        let actual_readiness = actual
+            .semantic_readiness
+            .first()
+            .expect("semantic readiness diagnostic should be present");
+        let actual_plan = actual
+            .retrieval_plan_diagnostics
+            .first()
+            .expect("retrieval plan diagnostic should be present");
+        let expected = (
+            0usize,
+            WorkspaceSemanticReadinessStatus::VectorIndexReady,
+            Some(2usize),
+            WorkspaceRetrievalPhaseStatus::Unavailable {
+                reason: WorkspaceRetrievalPhaseUnavailableReason::MissingQueryEmbedding,
+            },
+        );
+
+        assert_eq!(
+            (
+                setup.embedding_calls.load(Ordering::SeqCst),
+                actual_readiness.status.clone(),
+                actual_readiness.dimension,
+                actual_plan.phase_diagnostics.vector.clone(),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_context_semantic_no_model_config_reports_disabled_diagnostic() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root);
+        setup.disable_semantic_embedding_model();
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
+
+        let actual = ProjectContextInjection::new(setup, agent)
+            .explain(Some("find automatic injection needle".to_string()))
+            .await;
+        let actual = actual
+            .semantic_readiness
+            .first()
+            .expect("semantic readiness diagnostic should be present");
+        let expected = (
+            true,
+            WorkspaceSemanticReadinessStatus::SemanticDisabledNoModelConfig,
+            None,
+        );
+
+        assert_eq!(
+            (actual.evaluated, actual.status.clone(), actual.dimension),
+            expected
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_context_semantic_absent_no_match_reports_absent_diagnostic() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root);
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
+
+        let actual = ProjectContextInjection::new(setup, agent)
+            .explain(Some("find automatic injection needle".to_string()))
+            .await;
+        let actual = actual
+            .semantic_readiness
+            .first()
+            .expect("semantic readiness diagnostic should be present");
+        let expected = WorkspaceSemanticReadinessStatus::VectorIndexAbsentOrNoMatch;
+
+        assert_eq!(actual.status, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_context_semantic_ambiguous_reports_invalid_ambiguous_diagnostic() -> Result<()>
+    {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root.clone());
+        setup
+            .set_semantic_readiness(
+                root,
+                WorkspaceSemanticInjectionReadiness::VectorIndexAmbiguous,
+            )
+            .await;
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
+
+        let actual = ProjectContextInjection::new(setup, agent)
+            .explain(Some("find automatic injection needle".to_string()))
+            .await;
+        let actual = actual
+            .semantic_readiness
+            .first()
+            .expect("semantic readiness diagnostic should be present");
+        let expected = WorkspaceSemanticReadinessStatus::VectorIndexAmbiguous;
+
+        assert_eq!(actual.status, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_context_semantic_corrupt_reports_invalid_not_ready_diagnostic() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root.clone());
+        setup
+            .set_semantic_readiness(
+                root,
+                WorkspaceSemanticInjectionReadiness::VectorIndexCorruptOrNotReady,
+            )
+            .await;
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
+
+        let actual = ProjectContextInjection::new(setup, agent)
+            .explain(Some("find automatic injection needle".to_string()))
+            .await;
+        let actual = actual
+            .semantic_readiness
+            .first()
+            .expect("semantic readiness diagnostic should be present");
+        let expected = WorkspaceSemanticReadinessStatus::VectorIndexCorruptOrNotReady;
+
+        assert_eq!(actual.status, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_context_reranker_phase_reports_missing_runtime_without_activation()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root);
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
+
+        let actual = ProjectContextInjection::new(setup, agent)
+            .explain(Some("find automatic injection needle".to_string()))
+            .await;
+        let actual = actual
+            .retrieval_plan_diagnostics
+            .first()
+            .expect("retrieval plan diagnostic should be present");
+        let expected = WorkspaceRetrievalPhaseStatus::Unavailable {
+            reason: WorkspaceRetrievalPhaseUnavailableReason::MissingReranker,
+        };
+
+        assert_eq!(actual.phase_diagnostics.rerank, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_context_porcelain_json_contains_no_raw_embeddings_snippets_or_provider_payloads()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root.clone());
+        setup
+            .set_semantic_readiness(
+                root,
+                WorkspaceSemanticInjectionReadiness::VectorIndexReady { dimension: 2 },
+            )
+            .await;
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
+
+        let actual = ProjectContextInjection::new(setup, agent)
+            .explain(Some("find automatic injection needle".to_string()))
+            .await;
+        let actual = serde_json::to_string(&actual)?;
+        let expected = (false, false, false, false, true);
+
+        assert_eq!(
+            (
+                actual.contains("embedding\":"),
+                actual.contains("pub fn automatic_injection_needle"),
+                actual.contains("provider_request"),
+                actual.contains("provider_response"),
+                actual.contains("semantic_readiness"),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_context_does_not_perform_workspace_query_writes_or_episode_appends()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root);
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
+
+        let actual = ProjectContextInjection::new(setup.clone(), agent)
+            .explain(Some("find automatic injection needle".to_string()))
+            .await;
+        let expected = (0usize, 0usize, true, true);
+
+        assert_eq!(
+            (
+                setup.workspace_queries.load(Ordering::SeqCst),
+                setup.learning_records.lock().await.len(),
+                actual
+                    .retrieval_plan_diagnostics
+                    .first()
+                    .is_some_and(|diagnostic| diagnostic.write_decision.as_deref()
+                        == Some("WriteContextPackAfterReadback")),
+                actual.replay_preview_diagnostics.len() == 1,
+            ),
+            expected,
+        );
         Ok(())
     }
 

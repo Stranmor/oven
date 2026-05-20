@@ -318,6 +318,138 @@ pub struct WorkspaceContextCandidateDiagnostic {
     pub skip_reason: Option<String>,
 }
 
+/// Typed semantic readiness diagnostic for read-only workspace context explanations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSemanticReadinessDiagnostic {
+    /// Stable redaction-safe label for the workspace root being evaluated.
+    pub workspace_root_label: String,
+    /// Whether local semantic readiness was evaluated for this target.
+    pub evaluated: bool,
+    /// Semantic readiness status when evaluation completed.
+    pub status: WorkspaceSemanticReadinessStatus,
+    /// Fixed vector dimension when a current durable vector artifact is usable.
+    pub dimension: Option<usize>,
+    /// Redaction-safe reason when readiness was intentionally not evaluated.
+    pub not_evaluated_reason: Option<String>,
+}
+
+/// Stable semantic readiness status for read-only workspace context explanations.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceSemanticReadinessStatus {
+    /// Semantic retrieval is disabled because no embedding model is configured.
+    SemanticDisabledNoModelConfig,
+    /// No durable vector index matches the current manifest and embedding model.
+    VectorIndexAbsentOrNoMatch,
+    /// Exactly one current durable vector artifact is usable.
+    VectorIndexReady,
+    /// More than one current durable vector artifact matched.
+    VectorIndexAmbiguous,
+    /// Durable vector artifact state is corrupt, unreadable, or structurally not ready.
+    VectorIndexCorruptOrNotReady,
+    /// Query/runtime vector dimension does not match the durable index.
+    VectorDimensionMismatch,
+    /// Embedding provider is unavailable; included only when a runtime semantic attempt reported it.
+    EmbeddingProviderUnavailable,
+    /// Embedding provider timed out; included only when a runtime semantic attempt reported it.
+    EmbeddingProviderTimeout,
+    /// Target was not evaluated by the read-only diagnostic bridge.
+    #[default]
+    NotEvaluated,
+}
+
+/// Typed redaction-safe phase diagnostics for explain-context retrieval planning.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceRetrievalPhaseDiagnostics {
+    /// Lexical retrieval phase status.
+    pub lexical: WorkspaceRetrievalPhaseStatus,
+    /// Graph retrieval phase status.
+    pub graph: WorkspaceRetrievalPhaseStatus,
+    /// Vector retrieval phase status.
+    pub vector: WorkspaceRetrievalPhaseStatus,
+    /// Rerank phase status.
+    pub rerank: WorkspaceRetrievalPhaseStatus,
+}
+
+/// Stable phase status for explain-context retrieval planning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceRetrievalPhaseStatus {
+    /// Phase was active in the read-only plan projection.
+    Active {
+        /// Number of selected results carrying this phase score.
+        result_count: usize,
+    },
+    /// Phase was intentionally skipped by request shape.
+    Skipped {
+        /// Stable skip reason.
+        reason: WorkspaceRetrievalPhaseSkipReason,
+    },
+    /// Phase could not run because runtime input or boundary was missing/not ready.
+    Unavailable {
+        /// Stable unavailable reason.
+        reason: WorkspaceRetrievalPhaseUnavailableReason,
+    },
+    /// Phase input was present but invalid.
+    Invalid {
+        /// Stable invalid reason.
+        reason: WorkspaceRetrievalPhaseInvalidReason,
+    },
+}
+
+impl Default for WorkspaceRetrievalPhaseStatus {
+    fn default() -> Self {
+        Self::Skipped { reason: WorkspaceRetrievalPhaseSkipReason::EmptyQueryText }
+    }
+}
+
+/// Stable skip reason for explain-context retrieval planning phases.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceRetrievalPhaseSkipReason {
+    /// Query text is empty.
+    #[default]
+    EmptyQueryText,
+    /// Graph expansion was not requested.
+    GraphExpansionDisabled,
+}
+
+/// Stable unavailable reason for explain-context retrieval planning phases.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceRetrievalPhaseUnavailableReason {
+    /// Vector query embedding was not supplied because explain-context is read-only.
+    MissingQueryEmbedding,
+    /// Vector index boundary was not supplied.
+    MissingVectorIndex,
+    /// Vector index boundary reported not-ready status.
+    VectorIndexNotReady,
+    /// Reranker runtime boundary was not supplied.
+    MissingReranker,
+    /// Reranker runtime boundary reported not-ready status.
+    RerankerNotReady,
+    /// No durable vector index matched.
+    NoMatchingVectorIndex,
+    /// More than one durable vector index matched.
+    AmbiguousVectorIndex,
+}
+
+/// Stable invalid reason for explain-context retrieval planning phases.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceRetrievalPhaseInvalidReason {
+    /// Query vector dimension differs from index dimension.
+    VectorDimensionMismatch {
+        /// Query embedding dimension.
+        query_dimension: usize,
+        /// Durable index dimension.
+        index_dimension: usize,
+    },
+    /// Ready vector index reported zero dimensions.
+    VectorIndexZeroDimension,
+    /// Query embedding was empty.
+    EmptyQueryEmbedding,
+    /// Query embedding contains a non-finite value.
+    NonFiniteQueryEmbedding,
+    /// Query embedding has zero norm.
+    ZeroQueryEmbeddingNorm,
+}
+
 /// Query-specific read-only retrieval-plan diagnostic for explain-context.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceRetrievalPlanDiagnostic {
@@ -341,6 +473,9 @@ pub struct WorkspaceRetrievalPlanDiagnostic {
     pub selected_summaries: Vec<WorkspaceRetrievalPlanSelectedSummary>,
     /// Bounded metadata-only summaries of planned read requests.
     pub read_request_summaries: Vec<WorkspaceRetrievalPlanReadRequestSummary>,
+    /// Typed phase diagnostics derived from the read-only planner only.
+    #[serde(default)]
+    pub phase_diagnostics: WorkspaceRetrievalPhaseDiagnostics,
     /// Whether retrieval selected no evidence.
     pub retrieval_empty: bool,
     /// Whether selected or read-request summaries were truncated.
@@ -392,6 +527,10 @@ pub struct WorkspaceContextExplanation {
     /// explained query. This legacy field is preserved for porcelain
     /// compatibility; read-only explain no longer performs retrieval dry-runs.
     pub retrieval_empty_targets: Vec<PathBuf>,
+    /// Typed semantic readiness diagnostics for current durable vector artifacts.
+    /// This is separate from read-only retrieval phase participation.
+    #[serde(default)]
+    pub semantic_readiness: Vec<WorkspaceSemanticReadinessDiagnostic>,
     /// Query-specific read-only retrieval-plan diagnostics. These diagnostics
     /// are planner-derived, pre-readback, and never include source content or
     /// persisted context-pack bodies.
@@ -429,12 +568,14 @@ mod tests {
         let expected = (
             Vec::<WorkspaceEvidenceReplayPreviewDiagnostic>::new(),
             Vec::<WorkspaceRetrievalPlanDiagnostic>::new(),
+            Vec::<WorkspaceSemanticReadinessDiagnostic>::new(),
         );
 
         assert_eq!(
             (
                 actual.replay_preview_diagnostics,
                 actual.retrieval_plan_diagnostics,
+                actual.semantic_readiness,
             ),
             expected,
         );
