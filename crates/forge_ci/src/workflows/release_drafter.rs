@@ -1,35 +1,24 @@
 use gh_workflow::generate::Generate;
 use gh_workflow::*;
 
-use crate::jobs::draft_release_update_job;
-
-/// Generate release drafter workflow
+/// Generate a disabled release-drafter workflow for this fork.
 pub fn generate_release_drafter_workflow() {
-    let release_drafter = Workflow::default()
-        .name("Release Drafter")
+    let disabled_job = Job::new("Release drafting disabled")
+        .permissions(Permissions::default().contents(Level::Read))
+        .add_step(Step::new("Explain disabled release drafting").run(
+            "echo 'Release drafting is disabled in Stranmor/oven until fork-owned release policy is configured.'",
+        ));
+
+    let workflow = Workflow::default()
+        .name("Release Drafting Disabled")
         .on(Event {
-            push: Some(Push { branches: vec!["main".to_string()], ..Push::default() }),
-            pull_request_target: Some(PullRequestTarget {
-                types: vec![
-                    PullRequestType::Opened,
-                    PullRequestType::Reopened,
-                    PullRequestType::Synchronize,
-                    PullRequestType::Labeled,
-                    PullRequestType::Unlabeled,
-                    PullRequestType::Closed,
-                ],
-                branches: vec!["main".to_string()],
-            }),
+            workflow_dispatch: Some(WorkflowDispatch::default()),
             ..Event::default()
         })
-        .permissions(
-            Permissions::default()
-                .contents(Level::Write)
-                .pull_requests(Level::Write),
-        )
-        .add_job("update_release_draft", draft_release_update_job());
+        .permissions(Permissions::default().contents(Level::Read))
+        .add_job("release_drafting_disabled", disabled_job);
 
-    Generate::new(release_drafter)
+    Generate::new(workflow)
         .name("release-drafter.yml")
         .generate()
         .unwrap();

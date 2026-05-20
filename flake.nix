@@ -1,5 +1,5 @@
 {
-  description = "forge: AI enabled pair programmer for Claude, GPT, O Series, Grok, Deepseek, Gemini and 300+ models";
+  description = "Stranmor/oven: maintained ForgeCode fork with a Rust AI coding-agent terminal environment";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -87,9 +87,9 @@
             doCheck = false;
 
             meta = {
-              description = "forge: AI enabled pair programmer for Claude, GPT, O Series, Grok, Deepseek, Gemini and 300+ models";
-              homepage = "https://forgecode.dev";
-              license = lib.licenses.mit;
+              description = "Maintained ForgeCode fork with a Rust AI coding-agent terminal environment";
+              homepage = "https://github.com/Stranmor/oven";
+              license = lib.licenses.asl20;
               mainProgram = "forge";
               platforms = lib.platforms.unix;
             };

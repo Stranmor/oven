@@ -2,9 +2,9 @@
   "name": "forge-code-evals",
   "private": true,
   "version": "1.0.0",
-  "description": "",
-  "license": "ISC",
-  "author": "Tushar Mathur <tusharmath@gmail.com>",
+  "description": "Repository-local evaluation and maintenance tooling for the Stranmor/oven ForgeCode fork.",
+  "license": "Apache-2.0",
+  "author": "Stranmor and ForgeCode contributors",
   "type": "module",
   "scripts": {
     "eval": "tsx benchmarks/cli.ts",

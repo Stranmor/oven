@@ -15,37 +15,17 @@
 # ----------------------------- END WARNING -------------------------
 # -------------------------------------------------------------------
 
-name: Close Stale Issues and PR
-env:
-  DAYS_BEFORE_ISSUE_STALE: '30'
-  DAYS_BEFORE_ISSUE_CLOSE: '7'
-  DAYS_BEFORE_PR_STALE: '5'
-  DAYS_BEFORE_PR_CLOSE: '10'
+name: Stale Automation Disabled
 'on':
-  schedule:
-  - cron: '0 * * * *'
+  workflow_dispatch: {}
 permissions:
-  issues: write
-  pull-requests: write
+  contents: read
 jobs:
-  stale:
-    name: Stale Issues
+  stale_automation_disabled:
+    name: Stale automation disabled
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-    - name: Mark Stale Issues
-      uses: actions/stale@v10
-      with:
-        stale-issue-label: 'state: inactive'
-        stale-pr-label: 'state: inactive'
-        stale-issue-message: |-
-          **Action required:** Issue inactive for ${{ env.DAYS_BEFORE_ISSUE_STALE }} days.
-          Status update or closure in ${{ env.DAYS_BEFORE_ISSUE_CLOSE }} days.
-        close-issue-message: Issue closed after ${{ env.DAYS_BEFORE_ISSUE_CLOSE }} days of inactivity.
-        stale-pr-message: |-
-          **Action required:** PR inactive for ${{ env.DAYS_BEFORE_PR_STALE }} days.
-          Status update or closure in ${{ env.DAYS_BEFORE_PR_CLOSE }} days.
-        close-pr-message: PR closed after ${{ env.DAYS_BEFORE_PR_CLOSE }} days of inactivity.
-        days-before-issue-stale: ${{ env.DAYS_BEFORE_ISSUE_STALE }}
-        days-before-issue-close: ${{ env.DAYS_BEFORE_ISSUE_CLOSE }}
-        days-before-pr-stale: ${{ env.DAYS_BEFORE_PR_STALE }}
-        days-before-pr-close: ${{ env.DAYS_BEFORE_PR_CLOSE }}
+    - name: Explain disabled stale automation
+      run: echo 'Stale issue and PR automation is disabled in Stranmor/oven to avoid unintended issue or PR mutations.'

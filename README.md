@@ -1,21 +1,39 @@
-<h1 align="center">⚒️ Forge: AI-Enhanced Terminal Development Environment</h1>
-<p align="center">A comprehensive coding agent that integrates AI capabilities with your development environment</p>
+<h1 align="center">Stranmor/oven: maintained ForgeCode fork</h1>
+<p align="center">A Rust AI coding-agent terminal environment maintained as Stranmor's fork of upstream ForgeCode.</p>
 
-<p align="center"><code>curl -fsSL https://forgecode.dev/cli | sh</code></p>
+<p align="center">
+  <a href="https://github.com/Stranmor/oven/actions/workflows/ci.yml">CI</a> ·
+  <a href="https://github.com/Stranmor/oven/issues">Issues</a> ·
+  <a href="https://github.com/tailcallhq/forgecode">Upstream ForgeCode</a>
+</p>
 
-[![CI Status](https://img.shields.io/github/actions/workflow/status/tailcallhq/forgecode/ci.yml?style=for-the-badge)](https://github.com/tailcallhq/forgecode/actions)
-[![GitHub Release](https://img.shields.io/github/v/release/tailcallhq/forgecode?style=for-the-badge)](https://github.com/tailcallhq/forgecode/releases)
-[![Discord](https://img.shields.io/discord/1044859667798568962?style=for-the-badge&cacheSeconds=120&logo=discord)](https://discord.gg/kRZBPpkgwq)
-[![CLA assistant](https://cla-assistant.io/readme/badge/tailcallhq/forgecode?style=for-the-badge)](https://cla-assistant.io/tailcallhq/forgecode)
+> This repository is a maintained fork of upstream [ForgeCode](https://github.com/tailcallhq/forgecode). The fork preserves upstream Apache-2.0 licensing and attribution while carrying Stranmor-specific integration work. Upstream-hosted installers, badges, community links, and release channels are intentionally not advertised here because they do not represent this fork.
 
-![Code-Forge Demo](https://assets.antinomy.ai/images/forge_demo_2x.gif)
+## Build from source
+
+This fork currently documents source builds only. Use the upstream installer only if you intentionally want upstream ForgeCode rather than this fork.
+
+```bash
+git clone https://github.com/Stranmor/oven.git
+cd oven
+cargo build -p forge_main --bin forge
+./target/debug/forge --version
+```
+
+For Nix users:
+
+```bash
+nix build github:Stranmor/oven
+nix run github:Stranmor/oven
+```
 
 ---
 
 <details>
 <summary><strong>Table&nbsp;of&nbsp;Contents</strong></summary>
 
-- [Quickstart](#quickstart)
+- [Fork status](#fork-status)
+- [Build from source](#build-from-source)
 - [Usage Examples](#usage-examples)
 - [Why Forge?](#why-forge)
 - [How Forge Works: Three Modes](#how-forge-works-three-modes)
@@ -45,31 +63,16 @@
   - [Example Use Cases](#example-use-cases)
   - [Usage in Multi-Agent Workflows](#usage-in-multi-agent-workflows)
 - [Documentation](#documentation)
-- [Community](#community)
-- [Support Us](#support-us)
+- [Installation](#installation)
+- [Upstream](#upstream)
 
 </details>
 
 ---
 
-## Quickstart
+## Fork status
 
-To get started with Forge, run the command below:
-
-```bash
-curl -fsSL https://forgecode.dev/cli | sh
-```
-
-On first run, Forge will guide you through setting up your AI provider credentials using the interactive login flow. Alternatively, you can configure providers beforehand:
-
-```bash
-# Configure your provider credentials interactively
-forge provider login
-
-# Then start Forge
-forge
-```
-That's it! Forge is now ready to assist you with your development tasks.
+Stranmor/oven is maintained as a fork. Public release automation and upstream package channels are not enabled for this repository by default. Build from source when testing this fork.
 
 ## Usage Examples
 
@@ -368,7 +371,7 @@ Project-local skills override global ones, which override built-in ones. To scaf
 :workspace-info           # Show workspace details
 ```
 
-After running `:sync`, the AI can search your codebase by meaning rather than exact text matches. Indexing sends file content to the workspace server, which defaults to `https://api.forgecode.dev`. Set `FORGE_WORKSPACE_SERVER_URL` to override this if self-hosting.
+After running `:sync`, the AI can search your codebase by meaning rather than exact text matches. Indexing uses the configured workspace server. Set `FORGE_WORKSPACE_SERVER_URL` when self-hosting or when avoiding inherited upstream service defaults.
 
 ### Quick Reference: All `:` Commands
 
@@ -804,8 +807,8 @@ Override default API endpoints and provider/model settings:
 
 ```bash
 # .env
-FORGE_API_URL=https://api.forgecode.dev  # Custom Forge API URL (default: https://api.forgecode.dev)
-FORGE_WORKSPACE_SERVER_URL=http://localhost:8080  # URL for the indexing server (default: https://api.forgecode.dev/)
+FORGE_API_URL=<your_forge_api_url>  # Custom Forge API URL
+FORGE_WORKSPACE_SERVER_URL=http://localhost:8080  # URL for the indexing server
 ```
 
 </details>
@@ -1090,35 +1093,25 @@ MCP tools can be used as part of multi-agent workflows, allowing specialized age
 
 ## Documentation
 
-For comprehensive documentation on all features and capabilities, please visit the [documentation site](https://github.com/tailcallhq/forgecode/tree/main/docs).
+For repository documentation, use the files in this repository. For upstream project documentation, see [tailcallhq/forgecode](https://github.com/tailcallhq/forgecode).
 
 ---
 
 ## Installation
 
 ```bash
-# YOLO
-curl -fsSL https://forgecode.dev/cli | sh
+# Build this fork from source
+git clone https://github.com/Stranmor/oven.git
+cd oven
+cargo build -p forge_main --bin forge
+./target/debug/forge --version
 
-# Package managers
-nix run github:tailcallhq/forgecode # for latest dev branch
+# Nix source build
+nix run github:Stranmor/oven
 ```
 
 ---
 
-## Community
+## Upstream
 
-Join our vibrant Discord community to connect with other Forge users and contributors, get help with your projects, share ideas, and provide feedback!
-
-[![Discord](https://img.shields.io/discord/1044859667798568962?style=for-the-badge&cacheSeconds=120&logo=discord)](https://discord.gg/kRZBPpkgwq)
-
----
-
-## Support Us
-
-Your support drives Forge's continued evolution! By starring our GitHub repository, you:
-
-- Help others discover this powerful tool 🔍
-- Motivate our development team 💪
-- Enable us to prioritize new features 🛠️
-- Strengthen our open-source community 🌱
+This fork preserves attribution to upstream ForgeCode. Use upstream channels only when you intentionally want upstream releases, installers, package-manager distribution, community spaces, or documentation rather than Stranmor/oven fork behavior.

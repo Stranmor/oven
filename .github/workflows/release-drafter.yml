@@ -15,39 +15,17 @@
 # ----------------------------- END WARNING -------------------------
 # -------------------------------------------------------------------
 
-name: Release Drafter
+name: Release Drafting Disabled
 'on':
-  pull_request_target:
-    types:
-    - opened
-    - reopened
-    - synchronize
-    - labeled
-    - unlabeled
-    - closed
-    branches:
-    - main
-  push:
-    branches:
-    - main
+  workflow_dispatch: {}
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 jobs:
-  update_release_draft:
-    name: update_release_draft
+  release_drafting_disabled:
+    name: Release drafting disabled
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-    - name: Auto Labeler
-      if: github.event_name == 'pull_request_target'
-      uses: release-drafter/release-drafter/autolabeler@v7
-      with:
-        config-name: release-drafter.yml
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    - name: Release Drafter
-      uses: release-drafter/release-drafter@v7
-      with:
-        config-name: release-drafter.yml
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Explain disabled release drafting
+      run: echo 'Release drafting is disabled in Stranmor/oven until fork-owned release policy is configured.'

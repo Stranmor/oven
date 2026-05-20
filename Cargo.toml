@@ -7,6 +7,10 @@ resolver = "2"
 version = "0.1.0"
 rust-version = "1.94"
 edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/Stranmor/oven"
+homepage = "https://github.com/Stranmor/oven"
+description = "Maintained ForgeCode fork with a Rust AI coding-agent terminal environment"
 
 [profile.release]
 lto = true

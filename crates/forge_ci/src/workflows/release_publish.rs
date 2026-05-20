@@ -1,31 +1,24 @@
 use gh_workflow::generate::Generate;
 use gh_workflow::*;
 
-use crate::jobs::{ReleaseBuilderJob, release_homebrew_job, release_npm_job};
-
-/// Generate npm release workflow
+/// Generate a disabled release workflow for this fork.
 pub fn release_publish() {
-    let release_build_job = ReleaseBuilderJob::new("${{ github.event.release.tag_name }}")
-        .release_id("${{ github.event.release.id }}");
-    let npm_release_job = release_npm_job().add_needs("build_release");
-    let homebrew_release_job = release_homebrew_job().add_needs("build_release");
+    let disabled_job = Job::new("Release publishing disabled")
+        .permissions(Permissions::default().contents(Level::Read))
+        .add_step(Step::new("Explain disabled release publishing").run(
+            "echo 'Release publishing is disabled in Stranmor/oven to prevent accidental upstream package or Homebrew mutations.'",
+        ));
 
-    let npm_workflow = Workflow::default()
-        .name("Multi Channel Release")
+    let workflow = Workflow::default()
+        .name("Release Publishing Disabled")
         .on(Event {
-            release: Some(Release { types: vec![ReleaseType::Published] }),
+            workflow_dispatch: Some(WorkflowDispatch::default()),
             ..Event::default()
         })
-        .permissions(
-            Permissions::default()
-                .contents(Level::Write)
-                .pull_requests(Level::Write),
-        )
-        .add_job("build_release", release_build_job.into_job())
-        .add_job("npm_release", npm_release_job)
-        .add_job("homebrew_release", homebrew_release_job);
+        .permissions(Permissions::default().contents(Level::Read))
+        .add_job("release_publishing_disabled", disabled_job);
 
-    Generate::new(npm_workflow)
+    Generate::new(workflow)
         .name("release.yml")
         .generate()
         .unwrap();

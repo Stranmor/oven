@@ -15,50 +15,17 @@
 # ----------------------------- END WARNING -------------------------
 # -------------------------------------------------------------------
 
-name: Bounty Management
+name: Bounty Automation Disabled
 'on':
-  issues:
-    types:
-    - assigned
-    - unassigned
-    - labeled
-    - unlabeled
-  pull_request:
-    types:
-    - opened
-    - edited
-    - reopened
-  pull_request_target:
-    types:
-    - closed
-  schedule:
-  - cron: '0 2 * * *'
+  workflow_dispatch: {}
 permissions:
-  issues: write
-  pull-requests: write
+  contents: read
 jobs:
-  sync-all-issues:
-    name: Sync all bounty issues
+  bounty_automation_disabled:
+    name: Bounty automation disabled
     runs-on: ubuntu-latest
     permissions:
-      issues: write
+      contents: read
     steps:
-    - name: Checkout
-      uses: actions/checkout@v6
-    - name: Install npm packages
-      run: npm install
-    - name: Sync all bounty labels
-      run: npx tsx .github/scripts/bounty/src/sync-all-issues.ts --repo ${{ github.repository }} --token ${{ secrets.GITHUB_TOKEN }} --execute
-  sync-pr:
-    name: Sync PR bounty labels
-    runs-on: ubuntu-latest
-    permissions:
-      issues: write
-      pull-requests: write
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v6
-    - name: Install npm packages
-      run: npm install
-    - name: Sync bounty labels
-      run: npx tsx .github/scripts/bounty/src/sync-pr.ts --pr ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --token ${{ secrets.GITHUB_TOKEN }}
+    - name: Explain disabled bounty automation
+      run: echo 'Bounty automation is disabled in Stranmor/oven to avoid unintended issue or PR mutations.'

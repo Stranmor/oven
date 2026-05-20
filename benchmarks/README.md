@@ -10,7 +10,7 @@ Before running evaluations, create a `forgee` symlink to the debug binary:
 
 ```bash
 # Create symlink in your PATH (e.g., ~/bin or /usr/local/bin)
-ln -sf /path/to/code-forge/target/debug/forge ~/forgee
+ln -sf /path/to/oven/target/debug/forge ~/forgee
 
 # Or if ~/bin is in your PATH
 ln -sf $(pwd)/target/debug/forge ~/bin/forgee

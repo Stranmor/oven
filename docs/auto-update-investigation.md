@@ -1,31 +1,5 @@
-# Исследование: Ошибка механизма автообновления
+# Public repository note
 
-**СТАТУС: ЭСКАЛИРОВАНО НА ЧЕЛОВЕКА (STRANMOR)**
-Механизм автоматического обновления для проекта `forge` завершился с ошибкой, так как фоновый сервис (`forge-sync.service`) столкнулся со сложными конфликтами `git rebase` при попытке синхронизации локальных изменений с веткой `upstream/main`.
+This file previously contained local operator auto-update incident details. Those details are intentionally not part of the public repository presentation.
 
-## 1. Анализ таймеров Systemd
-При проверке пользовательских таймеров (`systemctl --user list-timers --all`) был найден активный таймер: `forge-sync.timer`.
-Этот таймер периодически запускает сервис `forge-sync.service` для синхронизации с upstream.
-
-## 2. Проверка логов сервиса
-Логи сервиса синхронизации (`journalctl --user -u forge-sync.service -n 50`) показали следующую ошибку:
-```
-ERROR: Rebase conflict detected! Aborting rebase...
-```
-Сбой произошел при попытке применить локальный коммит (`5cb872183... feat: image pasting via Ctrl+V, subchats hiding and infinite loop fix`) поверх новых коммитов из `upstream/main`.
-
-## 3. Логика скрипта автообновления
-Сервис `forge-sync.service` вызывает bash-скрипт `/home/stranmor/Documents/project/_mycelium/oven/scripts/sync-upstream.sh`. Скрипт работает следующим образом:
-1. Выполняет `git fetch upstream`.
-2. Прячет (stash) все незакоммиченные локальные изменения.
-3. Пытается выполнить `git rebase upstream/main`.
-4. Если возникает конфликт, скрипт выводит сообщение об ошибке и автоматически запускает `git rebase --abort`. Это предотвращает блокировку репозитория в состоянии `interactive rebase in progress`.
-5. Затем он возвращает изменения из stash и завершает работу с ошибкой.
-
-## 4. Корневая причина и разрешение
-Корневая причина кроется в расхождении кодовой базы. Локальная ветка `main` содержит локальные коммиты (в частности, функцию вставки изображений), которые конфликтуют с обновленной структурой `upstream/main`.
-
-Конфликты затронули ключевые файлы: `Cargo.lock`, `crates/forge_app/src/agent_executor.rs`, `crates/forge_main/src/editor.rs` и `crates/forge_main/src/ui.rs`. Они были разрешены вручную через контролируемую интеграцию локальных изменений с upstream без отката локальной работы.
-
-**Резюме:**
-Мы исследовали причину сбоя автообновления. Были проверены таймер `forge-sync.timer`, логи `forge-sync.service` и скрипт `sync-upstream.sh`. При попытке `git rebase upstream/main` возникли сложные конфликты, и скрипт штатно прервал операцию (`git rebase --abort`). Конфликты разобраны в исходном репозитории; дальнейшая проверка выполняется через сборку и тесты.
+For current local update policy and agent safety constraints, use the private/local agent rules that are loaded in the operator environment. Do not reconstruct local service paths, timers, or operator-specific incident history from public documentation.

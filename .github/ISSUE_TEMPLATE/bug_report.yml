@@ -100,10 +100,9 @@ body:
       label: Installation Method
       description: How did you install Forge?
       options:
-        - npx forgecode@latest
-        - npm install -g forgecode
-        - curl -fsSL https://forgecode.dev/cli | sh
-        - Built from source
+        - Built from this fork's source
+        - Nix from github:Stranmor/oven
+        - Upstream ForgeCode installer/package
         - Other
     validations:
       required: true
