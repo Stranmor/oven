@@ -47,6 +47,10 @@ const PROJECT_MODEL_SEARCH_TOOL: &str = "project_model_search";
 const PROJECT_MODEL_SEARCH_SUCCESS: &str = "success";
 const PROJECT_MODEL_SEARCH_PROVENANCE_SOURCE: &str = "WorkspaceService::query_workspace";
 const EXACT_FACT_READINESS_MAX_ISSUES: usize = 8;
+const PREVIEW_MANIFEST_MISSING_REASON: &str = "manifest_missing";
+const PREVIEW_MANIFEST_READ_ERROR_REASON: &str = "manifest_read_error";
+const PREVIEW_MANIFEST_FRESHNESS_ERROR_REASON: &str = "manifest_freshness_error";
+const PREVIEW_MANIFEST_BOUNDED_FRESHNESS_REASON: &str = "manifest_bounded_freshness_not_injectable";
 
 fn workspace_evidence_replay_diagnostic(
     path: PathBuf,
@@ -125,7 +129,7 @@ fn workspace_evidence_replay_preview_diagnostic(
         return Ok(not_previewed_evidence_replay_preview_diagnostic(
             false,
             WorkspaceContextFreshness::Unknown {
-                reason: "project-model manifest not found".to_string(),
+                reason: PREVIEW_MANIFEST_MISSING_REASON.to_string(),
             },
         ));
     }
@@ -133,24 +137,28 @@ fn workspace_evidence_replay_preview_diagnostic(
     let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
     let manifest = match indexer.read_manifest() {
         Ok(manifest) => manifest,
-        Err(error) => {
+        Err(_error) => {
             return Ok(not_previewed_evidence_replay_preview_diagnostic(
                 true,
-                WorkspaceContextFreshness::Unknown { reason: error.to_string() },
+                WorkspaceContextFreshness::Unknown {
+                    reason: PREVIEW_MANIFEST_READ_ERROR_REASON.to_string(),
+                },
             ));
         }
     };
     let freshness = match indexer.evaluate_manifest_freshness(&manifest) {
         Ok(evaluation) if evaluation.can_inject() => WorkspaceContextFreshness::Fresh,
         Ok(evaluation) if evaluation.state.fresh => WorkspaceContextFreshness::Unknown {
-            reason: "project-model freshness checked only indexed files; added-file discovery not proven".to_string(),
+            reason: PREVIEW_MANIFEST_BOUNDED_FRESHNESS_REASON.to_string(),
         },
         Ok(evaluation) => WorkspaceContextFreshness::Stale {
             changed: evaluation.state.changed,
             deleted: evaluation.state.deleted,
             added: evaluation.state.added,
         },
-        Err(error) => WorkspaceContextFreshness::Unknown { reason: error.to_string() },
+        Err(_error) => WorkspaceContextFreshness::Unknown {
+            reason: PREVIEW_MANIFEST_FRESHNESS_ERROR_REASON.to_string(),
+        },
     };
     if !matches!(freshness, WorkspaceContextFreshness::Fresh) {
         return Ok(not_previewed_evidence_replay_preview_diagnostic(
@@ -2259,6 +2267,52 @@ mod tests {
         );
         assert!(!stale_json.contains("raw stale artifact payload"));
         assert!(!unknown_json.contains("raw unknown artifact payload"));
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_replay_preview_manifest_read_error_uses_redaction_safe_reason() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let raw_manifest_path = local_project_model_manifest(&root).display().to_string();
+        fs::write(local_project_model_manifest(&root), "not json")?;
+
+        let actual = workspace_evidence_replay_preview_diagnostic(root.clone())?;
+        let actual_json = serde_json::to_string(&actual)?;
+        let expected = (
+            WorkspaceEvidenceReplayPreviewStatus::NotPreviewedManifestUnknown,
+            Some(PREVIEW_MANIFEST_READ_ERROR_REASON.to_string()),
+        );
+
+        assert_eq!((actual.status, actual.not_previewed_reason), expected);
+        assert!(!actual_json.contains(&root.display().to_string()));
+        assert!(!actual_json.contains(&raw_manifest_path));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_replay_preview_manifest_freshness_error_uses_redaction_safe_reason() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let raw_source_path = root.join("src").join("lib.rs");
+        fs::set_permissions(&raw_source_path, fs::Permissions::from_mode(0o000))?;
+
+        let actual_result = workspace_evidence_replay_preview_diagnostic(root.clone());
+        fs::set_permissions(&raw_source_path, fs::Permissions::from_mode(0o644))?;
+        let actual = actual_result?;
+        let actual_json = serde_json::to_string(&actual)?;
+        let expected = (
+            WorkspaceEvidenceReplayPreviewStatus::NotPreviewedManifestUnknown,
+            Some(PREVIEW_MANIFEST_FRESHNESS_ERROR_REASON.to_string()),
+        );
+
+        assert_eq!((actual.status, actual.not_previewed_reason), expected);
+        assert!(!actual_json.contains(&root.display().to_string()));
+        assert!(!actual_json.contains(&raw_source_path.display().to_string()));
+        assert!(!actual_json.contains(&local_project_model_manifest(&root).display().to_string()));
         Ok(())
     }
 
