@@ -507,6 +507,21 @@ safety_minimum:
         ))
     }
 
+    fn validate_recovered_forced_tool_choice(
+        context: &Context,
+    ) -> std::result::Result<(), PreflightContextWindowError> {
+        if let Some(ToolChoice::Call(required_name)) = context.tool_choice.as_ref() {
+            let required_tool_present = context
+                .tools
+                .iter()
+                .any(|tool| tool.name.as_str() == required_name.as_str());
+            if !required_tool_present {
+                return Err(Self::forced_tool_choice_missing_error(required_name));
+            }
+        }
+        Ok(())
+    }
+
     fn prioritized_tool_subset(
         &self,
         tools: &[ToolDefinition],
@@ -610,6 +625,7 @@ safety_minimum:
                 outbound_candidate.is_reasoning_supported(),
             )
             .map_err(PreflightContextWindowError::other)?;
+        Self::validate_recovered_forced_tool_choice(&prepared_outbound)?;
         let estimate = self
             .estimated_request(&prepared_outbound)
             .map_err(PreflightContextWindowError::other)?;
@@ -642,6 +658,7 @@ safety_minimum:
                     capped_candidate.is_reasoning_supported(),
                 )
                 .map_err(PreflightContextWindowError::other)?;
+            Self::validate_recovered_forced_tool_choice(&capped_outbound)?;
             let capped_estimate = self
                 .estimated_request(&capped_outbound)
                 .map_err(PreflightContextWindowError::other)?;
@@ -777,6 +794,7 @@ safety_minimum:
                     recovered_reasoning_supported,
                 )
                 .map_err(PreflightContextWindowError::other)?;
+            Self::validate_recovered_forced_tool_choice(&recovered_outbound)?;
             let recovered_estimate = self
                 .estimated_request(&recovered_outbound)
                 .map_err(PreflightContextWindowError::other)?;
@@ -919,6 +937,7 @@ safety_minimum:
                 recovery_reasoning_supported,
             )
             .map_err(PreflightContextWindowError::other)?;
+        Self::validate_recovered_forced_tool_choice(&recovery_outbound)?;
         let recovery_estimate = self
             .estimated_request(&recovery_outbound)
             .map_err(PreflightContextWindowError::other)?;
@@ -2117,6 +2136,49 @@ mod tests {
 
         assert_eq!(actual.contains("forced tool_choice"), expected);
         assert_eq!(actual.contains(missing_tool.as_str()), expected);
+        assert_eq!(actual.contains("zero or mismatched tools"), expected);
+    }
+
+    #[test]
+    fn test_preflight_emergency_recovery_errors_when_forced_tool_choice_resolves_to_zero_tools() {
+        let required_tool = ToolName::new("required_tool");
+        let setup = Context::default()
+            .add_message(ContextMessage::system(large_text(60_000)))
+            .add_message(ContextMessage::user(
+                "call required tool with this image",
+                None,
+            ))
+            .add_base64_url(Image::new_base64("B".repeat(20_000), "image/png"))
+            .tool_choice(ToolChoice::Call(required_tool.clone()))
+            .add_tool(
+                ToolDefinition::new(required_tool.as_str())
+                    .description(large_text(1_000))
+                    .input_schema(schemars::schema_for!(())),
+            )
+            .max_tokens(512_usize);
+        let agent = Agent::new(
+            AgentId::new("context_guard_agent"),
+            ProviderId::OPENAI,
+            ModelId::new("context-guard-model"),
+        )
+        .tool_supported(false)
+        .compact(Compact::new().retention_window(64_usize));
+        let fixture = Orchestrator::new(
+            Arc::new(FixtureServices),
+            forge_domain::Conversation::generate(),
+            agent,
+            forge_config::ForgeConfig::default(),
+        )
+        .models(vec![model_fixture(50_000)]);
+
+        let actual = fixture
+            .preflight_context_window(setup)
+            .unwrap_err()
+            .to_string();
+        let expected = true;
+
+        assert_eq!(actual.contains("forced tool_choice"), expected);
+        assert_eq!(actual.contains(required_tool.as_str()), expected);
         assert_eq!(actual.contains("zero or mismatched tools"), expected);
     }
 
