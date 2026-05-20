@@ -370,6 +370,9 @@ impl LearningLedgerEventRecord {
                 LearningRedactionStatus::Clean
             }
         });
+        if let Some(metadata) = event.capture_metadata.as_ref() {
+            metadata.validate_current()?;
+        }
         let capture_metadata = event
             .capture_metadata
             .as_ref()
@@ -403,6 +406,14 @@ impl LearningLedgerEventRecord {
         let event_kind = parse_event_kind(&self.event_kind)?;
         let redaction_status = parse_redaction_status(&self.redaction_status)?;
         let provenance = self.try_into_provenance()?;
+        let capture_metadata = self
+            .capture_metadata
+            .as_deref()
+            .map(serde_json::from_str::<LearningCaptureMetadata>)
+            .transpose()?;
+        if let Some(metadata) = capture_metadata.as_ref() {
+            metadata.validate_current()?;
+        }
         Ok(LearningLedgerEvent {
             event_id: LearningEventId::parse(self.event_id)?,
             record_id: LearningRecordId::parse(self.record_id)?,
@@ -412,11 +423,7 @@ impl LearningLedgerEventRecord {
             content_fingerprint: self.content_fingerprint,
             redaction_status,
             provenance,
-            capture_metadata: self
-                .capture_metadata
-                .as_deref()
-                .map(serde_json::from_str::<LearningCaptureMetadata>)
-                .transpose()?,
+            capture_metadata,
             created_at: from_naive(self.created_at),
             schema_version: self.schema_version,
         })
@@ -1084,6 +1091,104 @@ mod tests {
         );
         let expected = (true, 1usize, 1usize);
 
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_persistence_roundtrip_preserves_capture_metadata() -> anyhow::Result<()> {
+        let fixture = fixture_repo(14)?;
+        let conversation_id = ConversationId::generate();
+        let mut event =
+            fixture_event(conversation_id, "event-1", "metadata roundtrip", Utc::now())?;
+        let metadata = LearningCaptureMetadata::conversation_save(
+            3,
+            1,
+            "context-fingerprint-14",
+            "summary-fingerprint-14",
+        );
+        event.capture_metadata = Some(metadata.clone());
+        fixture.insert_learning_event(event).await?;
+
+        let actual = fixture
+            .list_learning_records(None, 10)
+            .await?
+            .first()
+            .and_then(|projection| projection.capture_metadata.clone());
+        let expected = Some(metadata);
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_repository_rejects_invalid_capture_metadata() -> anyhow::Result<()> {
+        let fixture = fixture_repo(15)?;
+        let conversation_id = ConversationId::generate();
+        let mut event = fixture_event(conversation_id, "event-1", "invalid metadata", Utc::now())?;
+        event.capture_metadata = Some(LearningCaptureMetadata::conversation_save(
+            0,
+            1,
+            "context-fingerprint-15",
+            "summary-fingerprint-15",
+        ));
+
+        let actual = fixture.insert_learning_event(event).await.is_err();
+        let expected = true;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_repository_rejects_corrupt_current_capture_metadata_on_readback()
+    -> anyhow::Result<()> {
+        let fixture = fixture_repo(16)?;
+        let conversation_id = ConversationId::generate();
+        let mut event = fixture_event(
+            conversation_id,
+            "event-1",
+            "corrupt metadata readback",
+            Utc::now(),
+        )?;
+        event.capture_metadata = Some(LearningCaptureMetadata::conversation_save(
+            3,
+            1,
+            "context-fingerprint-16",
+            "summary-fingerprint-16",
+        ));
+        fixture.insert_learning_event(event).await?;
+        fixture
+            .run_with_connection(move |connection, wid| {
+                diesel::update(
+                    learning_ledger_events::table
+                        .filter(learning_ledger_events::workspace_id.eq(workspace_db_id(wid))),
+                )
+                .set(learning_ledger_events::capture_metadata.eq(Some(
+                    r#"{"source":"conversation_save","capture_version":1,"message_count":0,"user_message_count":1,"context_fingerprint":"context-fingerprint-16","summary_fingerprint":"summary-fingerprint-16"}"#,
+                )))
+                .execute(connection)?;
+                Ok(())
+            })
+            .await?;
+
+        let actual = fixture.list_learning_records(None, 10).await.is_err();
+        let expected = true;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_repository_preserves_absent_capture_metadata() -> anyhow::Result<()> {
+        let fixture = fixture_repo(17)?;
+        let conversation_id = ConversationId::generate();
+        let event = fixture_event(conversation_id, "event-1", "absent metadata", Utc::now())?;
+        fixture.insert_learning_event(event).await?;
+
+        let actual = fixture
+            .list_learning_records(None, 10)
+            .await?
+            .first()
+            .and_then(|projection| projection.capture_metadata.clone());
+        let expected = None;
         assert_eq!(actual, expected);
         Ok(())
     }
