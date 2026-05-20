@@ -437,6 +437,7 @@ impl LearningSensorDecisionKind {
 
 /// Sanitized bounded learning Sensor review input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Setters)]
+#[serde(deny_unknown_fields)]
 #[setters(into, strip_option)]
 pub struct LearningSensorReviewInput {
     /// Sensor DTO schema version.
@@ -639,6 +640,11 @@ impl LearningSensorReviewOutput {
         }
         if let Some(body) = &self.proposal_body {
             ensure_learning_sensor_text("proposal_body", body, 1_024)?;
+        }
+        if self.decision != LearningSensorDecisionKind::ProposeLesson
+            && (self.proposal_title.is_some() || self.proposal_body.is_some())
+        {
+            anyhow::bail!("learning sensor non-proposal decision cannot include proposal payload");
         }
         if self.decision == LearningSensorDecisionKind::ProposeLesson {
             if input.evidence_kind != LearningSensorEvidenceKind::TypedFixtureObservation
@@ -1450,6 +1456,65 @@ mod tests {
                 .is_err(),
         );
         let expected = (true, blocked_scopes.len(), true);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn sensor_input_rejects_unknown_json_fields_before_validation() {
+        let projection = fixture_learning_projection(LearningReviewState::Candidate);
+        let input = LearningSensorReviewInput::from_candidate_projection(&projection);
+        let json = format!(
+            r#"{{"schema_version":{},"candidate_id":"{}","sanitized_projection_hash":"{}","sanitized_summary":"{}","sanitized_source_fingerprint":"{}","evidence_kind":"conversation_metadata","provenance_marker":"runtime_conversation_saved","fixture_title":null,"fixture_observation":null,"raw_transcript":"blocked","tool_action":"blocked","file_path":"/home/blocked","secret":"blocked"}}"#,
+            input.schema_version,
+            input.candidate_id.into_string(),
+            input.sanitized_projection_hash,
+            input.sanitized_summary,
+            input.sanitized_source_fingerprint,
+        );
+
+        let actual = serde_json::from_str::<LearningSensorReviewInput>(&json).is_err();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn sensor_output_rejects_non_proposal_payload_for_pending_and_reject_decisions() {
+        let projection = fixture_learning_projection(LearningReviewState::Candidate);
+        let input = LearningSensorReviewInput::from_candidate_projection(&projection);
+        let pending_with_payload = LearningSensorReviewOutput {
+            schema_version: LEARNING_SENSOR_REVIEW_SCHEMA_VERSION,
+            reviewer_id: FAKE_LEARNING_SENSOR_REVIEWER_ID.to_string(),
+            reviewer_version: FAKE_LEARNING_SENSOR_REVIEWER_VERSION,
+            input_fingerprint: input.fingerprint().unwrap(),
+            decision: LearningSensorDecisionKind::Pending,
+            reason_code: "insufficient_substantive_evidence".to_string(),
+            proposal_title: Some("Hidden harmless title".to_string()),
+            proposal_body: Some("Hidden harmless body changes audit identity".to_string()),
+        };
+        let reject_with_payload = LearningSensorReviewOutput {
+            decision: LearningSensorDecisionKind::Reject,
+            ..pending_with_payload.clone()
+        };
+
+        let actual = (
+            pending_with_payload
+                .validate_against(
+                    &input,
+                    FAKE_LEARNING_SENSOR_REVIEWER_ID,
+                    FAKE_LEARNING_SENSOR_REVIEWER_VERSION,
+                )
+                .is_err(),
+            reject_with_payload
+                .validate_against(
+                    &input,
+                    FAKE_LEARNING_SENSOR_REVIEWER_ID,
+                    FAKE_LEARNING_SENSOR_REVIEWER_VERSION,
+                )
+                .is_err(),
+        );
+        let expected = (true, true);
 
         assert_eq!(actual, expected);
     }
