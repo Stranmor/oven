@@ -184,11 +184,7 @@ impl LearningRepository for LearningRepositoryImpl {
                     .first::<LearningLedgerEventRecord>(connection)
                     .optional()?;
                 let event = if let Some(existing) = existing {
-                    if existing.record_id != record.record_id || existing.event_kind != record.event_kind {
-                        anyhow::bail!(
-                            "learning review idempotency key collision for a different record or transition"
-                        );
-                    }
+                    ensure_learning_event_idempotency_replay(&existing, &record)?;
                     existing.try_into_event()?
                 } else {
                     diesel::insert_into(learning_ledger_events::table)
@@ -953,6 +949,50 @@ mod tests {
             .await?;
         let actual = (colliding.is_err(), events.len());
         let expected = (true, 2usize);
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_review_rejects_stale_pre_candidate_replay_collision_for_same_record_and_kind()
+    -> anyhow::Result<()> {
+        let fixture = fixture_repo(21)?;
+        let conversation_id = ConversationId::generate();
+        let created_at = Utc::now();
+        let candidate_event = fixture_event(
+            conversation_id,
+            "event-1",
+            "pre candidate stale replay collision candidate",
+            created_at,
+        )?;
+        let stale_review = LearningLedgerEvent::review(
+            candidate_event.record_id,
+            LearningEventKind::ReviewAccepted,
+            "stale accepted review inserted before candidate",
+            LearningProvenance::conversation(conversation_id, "review-1", "review-fingerprint-1"),
+            created_at - Duration::seconds(1),
+        )?;
+        let stale_outcome = fixture.insert_learning_event(stale_review).await?;
+        let candidate = fixture.insert_learning_event(candidate_event).await?.event;
+        let mut colliding_review = LearningLedgerEvent::review(
+            candidate.record_id,
+            LearningEventKind::ReviewAccepted,
+            "different accepted review with stale forged idempotency key",
+            LearningProvenance::conversation(conversation_id, "review-2", "review-fingerprint-2"),
+            created_at + Duration::seconds(1),
+        )?;
+        colliding_review.idempotency_key = stale_outcome.event.idempotency_key.clone();
+
+        let colliding = fixture
+            .review_learning_candidate_event(colliding_review)
+            .await;
+        let projection = fixture
+            .get_learning_record(candidate.record_id)
+            .await?
+            .expect("candidate projection should exist");
+        let actual = (colliding.is_err(), projection.review_state);
+        let expected = (true, LearningReviewState::Candidate);
 
         assert_eq!(actual, expected);
         Ok(())
