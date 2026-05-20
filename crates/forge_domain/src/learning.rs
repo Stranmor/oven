@@ -664,12 +664,13 @@ impl LearningSensorReviewInput {
         observation: ValidatedSanitizedChatLessonObservation,
     ) -> Self {
         let observation = observation.observation().clone();
+        let observation_fingerprint = observation.fingerprint();
         Self {
             schema_version: LEARNING_SENSOR_REVIEW_SCHEMA_VERSION,
             candidate_id: projection.record_id,
             sanitized_projection_hash: learning_projection_hash(projection),
-            sanitized_summary: projection.summary.clone(),
-            sanitized_source_fingerprint: observation.fingerprint(),
+            sanitized_summary: format!("sanitized_chat_observation:{observation_fingerprint}"),
+            sanitized_source_fingerprint: observation_fingerprint,
             evidence_kind: LearningSensorEvidenceKind::SanctionedSanitizedChatObservation,
             provenance_marker: LearningSensorProvenanceMarker::RuntimeSanitizedChatObservation,
             fixture_title: None,
@@ -2237,6 +2238,33 @@ mod tests {
             )
             .is_err();
         let expected = true;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn sanctioned_sanitized_observation_input_does_not_smuggle_projection_free_text() {
+        let mut projection = fixture_learning_projection(LearningReviewState::Candidate);
+        projection.summary =
+            "plain free text that must not reach the sanitized observation sensor".to_string();
+        let input = LearningSensorReviewInput::from_sanitized_chat_observation(
+            &projection,
+            fixture_sanitized_observation().validate().unwrap(),
+        );
+
+        let actual = (
+            input.sanitized_summary.clone(),
+            serde_json::to_string(&input)
+                .unwrap()
+                .contains("plain free text that must not reach the sanitized observation sensor"),
+        );
+        let expected = (
+            format!(
+                "sanitized_chat_observation:{}",
+                fixture_sanitized_observation().fingerprint()
+            ),
+            false,
+        );
 
         assert_eq!(actual, expected);
     }
