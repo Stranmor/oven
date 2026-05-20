@@ -396,6 +396,8 @@ impl LearningCaptureMetadata {
 pub enum LearningSensorEvidenceKind {
     /// Metadata-only conversation-save candidate.
     ConversationMetadata,
+    /// Runtime sanitized chat observation with closed evidence fields only.
+    SanctionedSanitizedChatObservation,
     /// Typed fixture evidence available only from regression tests or explicit fixture paths.
     TypedFixtureObservation,
 }
@@ -407,8 +409,178 @@ pub enum LearningSensorEvidenceKind {
 pub enum LearningSensorProvenanceMarker {
     /// Normal runtime metadata-only capture path.
     RuntimeConversationSaved,
+    /// Runtime sanctioned sanitized chat observation path.
+    RuntimeSanitizedChatObservation,
     /// Explicit fake-reviewer fixture marker unavailable from runtime conversation-save metadata.
     FakeReviewerFixture,
+}
+
+/// Project-local opaque digest used for non-reversible sanitized chat evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct OpaqueLearningFingerprint(String);
+
+impl OpaqueLearningFingerprint {
+    /// Creates a validated opaque lowercase SHA-256-style fingerprint.
+    ///
+    /// # Arguments
+    /// * `value` - Fixed-length lowercase hex digest.
+    ///
+    /// # Errors
+    /// Returns an error when the value is empty, not 64 characters, or not lowercase hex.
+    pub fn new(value: impl Into<String>) -> anyhow::Result<Self> {
+        let value = value.into();
+        if value.len() != 64 {
+            anyhow::bail!(
+                "opaque learning fingerprint must be exactly 64 lowercase hex characters"
+            );
+        }
+        if !value
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+        {
+            anyhow::bail!("opaque learning fingerprint must contain only lowercase hex characters");
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the validated digest text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for OpaqueLearningFingerprint {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> anyhow::Result<Self> {
+        Self::new(value)
+    }
+}
+
+impl From<OpaqueLearningFingerprint> for String {
+    fn from(value: OpaqueLearningFingerprint) -> Self {
+        value.0
+    }
+}
+
+/// Closed runtime observation class for sanitized chat evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, StrumDisplay, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum SanitizedChatObservationKind {
+    /// Repeated agent behavior created a candidate self-learning opportunity.
+    RepeatedAgentBehavior,
+    /// A verifier or reviewer found a recurring same-path quality issue.
+    ReviewerIdentifiedGap,
+    /// A safety invariant near miss was observed through sanitized counters.
+    SafetyInvariantNearMiss,
+}
+
+/// Closed count bucket for sanitized chat evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, StrumDisplay, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum SanitizedObservationCountBucket {
+    /// One observed instance.
+    One,
+    /// Two observed instances.
+    Two,
+    /// Three to five observed instances.
+    ThreeToFive,
+    /// More than five observed instances.
+    MoreThanFive,
+}
+
+/// Closed severity class for sanitized chat evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, StrumDisplay, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum SanitizedObservationSeverity {
+    /// Low-risk improvement opportunity.
+    Low,
+    /// Structural or repeated quality risk.
+    Medium,
+    /// Safety-relevant or architecture-relevant risk.
+    High,
+}
+
+/// Runtime sanitized chat observation DTO containing only closed enums, counters, and opaque digests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SanitizedChatLessonObservation {
+    /// Observation class.
+    pub observation_kind: SanitizedChatObservationKind,
+    /// Count bucket for repeated evidence.
+    pub occurrence_bucket: SanitizedObservationCountBucket,
+    /// Sanitized impact severity.
+    pub severity: SanitizedObservationSeverity,
+    /// Project-local non-reversible fingerprint of the observation source cluster.
+    pub source_cluster_fingerprint: OpaqueLearningFingerprint,
+    /// Project-local non-reversible fingerprint of the behavioral pattern.
+    pub behavior_pattern_fingerprint: OpaqueLearningFingerprint,
+}
+
+impl SanitizedChatLessonObservation {
+    /// Creates a validated sanitized chat observation DTO.
+    ///
+    /// # Arguments
+    /// * `observation_kind` - Closed observation class.
+    /// * `occurrence_bucket` - Closed occurrence bucket.
+    /// * `severity` - Closed severity class.
+    /// * `source_cluster_fingerprint` - Non-reversible source-cluster digest.
+    /// * `behavior_pattern_fingerprint` - Non-reversible behavior-pattern digest.
+    ///
+    /// # Errors
+    /// Returns an error when any opaque fingerprint is malformed.
+    pub fn new(
+        observation_kind: SanitizedChatObservationKind,
+        occurrence_bucket: SanitizedObservationCountBucket,
+        severity: SanitizedObservationSeverity,
+        source_cluster_fingerprint: impl Into<String>,
+        behavior_pattern_fingerprint: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            observation_kind,
+            occurrence_bucket,
+            severity,
+            source_cluster_fingerprint: OpaqueLearningFingerprint::new(source_cluster_fingerprint)?,
+            behavior_pattern_fingerprint: OpaqueLearningFingerprint::new(
+                behavior_pattern_fingerprint,
+            )?,
+        })
+    }
+
+    /// Validates this DTO and returns a typestate wrapper for proposal-capable use.
+    ///
+    /// # Errors
+    /// Returns an error when any field is not sanctioned sanitized evidence.
+    pub fn validate(self) -> anyhow::Result<ValidatedSanitizedChatLessonObservation> {
+        Ok(ValidatedSanitizedChatLessonObservation(self))
+    }
+
+    /// Returns a stable non-reversible observation fingerprint.
+    pub fn fingerprint(&self) -> String {
+        learning_digest_hex(format!(
+            "{}:{}:{}:{}:{}",
+            self.observation_kind,
+            self.occurrence_bucket,
+            self.severity,
+            self.source_cluster_fingerprint.as_str(),
+            self.behavior_pattern_fingerprint.as_str()
+        ))
+    }
+}
+
+/// Typestate wrapper proving a sanitized chat observation passed validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedSanitizedChatLessonObservation(SanitizedChatLessonObservation);
+
+impl ValidatedSanitizedChatLessonObservation {
+    /// Returns the validated sanitized observation DTO.
+    pub fn observation(&self) -> &SanitizedChatLessonObservation {
+        &self.0
+    }
 }
 
 /// Separate untrusted Sensor decision enum; it cannot encode Accepted.
@@ -458,6 +630,8 @@ pub struct LearningSensorReviewInput {
     pub fixture_title: Option<String>,
     /// Optional sanitized fixture observation body.
     pub fixture_observation: Option<String>,
+    /// Optional runtime sanitized chat observation payload.
+    pub sanitized_chat_observation: Option<SanitizedChatLessonObservation>,
 }
 
 impl LearningSensorReviewInput {
@@ -476,6 +650,31 @@ impl LearningSensorReviewInput {
             provenance_marker: LearningSensorProvenanceMarker::RuntimeConversationSaved,
             fixture_title: None,
             fixture_observation: None,
+            sanitized_chat_observation: None,
+        }
+    }
+
+    /// Builds runtime sanctioned sanitized chat observation input from a projected candidate.
+    ///
+    /// # Arguments
+    /// * `projection` - Current candidate projection.
+    /// * `observation` - Validated sanitized chat observation typestate.
+    pub fn from_sanitized_chat_observation(
+        projection: &LearningRecordProjection,
+        observation: ValidatedSanitizedChatLessonObservation,
+    ) -> Self {
+        let observation = observation.observation().clone();
+        Self {
+            schema_version: LEARNING_SENSOR_REVIEW_SCHEMA_VERSION,
+            candidate_id: projection.record_id,
+            sanitized_projection_hash: learning_projection_hash(projection),
+            sanitized_summary: projection.summary.clone(),
+            sanitized_source_fingerprint: observation.fingerprint(),
+            evidence_kind: LearningSensorEvidenceKind::SanctionedSanitizedChatObservation,
+            provenance_marker: LearningSensorProvenanceMarker::RuntimeSanitizedChatObservation,
+            fixture_title: None,
+            fixture_observation: None,
+            sanitized_chat_observation: Some(observation),
         }
     }
 
@@ -500,6 +699,7 @@ impl LearningSensorReviewInput {
             provenance_marker: LearningSensorProvenanceMarker::FakeReviewerFixture,
             fixture_title: Some(title.into()),
             fixture_observation: Some(observation.into()),
+            sanitized_chat_observation: None,
         }
     }
 
@@ -540,13 +740,35 @@ impl LearningSensorReviewInput {
             if self.provenance_marker != LearningSensorProvenanceMarker::RuntimeConversationSaved {
                 anyhow::bail!("conversation metadata input requires runtime provenance marker");
             }
-            if self.fixture_title.is_some() || self.fixture_observation.is_some() {
-                anyhow::bail!("conversation metadata input cannot include fixture payload");
+            if self.fixture_title.is_some()
+                || self.fixture_observation.is_some()
+                || self.sanitized_chat_observation.is_some()
+            {
+                anyhow::bail!("conversation metadata input cannot include observation payload");
             }
+        }
+        if self.evidence_kind == LearningSensorEvidenceKind::SanctionedSanitizedChatObservation {
+            if self.provenance_marker
+                != LearningSensorProvenanceMarker::RuntimeSanitizedChatObservation
+            {
+                anyhow::bail!(
+                    "sanitized chat observation requires runtime sanitized observation marker"
+                );
+            }
+            if self.fixture_title.is_some() || self.fixture_observation.is_some() {
+                anyhow::bail!("sanitized chat observation cannot include fixture payload");
+            }
+            let observation = self.sanitized_chat_observation.clone().ok_or_else(|| {
+                anyhow::anyhow!("sanitized chat observation input requires observation payload")
+            })?;
+            observation.validate()?;
         }
         if self.evidence_kind == LearningSensorEvidenceKind::TypedFixtureObservation {
             if self.provenance_marker != LearningSensorProvenanceMarker::FakeReviewerFixture {
                 anyhow::bail!("fixture observation requires fake reviewer fixture marker");
+            }
+            if self.sanitized_chat_observation.is_some() {
+                anyhow::bail!("fixture observation cannot include sanitized chat payload");
             }
             if self
                 .fixture_title
@@ -565,6 +787,23 @@ impl LearningSensorReviewInput {
             }
         }
         Ok(())
+    }
+
+    fn is_proposal_capable_validated_evidence(&self) -> bool {
+        match (self.evidence_kind, self.provenance_marker) {
+            (
+                LearningSensorEvidenceKind::SanctionedSanitizedChatObservation,
+                LearningSensorProvenanceMarker::RuntimeSanitizedChatObservation,
+            ) => self
+                .sanitized_chat_observation
+                .clone()
+                .is_some_and(|observation| observation.validate().is_ok()),
+            (
+                LearningSensorEvidenceKind::TypedFixtureObservation,
+                LearningSensorProvenanceMarker::FakeReviewerFixture,
+            ) => self.fixture_title.is_some() && self.fixture_observation.is_some(),
+            _ => false,
+        }
     }
 }
 
@@ -701,12 +940,12 @@ impl LearningSensorReviewOutput {
         if self.input_fingerprint != input.fingerprint()? {
             anyhow::bail!("learning sensor input fingerprint mismatch");
         }
-        ensure_learning_sensor_text("reason_code", &self.reason_code, 128)?;
+        ensure_learning_sensor_code("reason_code", &self.reason_code, 128)?;
         if let Some(title) = &self.proposal_title {
-            ensure_learning_sensor_text("proposal_title", title, 160)?;
+            ensure_learning_sensor_proposal_code("proposal_title", title, 160)?;
         }
         if let Some(body) = &self.proposal_body {
-            ensure_learning_sensor_text("proposal_body", body, 1_024)?;
+            ensure_learning_sensor_proposal_code("proposal_body", body, 1_024)?;
         }
         if self.decision != LearningSensorDecisionKind::ProposeLesson
             && (self.proposal_title.is_some() || self.proposal_body.is_some())
@@ -714,10 +953,10 @@ impl LearningSensorReviewOutput {
             anyhow::bail!("learning sensor non-proposal decision cannot include proposal payload");
         }
         if self.decision == LearningSensorDecisionKind::ProposeLesson {
-            if input.evidence_kind != LearningSensorEvidenceKind::TypedFixtureObservation
-                || input.provenance_marker != LearningSensorProvenanceMarker::FakeReviewerFixture
-            {
-                anyhow::bail!("learning sensor proposal requires typed fake fixture evidence");
+            if !input.is_proposal_capable_validated_evidence() {
+                anyhow::bail!(
+                    "learning sensor proposal requires validated sanitized observation or typed fake fixture evidence"
+                );
             }
             if self
                 .proposal_title
@@ -870,13 +1109,24 @@ impl LearningSensorReviewer for FakeLearningSensorReviewer {
             (
                 LearningSensorEvidenceKind::TypedFixtureObservation,
                 LearningSensorProvenanceMarker::FakeReviewerFixture,
-                Some(title),
-                Some(observation),
+                Some(_),
+                Some(_),
             ) => (
                 LearningSensorDecisionKind::ProposeLesson,
                 "typed_fixture_substantive_evidence".to_string(),
-                Some(title),
-                Some(observation),
+                Some("typed_fixture_observation".to_string()),
+                Some("typed_fixture_substantive_pattern".to_string()),
+            ),
+            (
+                LearningSensorEvidenceKind::SanctionedSanitizedChatObservation,
+                LearningSensorProvenanceMarker::RuntimeSanitizedChatObservation,
+                _,
+                _,
+            ) => (
+                LearningSensorDecisionKind::ProposeLesson,
+                "sanctioned_sanitized_chat_observation".to_string(),
+                Some("sanctioned_sanitized_observation".to_string()),
+                Some("validated_counters_and_fingerprints".to_string()),
             ),
             _ => (
                 LearningSensorDecisionKind::Pending,
@@ -914,6 +1164,41 @@ pub fn learning_projection_hash(projection: &LearningRecordProjection) -> String
     ))
 }
 
+fn ensure_learning_sensor_proposal_code(
+    name: &str,
+    value: &str,
+    max_chars: usize,
+) -> anyhow::Result<()> {
+    ensure_learning_sensor_code(name, value, max_chars)?;
+    const ALLOWED_PROPOSAL_CODES: &[&str] = &[
+        "typed_fixture_observation",
+        "typed_fixture_substantive_pattern",
+        "sanctioned_sanitized_observation",
+        "validated_counters_and_fingerprints",
+    ];
+    if !ALLOWED_PROPOSAL_CODES.contains(&value.trim()) {
+        anyhow::bail!("learning sensor {name} is not an allowed audit-only proposal code");
+    }
+    Ok(())
+}
+
+fn ensure_learning_sensor_code(name: &str, value: &str, max_chars: usize) -> anyhow::Result<()> {
+    let value = value.trim();
+    if value.is_empty() {
+        anyhow::bail!("learning sensor {name} cannot be empty");
+    }
+    if value.chars().count() > max_chars {
+        anyhow::bail!("learning sensor {name} exceeds max length {max_chars}");
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+    {
+        anyhow::bail!("learning sensor {name} must be a bounded safe reason code");
+    }
+    ensure_learning_sensor_text(name, value, max_chars)
+}
+
 fn ensure_learning_sensor_text(name: &str, value: &str, max_chars: usize) -> anyhow::Result<()> {
     let value = value.trim();
     if value.is_empty() {
@@ -928,14 +1213,22 @@ fn ensure_learning_sensor_text(name: &str, value: &str, max_chars: usize) -> any
         "password",
         "bearer",
         "secret",
+        "api_key",
+        "apikey",
         "tool_call",
         "tool payload",
+        "raw_transcript",
+        "patch",
+        "diff --git",
         "action",
         "mutation_target",
         "file_path",
         "../",
         "/home/",
         "/etc/",
+        "http://",
+        "https://",
+        "www.",
         "rules",
         "skills",
         "system prompt",
@@ -948,6 +1241,16 @@ fn ensure_learning_sensor_text(name: &str, value: &str, max_chars: usize) -> any
     ];
     if forbidden.iter().any(|needle| lower.contains(needle)) {
         anyhow::bail!("learning sensor {name} contains forbidden control or secret-shaped text");
+    }
+    if lower.contains('@')
+        || lower.contains("cargo ")
+        || lower.contains("git ")
+        || lower.contains("curl ")
+        || lower.contains("rm ")
+        || lower.contains("sudo ")
+        || lower.contains("ssh ")
+    {
+        anyhow::bail!("learning sensor {name} contains raw-looking payload text");
     }
     Ok(())
 }
@@ -1720,6 +2023,233 @@ mod tests {
         let expected = vec![true, true, true];
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn sanitized_chat_observation_validates_and_builds_sensor_input() {
+        let projection = fixture_learning_projection(LearningReviewState::Candidate);
+        let observation = fixture_sanitized_observation().validate().unwrap();
+
+        let actual =
+            LearningSensorReviewInput::from_sanitized_chat_observation(&projection, observation);
+        let expected = (
+            LearningSensorEvidenceKind::SanctionedSanitizedChatObservation,
+            LearningSensorProvenanceMarker::RuntimeSanitizedChatObservation,
+            true,
+            true,
+        );
+
+        assert_eq!(
+            (
+                actual.evidence_kind,
+                actual.provenance_marker,
+                actual.sanitized_chat_observation.is_some(),
+                actual.validate().is_ok(),
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn sanitized_chat_observation_rejects_unknown_missing_and_unknown_enum_fields() {
+        let valid = fixture_sanitized_observation();
+        let valid_json = serde_json::to_string(&valid).unwrap();
+        let unknown_json = valid_json.replace('}', r#",\"raw_text\":\"blocked\"}"#);
+        let missing_json = r#"{"observation_kind":"repeated_agent_behavior","occurrence_bucket":"two","severity":"medium","source_cluster_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#
+            .to_string();
+        let unknown_enum_json = valid_json.replace("repeated_agent_behavior", "unknown_behavior");
+
+        let actual = (
+            serde_json::from_str::<SanitizedChatLessonObservation>(&unknown_json).is_err(),
+            serde_json::from_str::<SanitizedChatLessonObservation>(&missing_json).is_err(),
+            serde_json::from_str::<SanitizedChatLessonObservation>(&unknown_enum_json).is_err(),
+        );
+        let expected = (true, true, true);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn sanitized_chat_observation_fingerprint_constraints_are_enforced() {
+        let cases = vec![
+            "".to_string(),
+            "a".repeat(63),
+            "a".repeat(65),
+            "A".repeat(64),
+            "g".repeat(64),
+        ];
+
+        let actual = cases
+            .into_iter()
+            .map(|value| OpaqueLearningFingerprint::new(value).is_err())
+            .collect::<Vec<_>>();
+        let expected = vec![true, true, true, true, true];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn sanitized_chat_observation_rejects_mismatched_gate_payloads() {
+        let projection = fixture_learning_projection(LearningReviewState::Candidate);
+        let mut observation_input = LearningSensorReviewInput::from_sanitized_chat_observation(
+            &projection,
+            fixture_sanitized_observation().validate().unwrap(),
+        );
+        observation_input.provenance_marker =
+            LearningSensorProvenanceMarker::RuntimeConversationSaved;
+        let mut fixture_input = LearningSensorReviewInput::fake_fixture(
+            &projection,
+            "Durable typed observation",
+            "The sanitized evidence has substantive recurring behavior",
+        );
+        fixture_input.sanitized_chat_observation = Some(fixture_sanitized_observation());
+        let mut metadata_input = LearningSensorReviewInput::from_candidate_projection(&projection);
+        metadata_input.sanitized_chat_observation = Some(fixture_sanitized_observation());
+
+        let actual = (
+            observation_input.validate().is_err(),
+            fixture_input.validate().is_err(),
+            metadata_input.validate().is_err(),
+        );
+        let expected = (true, true, true);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn conversation_metadata_still_cannot_propose_lesson_or_accept() {
+        let projection = fixture_learning_projection(LearningReviewState::Candidate);
+        let input = LearningSensorReviewInput::from_candidate_projection(&projection);
+        let proposal = LearningSensorReviewOutput {
+            schema_version: LEARNING_SENSOR_REVIEW_SCHEMA_VERSION,
+            reviewer_id: FAKE_LEARNING_SENSOR_REVIEWER_ID.to_string(),
+            reviewer_version: FAKE_LEARNING_SENSOR_REVIEWER_VERSION,
+            input_fingerprint: input.fingerprint().unwrap(),
+            decision: LearningSensorDecisionKind::ProposeLesson,
+            reason_code: "blocked_runtime_metadata".to_string(),
+            proposal_title: Some("Metadata proposal".to_string()),
+            proposal_body: Some("Metadata cannot produce proposal".to_string()),
+        };
+        let accept_json = serde_json::to_string(&proposal)
+            .unwrap()
+            .replace("propose_lesson", "accept");
+
+        let actual = (
+            proposal
+                .validate_against(
+                    &input,
+                    FAKE_LEARNING_SENSOR_REVIEWER_ID,
+                    FAKE_LEARNING_SENSOR_REVIEWER_VERSION,
+                )
+                .is_err(),
+            serde_json::from_str::<LearningSensorReviewOutput>(&accept_json).is_err(),
+        );
+        let expected = (true, true);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn sanitized_observation_can_validate_proposal_into_sensor_audit_event() {
+        let projection = fixture_learning_projection(LearningReviewState::Candidate);
+        let input = LearningSensorReviewInput::from_sanitized_chat_observation(
+            &projection,
+            fixture_sanitized_observation().validate().unwrap(),
+        );
+        let output = FakeLearningSensorReviewer.review(input.clone()).unwrap();
+
+        let actual = output
+            .into_sensor_event(&input, Utc::now())
+            .unwrap()
+            .event_kind;
+        let expected = LearningEventKind::SensorLessonProposed;
+
+        assert_eq!(actual, expected);
+        assert_ne!(actual, LearningEventKind::ReviewAccepted);
+    }
+
+    #[test]
+    fn stage_two_output_cannot_carry_commands_patches_rule_text_or_freeform_payloads() {
+        let projection = fixture_learning_projection(LearningReviewState::Candidate);
+        let input = LearningSensorReviewInput::from_sanitized_chat_observation(
+            &projection,
+            fixture_sanitized_observation().validate().unwrap(),
+        );
+        let blocked = [
+            "cargo test -p forge_domain",
+            "git apply patch",
+            "https://example.com",
+            "user@example.com",
+            "/home/stranmor/file",
+            "token abcdefghijklmnopqrstuvwxyz",
+            "system prompt update",
+            "source code mutation",
+        ];
+        let actual = blocked
+            .iter()
+            .map(|payload| {
+                LearningSensorReviewOutput {
+                    schema_version: LEARNING_SENSOR_REVIEW_SCHEMA_VERSION,
+                    reviewer_id: FAKE_LEARNING_SENSOR_REVIEWER_ID.to_string(),
+                    reviewer_version: FAKE_LEARNING_SENSOR_REVIEWER_VERSION,
+                    input_fingerprint: input.fingerprint().unwrap(),
+                    decision: LearningSensorDecisionKind::ProposeLesson,
+                    reason_code: "sanctioned_sanitized_chat_observation".to_string(),
+                    proposal_title: Some("Blocked payload".to_string()),
+                    proposal_body: Some((*payload).to_string()),
+                }
+                .validate_against(
+                    &input,
+                    FAKE_LEARNING_SENSOR_REVIEWER_ID,
+                    FAKE_LEARNING_SENSOR_REVIEWER_VERSION,
+                )
+                .is_err()
+            })
+            .collect::<Vec<_>>();
+        let expected = vec![true; blocked.len()];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn stage_two_output_rejects_command_shaped_snake_case_tokens() {
+        let projection = fixture_learning_projection(LearningReviewState::Candidate);
+        let input = LearningSensorReviewInput::from_sanitized_chat_observation(
+            &projection,
+            fixture_sanitized_observation().validate().unwrap(),
+        );
+        let output = LearningSensorReviewOutput {
+            schema_version: LEARNING_SENSOR_REVIEW_SCHEMA_VERSION,
+            reviewer_id: FAKE_LEARNING_SENSOR_REVIEWER_ID.to_string(),
+            reviewer_version: FAKE_LEARNING_SENSOR_REVIEWER_VERSION,
+            input_fingerprint: input.fingerprint().unwrap(),
+            decision: LearningSensorDecisionKind::ProposeLesson,
+            reason_code: "sanctioned_sanitized_chat_observation".to_string(),
+            proposal_title: Some("safe_title".to_string()),
+            proposal_body: Some("run_shell".to_string()),
+        };
+
+        let actual = output
+            .validate_against(
+                &input,
+                FAKE_LEARNING_SENSOR_REVIEWER_ID,
+                FAKE_LEARNING_SENSOR_REVIEWER_VERSION,
+            )
+            .is_err();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+    }
+
+    fn fixture_sanitized_observation() -> SanitizedChatLessonObservation {
+        SanitizedChatLessonObservation::new(
+            SanitizedChatObservationKind::RepeatedAgentBehavior,
+            SanitizedObservationCountBucket::Two,
+            SanitizedObservationSeverity::Medium,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .unwrap()
     }
 
     fn fixture_learning_projection(review_state: LearningReviewState) -> LearningRecordProjection {

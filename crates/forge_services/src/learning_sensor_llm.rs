@@ -9,7 +9,7 @@ use forge_app::domain::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-const LEARNING_SENSOR_LLM_SYSTEM_INSTRUCTION: &str = "You are a read-only learning Sensor. Review only the provided sanitized LearningSensorReviewInput JSON. Return exactly one JSON object matching the schema. Do not request tools. Do not infer from transcripts, files, repositories, secrets, or external state. Normal runtime conversation_metadata evidence may only be pending or reject.";
+const LEARNING_SENSOR_LLM_SYSTEM_INSTRUCTION: &str = "You are a read-only learning Sensor. Review only the provided sanitized LearningSensorReviewInput JSON. Return exactly one JSON object matching the schema. Do not request tools. Do not infer from transcripts, files, repositories, secrets, or external state. Normal runtime conversation_metadata evidence may only be pending or reject. ProposeLesson is allowed only when the input evidence is sanctioned_sanitized_chat_observation with runtime_sanitized_chat_observation provenance, or typed_fixture_observation with fake_reviewer_fixture provenance.";
 const LEARNING_SENSOR_LLM_MAX_TOKENS: usize = 768;
 
 /// Narrow Sensor-safe port for live LLM JSON-schema calls.
@@ -347,9 +347,9 @@ fn learning_sensor_response_format_schema() -> serde_json::Value {
                     "reviewer_version": {"type": "integer", "minimum": 1},
                     "input_fingerprint": {"type": "string", "minLength": 1, "maxLength": 128},
                     "decision": {"type": "string", "enum": ["propose_lesson", "pending", "reject"]},
-                    "reason_code": {"type": "string", "minLength": 1, "maxLength": 128},
-                    "proposal_title": {"type": ["string", "null"], "maxLength": 160},
-                    "proposal_body": {"type": ["string", "null"], "maxLength": 1024}
+                    "reason_code": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-z0-9_]+$"},
+                    "proposal_title": {"type": ["string", "null"], "enum": ["typed_fixture_observation", "sanctioned_sanitized_observation", null]},
+                    "proposal_body": {"type": ["string", "null"], "enum": ["typed_fixture_substantive_pattern", "validated_counters_and_fingerprints", null]}
                 }
             }
         }
@@ -366,7 +366,8 @@ mod tests {
     use forge_app::domain::{
         ConversationId, LearningCaptureMetadata, LearningProvenance, LearningRecordId,
         LearningRecordProjection, LearningRedactionStatus, LearningReviewState,
-        learning_digest_hex,
+        SanitizedChatLessonObservation, SanitizedChatObservationKind,
+        SanitizedObservationCountBucket, SanitizedObservationSeverity, learning_digest_hex,
     };
 
     #[derive(Default)]
@@ -648,6 +649,70 @@ mod tests {
         let expected = false;
 
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn live_reviewer_allows_proposal_from_sanctioned_sanitized_observation() -> Result<()> {
+        let input = fixture_sanitized_observation_input();
+        let output = LearningSensorReviewOutput {
+            schema_version: LEARNING_SENSOR_REVIEW_SCHEMA_VERSION,
+            reviewer_id: LearningSensorReviewerIdentity::fake().reviewer_id,
+            reviewer_version: LearningSensorReviewerIdentity::fake().reviewer_version,
+            input_fingerprint: input.fingerprint()?,
+            decision: LearningSensorDecisionKind::ProposeLesson,
+            reason_code: "sanctioned_sanitized_chat_observation".to_string(),
+            proposal_title: Some("sanctioned_sanitized_observation".to_string()),
+            proposal_body: Some("validated_counters_and_fingerprints".to_string()),
+        };
+        let client = Arc::new(FixtureLearningSensorLlmClient::with_response(Ok(
+            LearningSensorLlmResponse::complete_json(serde_json::to_string(&output)?),
+        )));
+        let reviewer =
+            LiveLearningSensorReviewer::new(client, LearningSensorReviewerIdentity::fake());
+
+        let actual = reviewer.review(input.clone()).await;
+        let expected = LearningSensorDecisionKind::ProposeLesson;
+
+        actual.validate_against_identity(&input, &LearningSensorReviewerIdentity::fake())?;
+        assert_eq!(actual.decision, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn system_instruction_keeps_metadata_pending_and_sanctioned_gate_explicit() -> Result<()> {
+        let input = fixture_sanitized_observation_input();
+        let request = LearningSensorLlmRequest::from_input(&input)?;
+        let actual = (
+            request
+                .system_instruction
+                .contains("conversation_metadata evidence may only be pending or reject"),
+            request
+                .system_instruction
+                .contains("sanctioned_sanitized_chat_observation"),
+            request
+                .system_instruction
+                .contains("typed_fixture_observation"),
+        );
+        let expected = (true, true, true);
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    fn fixture_sanitized_observation_input() -> LearningSensorReviewInput {
+        LearningSensorReviewInput::from_sanitized_chat_observation(
+            &fixture_learning_projection(),
+            SanitizedChatLessonObservation::new(
+                SanitizedChatObservationKind::ReviewerIdentifiedGap,
+                SanitizedObservationCountBucket::Two,
+                SanitizedObservationSeverity::Medium,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            )
+            .unwrap()
+            .validate()
+            .unwrap(),
+        )
     }
 
     fn fixture_sensor_input(fixture_evidence: bool) -> LearningSensorReviewInput {

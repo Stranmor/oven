@@ -620,7 +620,9 @@ mod tests {
     use chrono::Duration;
     use forge_domain::{
         FakeLearningSensorReviewer, LEARNING_LEDGER_SCHEMA_VERSION, LearningSensorReviewInput,
-        LearningSensorReviewer, RedactedLearningSummary,
+        LearningSensorReviewer, RedactedLearningSummary, SanitizedChatLessonObservation,
+        SanitizedChatObservationKind, SanitizedObservationCountBucket,
+        SanitizedObservationSeverity,
     };
     use pretty_assertions::assert_eq;
 
@@ -1633,6 +1635,61 @@ mod tests {
 
         assert_eq!(actual, expected);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn sanitized_observation_sensor_proposal_remains_candidate_non_accepted()
+    -> anyhow::Result<()> {
+        let fixture = fixture_repo(27)?;
+        let conversation_id = ConversationId::generate();
+        let created_at = Utc::now();
+        let candidate = fixture
+            .insert_learning_event(fixture_event(
+                conversation_id,
+                "event-1",
+                "sanitized observation proposal stays audit only",
+                created_at,
+            )?)
+            .await?
+            .event;
+        let projection = fixture
+            .get_learning_record(candidate.record_id)
+            .await?
+            .expect("candidate projection should exist");
+        let input = LearningSensorReviewInput::from_sanitized_chat_observation(
+            &projection,
+            fixture_sanitized_observation().validate()?,
+        );
+        let output = FakeLearningSensorReviewer.review(input.clone())?;
+        fixture
+            .insert_learning_event(
+                output.into_sensor_event(&input, created_at + Duration::seconds(1))?,
+            )
+            .await?;
+
+        let projection = fixture
+            .get_learning_record(candidate.record_id)
+            .await?
+            .expect("candidate projection should exist after sensor event");
+        let accepted = fixture
+            .list_learning_records(Some(LearningReviewState::Accepted), 10)
+            .await?;
+        let actual = (projection.review_state, accepted.len());
+        let expected = (LearningReviewState::Candidate, 0usize);
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    fn fixture_sanitized_observation() -> SanitizedChatLessonObservation {
+        SanitizedChatLessonObservation::new(
+            SanitizedChatObservationKind::ReviewerIdentifiedGap,
+            SanitizedObservationCountBucket::Two,
+            SanitizedObservationSeverity::Medium,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .unwrap()
     }
 
     #[tokio::test]
