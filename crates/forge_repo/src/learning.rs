@@ -167,9 +167,10 @@ impl LearningRepository for LearningRepositoryImpl {
                         .filter(learning_ledger_events::record_id.eq(&record.record_id))
                         .filter(learning_ledger_events::event_kind.eq(&record.event_kind))
                         .order(learning_ledger_events::event_seq.desc())
-                        .first::<LearningLedgerEventRecord>(connection)?
-                        .try_into_event()?;
-                    return Ok(LearningReviewOutcome { event: existing, projection });
+                        .first::<LearningLedgerEventRecord>(connection)?;
+                    ensure_learning_event_idempotency_replay(&existing, &record)?;
+                    let event = existing.try_into_event()?;
+                    return Ok(LearningReviewOutcome { event, projection });
                 }
                 if projection.review_state != LearningReviewState::Candidate {
                     anyhow::bail!(
@@ -471,7 +472,8 @@ fn ensure_learning_event_idempotency_replay(
     existing: &LearningLedgerEventRecord,
     replay: &LearningLedgerEventRecord,
 ) -> anyhow::Result<()> {
-    if existing.event_kind == replay.event_kind
+    if existing.idempotency_key == replay.idempotency_key
+        && existing.event_kind == replay.event_kind
         && (existing.event_kind == LearningEventKind::CandidateCaptured.to_string()
             || existing.record_id == replay.record_id)
         && existing.summary == replay.summary
@@ -793,14 +795,8 @@ mod tests {
             LearningProvenance::conversation(conversation_id, "review-1", "review-fingerprint-1"),
             created_at + Duration::seconds(1),
         )?;
+        let repeated = accepted.clone();
         let first = fixture.review_learning_candidate_event(accepted).await?;
-        let repeated = LearningLedgerEvent::review(
-            candidate.record_id,
-            LearningEventKind::ReviewAccepted,
-            "different caller note must not create phantom event",
-            LearningProvenance::conversation(conversation_id, "review-2", "review-fingerprint-2"),
-            created_at + Duration::seconds(2),
-        )?;
         let second = fixture.review_learning_candidate_event(repeated).await?;
         let rejected = LearningLedgerEvent::review(
             candidate.record_id,
@@ -905,6 +901,58 @@ mod tests {
             events.len(),
         );
         let expected = (true, LearningReviewState::Candidate, 3usize);
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_review_rejects_idempotency_collision_for_same_record_and_kind()
+    -> anyhow::Result<()> {
+        let fixture = fixture_repo(20)?;
+        let conversation_id = ConversationId::generate();
+        let created_at = Utc::now();
+        let candidate = fixture
+            .insert_learning_event(fixture_event(
+                conversation_id,
+                "event-1",
+                "same record same kind collision candidate",
+                created_at,
+            )?)
+            .await?
+            .event;
+        let first_review = LearningLedgerEvent::review(
+            candidate.record_id,
+            LearningEventKind::ReviewAccepted,
+            "original accepted review",
+            LearningProvenance::conversation(conversation_id, "review-1", "review-fingerprint-1"),
+            created_at + Duration::seconds(1),
+        )?;
+        let first_outcome = fixture
+            .review_learning_candidate_event(first_review)
+            .await?;
+        let mut colliding_review = LearningLedgerEvent::review(
+            candidate.record_id,
+            LearningEventKind::ReviewAccepted,
+            "different accepted review with forged idempotency key",
+            LearningProvenance::conversation(conversation_id, "review-2", "review-fingerprint-2"),
+            created_at + Duration::seconds(2),
+        )?;
+        colliding_review.idempotency_key = first_outcome.event.idempotency_key.clone();
+
+        let colliding = fixture
+            .review_learning_candidate_event(colliding_review)
+            .await;
+        let events = fixture
+            .run_with_connection(move |connection, wid| {
+                learning_ledger_events::table
+                    .filter(learning_ledger_events::workspace_id.eq(workspace_db_id(wid)))
+                    .load::<LearningLedgerEventRecord>(connection)
+                    .map_err(Into::into)
+            })
+            .await?;
+        let actual = (colliding.is_err(), events.len());
+        let expected = (true, 2usize);
 
         assert_eq!(actual, expected);
         Ok(())
