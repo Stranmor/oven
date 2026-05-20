@@ -6,12 +6,13 @@ use std::path::{Component, Path};
 use anyhow::{Result, bail};
 
 use crate::context_adapter::resolve_manifest_evidence_target;
-use crate::retrieval::retrieve;
+use crate::retrieval::retrieve_with_boundaries;
 use crate::types::{
     ContextPack, ContextPackEvidence, ContextPackSelection, FreshnessProofLevel,
     ManifestFreshnessEvaluation, ProjectManifest, RetrievalQuery, RetrievalResult,
-    StaleEvidencePolicy,
+    RetrievalScoringWeights, StaleEvidencePolicy, VectorQuery,
 };
+use crate::vector::{Reranker, VectorIndex};
 
 const MAX_DIAGNOSTIC_SUMMARIES: usize = 8;
 
@@ -84,6 +85,172 @@ impl ProjectContextPathScope {
         }
         true
     }
+}
+
+/// Optional pure retrieval integration boundaries supplied by the caller.
+#[derive(Clone, Copy, Default)]
+pub struct ProjectContextRetrievalOptions<'a> {
+    /// Optional precomputed vector query generated outside this crate.
+    pub vector_query: Option<&'a VectorQuery>,
+    /// Optional validated vector index boundary.
+    pub vector_index: Option<ProjectContextVectorIndexBoundary<'a>>,
+    /// Optional reranker boundary and readiness metadata.
+    pub reranker: Option<ProjectContextRerankerBoundary<'a>>,
+}
+
+/// Validated vector index boundary plus redaction-safe metadata.
+#[derive(Clone, Copy)]
+pub struct ProjectContextVectorIndexBoundary<'a> {
+    /// Vector index implementation used by pure hybrid retrieval.
+    pub index: &'a dyn VectorIndex,
+    /// Redaction-safe identity for diagnostics.
+    pub identity: ProjectContextIntegrationIdentity,
+    /// Explicit readiness metadata supplied by the integration boundary.
+    pub readiness: ProjectContextVectorReadiness,
+}
+
+/// Reranker boundary plus redaction-safe metadata.
+#[derive(Clone, Copy)]
+pub struct ProjectContextRerankerBoundary<'a> {
+    /// Reranker implementation used by pure hybrid retrieval.
+    pub reranker: &'a dyn Reranker,
+    /// Redaction-safe identity for diagnostics.
+    pub identity: ProjectContextIntegrationIdentity,
+    /// Explicit readiness metadata supplied by the integration boundary.
+    pub readiness: ProjectContextRerankerReadiness,
+}
+
+/// Redaction-safe integration identity metadata.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProjectContextIntegrationIdentity {
+    /// Stable provider or subsystem label with no secrets or raw source text.
+    pub provider: &'static str,
+    /// Stable model or artifact label with no secrets or raw source text.
+    pub artifact: &'static str,
+}
+
+/// Explicit vector boundary readiness metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectContextVectorReadiness {
+    /// Vector index is ready for queries with the given embedding dimension.
+    Ready { dimension: usize },
+    /// Vector index is intentionally unavailable.
+    Unavailable(ProjectContextVectorUnavailableReason),
+}
+
+/// Explicit reranker boundary readiness metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectContextRerankerReadiness {
+    /// Reranker is ready for use.
+    Ready,
+    /// Reranker is intentionally unavailable.
+    Unavailable(ProjectContextRerankerUnavailableReason),
+}
+
+/// Redaction-safe vector unavailability reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectContextVectorUnavailableReason {
+    /// No query embedding was supplied by the caller.
+    MissingQueryEmbedding,
+    /// No vector index boundary was supplied by the caller.
+    MissingVectorIndex,
+    /// Vector index metadata says the index is not ready.
+    IndexNotReady,
+}
+
+/// Redaction-safe reranker unavailability reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectContextRerankerUnavailableReason {
+    /// No reranker boundary was supplied by the caller.
+    MissingReranker,
+    /// Reranker metadata says the boundary is not ready.
+    RerankerNotReady,
+}
+
+/// Redaction-safe invalid vector boundary reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectContextVectorInvalidReason {
+    /// Query embedding dimension differs from the ready vector index dimension.
+    DimensionMismatch {
+        query_dimension: usize,
+        index_dimension: usize,
+    },
+    /// Ready vector index reported an invalid zero dimension.
+    ZeroIndexDimension,
+    /// Query embedding is empty while vector retrieval was requested.
+    EmptyQueryEmbedding,
+}
+
+/// Typed redaction-safe phase diagnostics for pure retrieval planning.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProjectContextRetrievalPhaseDiagnostics {
+    /// Lexical retrieval phase status.
+    pub lexical: ProjectContextRetrievalPhaseStatus,
+    /// Graph expansion phase status.
+    pub graph: ProjectContextRetrievalPhaseStatus,
+    /// Vector retrieval phase status.
+    pub vector: ProjectContextRetrievalPhaseStatus,
+    /// Reranking phase status.
+    pub rerank: ProjectContextRetrievalPhaseStatus,
+}
+
+/// Typed redaction-safe status for one retrieval phase.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProjectContextRetrievalPhaseStatus {
+    /// Phase was active; result count is a phase participation count, not an
+    /// availability proof.
+    Active { result_count: usize },
+    /// Phase was valid but intentionally not used for this request.
+    Skipped(ProjectContextRetrievalPhaseSkipReason),
+    /// Phase could not run because a boundary or input was absent/not ready.
+    Unavailable(ProjectContextRetrievalPhaseUnavailableReason),
+    /// Phase input was present but invalid.
+    Invalid(ProjectContextRetrievalPhaseInvalidReason),
+}
+
+impl Default for ProjectContextRetrievalPhaseStatus {
+    fn default() -> Self {
+        Self::Skipped(ProjectContextRetrievalPhaseSkipReason::EmptyQueryText)
+    }
+}
+
+/// Redaction-safe reason for a skipped phase.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProjectContextRetrievalPhaseSkipReason {
+    /// Query text is empty, so lexical/rerank text matching is skipped.
+    #[default]
+    EmptyQueryText,
+    /// Graph expansion was not requested.
+    GraphExpansionDisabled,
+}
+
+/// Redaction-safe reason for an unavailable phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectContextRetrievalPhaseUnavailableReason {
+    /// Vector query embedding was not supplied.
+    MissingQueryEmbedding,
+    /// Vector index boundary was not supplied.
+    MissingVectorIndex,
+    /// Vector index boundary reported not-ready status.
+    VectorIndexNotReady,
+    /// Reranker boundary was not supplied.
+    MissingReranker,
+    /// Reranker boundary reported not-ready status.
+    RerankerNotReady,
+}
+
+/// Redaction-safe reason for an invalid phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectContextRetrievalPhaseInvalidReason {
+    /// Query vector dimension differs from index dimension.
+    VectorDimensionMismatch {
+        query_dimension: usize,
+        index_dimension: usize,
+    },
+    /// Ready index reported zero dimensions.
+    VectorIndexZeroDimension,
+    /// Query embedding was empty.
+    EmptyQueryEmbedding,
 }
 
 /// Pure planner refusal for project-context retrieval.
@@ -280,6 +447,8 @@ pub struct ProjectContextRetrievalQueryDiagnostics {
     pub stale_policy: StaleEvidencePolicy,
     /// Freshness proof level used for injection gating.
     pub freshness_proof_level: FreshnessProofLevel,
+    /// Typed redaction-safe retrieval phase diagnostics.
+    pub phase_diagnostics: ProjectContextRetrievalPhaseDiagnostics,
 }
 
 /// Deterministic write decision for project-context retrieval.
@@ -366,10 +535,39 @@ pub fn plan_project_context_retrieval(
     freshness: &ManifestFreshnessEvaluation,
     request: ProjectContextRetrievalRequest,
 ) -> ProjectContextRetrievalPlanningOutcome {
+    plan_project_context_retrieval_with_options(
+        manifest,
+        freshness,
+        request,
+        ProjectContextRetrievalOptions::default(),
+    )
+}
+
+/// Plans project-context retrieval with optional pure semantic boundaries.
+///
+/// # Arguments
+///
+/// * `manifest` - Project manifest used for retrieval and evidence resolution.
+/// * `freshness` - Freshness evaluation used for injection gating and stale
+///   evidence checks.
+/// * `request` - Typed retrieval request.
+/// * `options` - Optional vector/reranker boundaries supplied by the caller.
+pub fn plan_project_context_retrieval_with_options(
+    manifest: &ProjectManifest,
+    freshness: &ManifestFreshnessEvaluation,
+    request: ProjectContextRetrievalRequest,
+    options: ProjectContextRetrievalOptions<'_>,
+) -> ProjectContextRetrievalPlanningOutcome {
     let effective_limit = if request.limit == 0 {
         10
     } else {
         request.limit
+    };
+    let phase_diagnostics = ProjectContextRetrievalPhaseDiagnostics {
+        lexical: lexical_phase_status(&request.query_text),
+        graph: graph_phase_status(request.include_graph_expansion),
+        vector: ProjectContextRetrievalPhaseStatus::default(),
+        rerank: ProjectContextRetrievalPhaseStatus::default(),
     };
     let diagnostics = ProjectContextRetrievalQueryDiagnostics {
         query_text: Some(request.query_text.clone()),
@@ -379,6 +577,7 @@ pub fn plan_project_context_retrieval(
         include_graph_expansion: request.include_graph_expansion,
         stale_policy: StaleEvidencePolicy::Reject,
         freshness_proof_level: freshness.proof_level.clone(),
+        phase_diagnostics,
     };
     if !freshness.can_inject() {
         return ProjectContextRetrievalPlanningOutcome::Refusal(ProjectContextRetrievalRefusal {
@@ -395,12 +594,29 @@ pub fn plan_project_context_retrieval(
         limit: usize::MAX,
         include_graph_expansion: diagnostics.include_graph_expansion,
     };
-    let mut selected_results = retrieve(manifest, &query)
-        .into_iter()
-        .filter(|result| request.path_scope.matches(&result.path))
-        .collect::<Vec<_>>();
+    let vector_activation = vector_activation(options.vector_query, options.vector_index);
+    let reranker_activation = reranker_activation(options.reranker, &request.query_text);
+    let mut selected_results = retrieve_with_boundaries(
+        manifest,
+        &query,
+        vector_activation.vector_query,
+        vector_activation.vector_index,
+        reranker_activation.reranker,
+        &RetrievalScoringWeights::default(),
+    )
+    .into_iter()
+    .filter(|result| request.path_scope.matches(&result.path))
+    .collect::<Vec<_>>();
     selected_results.sort_by(compare_retrieval_results_for_return);
     selected_results.truncate(effective_limit);
+
+    let mut diagnostics = diagnostics;
+    diagnostics.phase_diagnostics.vector = vector_activation.status(&selected_results);
+    diagnostics.phase_diagnostics.rerank = reranker_activation.status(&selected_results);
+    diagnostics.phase_diagnostics.lexical =
+        lexical_phase_status_with_results(&request.query_text, &selected_results);
+    diagnostics.phase_diagnostics.graph =
+        graph_phase_status_with_results(request.include_graph_expansion, &selected_results);
 
     if selected_results.is_empty() {
         return ProjectContextRetrievalPlanningOutcome::Plan(Box::new(
@@ -491,6 +707,201 @@ pub fn plan_project_context_retrieval(
     }))
 }
 
+fn lexical_phase_status(query_text: &str) -> ProjectContextRetrievalPhaseStatus {
+    if query_text.trim().is_empty() {
+        ProjectContextRetrievalPhaseStatus::Skipped(
+            ProjectContextRetrievalPhaseSkipReason::EmptyQueryText,
+        )
+    } else {
+        ProjectContextRetrievalPhaseStatus::Active { result_count: 0 }
+    }
+}
+
+fn lexical_phase_status_with_results(
+    query_text: &str,
+    selected_results: &[RetrievalResult],
+) -> ProjectContextRetrievalPhaseStatus {
+    if query_text.trim().is_empty() {
+        ProjectContextRetrievalPhaseStatus::Skipped(
+            ProjectContextRetrievalPhaseSkipReason::EmptyQueryText,
+        )
+    } else {
+        ProjectContextRetrievalPhaseStatus::Active {
+            result_count: selected_results
+                .iter()
+                .filter(|result| result.score_parts.contains_key("lexical"))
+                .count(),
+        }
+    }
+}
+
+fn graph_phase_status(include_graph_expansion: bool) -> ProjectContextRetrievalPhaseStatus {
+    if include_graph_expansion {
+        ProjectContextRetrievalPhaseStatus::Active { result_count: 0 }
+    } else {
+        ProjectContextRetrievalPhaseStatus::Skipped(
+            ProjectContextRetrievalPhaseSkipReason::GraphExpansionDisabled,
+        )
+    }
+}
+
+fn graph_phase_status_with_results(
+    include_graph_expansion: bool,
+    selected_results: &[RetrievalResult],
+) -> ProjectContextRetrievalPhaseStatus {
+    if include_graph_expansion {
+        ProjectContextRetrievalPhaseStatus::Active {
+            result_count: selected_results
+                .iter()
+                .filter(|result| result.score_parts.contains_key("graph"))
+                .count(),
+        }
+    } else {
+        ProjectContextRetrievalPhaseStatus::Skipped(
+            ProjectContextRetrievalPhaseSkipReason::GraphExpansionDisabled,
+        )
+    }
+}
+
+fn vector_activation<'a>(
+    vector_query: Option<&'a VectorQuery>,
+    vector_index: Option<ProjectContextVectorIndexBoundary<'a>>,
+) -> ProjectContextVectorActivation<'a> {
+    match (vector_query, vector_index) {
+        (Some(query), Some(boundary)) => match boundary.readiness {
+            ProjectContextVectorReadiness::Ready { dimension } => {
+                if dimension == 0 {
+                    ProjectContextVectorActivation::invalid(
+                        ProjectContextRetrievalPhaseInvalidReason::VectorIndexZeroDimension,
+                    )
+                } else if query.embedding.is_empty() {
+                    ProjectContextVectorActivation::invalid(
+                        ProjectContextRetrievalPhaseInvalidReason::EmptyQueryEmbedding,
+                    )
+                } else if query.embedding.len() != dimension {
+                    ProjectContextVectorActivation::invalid(
+                        ProjectContextRetrievalPhaseInvalidReason::VectorDimensionMismatch {
+                            query_dimension: query.embedding.len(),
+                            index_dimension: dimension,
+                        },
+                    )
+                } else {
+                    ProjectContextVectorActivation {
+                        vector_query: Some(query),
+                        vector_index: Some(boundary.index),
+                        initial_status: None,
+                    }
+                }
+            }
+            ProjectContextVectorReadiness::Unavailable(_) => {
+                ProjectContextVectorActivation::unavailable(
+                    ProjectContextRetrievalPhaseUnavailableReason::VectorIndexNotReady,
+                )
+            }
+        },
+        (None, _) => ProjectContextVectorActivation::unavailable(
+            ProjectContextRetrievalPhaseUnavailableReason::MissingQueryEmbedding,
+        ),
+        (Some(_), None) => ProjectContextVectorActivation::unavailable(
+            ProjectContextRetrievalPhaseUnavailableReason::MissingVectorIndex,
+        ),
+    }
+}
+
+fn reranker_activation<'a>(
+    reranker: Option<ProjectContextRerankerBoundary<'a>>,
+    query_text: &str,
+) -> ProjectContextRerankerActivation<'a> {
+    if query_text.trim().is_empty() {
+        return ProjectContextRerankerActivation::skipped(
+            ProjectContextRetrievalPhaseSkipReason::EmptyQueryText,
+        );
+    }
+    match reranker {
+        Some(boundary) => match boundary.readiness {
+            ProjectContextRerankerReadiness::Ready => ProjectContextRerankerActivation {
+                reranker: Some(boundary.reranker),
+                initial_status: None,
+            },
+            ProjectContextRerankerReadiness::Unavailable(_) => {
+                ProjectContextRerankerActivation::unavailable(
+                    ProjectContextRetrievalPhaseUnavailableReason::RerankerNotReady,
+                )
+            }
+        },
+        None => ProjectContextRerankerActivation::unavailable(
+            ProjectContextRetrievalPhaseUnavailableReason::MissingReranker,
+        ),
+    }
+}
+
+struct ProjectContextVectorActivation<'a> {
+    vector_query: Option<&'a VectorQuery>,
+    vector_index: Option<&'a dyn VectorIndex>,
+    initial_status: Option<ProjectContextRetrievalPhaseStatus>,
+}
+
+impl ProjectContextVectorActivation<'_> {
+    fn unavailable(reason: ProjectContextRetrievalPhaseUnavailableReason) -> Self {
+        Self {
+            vector_query: None,
+            vector_index: None,
+            initial_status: Some(ProjectContextRetrievalPhaseStatus::Unavailable(reason)),
+        }
+    }
+
+    fn invalid(reason: ProjectContextRetrievalPhaseInvalidReason) -> Self {
+        Self {
+            vector_query: None,
+            vector_index: None,
+            initial_status: Some(ProjectContextRetrievalPhaseStatus::Invalid(reason)),
+        }
+    }
+
+    fn status(&self, selected_results: &[RetrievalResult]) -> ProjectContextRetrievalPhaseStatus {
+        self.initial_status
+            .clone()
+            .unwrap_or_else(|| ProjectContextRetrievalPhaseStatus::Active {
+                result_count: selected_results
+                    .iter()
+                    .filter(|result| result.score_parts.contains_key("vector"))
+                    .count(),
+            })
+    }
+}
+
+struct ProjectContextRerankerActivation<'a> {
+    reranker: Option<&'a dyn Reranker>,
+    initial_status: Option<ProjectContextRetrievalPhaseStatus>,
+}
+
+impl ProjectContextRerankerActivation<'_> {
+    fn unavailable(reason: ProjectContextRetrievalPhaseUnavailableReason) -> Self {
+        Self {
+            reranker: None,
+            initial_status: Some(ProjectContextRetrievalPhaseStatus::Unavailable(reason)),
+        }
+    }
+
+    fn skipped(reason: ProjectContextRetrievalPhaseSkipReason) -> Self {
+        Self {
+            reranker: None,
+            initial_status: Some(ProjectContextRetrievalPhaseStatus::Skipped(reason)),
+        }
+    }
+
+    fn status(&self, selected_results: &[RetrievalResult]) -> ProjectContextRetrievalPhaseStatus {
+        self.initial_status
+            .clone()
+            .unwrap_or_else(|| ProjectContextRetrievalPhaseStatus::Active {
+                result_count: selected_results
+                    .iter()
+                    .filter(|result| result.score_parts.contains_key("rerank"))
+                    .count(),
+            })
+    }
+}
+
 fn stable_return_order(evidence: &[ContextPackEvidence]) -> Vec<ProjectContextReturnOrderItem> {
     let mut items = evidence
         .iter()
@@ -562,6 +973,8 @@ fn validate_manifest_relative_path(path: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use anyhow::Result;
     use pretty_assertions::assert_eq;
 
@@ -572,6 +985,7 @@ mod tests {
         CargoPackageMetadata, CargoTargetDeclaration, CargoTargetKind, CargoTargetMetadata,
         FreshnessState, Language, Provenance, SourceFile,
     };
+    use crate::vector::DeterministicVectorIndex;
     use crate::{ProjectIndexer, ShardManifest, SymbolKind, SymbolNode, fingerprint};
 
     #[test]
@@ -860,6 +1274,253 @@ mod tests {
     }
 
     #[test]
+    fn default_options_preserve_no_vector_planner_fixture() -> Result<()> {
+        let (_fixture, _root, manifest) = indexed_fixture()?;
+        let request = ProjectContextRetrievalRequest::new(
+            "Root model",
+            5,
+            ProjectContextPathScope::default(),
+            true,
+        );
+
+        let actual_default =
+            plan_project_context_retrieval(&manifest, &freshness(&manifest), request.clone());
+        let actual_options = plan_project_context_retrieval_with_options(
+            &manifest,
+            &freshness(&manifest),
+            request,
+            ProjectContextRetrievalOptions::default(),
+        );
+        let actual = plan_snapshot(actual_options);
+        let expected = plan_snapshot(actual_default);
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn vector_hits_participate_when_query_vector_and_ready_index_are_supplied() -> Result<()> {
+        let (_fixture, _root, manifest) = indexed_fixture()?;
+        let widget_symbol = manifest
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "Widget")
+            .expect("fixture should include Widget symbol");
+        let vector_index = DeterministicVectorIndex::new(BTreeMap::from([(
+            widget_symbol.id.clone(),
+            vec![1.0, 0.0],
+        )]));
+        let vector_query = VectorQuery { embedding: vec![1.0, 0.0] };
+        let request = ProjectContextRetrievalRequest::new(
+            "lexicalmissneedle",
+            1,
+            ProjectContextPathScope::default(),
+            false,
+        );
+
+        let actual = plan_project_context_retrieval_with_options(
+            &manifest,
+            &freshness(&manifest),
+            request,
+            ProjectContextRetrievalOptions {
+                vector_query: Some(&vector_query),
+                vector_index: Some(ready_vector_boundary(&vector_index, 2)),
+                reranker: None,
+            },
+        );
+        let plan = expect_plan(actual);
+        let expected = (
+            Some(widget_symbol.id.clone()),
+            ProjectContextRetrievalPhaseStatus::Active { result_count: 1 },
+            Some(1.0),
+        );
+        assert_eq!(
+            (
+                plan.selected_results
+                    .first()
+                    .map(|result| result.id.clone()),
+                plan.query_diagnostics.phase_diagnostics.vector,
+                plan.selected_results
+                    .first()
+                    .and_then(|result| result.score_parts.get("vector"))
+                    .copied(),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_query_embedding_reports_unavailable_and_preserves_fallback() -> Result<()> {
+        let (_fixture, _root, manifest) = indexed_fixture()?;
+        let vector_index = DeterministicVectorIndex::default();
+        let request = ProjectContextRetrievalRequest::new(
+            "Root model",
+            3,
+            ProjectContextPathScope::default(),
+            true,
+        );
+
+        let fallback =
+            plan_project_context_retrieval(&manifest, &freshness(&manifest), request.clone());
+        let actual = plan_project_context_retrieval_with_options(
+            &manifest,
+            &freshness(&manifest),
+            request,
+            ProjectContextRetrievalOptions {
+                vector_query: None,
+                vector_index: Some(ready_vector_boundary(&vector_index, 2)),
+                reranker: None,
+            },
+        );
+        let actual_plan = expect_plan(actual);
+        let expected = (
+            plan_snapshot(fallback),
+            ProjectContextRetrievalPhaseStatus::Unavailable(
+                ProjectContextRetrievalPhaseUnavailableReason::MissingQueryEmbedding,
+            ),
+        );
+        assert_eq!(
+            (
+                plan_snapshot(ProjectContextRetrievalPlanningOutcome::Plan(
+                    actual_plan.clone()
+                )),
+                actual_plan.query_diagnostics.phase_diagnostics.vector,
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_vector_index_reports_unavailable_and_preserves_fallback() -> Result<()> {
+        let (_fixture, _root, manifest) = indexed_fixture()?;
+        let vector_query = VectorQuery { embedding: vec![1.0, 0.0] };
+        let request = ProjectContextRetrievalRequest::new(
+            "Root model",
+            3,
+            ProjectContextPathScope::default(),
+            true,
+        );
+
+        let fallback =
+            plan_project_context_retrieval(&manifest, &freshness(&manifest), request.clone());
+        let actual = plan_project_context_retrieval_with_options(
+            &manifest,
+            &freshness(&manifest),
+            request,
+            ProjectContextRetrievalOptions {
+                vector_query: Some(&vector_query),
+                vector_index: None,
+                reranker: None,
+            },
+        );
+        let actual_plan = expect_plan(actual);
+        let expected = (
+            plan_snapshot(fallback),
+            ProjectContextRetrievalPhaseStatus::Unavailable(
+                ProjectContextRetrievalPhaseUnavailableReason::MissingVectorIndex,
+            ),
+        );
+        assert_eq!(
+            (
+                plan_snapshot(ProjectContextRetrievalPlanningOutcome::Plan(
+                    actual_plan.clone()
+                )),
+                actual_plan.query_diagnostics.phase_diagnostics.vector,
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vector_dimension_mismatch_reports_invalid_and_does_not_succeed_silently() -> Result<()> {
+        let (_fixture, _root, manifest) = indexed_fixture()?;
+        let vector_index = DeterministicVectorIndex::default();
+        let vector_query = VectorQuery { embedding: vec![1.0, 0.0] };
+        let request = ProjectContextRetrievalRequest::new(
+            "Root model",
+            3,
+            ProjectContextPathScope::default(),
+            true,
+        );
+
+        let fallback =
+            plan_project_context_retrieval(&manifest, &freshness(&manifest), request.clone());
+        let actual = plan_project_context_retrieval_with_options(
+            &manifest,
+            &freshness(&manifest),
+            request,
+            ProjectContextRetrievalOptions {
+                vector_query: Some(&vector_query),
+                vector_index: Some(ready_vector_boundary(&vector_index, 3)),
+                reranker: None,
+            },
+        );
+        let actual_plan = expect_plan(actual);
+        let expected = (
+            plan_snapshot(fallback),
+            ProjectContextRetrievalPhaseStatus::Invalid(
+                ProjectContextRetrievalPhaseInvalidReason::VectorDimensionMismatch {
+                    query_dimension: 2,
+                    index_dimension: 3,
+                },
+            ),
+            false,
+        );
+        assert_eq!(
+            (
+                plan_snapshot(ProjectContextRetrievalPlanningOutcome::Plan(
+                    actual_plan.clone()
+                )),
+                actual_plan.query_diagnostics.phase_diagnostics.vector,
+                actual_plan
+                    .selected_results
+                    .iter()
+                    .any(|result| result.score_parts.contains_key("vector")),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reranker_absence_reports_diagnostic_without_changing_fallback() -> Result<()> {
+        let (_fixture, _root, manifest) = indexed_fixture()?;
+        let request = ProjectContextRetrievalRequest::new(
+            "Root model",
+            3,
+            ProjectContextPathScope::default(),
+            true,
+        );
+
+        let fallback =
+            plan_project_context_retrieval(&manifest, &freshness(&manifest), request.clone());
+        let actual = plan_project_context_retrieval_with_options(
+            &manifest,
+            &freshness(&manifest),
+            request,
+            ProjectContextRetrievalOptions::default(),
+        );
+        let actual_plan = expect_plan(actual);
+        let expected = (
+            plan_snapshot(fallback),
+            ProjectContextRetrievalPhaseStatus::Unavailable(
+                ProjectContextRetrievalPhaseUnavailableReason::MissingReranker,
+            ),
+        );
+        assert_eq!(
+            (
+                plan_snapshot(ProjectContextRetrievalPlanningOutcome::Plan(
+                    actual_plan.clone()
+                )),
+                actual_plan.query_diagnostics.phase_diagnostics.rerank,
+            ),
+            expected,
+        );
+        Ok(())
+    }
+    #[test]
     fn read_request_plans_symbol_shard_and_file_evidence_ranges() -> Result<()> {
         let mut manifest = manual_manifest();
         manifest.symbols.push(SymbolNode {
@@ -1002,6 +1663,65 @@ mod tests {
         assert_eq!(actual_return, expected_return);
         assert_ne!(return_ids, pack_order);
         Ok(())
+    }
+
+    fn expect_plan(
+        outcome: ProjectContextRetrievalPlanningOutcome,
+    ) -> Box<ProjectContextRetrievalPlan> {
+        match outcome {
+            ProjectContextRetrievalPlanningOutcome::Plan(plan) => plan,
+            ProjectContextRetrievalPlanningOutcome::Refusal(refusal) => {
+                panic!("unexpected refusal: {:?}", refusal)
+            }
+        }
+    }
+
+    fn plan_snapshot(
+        outcome: ProjectContextRetrievalPlanningOutcome,
+    ) -> (
+        Vec<(String, String, Option<String>)>,
+        Vec<(String, String, u32, u32)>,
+        ProjectContextWriteDecision,
+    ) {
+        let plan = expect_plan(outcome);
+        (
+            plan.selected_results
+                .iter()
+                .map(|result| {
+                    (
+                        result.id.clone(),
+                        result.path.clone(),
+                        result.symbol.clone(),
+                    )
+                })
+                .collect(),
+            plan.read_requests
+                .iter()
+                .map(|request| {
+                    (
+                        request.evidence_id.clone(),
+                        request.relative_manifest_path().to_string(),
+                        request.start_line,
+                        request.end_line,
+                    )
+                })
+                .collect(),
+            plan.write_decision,
+        )
+    }
+
+    fn ready_vector_boundary<'a>(
+        index: &'a DeterministicVectorIndex,
+        dimension: usize,
+    ) -> ProjectContextVectorIndexBoundary<'a> {
+        ProjectContextVectorIndexBoundary {
+            index,
+            identity: ProjectContextIntegrationIdentity {
+                provider: "fixture",
+                artifact: "deterministic-vector-index",
+            },
+            readiness: ProjectContextVectorReadiness::Ready { dimension },
+        }
     }
 
     fn cargo_plan_manifest() -> ProjectManifest {

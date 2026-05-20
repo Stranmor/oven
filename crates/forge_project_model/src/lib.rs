@@ -93,12 +93,20 @@ pub use render::{
 };
 pub use retrieval::{plan_retrieval, retrieve, retrieve_with_boundaries};
 pub use retrieval_plan::{
-    ProjectContextPathScope, ProjectContextReadRequest, ProjectContextRetrievalPlan,
+    ProjectContextIntegrationIdentity, ProjectContextPathScope, ProjectContextReadRequest,
+    ProjectContextRerankerBoundary, ProjectContextRerankerReadiness,
+    ProjectContextRerankerUnavailableReason, ProjectContextRetrievalOptions,
+    ProjectContextRetrievalPhaseDiagnostics, ProjectContextRetrievalPhaseInvalidReason,
+    ProjectContextRetrievalPhaseSkipReason, ProjectContextRetrievalPhaseStatus,
+    ProjectContextRetrievalPhaseUnavailableReason, ProjectContextRetrievalPlan,
     ProjectContextRetrievalPlanDiagnostic, ProjectContextRetrievalPlanningOutcome,
     ProjectContextRetrievalQueryDiagnostics, ProjectContextRetrievalReadRequestSummary,
     ProjectContextRetrievalRefusal, ProjectContextRetrievalRefusalCode,
     ProjectContextRetrievalRequest, ProjectContextRetrievalSelectedSummary,
-    ProjectContextReturnOrderItem, ProjectContextWriteDecision, plan_project_context_retrieval,
+    ProjectContextReturnOrderItem, ProjectContextVectorIndexBoundary,
+    ProjectContextVectorInvalidReason, ProjectContextVectorReadiness,
+    ProjectContextVectorUnavailableReason, ProjectContextWriteDecision,
+    plan_project_context_retrieval, plan_project_context_retrieval_with_options,
 };
 pub use status::{
     ExactFactArtifactStoreMetadata, ExactFactArtifactStoreState, ExactFactStatus,

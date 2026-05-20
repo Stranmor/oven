@@ -82,8 +82,8 @@ pub fn retrieve_with_boundaries<V, R>(
     weights: &RetrievalScoringWeights,
 ) -> Vec<RetrievalResult>
 where
-    V: VectorIndex,
-    R: Reranker,
+    V: VectorIndex + ?Sized,
+    R: Reranker + ?Sized,
 {
     if weights.validate().is_err() {
         return Vec::new();
