@@ -96,8 +96,12 @@ pub(crate) fn line_number_from_index(index: usize) -> Option<u32> {
 }
 
 pub(crate) fn hash_text(content: &str) -> String {
+    hash_bytes(content.as_bytes())
+}
+
+pub(crate) fn hash_bytes(content: impl AsRef<[u8]>) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(content.as_bytes());
+    hasher.update(content.as_ref());
     hasher
         .finalize()
         .iter()

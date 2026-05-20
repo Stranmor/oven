@@ -5,7 +5,7 @@ use std::marker::PhantomData;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::fingerprint;
+use crate::{fingerprint, util::hash_bytes};
 
 /// Stable schema version for project-model cache partition payloads.
 pub const CACHE_PARTITION_SCHEMA_VERSION: u32 = 1;
@@ -289,8 +289,7 @@ impl ProjectModelCachePartition<ReadbackVerified> {
         self,
         provider_visible_payload: impl AsRef<[u8]>,
     ) -> Result<CachePartitionStablePayloadSealed, CachePartitionError> {
-        let payload = String::from_utf8_lossy(provider_visible_payload.as_ref());
-        self.seal_stable_payload_with_provider_visible_digest(fingerprint(&payload))
+        self.seal_stable_payload_with_provider_visible_digest(hash_bytes(provider_visible_payload))
     }
 
     fn seal_stable_payload_with_provider_visible_digest(
@@ -307,11 +306,8 @@ impl ProjectModelCachePartition<ReadbackVerified> {
         if bytes.len() > self.identity.render_budget as usize {
             return Err(CachePartitionError::BudgetOverflowUnclassified);
         }
-        let stable_payload = ProjectModelStablePayload {
-            identity: fingerprint(&String::from_utf8_lossy(&bytes)),
-            bytes,
-            fields,
-        };
+        let stable_payload =
+            ProjectModelStablePayload { identity: hash_bytes(&bytes), bytes, fields };
         Ok(ProjectModelCachePartition {
             identity: self.identity,
             sources: self.sources,
@@ -400,7 +396,7 @@ impl ProjectModelStablePayload {
         &self,
         provider_visible_payload: &str,
     ) -> Result<String, CachePartitionError> {
-        let actual = fingerprint(provider_visible_payload);
+        let actual = hash_bytes(provider_visible_payload.as_bytes());
         let expected = &self.fields.stable_provider_visible_payload_digest;
         if &actual != expected {
             return Err(CachePartitionError::ProviderVisiblePayloadDigestMismatch {
@@ -704,6 +700,84 @@ mod tests {
 
         let expected = false;
         assert_eq!(actual.0 == actual.1, expected);
+    }
+
+    #[test]
+    fn provider_visible_payload_digest_uses_exact_bytes_not_utf8_lossy_text() {
+        let actual = (
+            ProjectModelCachePartitionInput { identity: identity() }
+                .manifest_known()
+                .unwrap()
+                .select_sources(vec![source("src/lib.rs", "fn main() {}")])
+                .unwrap()
+                .verify_readback()
+                .unwrap()
+                .seal_stable_payload_bytes([0xEF, 0xBF, 0xBD])
+                .unwrap()
+                .stable_payload()
+                .identity()
+                .to_string(),
+            ProjectModelCachePartitionInput { identity: identity() }
+                .manifest_known()
+                .unwrap()
+                .select_sources(vec![source("src/lib.rs", "fn main() {}")])
+                .unwrap()
+                .verify_readback()
+                .unwrap()
+                .seal_stable_payload_bytes([0xFF])
+                .unwrap()
+                .stable_payload()
+                .identity()
+                .to_string(),
+        );
+
+        let expected = false;
+        assert_eq!(actual.0 == actual.1, expected);
+    }
+
+    #[test]
+    fn provider_visible_message_rejects_utf8_replacement_for_invalid_sealed_bytes() {
+        let setup = ProjectModelCachePartitionInput { identity: identity() }
+            .manifest_known()
+            .unwrap()
+            .select_sources(vec![source("src/lib.rs", "fn main() {}")])
+            .unwrap()
+            .verify_readback()
+            .unwrap()
+            .seal_stable_payload_bytes([0xFF])
+            .unwrap()
+            .stable_payload()
+            .clone();
+
+        let actual = setup.provider_visible_message("�").is_err();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn provider_visible_message_accepts_exact_sealed_utf8_payload() {
+        let setup = ProjectModelCachePartitionInput { identity: identity() }
+            .manifest_known()
+            .unwrap()
+            .select_sources(vec![source("src/lib.rs", "fn main() {}")])
+            .unwrap()
+            .verify_readback()
+            .unwrap()
+            .seal_stable_payload_bytes(b"<project_model_context score=\"0.875000\" />")
+            .unwrap()
+            .stable_payload()
+            .clone();
+
+        let actual = setup
+            .provider_visible_message("<project_model_context score=\"0.875000\" />")
+            .unwrap();
+        let expected = format!(
+            "<project_model_context cache=\"stable\" stable_identity=\"{}\">\n<project_model_context score=\"0.875000\" />\n</project_model_context>",
+            setup.identity()
+        );
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
