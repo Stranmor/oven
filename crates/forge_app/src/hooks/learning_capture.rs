@@ -246,9 +246,9 @@ mod tests {
     use std::sync::Mutex;
 
     use forge_domain::{
-        Context, ContextMessage, ConversationId, LearningLedgerEvent, LearningLedgerFreshness,
-        LearningProvenance, LearningRecordProjection, LearningReviewOutcome, LearningReviewState,
-        ModelId,
+        Context, ContextMessage, ConversationId, LearningLedgerAppendOutcome, LearningLedgerEvent,
+        LearningLedgerFreshness, LearningProvenance, LearningRecordProjection,
+        LearningReviewOutcome, LearningReviewState, ModelId,
     };
     use pretty_assertions::assert_eq;
 
@@ -427,10 +427,9 @@ mod tests {
     #[tokio::test]
     async fn learning_capture_concurrent_duplicate_auto_reviews_once() -> anyhow::Result<()> {
         let fixture = Arc::new(FixtureLearningService::default());
-        let capture = LearningCapture::new(fixture.clone());
         let conversation = fixture_conversation();
-        let left_capture = capture.clone();
-        let right_capture = capture;
+        let left_capture = LearningCapture::new(fixture.clone());
+        let right_capture = LearningCapture::new(fixture.clone());
         let left_conversation = conversation.clone();
         let right_conversation = conversation;
 
