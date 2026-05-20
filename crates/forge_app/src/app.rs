@@ -1645,6 +1645,13 @@ mod tests {
             anyhow::bail!("unused workspace exact-fact status")
         }
 
+        async fn workspace_evidence_replay_diagnostic(
+            &self,
+            _path: PathBuf,
+        ) -> Result<WorkspaceEvidenceReplayDiagnostic> {
+            anyhow::bail!("unused workspace evidence replay diagnostic")
+        }
+
         async fn query_workspace(
             &self,
             _path: PathBuf,
@@ -2234,6 +2241,13 @@ mod tests {
             _path: PathBuf,
         ) -> Result<WorkspaceExactFactStatusReport> {
             anyhow::bail!("unused workspace exact-fact status")
+        }
+
+        async fn workspace_evidence_replay_diagnostic(
+            &self,
+            _path: PathBuf,
+        ) -> Result<WorkspaceEvidenceReplayDiagnostic> {
+            anyhow::bail!("unused workspace evidence replay diagnostic")
         }
 
         async fn query_workspace(

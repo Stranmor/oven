@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use derive_more::Display;
@@ -231,6 +232,145 @@ pub struct WorkspaceContextExplanation {
     pub would_inject: bool,
     /// Exact top-level reason context would not be injected.
     pub skip_reason: Option<String>,
+}
+
+/// Redaction-safe diagnostic-only workspace evidence replay status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceEvidenceReplayStatus {
+    /// Project-model manifest was not found at the expected workspace path.
+    ManifestMissing,
+    /// Manifest exists but is stale relative to the current filesystem view.
+    ManifestStale,
+    /// Manifest exists but freshness could not be proven.
+    ManifestUnknown,
+    /// Manifest is injectable, replay ran, and no selected references or issues were found.
+    ReplayedEmpty,
+    /// Manifest is injectable and replay selected bounded reference-only evidence.
+    ReplayedWithSelection,
+    /// Manifest is injectable and replay found typed issues.
+    ReplayedWithIssues,
+}
+
+impl WorkspaceEvidenceReplayStatus {
+    /// Returns the stable status label used by diagnostics.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::ManifestMissing => "not_replayed_manifest_missing",
+            Self::ManifestStale => "not_replayed_manifest_stale",
+            Self::ManifestUnknown => "not_replayed_manifest_unknown",
+            Self::ReplayedEmpty => "replayed_empty",
+            Self::ReplayedWithSelection => "replayed_with_selection",
+            Self::ReplayedWithIssues => "replayed_with_issues",
+        }
+    }
+}
+
+/// Reference-only selected evidence item for workspace replay diagnostics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceEvidenceReplayReference {
+    /// Context-pack artifact identifier.
+    pub artifact_id: String,
+    /// Context-pack artifact path under the model metadata root.
+    pub artifact_path: String,
+    /// Evidence identifier inside the artifact.
+    pub evidence_id: String,
+    /// Evidence source path relative to the project root.
+    pub evidence_path: String,
+    /// Optional one-based inclusive start line.
+    pub start_line: Option<u32>,
+    /// Optional one-based inclusive end line.
+    pub end_line: Option<u32>,
+    /// Stable score class label.
+    pub score_kind: String,
+    /// Redaction-safe numeric priority within the score class.
+    pub score: f32,
+    /// Evidence provenance path.
+    pub provenance_path: String,
+    /// Optional provenance one-based inclusive start line.
+    pub provenance_start_line: Option<u32>,
+    /// Optional provenance one-based inclusive end line.
+    pub provenance_end_line: Option<u32>,
+    /// Evidence provenance source label.
+    pub provenance_source: String,
+    /// Redaction-safe provenance fingerprint.
+    pub provenance_fingerprint: String,
+    /// Evidence freshness label.
+    pub freshness: String,
+    /// Number of valid tool episodes linking this artifact.
+    pub linked_episode_count: usize,
+    /// Number of dangling or invalid linkage proofs seen for this artifact.
+    pub link_issue_count: usize,
+}
+
+/// Redaction-safe typed issue emitted by workspace evidence replay diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceEvidenceReplayIssueSummary {
+    /// Machine-readable issue code.
+    pub code: String,
+    /// Optional context-pack artifact identifier.
+    pub artifact_id: Option<String>,
+    /// Optional evidence identifier.
+    pub evidence_id: Option<String>,
+    /// Optional tool-episode fingerprint.
+    pub episode_fingerprint: Option<String>,
+    /// Redaction-safe path or storage label.
+    pub path: Option<String>,
+}
+
+/// Deterministic budget summary for workspace evidence replay diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceEvidenceReplayBudgetSummary {
+    /// Number of artifact candidates before inspection budget truncation.
+    pub original_candidate_count: usize,
+    /// Number of selected reference-only evidence items.
+    pub selected_count: usize,
+    /// Total excluded candidate/evidence/link count.
+    pub excluded_count: usize,
+    /// Excluded counts keyed by typed issue code label.
+    pub excluded_by_reason: BTreeMap<String, usize>,
+    /// Whether any artifact, episode, or selected output was truncated by budget.
+    pub truncated: bool,
+    /// Maximum artifact candidates inspected.
+    pub max_artifacts: usize,
+    /// Maximum episode lines inspected.
+    pub max_episode_lines: usize,
+    /// Maximum selected references returned.
+    pub max_selected: usize,
+    /// Stable ordering and tie-break contract used by replay.
+    pub stable_ordering: String,
+}
+
+/// Redaction-safe diagnostic-only workspace evidence replay surface.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceEvidenceReplayDiagnostic {
+    /// Stable replay status.
+    pub status: WorkspaceEvidenceReplayStatus,
+    /// Canonical workspace root evaluated for replay.
+    pub workspace_root: PathBuf,
+    /// Expected local project-model manifest path.
+    pub manifest_path: PathBuf,
+    /// Whether the manifest file exists at the expected path.
+    pub manifest_found: bool,
+    /// Manifest freshness classification label.
+    pub manifest_freshness: String,
+    /// Redaction-safe freshness issue or skip reason when replay is not allowed.
+    pub not_replayed_reason: Option<String>,
+    /// Manifest hash used by replay after freshness was proven.
+    pub manifest_hash: Option<String>,
+    /// Content policy label; always reference-only when replay runs.
+    pub content_policy: Option<String>,
+    /// Stale policy label when replay runs.
+    pub stale_policy: Option<String>,
+    /// Changed evidence references excluded by policy.
+    pub changed_excluded: usize,
+    /// Deleted evidence references excluded by policy.
+    pub deleted_excluded: usize,
+    /// Deterministic budget and selection audit when replay runs.
+    pub budget: Option<WorkspaceEvidenceReplayBudgetSummary>,
+    /// Reference-only selected evidence items.
+    pub selected: Vec<WorkspaceEvidenceReplayReference>,
+    /// Typed redaction-safe issue summaries.
+    pub issues: Vec<WorkspaceEvidenceReplayIssueSummary>,
 }
 
 /// Redaction-safe transport report for read-only exact-fact workspace status.

@@ -10,14 +10,18 @@ use forge_domain::{
     SearchParams, SyncProgress, UserId, WorkspaceContextFreshness,
     WorkspaceContextManifestDiagnostic, WorkspaceEvidenceLedgerActivationDiagnostic,
     WorkspaceEvidenceLedgerActivationSummary, WorkspaceEvidenceLedgerGraphMetadata,
-    WorkspaceEvidenceReadinessDiagnostic, WorkspaceExactFactBoundedLoss,
+    WorkspaceEvidenceReadinessDiagnostic, WorkspaceEvidenceReplayBudgetSummary,
+    WorkspaceEvidenceReplayDiagnostic, WorkspaceEvidenceReplayIssueSummary,
+    WorkspaceEvidenceReplayReference, WorkspaceEvidenceReplayStatus, WorkspaceExactFactBoundedLoss,
     WorkspaceExactFactIngestionSummary, WorkspaceExactFactIssue,
     WorkspaceExactFactReadinessDiagnostic, WorkspaceExactFactReferenceReport,
     WorkspaceExactFactReferenceStatus, WorkspaceExactFactStatusReport, WorkspaceId,
     WorkspaceIndexRepository,
 };
 use forge_project_model::{
-    ContextPack, ContextPackArtifactId, ContextPackSelection, EvidenceReadinessDiagnostic,
+    ContextPack, ContextPackArtifactId, ContextPackSelection, EvidenceFreshness,
+    EvidenceLedgerReplayReport, EvidenceReadinessDiagnostic, EvidenceReplayContentPolicy,
+    EvidenceReplayFreshnessPolicy, EvidenceReplayIssueCode, EvidenceReplayScoreKind,
     ExternalFactArtifactIngestionReport, ExternalFactIngestionIssue, ExternalFactProductionReport,
     ExternalFactProductionRequest, ExternalFactProductionStatus, NativeLspReferenceProducer,
     NativeLspReferenceRequest, NativeLspReferenceRequestDerivation, ProjectIndexer, Provenance,
@@ -25,7 +29,7 @@ use forge_project_model::{
     RustAnalyzerCapabilityStatus, RustAnalyzerProbe, StaleEvidencePolicy, StdRustAnalyzerProcess,
     ToolEpisode, derive_native_lsp_reference_request, evidence_line_range, fingerprint,
     load_evidence_ledger_activation, local_project_model_dir, local_project_model_manifest,
-    read_exact_fact_status, retrieve,
+    read_exact_fact_status, retrieve, select_evidence_ledger_replay,
 };
 use forge_stream::MpscStream;
 use futures::future::join_all;
@@ -38,6 +42,244 @@ const PROJECT_MODEL_SEARCH_TOOL: &str = "project_model_search";
 const PROJECT_MODEL_SEARCH_SUCCESS: &str = "success";
 const PROJECT_MODEL_SEARCH_PROVENANCE_SOURCE: &str = "WorkspaceService::query_workspace";
 const EXACT_FACT_READINESS_MAX_ISSUES: usize = 8;
+
+fn workspace_evidence_replay_diagnostic(
+    path: PathBuf,
+) -> Result<WorkspaceEvidenceReplayDiagnostic> {
+    let root = canonicalize_path(path)?;
+    let manifest_path = local_project_model_manifest(&root);
+    if !root.is_dir() || !manifest_path.is_file() {
+        return Ok(not_replayed_evidence_replay_diagnostic(
+            root,
+            manifest_path,
+            false,
+            WorkspaceContextFreshness::Unknown {
+                reason: "project-model manifest not found".to_string(),
+            },
+        ));
+    }
+
+    let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+    let manifest = match indexer.read_manifest() {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return Ok(not_replayed_evidence_replay_diagnostic(
+                root,
+                manifest_path,
+                true,
+                WorkspaceContextFreshness::Unknown { reason: error.to_string() },
+            ));
+        }
+    };
+    let freshness = match indexer.evaluate_manifest_freshness(&manifest) {
+        Ok(evaluation) if evaluation.can_inject() => WorkspaceContextFreshness::Fresh,
+        Ok(evaluation) if evaluation.state.fresh => WorkspaceContextFreshness::Unknown {
+            reason: "project-model freshness checked only indexed files; added-file discovery not proven".to_string(),
+        },
+        Ok(evaluation) => WorkspaceContextFreshness::Stale {
+            changed: evaluation.state.changed,
+            deleted: evaluation.state.deleted,
+            added: evaluation.state.added,
+        },
+        Err(error) => WorkspaceContextFreshness::Unknown { reason: error.to_string() },
+    };
+    let manifest_diagnostic = WorkspaceContextManifestDiagnostic {
+        workspace_root: root.clone(),
+        manifest_path: manifest_path.clone(),
+        manifest_found: true,
+        freshness: freshness.clone(),
+        exact_fact_readiness: None,
+        evidence_readiness: None,
+        evidence_ledger_activation: None,
+    };
+    if !manifest_diagnostic.can_inject() {
+        return Ok(not_replayed_evidence_replay_diagnostic(
+            root,
+            manifest_path,
+            true,
+            freshness,
+        ));
+    }
+
+    let request = forge_project_model::EvidenceLedgerReplayRequest::reference_only(&manifest);
+    let report = select_evidence_ledger_replay(&indexer, &manifest, &request);
+    Ok(replayed_evidence_replay_diagnostic(
+        root,
+        manifest_path,
+        manifest.manifest_hash,
+        report,
+    ))
+}
+
+fn not_replayed_evidence_replay_diagnostic(
+    workspace_root: PathBuf,
+    manifest_path: PathBuf,
+    manifest_found: bool,
+    freshness: WorkspaceContextFreshness,
+) -> WorkspaceEvidenceReplayDiagnostic {
+    let status = match &freshness {
+        WorkspaceContextFreshness::Stale { .. } => WorkspaceEvidenceReplayStatus::ManifestStale,
+        WorkspaceContextFreshness::Unknown { .. } if manifest_found => {
+            WorkspaceEvidenceReplayStatus::ManifestUnknown
+        }
+        WorkspaceContextFreshness::Unknown { .. } => WorkspaceEvidenceReplayStatus::ManifestMissing,
+        WorkspaceContextFreshness::Fresh => WorkspaceEvidenceReplayStatus::ManifestUnknown,
+    };
+    let not_replayed_reason = match &freshness {
+        WorkspaceContextFreshness::Fresh => Some("manifest_not_replayed".to_string()),
+        WorkspaceContextFreshness::Stale { changed, deleted, added } => Some(format!(
+            "manifest stale: changed={}, deleted={}, added={}",
+            changed.len(),
+            deleted.len(),
+            added.len()
+        )),
+        WorkspaceContextFreshness::Unknown { reason } => Some(reason.clone()),
+    };
+    WorkspaceEvidenceReplayDiagnostic {
+        status,
+        workspace_root,
+        manifest_path,
+        manifest_found,
+        manifest_freshness: freshness.label().to_string(),
+        not_replayed_reason,
+        manifest_hash: None,
+        content_policy: None,
+        stale_policy: None,
+        changed_excluded: 0,
+        deleted_excluded: 0,
+        budget: None,
+        selected: Vec::new(),
+        issues: Vec::new(),
+    }
+}
+
+fn replayed_evidence_replay_diagnostic(
+    workspace_root: PathBuf,
+    manifest_path: PathBuf,
+    manifest_hash: String,
+    report: EvidenceLedgerReplayReport,
+) -> WorkspaceEvidenceReplayDiagnostic {
+    let visible_issues = report
+        .issues
+        .into_iter()
+        .filter(|issue| issue.code != EvidenceReplayIssueCode::EmptyStore)
+        .collect::<Vec<_>>();
+    let status = if !visible_issues.is_empty() {
+        WorkspaceEvidenceReplayStatus::ReplayedWithIssues
+    } else if !report.selected.is_empty() {
+        WorkspaceEvidenceReplayStatus::ReplayedWithSelection
+    } else {
+        WorkspaceEvidenceReplayStatus::ReplayedEmpty
+    };
+    let budget = WorkspaceEvidenceReplayBudgetSummary {
+        original_candidate_count: report.budget.original_candidate_count,
+        selected_count: report.budget.selected_count,
+        excluded_count: report.budget.excluded_count,
+        excluded_by_reason: report
+            .budget
+            .excluded_by_reason
+            .into_iter()
+            .map(|(code, count)| (evidence_replay_issue_code_label(&code), count))
+            .collect(),
+        truncated: report.budget.truncated,
+        max_artifacts: report.budget.budget.max_artifacts,
+        max_episode_lines: report.budget.budget.max_episode_lines,
+        max_selected: report.budget.budget.max_selected,
+        stable_ordering: report.budget.stable_ordering,
+    };
+    WorkspaceEvidenceReplayDiagnostic {
+        status,
+        workspace_root,
+        manifest_path,
+        manifest_found: true,
+        manifest_freshness: WorkspaceContextFreshness::Fresh.label().to_string(),
+        not_replayed_reason: None,
+        manifest_hash: Some(manifest_hash),
+        content_policy: Some(evidence_replay_content_policy_label(&report.content_policy)),
+        stale_policy: Some(evidence_replay_freshness_policy_label(
+            &report.stale_policy.policy,
+        )),
+        changed_excluded: report.stale_policy.changed_excluded,
+        deleted_excluded: report.stale_policy.deleted_excluded,
+        budget: Some(budget),
+        selected: report
+            .selected
+            .into_iter()
+            .map(workspace_evidence_replay_reference)
+            .collect(),
+        issues: visible_issues
+            .into_iter()
+            .map(|issue| WorkspaceEvidenceReplayIssueSummary {
+                code: evidence_replay_issue_code_label(&issue.code),
+                artifact_id: issue.artifact_id,
+                evidence_id: issue.evidence_id,
+                episode_fingerprint: issue.episode_fingerprint,
+                path: issue.path,
+            })
+            .collect(),
+    }
+}
+
+fn workspace_evidence_replay_reference(
+    reference: forge_project_model::EvidenceReplayReference,
+) -> WorkspaceEvidenceReplayReference {
+    WorkspaceEvidenceReplayReference {
+        artifact_id: reference.artifact_id,
+        artifact_path: reference.artifact_path,
+        evidence_id: reference.evidence_id,
+        evidence_path: reference.evidence_path,
+        start_line: reference.start_line,
+        end_line: reference.end_line,
+        score_kind: evidence_replay_score_kind_label(&reference.score_kind),
+        score: reference.score,
+        provenance_path: reference.provenance.path,
+        provenance_start_line: reference.provenance.start_line,
+        provenance_end_line: reference.provenance.end_line,
+        provenance_source: reference.provenance.source,
+        provenance_fingerprint: reference.provenance.fingerprint,
+        freshness: evidence_freshness_label(&reference.freshness),
+        linked_episode_count: reference.linked_episode_count,
+        link_issue_count: reference.link_issue_count,
+    }
+}
+
+fn evidence_replay_content_policy_label(policy: &EvidenceReplayContentPolicy) -> String {
+    match policy {
+        EvidenceReplayContentPolicy::ReferenceOnly => "reference_only".to_string(),
+    }
+}
+
+fn evidence_replay_freshness_policy_label(policy: &EvidenceReplayFreshnessPolicy) -> String {
+    match policy {
+        EvidenceReplayFreshnessPolicy::ExcludeChangedAndDeleted => {
+            "exclude_changed_and_deleted".to_string()
+        }
+        EvidenceReplayFreshnessPolicy::AllowChangedExcludeDeleted => {
+            "allow_changed_exclude_deleted".to_string()
+        }
+    }
+}
+
+fn evidence_replay_score_kind_label(kind: &EvidenceReplayScoreKind) -> String {
+    match kind {
+        EvidenceReplayScoreKind::RetrievalResult => "retrieval_result".to_string(),
+        EvidenceReplayScoreKind::Shard => "shard".to_string(),
+        EvidenceReplayScoreKind::DirectEvidence => "direct_evidence".to_string(),
+    }
+}
+
+fn evidence_freshness_label(freshness: &EvidenceFreshness) -> String {
+    match freshness {
+        EvidenceFreshness::Fresh => "fresh".to_string(),
+        EvidenceFreshness::Changed => "changed".to_string(),
+        EvidenceFreshness::Added => "added".to_string(),
+        EvidenceFreshness::Deleted => "deleted".to_string(),
+    }
+}
+
+fn evidence_replay_issue_code_label(code: &EvidenceReplayIssueCode) -> String {
+    format!("{code:?}").to_ascii_snake_case()
+}
 
 /// Service for indexing workspaces and performing semantic search.
 ///
@@ -861,6 +1103,13 @@ impl<
         Ok(workspace_exact_fact_status_report(report))
     }
 
+    async fn workspace_evidence_replay_diagnostic(
+        &self,
+        path: PathBuf,
+    ) -> Result<WorkspaceEvidenceReplayDiagnostic> {
+        workspace_evidence_replay_diagnostic(path)
+    }
+
     /// Performs semantic code search on a workspace.
     async fn query_workspace(
         &self,
@@ -1474,6 +1723,237 @@ mod tests {
         setup.write_manifest(&manifest)
     }
 
+    fn write_fixture_context_pack(root: &Path) -> Result<()> {
+        let indexer = ProjectIndexer::new(root, local_project_model_dir(root));
+        let manifest = indexer.read_manifest()?;
+        let result = retrieve(
+            &manifest,
+            &RetrievalQuery {
+                text: Some("RuntimeNeedle".to_string()),
+                path: None,
+                path_prefix: None,
+                symbol: None,
+                limit: 1,
+                include_graph_expansion: false,
+            },
+        )
+        .into_iter()
+        .next()
+        .expect("fixture should retrieve RuntimeNeedle evidence");
+        let freshness = indexer.evaluate_manifest_freshness(&manifest)?.state;
+        let pack = ContextPack::from_selection(
+            &manifest,
+            ContextPackSelection {
+                retrieval_results: vec![result],
+                shards: Vec::new(),
+                evidence: Vec::new(),
+                freshness,
+                stale_policy: StaleEvidencePolicy::Mark,
+            },
+        )?;
+        indexer.write_context_pack(&pack)?;
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_replay_fresh_manifest_missing_store_returns_empty_without_writes() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let model_dir = local_project_model_dir(&root);
+        let context_pack_dir = model_dir.join("context_packs");
+        let episode_file = model_dir.join("tool_episodes.jsonl");
+
+        let actual = workspace_evidence_replay_diagnostic(root)?;
+        let expected = (
+            WorkspaceEvidenceReplayStatus::ReplayedEmpty,
+            Some("reference_only"),
+            0usize,
+            0usize,
+            false,
+            false,
+        );
+
+        assert_eq!(
+            (
+                actual.status,
+                actual.content_policy.as_deref(),
+                actual.selected.len(),
+                actual.issues.len(),
+                context_pack_dir.exists(),
+                episode_file.exists(),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_replay_stale_manifest_returns_not_replayed_without_artifact_inspection()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let context_pack_dir = local_project_model_dir(&root).join("context_packs");
+        fs::create_dir_all(&context_pack_dir)?;
+        fs::write(
+            context_pack_dir.join(format!("{}.json", "a".repeat(64))),
+            "raw tool payload",
+        )?;
+        fs::write(root.join("src").join("lib.rs"), "pub fn changed() {}\n")?;
+
+        let actual = workspace_evidence_replay_diagnostic(root)?;
+        let actual_json = serde_json::to_string(&actual)?;
+        let expected = (
+            WorkspaceEvidenceReplayStatus::ManifestStale,
+            None,
+            0usize,
+            None,
+        );
+
+        assert_eq!(
+            (
+                actual.status,
+                actual.budget,
+                actual.issues.len(),
+                actual.content_policy,
+            ),
+            expected,
+        );
+        assert!(!actual_json.contains("raw tool payload"));
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_replay_unknown_manifest_freshness_returns_not_replayed() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        fs::write(local_project_model_manifest(&root), "not json")?;
+
+        let actual = workspace_evidence_replay_diagnostic(root)?;
+        let expected = (
+            WorkspaceEvidenceReplayStatus::ManifestUnknown,
+            false,
+            0usize,
+        );
+
+        assert_eq!(
+            (
+                actual.status,
+                actual.manifest_hash.is_some(),
+                actual.issues.len(),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_replay_corrupt_artifact_maps_to_issue_summary_without_payload() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let context_pack_dir = local_project_model_dir(&root).join("context_packs");
+        fs::create_dir_all(&context_pack_dir)?;
+        fs::write(
+            context_pack_dir.join(format!("{}.json", "b".repeat(64))),
+            "raw artifact body with pub struct RuntimeNeedle and tool payload",
+        )?;
+
+        let actual = workspace_evidence_replay_diagnostic(root)?;
+        let actual_json = serde_json::to_string(&actual)?;
+        let expected = (
+            WorkspaceEvidenceReplayStatus::ReplayedWithIssues,
+            vec!["corrupt_artifact".to_string()],
+        );
+
+        assert_eq!(
+            (
+                actual.status,
+                actual
+                    .issues
+                    .iter()
+                    .map(|issue| issue.code.clone())
+                    .collect::<Vec<_>>(),
+            ),
+            expected,
+        );
+        assert!(!actual_json.contains("raw artifact body"));
+        assert!(!actual_json.contains("pub struct RuntimeNeedle"));
+        assert!(!actual_json.contains("tool payload"));
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_replay_dto_selected_refs_are_stable_capped_and_reference_only() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        write_fixture_context_pack(&root)?;
+
+        let actual = workspace_evidence_replay_diagnostic(root.clone())?;
+        let repeated = workspace_evidence_replay_diagnostic(root)?;
+        let actual_json = serde_json::to_string(&actual)?;
+        let expected = (
+            WorkspaceEvidenceReplayStatus::ReplayedWithSelection,
+            actual.selected.clone(),
+            1usize,
+            true,
+        );
+
+        assert_eq!(
+            (
+                actual.status,
+                repeated.selected,
+                actual.selected.len(),
+                actual
+                    .budget
+                    .as_ref()
+                    .map(|budget| actual.selected.len() <= budget.max_selected)
+                    .unwrap_or(false),
+            ),
+            expected,
+        );
+        assert!(!actual_json.contains("pub struct RuntimeNeedle"));
+        assert!(!actual_json.contains("build_runtime_needle"));
+        assert!(!actual_json.contains("input_fingerprint"));
+        assert!(!actual_json.contains("output_fingerprint"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn evidence_replay_service_path_does_not_call_query_or_file_content_readback()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        write_fixture_context_pack(&root)?;
+        let remote_search_called = Arc::new(AtomicBool::new(false));
+        let range_read_called = Arc::new(AtomicBool::new(false));
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
+                remote_search_called: Arc::clone(&remote_search_called),
+                range_read_called: Arc::clone(&range_read_called),
+                range_read_fails: true,
+            }),
+            Arc::new(NoopDiscovery),
+        );
+
+        let actual = WorkspaceService::workspace_evidence_replay_diagnostic(&setup, root).await?;
+        let expected = (
+            false,
+            false,
+            WorkspaceEvidenceReplayStatus::ReplayedWithSelection,
+        );
+
+        assert_eq!(
+            (
+                remote_search_called.load(Ordering::SeqCst),
+                range_read_called.load(Ordering::SeqCst),
+                actual.status,
+            ),
+            expected,
+        );
+        Ok(())
+    }
     #[test]
     fn service_maps_exact_fact_readiness_active_and_inactive_issue_summaries() {
         let setup = ExactFactStatusReport {
