@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -44,6 +45,7 @@ use forge_project_model::{
 };
 use forge_stream::MpscStream;
 use futures::future::join_all;
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::fd::FileDiscovery;
@@ -57,7 +59,6 @@ const PREVIEW_MANIFEST_MISSING_REASON: &str = "manifest_missing";
 const PREVIEW_MANIFEST_READ_ERROR_REASON: &str = "manifest_read_error";
 const PREVIEW_MANIFEST_FRESHNESS_ERROR_REASON: &str = "manifest_freshness_error";
 const PREVIEW_MANIFEST_BOUNDED_FRESHNESS_REASON: &str = "manifest_bounded_freshness_not_injectable";
-const LOCAL_WORKSPACE_EMBEDDING_MODEL_ID: &str = "forge-local-hashing-v1";
 const SEMANTIC_EMBEDDING_TEXT_LIMIT: usize = 4096;
 const QUERY_EMBEDDING_SOURCE_ID: &str = "query";
 const QUERY_EMBEDDING_SOURCE_FINGERPRINT: &str = "query";
@@ -132,48 +133,114 @@ pub enum ProjectSemanticEmbeddingError {
     },
 }
 
-/// Local hashing embedding boundary used by the production CLI until an external provider is configured.
-#[derive(Clone, Debug, Default)]
-pub struct LocalHashingProjectSemanticEmbeddingProvider;
+/// OpenAI-compatible HTTP embedding boundary used by production workspace semantic commands.
+#[derive(Clone, Debug)]
+pub struct OpenAiCompatibleProjectSemanticEmbeddingProvider {
+    endpoint: String,
+    api_key_env: String,
+}
+
+impl Default for OpenAiCompatibleProjectSemanticEmbeddingProvider {
+    fn default() -> Self {
+        Self {
+            endpoint: "https://antigravity.quantumind.ru/v1/embeddings".to_string(),
+            api_key_env: "ANTIGRAVITY_API_KEY".to_string(),
+        }
+    }
+}
+
+impl OpenAiCompatibleProjectSemanticEmbeddingProvider {
+    /// Creates a provider for an OpenAI-compatible embeddings endpoint.
+    ///
+    /// # Arguments
+    ///
+    /// * `endpoint` - HTTP endpoint accepting OpenAI-compatible embedding requests.
+    /// * `api_key_env` - Environment variable that contains the bearer token.
+    pub fn new(endpoint: impl Into<String>, api_key_env: impl Into<String>) -> Self {
+        Self { endpoint: endpoint.into(), api_key_env: api_key_env.into() }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiEmbeddingRequest {
+    model: String,
+    input: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiEmbeddingResponse {
+    data: Vec<OpenAiEmbeddingData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiEmbeddingData {
+    embedding: Vec<f32>,
+}
 
 #[async_trait]
-impl ProjectSemanticEmbeddingProvider for LocalHashingProjectSemanticEmbeddingProvider {
+impl ProjectSemanticEmbeddingProvider for OpenAiCompatibleProjectSemanticEmbeddingProvider {
     async fn embed_project_semantic(
         &self,
         request: ProjectSemanticEmbeddingRequest,
     ) -> std::result::Result<ProjectSemanticEmbeddingOutput, ProjectSemanticEmbeddingError> {
-        if request.embedding_model_id != LOCAL_WORKSPACE_EMBEDDING_MODEL_ID {
+        let api_key = env::var(&self.api_key_env).map_err(|_| {
+            ProjectSemanticEmbeddingError::ProviderUnavailable(format!(
+                "embedding API key environment variable is unavailable: {}",
+                self.api_key_env
+            ))
+        })?;
+        let response = reqwest::Client::new()
+            .post(&self.endpoint)
+            .bearer_auth(api_key)
+            .json(&OpenAiEmbeddingRequest {
+                model: request.embedding_model_id.clone(),
+                input: request
+                    .inputs
+                    .iter()
+                    .map(|input| input.text.clone())
+                    .collect(),
+            })
+            .send()
+            .await
+            .map_err(|error| {
+                ProjectSemanticEmbeddingError::ProviderUnavailable(error.to_string())
+            })?;
+        if !response.status().is_success() {
             return Err(ProjectSemanticEmbeddingError::ProviderUnavailable(format!(
-                "unsupported local embedding model id: {}",
-                request.embedding_model_id
+                "embedding endpoint returned HTTP {}",
+                response.status()
             )));
+        }
+        let response = response
+            .json::<OpenAiEmbeddingResponse>()
+            .await
+            .map_err(|error| {
+                ProjectSemanticEmbeddingError::ProviderUnavailable(error.to_string())
+            })?;
+        let data = response.data;
+        if data.len() != request.inputs.len() {
+            return Err(ProjectSemanticEmbeddingError::SourceMismatch {
+                position: request.inputs.len(),
+                expected: format!("{} vectors", request.inputs.len()),
+                actual: format!("{} vectors", data.len()),
+            });
         }
         let vectors = request
             .inputs
             .iter()
-            .map(|input| ProjectSemanticEmbeddingVector {
+            .zip(data)
+            .map(|(input, data)| ProjectSemanticEmbeddingVector {
                 source_id: input.source_id.clone(),
                 source_fingerprint: input.source_fingerprint.clone(),
-                embedding: local_hashing_embedding(&input.text),
+                embedding: data.embedding,
             })
             .collect::<Vec<_>>();
         Ok(ProjectSemanticEmbeddingOutput {
             embedding_model_id: request.embedding_model_id,
-            dimension: 2,
+            dimension: vectors.first().map_or(0, |vector| vector.embedding.len()),
             vectors,
         })
     }
-}
-
-fn local_hashing_embedding(text: &str) -> Vec<f32> {
-    let lower = text.to_ascii_lowercase();
-    let semantic_score = if lower.contains("runtime") || lower.contains("needle") {
-        1.0
-    } else {
-        0.25
-    };
-    let lexical_score = if lower.contains("query") { 0.75 } else { 0.1 };
-    vec![semantic_score, lexical_score]
 }
 
 fn workspace_evidence_replay_diagnostic(
@@ -1787,7 +1854,7 @@ impl<
         path: PathBuf,
         embedding_model_id: String,
     ) -> Result<WorkspaceVectorIndexBuildReport> {
-        let provider = LocalHashingProjectSemanticEmbeddingProvider;
+        let provider = OpenAiCompatibleProjectSemanticEmbeddingProvider::default();
         self.build_workspace_vector_index_with_provider(path, embedding_model_id, &provider)
             .await
     }
@@ -1797,7 +1864,7 @@ impl<
         query: String,
         embedding_model_id: String,
     ) -> Result<ProjectSemanticEmbeddingOutput> {
-        let provider = LocalHashingProjectSemanticEmbeddingProvider;
+        let provider = OpenAiCompatibleProjectSemanticEmbeddingProvider::default();
         self.embed_workspace_query_with_provider(&query, embedding_model_id, &provider)
             .await
     }

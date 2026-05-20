@@ -918,9 +918,12 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                             params = params.ends_with(vec![suffix]);
                         }
                         if semantic {
+                            let embedding_model_id = embedding_model_id.context(
+                                "--embedding-model-id is required when --semantic is set",
+                            )?;
                             let output = self
                                 .api
-                                .embed_workspace_query(query.clone(), embedding_model_id.clone())
+                                .embed_workspace_query(query.clone(), embedding_model_id)
                                 .await?;
                             let query_vector = output
                                 .vectors

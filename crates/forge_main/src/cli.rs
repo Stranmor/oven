@@ -360,7 +360,7 @@ pub enum WorkspaceVectorIndexCommand {
         path: PathBuf,
 
         /// Embedding model identity for artifact/query compatibility.
-        #[arg(long, default_value = "forge-local-hashing-v1")]
+        #[arg(long)]
         embedding_model_id: String,
     },
 }
@@ -430,8 +430,8 @@ pub enum WorkspaceCommand {
         semantic: bool,
 
         /// Embedding model identity used when --semantic is set.
-        #[arg(long, default_value = "forge-local-hashing-v1")]
-        embedding_model_id: String,
+        #[arg(long, requires = "semantic")]
+        embedding_model_id: Option<String>,
     },
 
     /// Show workspace information for an indexed directory.
@@ -1217,7 +1217,7 @@ mod tests {
             },
             _ => panic!("expected workspace command"),
         };
-        let expected = (true, "fixture-model".to_string());
+        let expected = (true, Some("fixture-model".to_string()));
         assert_eq!(actual, expected);
     }
 
