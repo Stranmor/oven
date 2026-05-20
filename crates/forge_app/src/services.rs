@@ -2512,6 +2512,22 @@ mod tests {
             anyhow::bail!("unused workspace service")
         }
 
+        async fn build_workspace_vector_index(
+            &self,
+            _path: PathBuf,
+            _embedding_model_id: String,
+        ) -> anyhow::Result<WorkspaceVectorIndexBuildReport> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn embed_workspace_query(
+            &self,
+            _query: String,
+            _embedding_model_id: String,
+        ) -> anyhow::Result<ProjectSemanticEmbeddingOutput> {
+            anyhow::bail!("unused workspace service")
+        }
+
         async fn query_workspace(
             &self,
             _path: PathBuf,

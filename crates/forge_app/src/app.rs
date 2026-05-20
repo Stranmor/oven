@@ -2968,7 +2968,7 @@ mod tests {
             path: &Path,
         ) -> Result<WorkspaceContextManifestDiagnostic> {
             self.index_checks.fetch_add(1, Ordering::SeqCst);
-            let manifest_path = local_project_model_manifest(&path);
+            let manifest_path = local_project_model_manifest(path);
             let manifest_found = manifest_path.is_file();
             let freshness = if self.stale_paths.iter().any(|stale_path| stale_path == path) {
                 WorkspaceContextFreshness::Stale {

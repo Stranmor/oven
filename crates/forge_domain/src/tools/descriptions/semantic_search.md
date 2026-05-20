@@ -24,4 +24,4 @@ IMPORTANT: Only searches within {{env.cwd}} and subdirectories. For paths outsid
 - Keep queries targeted - too many broad queries can cause timeouts
 - **Match your intent**: If seeking documentation, use doc-focused keywords ("setup guide", "configuration README"); if seeking code, use implementation terms ("token refresh logic", "error handling implementation")
 
-Returns the topK most relevant file:line locations with code context. Each query is ranked independently, then reranked by relevance to your stated intent.
+Returns the topK most relevant file:line locations with code context. Each query is embedded with the configured semantic embedding model and matched against an existing durable workspace vector index plus project-model retrieval signals. Production reranker runtime is not active yet (`reranker: None`), so do not assume cross-encoder reranking is applied.

@@ -23,6 +23,7 @@ max_tool_failure_per_turn = 3
 model_cache_ttl_secs = 604800
 restricted = false
 sem_search_top_k = 10
+semantic_embedding_model_id = "text-embedding-3-large"
 services_url = "https://api.forgecode.dev/"
 terminal_context = false
 tool_supported = true

@@ -306,11 +306,18 @@
       ]
     },
     "sem_search_top_k": {
-      "description": "Number of top results retained after re-ranking in semantic search.",
+      "description": "Number of top results retained after query planning in semantic search.",
       "type": "integer",
       "format": "uint",
       "default": 0,
       "minimum": 0
+    },
+    "semantic_embedding_model_id": {
+      "description": "Default embedding model identity used by agent-facing semantic search.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "services_url": {
       "description": "Base URL of the Forge services API used for semantic search and\nindexing.",
@@ -479,7 +486,7 @@
           "minimum": 0
         },
         "token_threshold": {
-          "description": "Maximum number of tokens before triggering compaction. This acts as an\nabsolute cap and is combined with\n`token_threshold_percentage` by taking the lower value.",
+          "description": "Maximum number of tokens before triggering compaction. This is an\nexplicit absolute threshold. It is preserved as-is unless\n`token_threshold_percentage` is also configured, in which case the lower\neffective threshold is used when the model context window is known.",
           "type": [
             "integer",
             "null"
@@ -488,7 +495,7 @@
           "minimum": 0
         },
         "token_threshold_percentage": {
-          "description": "Maximum percentage of the model context window used to derive the token\nthreshold before triggering compaction. This is combined with\n`token_threshold` by taking the lower value.",
+          "description": "Maximum percentage of the model context window used to derive the token\nthreshold before triggering compaction. When `token_threshold` is absent,\nthis derives the threshold from the model context window. When\n`token_threshold` is present, it acts as an explicit cap and the lower\neffective threshold is used.",
           "anyOf": [
             {
               "$ref": "#/$defs/double"

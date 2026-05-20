@@ -236,9 +236,12 @@ pub struct ForgeConfig {
     /// search vector query.
     #[serde(default)]
     pub max_sem_search_results: usize,
-    /// Number of top results retained after re-ranking in semantic search.
+    /// Number of top results retained after query planning in semantic search.
     #[serde(default)]
     pub sem_search_top_k: usize,
+    /// Default embedding model identity used by agent-facing semantic search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_embedding_model_id: Option<String>,
     /// Base URL of the Forge services API used for semantic search and
     /// indexing.
     #[serde(default)]
@@ -587,6 +590,17 @@ completion_notification = "telegram"
 
         let expected = Some(CompletionNotification::Desktop);
         assert_eq!(actual.completion_notification, expected);
+    }
+
+    #[test]
+    fn test_default_semantic_embedding_model_id_is_available() {
+        let actual = ConfigReader::default()
+            .read_defaults()
+            .build()
+            .expect("config fixture should build");
+
+        let expected = Some("text-embedding-3-large".to_string());
+        assert_eq!(actual.semantic_embedding_model_id, expected);
     }
 
     #[test]
