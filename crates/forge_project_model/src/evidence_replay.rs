@@ -230,13 +230,8 @@ impl Default for ReplayActivationCaps {
 }
 
 impl ReplayActivationCaps {
-    fn sanitized(self) -> Self {
-        Self {
-            per_source: self.per_source.max(1),
-            per_episode: self.per_episode.max(1),
-            per_file: self.per_file.max(1),
-            global: self.global.max(1),
-        }
+    fn effective(self) -> Self {
+        self
     }
 }
 
@@ -639,7 +634,7 @@ pub fn activate_evidence_ledger_replay(
         return builder.finish(Vec::new());
     }
 
-    let caps = request.caps.sanitized();
+    let caps = request.caps.effective();
     let mut candidates = report
         .selected
         .iter()
@@ -941,7 +936,7 @@ impl<'a> ActivationBuilder<'a> {
                 active_count: active_refs.len(),
                 excluded_count: self.issues.len(),
                 excluded_by_reason: self.excluded_by_reason,
-                caps: self.request.caps.sanitized(),
+                caps: self.request.caps.effective(),
                 stable_ordering: "linked_episode_count_desc:score_kind:score_desc:freshness:path:evidence_id:artifact_id:quota_caps:canonical_target".to_string(),
                 activation_fingerprint,
             },
@@ -2223,6 +2218,130 @@ mod tests {
                 .issues
                 .iter()
                 .any(|issue| { issue.code == EvidenceReplayIssueCode::FairnessQuotaExceeded })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn activation_zero_global_cap_selects_no_replay_evidence() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let indexer = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = indexer.index()?;
+        write_fixture_context_pack(&indexer, &manifest, EvidenceFreshness::Fresh, 1.0)?;
+        let report =
+            select_evidence_ledger_replay(&indexer, &manifest, &fixture_request(&manifest));
+        let setup = ReplayActivationRequest::new(
+            &manifest,
+            "query",
+            ReplayActivationCaps { per_source: 0, per_episode: 0, per_file: 0, global: 0 },
+        );
+
+        let actual =
+            activate_evidence_ledger_replay(&manifest, &fresh_activation_state(), &report, &setup);
+        let expected = (0usize, true);
+
+        assert_eq!(
+            (
+                actual.active_refs.len(),
+                actual
+                    .issues
+                    .iter()
+                    .any(|issue| issue.code == EvidenceReplayIssueCode::FairnessQuotaExceeded),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn activation_zero_per_source_cap_selects_no_replay_evidence() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let indexer = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = indexer.index()?;
+        write_fixture_context_pack(&indexer, &manifest, EvidenceFreshness::Fresh, 1.0)?;
+        let report =
+            select_evidence_ledger_replay(&indexer, &manifest, &fixture_request(&manifest));
+        let setup = ReplayActivationRequest::new(
+            &manifest,
+            "query",
+            ReplayActivationCaps { per_source: 0, per_episode: 8, per_file: 8, global: 16 },
+        );
+
+        let actual =
+            activate_evidence_ledger_replay(&manifest, &fresh_activation_state(), &report, &setup);
+        let expected = (0usize, true);
+
+        assert_eq!(
+            (
+                actual.active_refs.len(),
+                actual
+                    .issues
+                    .iter()
+                    .any(|issue| issue.code == EvidenceReplayIssueCode::FairnessQuotaExceeded),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn activation_zero_per_episode_cap_selects_no_replay_evidence() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let indexer = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = indexer.index()?;
+        write_fixture_context_pack(&indexer, &manifest, EvidenceFreshness::Fresh, 1.0)?;
+        let report =
+            select_evidence_ledger_replay(&indexer, &manifest, &fixture_request(&manifest));
+        let setup = ReplayActivationRequest::new(
+            &manifest,
+            "query",
+            ReplayActivationCaps { per_source: 8, per_episode: 0, per_file: 8, global: 16 },
+        );
+
+        let actual =
+            activate_evidence_ledger_replay(&manifest, &fresh_activation_state(), &report, &setup);
+        let expected = (0usize, true);
+
+        assert_eq!(
+            (
+                actual.active_refs.len(),
+                actual
+                    .issues
+                    .iter()
+                    .any(|issue| issue.code == EvidenceReplayIssueCode::FairnessQuotaExceeded),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn activation_zero_per_file_cap_selects_no_replay_evidence() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let indexer = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = indexer.index()?;
+        write_fixture_context_pack(&indexer, &manifest, EvidenceFreshness::Fresh, 1.0)?;
+        let report =
+            select_evidence_ledger_replay(&indexer, &manifest, &fixture_request(&manifest));
+        let setup = ReplayActivationRequest::new(
+            &manifest,
+            "query",
+            ReplayActivationCaps { per_source: 8, per_episode: 8, per_file: 0, global: 16 },
+        );
+
+        let actual =
+            activate_evidence_ledger_replay(&manifest, &fresh_activation_state(), &report, &setup);
+        let expected = (0usize, true);
+
+        assert_eq!(
+            (
+                actual.active_refs.len(),
+                actual
+                    .issues
+                    .iter()
+                    .any(|issue| issue.code == EvidenceReplayIssueCode::FairnessQuotaExceeded),
+            ),
+            expected,
         );
         Ok(())
     }
