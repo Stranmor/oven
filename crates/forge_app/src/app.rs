@@ -1446,9 +1446,20 @@ mod tests {
 
         async fn list_branch_targets(
             &self,
-            _conversation_id: &ConversationId,
+            conversation_id: &ConversationId,
         ) -> Result<Vec<crate::dto::ConversationBranchTarget>> {
-            Ok(Vec::new())
+            let conversations = self.conversations.lock().await;
+            let source = conversations
+                .get(conversation_id)
+                .ok_or_else(|| forge_domain::Error::ConversationNotFound(*conversation_id))?;
+            let mut context = source
+                .context
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Conversation {conversation_id} has no context"))?;
+            context.conversation_id = Some(source.id);
+            Ok(crate::dto::ConversationBranchTarget::list_from_context(
+                source.id, &context,
+            ))
         }
 
         async fn modify_conversation<F, T>(&self, id: &ConversationId, f: F) -> Result<T>
@@ -1578,6 +1589,60 @@ mod tests {
             drop(events);
             self.apply_learning_event(&event).await;
             Ok(event)
+        }
+
+        async fn review_learning_candidate_event(
+            &self,
+            event: LearningLedgerEvent,
+        ) -> Result<LearningReviewOutcome> {
+            let target_state = match event.event_kind {
+                LearningEventKind::ReviewAccepted => LearningReviewState::Accepted,
+                LearningEventKind::ReviewRejected => LearningReviewState::Rejected,
+                LearningEventKind::Superseded => LearningReviewState::Superseded,
+                LearningEventKind::CandidateCaptured => {
+                    anyhow::bail!("candidate capture event cannot review learning record")
+                }
+            };
+            let before = self
+                .learning_records
+                .lock()
+                .await
+                .iter()
+                .find(|record| record.record_id == event.record_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("learning candidate record not found"))?;
+            if before.review_state == target_state {
+                let existing = self
+                    .learning_events
+                    .lock()
+                    .await
+                    .iter()
+                    .find(|existing| {
+                        existing.record_id == event.record_id
+                            && existing.event_kind == event.event_kind
+                    })
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("learning review event not found"))?;
+                return Ok(LearningReviewOutcome { event: existing, projection: before });
+            }
+            if before.review_state != LearningReviewState::Candidate {
+                anyhow::bail!(
+                    "learning record cannot be reviewed from state {}",
+                    before.review_state
+                );
+            }
+            let event = self.insert_learning_event(event).await?;
+            let projection = self
+                .learning_records
+                .lock()
+                .await
+                .iter()
+                .find(|record| record.record_id == event.record_id)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("learning review projection not found after append")
+                })?;
+            Ok(LearningReviewOutcome { event, projection })
         }
 
         async fn list_learning_records(
@@ -2817,6 +2882,13 @@ mod tests {
             _event: LearningLedgerEvent,
         ) -> Result<LearningLedgerEvent> {
             anyhow::bail!("unused learning insert")
+        }
+
+        async fn review_learning_candidate_event(
+            &self,
+            _event: LearningLedgerEvent,
+        ) -> Result<LearningReviewOutcome> {
+            anyhow::bail!("unused learning review")
         }
 
         async fn list_learning_records(

@@ -470,6 +470,18 @@ pub trait LearningService: Send + Sync {
         event: LearningLedgerEvent,
     ) -> anyhow::Result<LearningLedgerEvent>;
 
+    /// Atomically reviews a candidate through a repository-backed compare-and-append operation.
+    ///
+    /// # Arguments
+    /// * `event` - Review event to append or deduplicate.
+    ///
+    /// # Errors
+    /// Returns an error when the record cannot accept this review transition.
+    async fn review_learning_candidate_event(
+        &self,
+        event: LearningLedgerEvent,
+    ) -> anyhow::Result<LearningReviewOutcome>;
+
     /// Reviews a captured candidate through a typed append-only event.
     ///
     /// # Arguments
@@ -481,29 +493,7 @@ pub trait LearningService: Send + Sync {
         &self,
         request: LearningReviewRequest,
     ) -> anyhow::Result<LearningReviewOutcome> {
-        let before = self
-            .list_learning_records(None, usize::MAX)
-            .await?
-            .into_iter()
-            .find(|record| record.record_id == request.record_id)
-            .ok_or_else(|| anyhow::anyhow!("learning candidate record not found"))?;
         let target_state = request.decision.review_state();
-        if before.review_state == target_state {
-            let event = LearningLedgerEvent::review(
-                request.record_id,
-                request.decision.event_kind(),
-                request.review_note,
-                request.provenance,
-                chrono::Utc::now(),
-            )?;
-            return Ok(LearningReviewOutcome { event, projection: before });
-        }
-        if before.review_state != LearningReviewState::Candidate {
-            anyhow::bail!(
-                "learning record cannot be reviewed from state {}",
-                before.review_state
-            );
-        }
         let event = LearningLedgerEvent::review(
             request.record_id,
             request.decision.event_kind(),
@@ -511,16 +501,15 @@ pub trait LearningService: Send + Sync {
             request.provenance,
             chrono::Utc::now(),
         )?;
-        let event = self.insert_learning_event(event).await?;
-        let projection = self
-            .list_learning_records(Some(target_state), usize::MAX)
-            .await?
-            .into_iter()
-            .find(|record| record.record_id == request.record_id)
-            .ok_or_else(|| anyhow::anyhow!("learning review event did not produce target state"))?;
-        Ok(LearningReviewOutcome { event, projection })
+        let outcome = self.review_learning_candidate_event(event).await?;
+        if outcome.projection.review_state != target_state {
+            anyhow::bail!(
+                "learning review produced unexpected state {}",
+                outcome.projection.review_state
+            );
+        }
+        Ok(outcome)
     }
-
     /// Lists projected learning records.
     ///
     /// # Arguments
@@ -1148,6 +1137,15 @@ impl<I: Services> LearningService for I {
         self.learning_service().insert_learning_event(event).await
     }
 
+    async fn review_learning_candidate_event(
+        &self,
+        event: LearningLedgerEvent,
+    ) -> anyhow::Result<LearningReviewOutcome> {
+        self.learning_service()
+            .review_learning_candidate_event(event)
+            .await
+    }
+
     async fn review_learning_candidate(
         &self,
         request: LearningReviewRequest,
@@ -1723,7 +1721,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
 
-    use forge_domain::{Context, Initiator, SteerQueue};
+    use forge_domain::{Context, ContextMessage, Initiator, Role, SteerQueue, TextMessage};
     use pretty_assertions::assert_eq;
     use tokio::sync::Mutex;
 
@@ -1790,9 +1788,20 @@ mod tests {
 
         async fn list_branch_targets(
             &self,
-            _conversation_id: &ConversationId,
+            conversation_id: &ConversationId,
         ) -> anyhow::Result<Vec<ConversationBranchTarget>> {
-            Ok(Vec::new())
+            let conversations = self.conversations.lock().await;
+            let source = conversations
+                .get(conversation_id)
+                .ok_or_else(|| forge_domain::Error::ConversationNotFound(*conversation_id))?;
+            let mut context = source
+                .context
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Conversation {conversation_id} has no context"))?;
+            context.conversation_id = Some(source.id);
+            Ok(ConversationBranchTarget::list_from_context(
+                source.id, &context,
+            ))
         }
 
         async fn modify_conversation<F, T>(&self, id: &ConversationId, f: F) -> anyhow::Result<T>
@@ -1938,6 +1947,13 @@ mod tests {
             &self,
             _event: LearningLedgerEvent,
         ) -> anyhow::Result<LearningLedgerEvent> {
+            anyhow::bail!("unused learning service")
+        }
+
+        async fn review_learning_candidate_event(
+            &self,
+            _event: LearningLedgerEvent,
+        ) -> anyhow::Result<LearningReviewOutcome> {
             anyhow::bail!("unused learning service")
         }
 
@@ -2582,6 +2598,40 @@ mod tests {
         fn skill_fetch_service(&self) -> &Self::SkillFetchService {
             &self.noop
         }
+    }
+
+    #[tokio::test]
+    async fn test_raw_conversation_service_lists_branch_targets_through_domain_filter() {
+        let setup = RawConversationService::default();
+        let conversation_id = ConversationId::generate();
+        let conversation = Conversation::new(conversation_id).context(Some(
+            Context::default()
+                .conversation_id(conversation_id)
+                .messages(vec![
+                    ContextMessage::system("system").into(),
+                    ContextMessage::user("kept user", None).into(),
+                    ContextMessage::Text(TextMessage::learning_context(Role::User, "internal"))
+                        .into(),
+                    ContextMessage::Text(TextMessage::new(Role::User, "droppable").droppable(true))
+                        .into(),
+                    ContextMessage::assistant("kept assistant", None, None, None).into(),
+                ]),
+        ));
+
+        setup.upsert_conversation(conversation).await.unwrap();
+        let actual = setup
+            .list_branch_targets(&conversation_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|target| (target.ordinal, target.role, target.preview))
+            .collect::<Vec<_>>();
+        let expected = vec![
+            (1usize, Role::User, "kept user".to_string()),
+            (4usize, Role::Assistant, "kept assistant".to_string()),
+        ];
+
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]

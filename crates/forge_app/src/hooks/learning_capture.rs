@@ -102,7 +102,7 @@ mod tests {
 
     use forge_domain::{
         Context, ContextMessage, ConversationId, LearningLedgerEvent, LearningLedgerFreshness,
-        LearningRecordProjection, LearningReviewState, ModelId,
+        LearningRecordProjection, LearningReviewOutcome, LearningReviewState, ModelId,
     };
     use pretty_assertions::assert_eq;
 
@@ -144,6 +144,13 @@ mod tests {
             _event: LearningLedgerEvent,
         ) -> anyhow::Result<LearningLedgerEvent> {
             anyhow::bail!("unused insert")
+        }
+
+        async fn review_learning_candidate_event(
+            &self,
+            _event: LearningLedgerEvent,
+        ) -> anyhow::Result<LearningReviewOutcome> {
+            anyhow::bail!("unused review")
         }
 
         async fn list_learning_records(

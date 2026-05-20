@@ -5,7 +5,8 @@ use chrono::Utc;
 use forge_app::LearningService;
 use forge_app::domain::{
     ConversationId, LearningLedgerEvent, LearningLedgerFreshness, LearningProvenance,
-    LearningRecordProjection, LearningRepository, LearningReviewState, RedactedLearningSummary,
+    LearningRecordProjection, LearningRepository, LearningReviewOutcome, LearningReviewState,
+    RedactedLearningSummary,
 };
 
 /// Domain service for capture/query operations over the append-only learning
@@ -53,6 +54,13 @@ impl<R: LearningRepository> LearningService for ForgeLearningService<R> {
         self.repository.insert_learning_event(event).await
     }
 
+    async fn review_learning_candidate_event(
+        &self,
+        event: LearningLedgerEvent,
+    ) -> Result<LearningReviewOutcome> {
+        self.repository.review_learning_candidate_event(event).await
+    }
+
     async fn list_learning_records(
         &self,
         review_state: Option<LearningReviewState>,
@@ -96,6 +104,26 @@ mod tests {
             let mut events = self.events.lock().unwrap();
             let entry = events.entry(event.idempotency_key.clone()).or_insert(event);
             Ok(entry.clone())
+        }
+
+        async fn review_learning_candidate_event(
+            &self,
+            event: LearningLedgerEvent,
+        ) -> Result<LearningReviewOutcome> {
+            let event = self.insert_learning_event(event).await?;
+            Ok(LearningReviewOutcome {
+                projection: LearningRecordProjection {
+                    record_id: event.record_id,
+                    summary: event.summary.clone(),
+                    review_state: LearningReviewState::Accepted,
+                    redaction_status: event.redaction_status,
+                    provenance: event.provenance.clone(),
+                    created_at: event.created_at,
+                    updated_at: event.created_at,
+                    schema_version: event.schema_version,
+                },
+                event,
+            })
         }
 
         async fn list_learning_records(

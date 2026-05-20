@@ -5,10 +5,10 @@ use url::Url;
 
 use crate::{
     AnyProvider, AuthCredential, ChatCompletionMessage, Context, Conversation, ConversationId,
-    LearningLedgerEvent, LearningLedgerFreshness, LearningRecordProjection, LearningReviewState,
-    MigrationResult, Model, ModelId, Provider, ProviderId, ProviderTemplate, ResultStream,
-    SearchMatch, Skill, Snapshot, SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter,
-    WorkspaceAuth, WorkspaceId,
+    LearningLedgerEvent, LearningLedgerFreshness, LearningRecordProjection, LearningReviewOutcome,
+    LearningReviewState, MigrationResult, Model, ModelId, Provider, ProviderId, ProviderTemplate,
+    ResultStream, SearchMatch, Skill, Snapshot, SubagentTaskId, SubagentTaskSession,
+    SubagentTaskSessionFilter, WorkspaceAuth, WorkspaceId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +183,18 @@ pub trait LearningRepository: Send + Sync {
         &self,
         event: LearningLedgerEvent,
     ) -> Result<LearningLedgerEvent>;
+
+    /// Atomically appends or deduplicates one review event only when the target record is still reviewable.
+    ///
+    /// # Arguments
+    /// * `event` - Review event to append or deduplicate by idempotency key.
+    ///
+    /// # Errors
+    /// Returns an error if the record is missing, terminal in a different state, or persistence fails.
+    async fn review_learning_candidate_event(
+        &self,
+        event: LearningLedgerEvent,
+    ) -> Result<LearningReviewOutcome>;
 
     /// Lists projected learning records for the current workspace.
     ///
