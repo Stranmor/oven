@@ -8,6 +8,45 @@ use uuid::Uuid;
 
 use crate::{Context, Error, Metrics, Result, TokenCount};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationListQuery {
+    pub visibility: ConversationVisibilityFilter,
+    pub initiator: Option<Initiator>,
+    pub include_agent: bool,
+    pub limit: usize,
+}
+
+impl ConversationListQuery {
+    /// Creates a bounded primary-user list query for the normal conversation surface.
+    ///
+    /// # Arguments
+    /// * `limit` - Maximum number of rows returned after all membership filters are applied.
+    pub fn primary_user(limit: usize) -> Self {
+        Self {
+            visibility: ConversationVisibilityFilter::Normal,
+            initiator: Some(Initiator::User),
+            include_agent: false,
+            limit,
+        }
+    }
+
+    /// Creates a bounded list query with explicit membership filters.
+    ///
+    /// # Arguments
+    /// * `visibility` - Visibility classes to include before ordering and limiting.
+    /// * `initiator` - Optional initiator filter applied before ordering and limiting.
+    /// * `include_agent` - Whether unfiltered initiator queries include agent conversations.
+    /// * `limit` - Maximum number of rows returned after all membership filters are applied.
+    pub fn new(
+        visibility: ConversationVisibilityFilter,
+        initiator: Option<Initiator>,
+        include_agent: bool,
+        limit: usize,
+    ) -> Self {
+        Self { visibility, initiator, include_agent, limit }
+    }
+}
+
 #[derive(Debug, Default, Display, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
 #[serde(transparent)]
 pub struct ConversationId(Uuid);

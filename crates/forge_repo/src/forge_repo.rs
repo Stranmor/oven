@@ -12,16 +12,16 @@ use forge_app::{
 use forge_config::ForgeConfig;
 use forge_domain::{
     AnyProvider, AuthCredential, ChatCompletionMessage, ChatRepository, CommandExecutionOutput,
-    Context, Conversation, ConversationId, ConversationListItem, ConversationRepository,
-    ConversationVisibilityFilter, Environment, FileInfo, FuzzySearchRepository, LearningEventId,
-    LearningLedgerAppendOutcome, LearningLedgerEvent, LearningLedgerEventView,
-    LearningLedgerFreshness, LearningRecordId, LearningRecordProjection, LearningRepository,
-    LearningReviewOutcome, LearningReviewState, McpServerConfig, MigrationResult, Model, ModelId,
-    ProcessId, ProcessReadCursor, ProcessReadOutput, ProcessStartOutput, ProcessStatus, Provider,
-    ProviderId, ProviderRepository, ResultStream, SearchMatch, SensorLessonPromotionOutcome,
-    SensorLessonPromotionRequest, Skill, SkillRepository, Snapshot, SnapshotRepository,
-    SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter, TextPatchBlock,
-    TextPatchRepository,
+    Context, Conversation, ConversationId, ConversationListItem, ConversationListQuery,
+    ConversationRepository, ConversationVisibilityFilter, Environment, FileInfo,
+    FuzzySearchRepository, LearningEventId, LearningLedgerAppendOutcome, LearningLedgerEvent,
+    LearningLedgerEventView, LearningLedgerFreshness, LearningRecordId, LearningRecordProjection,
+    LearningRepository, LearningReviewOutcome, LearningReviewState, McpServerConfig,
+    MigrationResult, Model, ModelId, ProcessId, ProcessReadCursor, ProcessReadOutput,
+    ProcessStartOutput, ProcessStatus, Provider, ProviderId, ProviderRepository, ResultStream,
+    SearchMatch, SensorLessonPromotionOutcome, SensorLessonPromotionRequest, Skill,
+    SkillRepository, Snapshot, SnapshotRepository, SubagentTaskId, SubagentTaskSession,
+    SubagentTaskSessionFilter, TextPatchBlock, TextPatchRepository,
 };
 use forge_eventsource::EventSource;
 // Re-export CacacheStorage from forge_infra
@@ -152,12 +152,12 @@ impl<F: Send + Sync> ConversationRepository for ForgeRepo<F> {
             .await
     }
 
-    async fn get_all_conversation_list_items(
+    async fn get_conversation_list_items_by_query(
         &self,
-        limit: usize,
+        query: ConversationListQuery,
     ) -> anyhow::Result<Vec<ConversationListItem>> {
         self.conversation_repository
-            .get_all_conversation_list_items(limit)
+            .get_conversation_list_items_by_query(query)
             .await
     }
 

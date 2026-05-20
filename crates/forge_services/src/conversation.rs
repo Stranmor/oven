@@ -8,7 +8,10 @@ use forge_app::domain::{
     SubagentTaskSessionFilter,
 };
 use forge_app::dto::ConversationBranchTarget;
-use forge_domain::{ConversationListItem, ConversationRepository, ConversationVisibilityFilter};
+use forge_domain::{
+    ConversationListItem, ConversationListQuery, ConversationRepository,
+    ConversationVisibilityFilter,
+};
 
 /// Service for managing conversations, including creation, retrieval, and
 /// updates
@@ -153,9 +156,12 @@ impl<S: ConversationRepository> ConversationService for ForgeConversationService
         Ok(branch)
     }
 
-    async fn get_conversation_list_items(&self, limit: usize) -> Result<Vec<ConversationListItem>> {
+    async fn get_conversation_list_items_by_query(
+        &self,
+        query: ConversationListQuery,
+    ) -> Result<Vec<ConversationListItem>> {
         self.conversation_repository
-            .get_all_conversation_list_items(limit)
+            .get_conversation_list_items_by_query(query)
             .await
     }
 
@@ -324,15 +330,31 @@ mod tests {
                 .cloned())
         }
 
-        async fn get_all_conversation_list_items(
+        async fn get_conversation_list_items_by_query(
             &self,
-            limit: usize,
+            query: forge_app::domain::ConversationListQuery,
         ) -> anyhow::Result<Vec<forge_app::domain::ConversationListItem>> {
-            let conversations = self.get_all_conversations().await?;
+            let conversations = self.get_all_conversations_including_agent().await?;
             Ok(conversations
                 .into_iter()
-                .filter(|conversation| conversation.is_primary_user_conversation())
-                .take(limit)
+                .filter(|conversation| {
+                    conversation.parent_id.is_none() && conversation.context.is_some()
+                })
+                .filter(|conversation| match query.visibility {
+                    forge_app::domain::ConversationVisibilityFilter::Normal => {
+                        conversation.is_normal_visibility()
+                    }
+                    forge_app::domain::ConversationVisibilityFilter::Background => {
+                        conversation.is_background()
+                    }
+                    forge_app::domain::ConversationVisibilityFilter::All => true,
+                })
+                .filter(|conversation| match query.initiator {
+                    Some(initiator) => conversation.initiator == initiator,
+                    None if query.include_agent => true,
+                    None => !conversation.is_agent_initiated(),
+                })
+                .take(query.limit)
                 .map(conversation_list_item_fixture)
                 .collect())
         }

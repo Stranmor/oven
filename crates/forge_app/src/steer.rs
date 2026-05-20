@@ -210,9 +210,9 @@ mod tests {
             anyhow::bail!("branch conversation is not implemented for steer fixture service")
         }
 
-        async fn get_conversation_list_items(
+        async fn get_conversation_list_items_by_query(
             &self,
-            _limit: usize,
+            _query: forge_domain::ConversationListQuery,
         ) -> anyhow::Result<Vec<ConversationListItem>> {
             Ok(Vec::new())
         }

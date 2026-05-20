@@ -4,8 +4,8 @@ use anyhow::Result;
 use forge_app::dto::ToolsOverview;
 use forge_app::{User, UserUsage};
 use forge_domain::{
-    AgentId, ConversationListItem, Effort, ModelId, ProviderModels, SubagentTaskId,
-    SubagentTaskSession, SubagentTaskSessionFilter,
+    AgentId, ConversationListItem, ConversationListQuery, Effort, ModelId, ProviderModels,
+    SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter,
 };
 use forge_stream::MpscStream;
 use futures::stream::BoxStream;
@@ -83,8 +83,12 @@ pub trait API: Sync + Send {
         target_id: forge_domain::MessageId,
     ) -> Result<Conversation>;
 
-    /// Lists bounded metadata-only primary user conversation rows for the active workspace.
-    async fn get_conversation_list_items(&self) -> Result<Vec<ConversationListItem>>;
+    /// Lists bounded metadata-only root conversation rows with all membership filters applied
+    /// before ordering and limiting.
+    async fn get_conversation_list_items_by_query(
+        &self,
+        query: ConversationListQuery,
+    ) -> Result<Vec<ConversationListItem>>;
 
     /// Lists bounded metadata-only root conversation rows including internal agent sessions.
     async fn get_conversation_list_items_including_agent(

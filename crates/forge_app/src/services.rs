@@ -6,11 +6,12 @@ use derive_setters::Setters;
 use forge_domain::{
     AgentId, AnyProvider, Attachment, AuthContextRequest, AuthContextResponse, AuthMethod,
     ChatCompletionMessage, CommandOutput, Context, Conversation, ConversationId,
-    ConversationListItem, File, FileInfo, FileStatus, Image, LearningCaptureMetadata,
-    LearningLedgerAppendOutcome, LearningLedgerEvent, LearningLedgerFreshness, LearningRecordId,
-    LearningRecordProjection, LearningReviewOutcome, LearningReviewRequest, LearningReviewState,
-    LearningSensorReviewInput, LearningSensorReviewOutput, McpConfig, McpServers, Model, ModelId,
-    Node, ProcessId, ProcessReadCursor, ProcessReadOutput, ProcessStartOutput, ProcessStatus,
+    ConversationListItem, ConversationListQuery, File, FileInfo, FileStatus, Image,
+    LearningCaptureMetadata, LearningLedgerAppendOutcome, LearningLedgerEvent,
+    LearningLedgerFreshness, LearningRecordId, LearningRecordProjection, LearningReviewOutcome,
+    LearningReviewRequest, LearningReviewState, LearningSensorReviewInput,
+    LearningSensorReviewOutput, McpConfig, McpServers, Model, ModelId, Node, ProcessId,
+    ProcessReadCursor, ProcessReadOutput, ProcessStartOutput, ProcessStatus,
     ProjectSemanticEmbeddingOutput, Provider, ProviderId, ResultStream, Scope, SearchParams,
     SemSearchAvailability, SensorLessonPromotionOutcome, SensorLessonPromotionRequest,
     SteerMessage, SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter, SyncProgress,
@@ -356,16 +357,17 @@ pub trait ConversationService: Send + Sync {
         target_id: forge_domain::MessageId,
     ) -> anyhow::Result<Conversation>;
 
-    /// Lists bounded metadata-only primary user conversation rows.
+    /// Lists bounded metadata-only root conversation rows with all membership filters applied
+    /// before ordering and limiting.
     ///
     /// # Arguments
-    /// * `limit` - Maximum number of rows returned by the repository query.
+    /// * `query` - Typed visibility, initiator, include-agent, and limit filters.
     ///
     /// # Errors
     /// Returns an error if listing conversations fails.
-    async fn get_conversation_list_items(
+    async fn get_conversation_list_items_by_query(
         &self,
-        limit: usize,
+        query: ConversationListQuery,
     ) -> anyhow::Result<Vec<ConversationListItem>>;
 
     /// Lists bounded metadata-only root conversation rows including internal agent sessions.
@@ -1214,12 +1216,12 @@ impl<I: Services> ConversationService for I {
             .await
     }
 
-    async fn get_conversation_list_items(
+    async fn get_conversation_list_items_by_query(
         &self,
-        limit: usize,
+        query: ConversationListQuery,
     ) -> anyhow::Result<Vec<ConversationListItem>> {
         self.conversation_service()
-            .get_conversation_list_items(limit)
+            .get_conversation_list_items_by_query(query)
             .await
     }
 
@@ -2098,18 +2100,36 @@ mod tests {
             anyhow::bail!("branch conversation is not implemented for raw fixture service")
         }
 
-        async fn get_conversation_list_items(
+        async fn get_conversation_list_items_by_query(
             &self,
-            _limit: usize,
+            query: ConversationListQuery,
         ) -> anyhow::Result<Vec<ConversationListItem>> {
-            Ok(self
+            let conversations = self
                 .conversations
                 .lock()
                 .await
                 .values()
-                .filter(|conversation| conversation.is_primary_user_conversation())
+                .filter(|conversation| {
+                    conversation.parent_id.is_none() && conversation.context.is_some()
+                })
+                .filter(|conversation| match query.visibility {
+                    forge_domain::ConversationVisibilityFilter::Normal => {
+                        conversation.is_normal_visibility()
+                    }
+                    forge_domain::ConversationVisibilityFilter::Background => {
+                        conversation.is_background()
+                    }
+                    forge_domain::ConversationVisibilityFilter::All => true,
+                })
+                .filter(|conversation| match query.initiator {
+                    Some(initiator) => conversation.initiator == initiator,
+                    None if query.include_agent => true,
+                    None => !conversation.is_agent_initiated(),
+                })
+                .take(query.limit)
                 .map(conversation_list_item_from_conversation)
-                .collect())
+                .collect();
+            Ok(conversations)
         }
 
         async fn get_conversation_list_items_including_agent(

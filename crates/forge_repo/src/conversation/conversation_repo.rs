@@ -4,9 +4,9 @@ use chrono::{Duration, Utc};
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 use forge_domain::{
-    Conversation, ConversationId, ConversationListItem, ConversationRepository,
-    ConversationVisibilityFilter, SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter,
-    SubagentTaskStatus, WorkspaceHash,
+    Conversation, ConversationId, ConversationListItem, ConversationListQuery,
+    ConversationRepository, ConversationVisibilityFilter, Initiator, SubagentTaskId,
+    SubagentTaskSession, SubagentTaskSessionFilter, SubagentTaskStatus, WorkspaceHash,
 };
 
 use crate::conversation::conversation_record::{ConversationListItemRecord, ConversationRecord};
@@ -254,6 +254,46 @@ fn conversation_list_items_from_records(
         .collect::<Result<Vec<_>, _>>()
 }
 
+fn load_conversation_list_items_by_query(
+    connection: &mut SqliteConnection,
+    workspace_id: i64,
+    query: ConversationListQuery,
+) -> anyhow::Result<Vec<ConversationListItem>> {
+    let base_query = "SELECT conversation_id, title, parent_id, created_at, updated_at, initiator,
+            visibility, context IS NOT NULL AS context_present
+         FROM conversations
+         WHERE workspace_id = ?
+            AND context IS NOT NULL
+            AND parent_id IS NULL";
+    let visibility_clause = match query.visibility {
+        ConversationVisibilityFilter::Normal => " AND visibility IS NULL",
+        ConversationVisibilityFilter::Background => " AND visibility = 'background'",
+        ConversationVisibilityFilter::All => "",
+    };
+    let initiator_clause = match query.initiator {
+        Some(Initiator::User) => {
+            " AND initiator IS NULL
+              AND context NOT LIKE '%\"initiator\":\"agent\"%'
+              AND context NOT LIKE '%\"initiator\": \"agent\"%'"
+        }
+        Some(Initiator::Agent) => " AND initiator = 'agent'",
+        None if query.include_agent => "",
+        None => {
+            " AND initiator IS NULL
+              AND context NOT LIKE '%\"initiator\":\"agent\"%'
+              AND context NOT LIKE '%\"initiator\": \"agent\"%'"
+        }
+    };
+    let sql = format!(
+        "{base_query}{visibility_clause}{initiator_clause} ORDER BY updated_at DESC LIMIT ?"
+    );
+    let records = diesel::sql_query(sql)
+        .bind::<diesel::sql_types::BigInt, _>(workspace_id)
+        .bind::<diesel::sql_types::BigInt, _>(repository_limit(query.limit))
+        .load::<ConversationListItemRecord>(connection)?;
+    conversation_list_items_from_records(records)
+}
+
 pub struct ConversationRepositoryImpl {
     pool: Arc<DatabasePool>,
     wid: WorkspaceHash,
@@ -441,30 +481,13 @@ impl ConversationRepository for ConversationRepositoryImpl {
         .await
     }
 
-    async fn get_all_conversation_list_items(
+    async fn get_conversation_list_items_by_query(
         &self,
-        limit: usize,
+        query: ConversationListQuery,
     ) -> anyhow::Result<Vec<ConversationListItem>> {
         self.run_with_connection(move |connection, wid| {
             let workspace_id = workspace_db_id(wid);
-            let records = diesel::sql_query(
-                "SELECT conversation_id, title, parent_id, created_at, updated_at, initiator,
-                    visibility, context IS NOT NULL AS context_present
-                 FROM conversations
-                 WHERE workspace_id = ?
-                    AND context IS NOT NULL
-                    AND parent_id IS NULL
-                    AND visibility IS NULL
-                    AND initiator IS NULL
-                    AND context NOT LIKE '%\"initiator\":\"agent\"%'
-                    AND context NOT LIKE '%\"initiator\": \"agent\"%'
-                 ORDER BY updated_at DESC
-                 LIMIT ?",
-            )
-            .bind::<diesel::sql_types::BigInt, _>(workspace_id)
-            .bind::<diesel::sql_types::BigInt, _>(repository_limit(limit))
-            .load::<ConversationListItemRecord>(connection)?;
-            conversation_list_items_from_records(records)
+            load_conversation_list_items_by_query(connection, workspace_id, query)
         })
         .await
     }
@@ -473,10 +496,12 @@ impl ConversationRepository for ConversationRepositoryImpl {
         &self,
         limit: usize,
     ) -> anyhow::Result<Vec<ConversationListItem>> {
-        self.get_all_conversation_list_items_by_visibility(
+        self.get_conversation_list_items_by_query(ConversationListQuery::new(
             ConversationVisibilityFilter::Normal,
+            None,
+            true,
             limit,
-        )
+        ))
         .await
     }
 
@@ -485,27 +510,9 @@ impl ConversationRepository for ConversationRepositoryImpl {
         visibility: ConversationVisibilityFilter,
         limit: usize,
     ) -> anyhow::Result<Vec<ConversationListItem>> {
-        self.run_with_connection(move |connection, wid| {
-            let workspace_id = workspace_db_id(wid);
-            let base_query =
-                "SELECT conversation_id, title, parent_id, created_at, updated_at, initiator,
-                    visibility, context IS NOT NULL AS context_present
-                 FROM conversations
-                 WHERE workspace_id = ?
-                    AND context IS NOT NULL
-                    AND parent_id IS NULL";
-            let visibility_clause = match visibility {
-                ConversationVisibilityFilter::Normal => " AND visibility IS NULL",
-                ConversationVisibilityFilter::Background => " AND visibility = 'background'",
-                ConversationVisibilityFilter::All => "",
-            };
-            let query = format!("{base_query}{visibility_clause} ORDER BY updated_at DESC LIMIT ?");
-            let records = diesel::sql_query(query)
-                .bind::<diesel::sql_types::BigInt, _>(workspace_id)
-                .bind::<diesel::sql_types::BigInt, _>(repository_limit(limit))
-                .load::<ConversationListItemRecord>(connection)?;
-            conversation_list_items_from_records(records)
-        })
+        self.get_conversation_list_items_by_query(ConversationListQuery::new(
+            visibility, None, true, limit,
+        ))
         .await
     }
 
@@ -831,6 +838,42 @@ mod tests {
         Ok(id)
     }
 
+    async fn insert_list_item_record(
+        repo: &ConversationRepositoryImpl,
+        title: &str,
+        initiator: Option<&str>,
+        visibility: Option<&str>,
+        updated_minutes_ago: i64,
+    ) -> anyhow::Result<ConversationId> {
+        let id = ConversationId::generate();
+        let now = Utc::now().naive_utc() - Duration::minutes(updated_minutes_ago);
+        let context = serde_json::to_string(&ContextRecord::from(
+            &Context::default().messages(vec![ContextMessage::user(title, None).into()]),
+        ))?;
+        let record = ConversationRecord {
+            conversation_id: id.into_string(),
+            title: Some(title.to_string()),
+            workspace_id: 0,
+            context: Some(context),
+            created_at: now,
+            updated_at: Some(now),
+            metrics: None,
+            parent_id: None,
+            initiator: initiator.map(str::to_string),
+            visibility: visibility.map(str::to_string),
+        };
+
+        repo.run_with_connection(move |connection, _wid| {
+            diesel::insert_into(conversations::table)
+                .values(&record)
+                .execute(connection)?;
+            Ok(())
+        })
+        .await?;
+
+        Ok(id)
+    }
+
     async fn insert_legacy_agent_record(
         repo: &ConversationRepositoryImpl,
         title: &str,
@@ -1108,7 +1151,14 @@ mod tests {
         let repo = repository()?;
         let fixture = insert_raw_context_record(&repo, "Broken Context", "{not-json").await?;
 
-        let actual = repo.get_all_conversation_list_items(10).await?;
+        let actual = repo
+            .get_conversation_list_items_by_query(ConversationListQuery::new(
+                ConversationVisibilityFilter::Normal,
+                None,
+                false,
+                10,
+            ))
+            .await?;
         let expected = (vec![fixture], true, Some("Broken Context".to_string()));
         let actual_item = actual
             .first()
@@ -1142,7 +1192,14 @@ mod tests {
         repo.upsert_conversation(conversation1).await?;
         repo.upsert_conversation(conversation2).await?;
 
-        let actual = repo.get_all_conversation_list_items(1).await?;
+        let actual = repo
+            .get_conversation_list_items_by_query(ConversationListQuery::new(
+                ConversationVisibilityFilter::Normal,
+                None,
+                false,
+                1,
+            ))
+            .await?;
         let expected = 1;
 
         assert_eq!(actual.len(), expected);
@@ -1192,6 +1249,147 @@ mod tests {
             actual_all.iter().map(|conv| conv.id).collect::<Vec<_>>(),
             expected_all
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_conversation_list_items_apply_agent_initiator_filter_before_limit()
+    -> anyhow::Result<()> {
+        let repo = repository()?;
+        let _newer_user_one =
+            insert_list_item_record(&repo, "newer user one", None, None, 1).await?;
+        let _newer_user_two =
+            insert_list_item_record(&repo, "newer user two", None, None, 2).await?;
+        let matching_agent =
+            insert_list_item_record(&repo, "older agent", Some("agent"), None, 3).await?;
+
+        let actual = repo
+            .get_conversation_list_items_by_query(ConversationListQuery::new(
+                ConversationVisibilityFilter::Normal,
+                Some(forge_domain::Initiator::Agent),
+                true,
+                1,
+            ))
+            .await?
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        let expected = vec![matching_agent];
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_conversation_list_items_apply_user_initiator_filter_before_limit()
+    -> anyhow::Result<()> {
+        let repo = repository()?;
+        let _newer_agent_one =
+            insert_list_item_record(&repo, "newer agent one", Some("agent"), None, 1).await?;
+        let _newer_agent_two =
+            insert_list_item_record(&repo, "newer agent two", Some("agent"), None, 2).await?;
+        let matching_user = insert_list_item_record(&repo, "older user", None, None, 3).await?;
+
+        let actual = repo
+            .get_conversation_list_items_by_query(ConversationListQuery::new(
+                ConversationVisibilityFilter::Normal,
+                Some(forge_domain::Initiator::User),
+                false,
+                1,
+            ))
+            .await?
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        let expected = vec![matching_user];
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_conversation_list_items_apply_background_agent_filters_before_limit()
+    -> anyhow::Result<()> {
+        let repo = repository()?;
+        let _newer_normal_agent =
+            insert_list_item_record(&repo, "newer normal agent", Some("agent"), None, 1).await?;
+        let _newer_background_user =
+            insert_list_item_record(&repo, "newer background user", None, Some("background"), 2)
+                .await?;
+        let matching_background_agent = insert_list_item_record(
+            &repo,
+            "older background agent",
+            Some("agent"),
+            Some("background"),
+            3,
+        )
+        .await?;
+
+        let actual = repo
+            .get_conversation_list_items_by_query(ConversationListQuery::new(
+                ConversationVisibilityFilter::Background,
+                Some(forge_domain::Initiator::Agent),
+                true,
+                1,
+            ))
+            .await?
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        let expected = vec![matching_background_agent];
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_conversation_list_item_id_is_fetched_as_full_conversation_after_selection()
+    -> anyhow::Result<()> {
+        let repo = repository()?;
+        let context =
+            Context::default().messages(vec![ContextMessage::user("Selected", None).into()]);
+        let conversation = Conversation::new(ConversationId::generate())
+            .title(Some("Selectable".to_string()))
+            .context(Some(context));
+        repo.upsert_conversation(conversation.clone()).await?;
+
+        let item = repo
+            .get_conversation_list_items_by_query(ConversationListQuery::primary_user(1))
+            .await?
+            .into_iter()
+            .next()
+            .expect("one metadata-only row should be returned");
+        let actual = repo
+            .get_conversation(&item.id)
+            .await?
+            .expect("selected row ID should fetch full conversation");
+        let expected = (conversation.id, true);
+
+        assert_eq!((actual.id, actual.context.is_some()), expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_conversation_list_items_do_not_deserialize_many_large_contexts()
+    -> anyhow::Result<()> {
+        let repo = repository()?;
+        let large_invalid_context = format!("{{not-json:{}", "x".repeat(128 * 1024));
+        let first =
+            insert_raw_context_record(&repo, "Large Broken One", &large_invalid_context).await?;
+        let second =
+            insert_raw_context_record(&repo, "Large Broken Two", &large_invalid_context).await?;
+        let third =
+            insert_raw_context_record(&repo, "Large Broken Three", &large_invalid_context).await?;
+
+        let actual = repo
+            .get_conversation_list_items_by_query(ConversationListQuery::primary_user(10))
+            .await?
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        let expected = vec![third, second, first];
+
+        assert_eq!(actual, expected);
         Ok(())
     }
 

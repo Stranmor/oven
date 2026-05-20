@@ -5,7 +5,7 @@ use url::Url;
 
 use crate::{
     AnyProvider, AuthCredential, ChatCompletionMessage, Context, Conversation, ConversationId,
-    ConversationListItem, ConversationVisibilityFilter, LearningEventId,
+    ConversationListItem, ConversationListQuery, ConversationVisibilityFilter, LearningEventId,
     LearningLedgerAppendOutcome, LearningLedgerEvent, LearningLedgerEventView,
     LearningLedgerFreshness, LearningRecordId, LearningRecordProjection, LearningReviewOutcome,
     LearningReviewState, MigrationResult, Model, ModelId, Provider, ProviderId, ProviderTemplate,
@@ -90,16 +90,17 @@ pub trait ConversationRepository: Send + Sync {
         conversation_id: &ConversationId,
     ) -> Result<Option<Conversation>>;
 
-    /// Retrieves bounded metadata-only primary user conversation list items.
+    /// Retrieves bounded metadata-only root conversation list items with all membership filters
+    /// applied before ordering and limiting.
     ///
     /// # Arguments
-    /// * `limit` - Maximum number of rows returned by the repository query.
+    /// * `query` - Typed visibility, initiator, include-agent, and limit filters.
     ///
     /// # Errors
     /// Returns an error if the operation fails.
-    async fn get_all_conversation_list_items(
+    async fn get_conversation_list_items_by_query(
         &self,
-        limit: usize,
+        query: ConversationListQuery,
     ) -> Result<Vec<ConversationListItem>>;
 
     /// Retrieves bounded metadata-only root conversation list items, including internal

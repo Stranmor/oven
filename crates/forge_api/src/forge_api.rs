@@ -220,9 +220,13 @@ impl<
             .await
     }
 
-    async fn get_conversation_list_items(&self) -> anyhow::Result<Vec<ConversationListItem>> {
+    async fn get_conversation_list_items_by_query(
+        &self,
+        mut query: ConversationListQuery,
+    ) -> anyhow::Result<Vec<ConversationListItem>> {
+        query.limit = self.services.get_config()?.max_conversations;
         self.services
-            .get_conversation_list_items(self.services.get_config()?.max_conversations)
+            .get_conversation_list_items_by_query(query)
             .await
     }
 

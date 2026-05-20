@@ -1142,7 +1142,12 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                         }
                     }
                     SelectCommand::Conversation { query } => {
-                        let conversations = self.api.get_conversation_list_items().await?;
+                        let conversations = self
+                            .api
+                            .get_conversation_list_items_by_query(
+                                forge_domain::ConversationListQuery::primary_user(0),
+                            )
+                            .await?;
 
                         if !conversations.is_empty()
                             && let Some(conversation_id) =
@@ -2329,7 +2334,12 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
     async fn list_conversations(&mut self) -> anyhow::Result<()> {
         self.spinner.start(Some("Loading Conversations"))?;
 
-        let conversations = self.api.get_conversation_list_items().await?;
+        let conversations = self
+            .api
+            .get_conversation_list_items_by_query(
+                forge_domain::ConversationListQuery::primary_user(0),
+            )
+            .await?;
         self.spinner.stop(None)?;
 
         if conversations.is_empty() {
@@ -2500,55 +2510,50 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         initiator: Option<ConversationInitiatorFilter>,
         visibility: ConversationVisibilityFilter,
     ) -> anyhow::Result<()> {
-        let conversations = match visibility {
-            ConversationVisibilityFilter::Normal if include_agent || initiator.is_some() => {
-                self.api
-                    .get_conversation_list_items_including_agent()
-                    .await?
-            }
-            ConversationVisibilityFilter::Normal => self.api.get_conversation_list_items().await?,
-            other => {
-                self.api
-                    .get_conversation_list_items_by_visibility(
-                        forge_domain::ConversationVisibilityFilter::from(other),
-                    )
-                    .await?
-            }
-        };
+        let initiator_filter = initiator.map(forge_domain::Initiator::from);
+        let query = forge_domain::ConversationListQuery::new(
+            forge_domain::ConversationVisibilityFilter::from(visibility),
+            initiator_filter,
+            include_agent,
+            0,
+        );
+        let conversations = self.api.get_conversation_list_items_by_query(query).await?;
 
         if conversations.is_empty() {
             return Ok(());
         }
 
         let mut info = Info::new();
-        let initiator_filter = initiator.map(forge_domain::Initiator::from);
 
         for conv in conversations.into_iter() {
+            debug_assert!(
+                conv.has_context(),
+                "conversation list query returned contextless row"
+            );
+            debug_assert!(
+                conv.parent_id.is_none(),
+                "conversation list query returned nested row"
+            );
+            debug_assert!(
+                initiator_filter.is_none_or(|expected| conv.initiator == expected),
+                "conversation list query returned row outside initiator filter"
+            );
+            debug_assert!(
+                visibility == ConversationVisibilityFilter::All
+                    || match forge_domain::ConversationVisibilityFilter::from(visibility) {
+                        forge_domain::ConversationVisibilityFilter::Normal => {
+                            conv.is_normal_visibility()
+                        }
+                        forge_domain::ConversationVisibilityFilter::Background => {
+                            conv.is_background()
+                        }
+                        forge_domain::ConversationVisibilityFilter::All => true,
+                    },
+                "conversation list query returned row outside visibility filter"
+            );
             if !conv.has_context() {
                 continue;
             }
-            if let Some(expected) = initiator_filter {
-                if conv.initiator != expected {
-                    continue;
-                }
-            } else if !include_agent && conv.is_agent_initiated() {
-                continue;
-            }
-
-            if visibility != ConversationVisibilityFilter::All {
-                let expected = forge_domain::ConversationVisibilityFilter::from(visibility);
-                let visible = match expected {
-                    forge_domain::ConversationVisibilityFilter::Normal => {
-                        conv.is_normal_visibility()
-                    }
-                    forge_domain::ConversationVisibilityFilter::Background => conv.is_background(),
-                    forge_domain::ConversationVisibilityFilter::All => true,
-                };
-                if !visible {
-                    continue;
-                }
-            }
-
             let title = conv
                 .title
                 .as_deref()

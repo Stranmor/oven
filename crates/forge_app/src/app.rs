@@ -2095,9 +2095,9 @@ mod tests {
             anyhow::bail!("unused branch conversation")
         }
 
-        async fn get_conversation_list_items(
+        async fn get_conversation_list_items_by_query(
             &self,
-            _limit: usize,
+            _query: forge_domain::ConversationListQuery,
         ) -> Result<Vec<ConversationListItem>> {
             Ok(Vec::new())
         }
