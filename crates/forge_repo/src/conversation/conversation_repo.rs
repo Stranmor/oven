@@ -355,10 +355,19 @@ impl ConversationRepository for ConversationRepositoryImpl {
 
     async fn upsert_conversation(&self, conversation: Conversation) -> anyhow::Result<()> {
         self.run_with_connection(move |connection, wid| {
-            let workspace_id = workspace_db_id(wid);
-            let record = ConversationRecord::new(conversation, workspace_id);
-            let changed_rows = diesel::sql_query(
-                "INSERT INTO conversations (
+            connection.immediate_transaction::<_, anyhow::Error, _>(|connection| {
+                let workspace_id = workspace_db_id(wid);
+                let record = ConversationRecord::new(conversation, workspace_id);
+                let existing_record: Option<ConversationRecord> = conversations::table
+                    .filter(conversations::workspace_id.eq(workspace_id))
+                    .filter(conversations::conversation_id.eq(&record.conversation_id))
+                    .first(connection)
+                    .optional()?;
+                if let Some(existing_record) = existing_record {
+                    let _existing_conversation = Conversation::try_from(existing_record)?;
+                }
+                let changed_rows = diesel::sql_query(
+                    "INSERT INTO conversations (
                     conversation_id, title, workspace_id, context, created_at,
                     updated_at, metrics, parent_id, initiator, visibility
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -371,26 +380,29 @@ impl ConversationRepository for ConversationRepositoryImpl {
                     initiator = excluded.initiator,
                     visibility = excluded.visibility
                 WHERE conversations.workspace_id = excluded.workspace_id",
-            )
-            .bind::<diesel::sql_types::Text, _>(&record.conversation_id)
-            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.title)
-            .bind::<diesel::sql_types::BigInt, _>(record.workspace_id)
-            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.context)
-            .bind::<diesel::sql_types::Timestamp, _>(record.created_at)
-            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamp>, _>(record.updated_at)
-            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.metrics)
-            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.parent_id)
-            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.initiator)
-            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.visibility)
-            .execute(connection)?;
+                )
+                .bind::<diesel::sql_types::Text, _>(&record.conversation_id)
+                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.title)
+                .bind::<diesel::sql_types::BigInt, _>(record.workspace_id)
+                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.context)
+                .bind::<diesel::sql_types::Timestamp, _>(record.created_at)
+                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamp>, _>(
+                    record.updated_at,
+                )
+                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.metrics)
+                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.parent_id)
+                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.initiator)
+                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&record.visibility)
+                .execute(connection)?;
 
-            if changed_rows == 0 {
-                anyhow::bail!(
-                    "Conversation {} belongs to a different workspace",
-                    record.conversation_id
-                );
-            }
-            Ok(())
+                if changed_rows == 0 {
+                    anyhow::bail!(
+                        "Conversation {} belongs to a different workspace",
+                        record.conversation_id
+                    );
+                }
+                Ok(())
+            })
         })
         .await
     }
@@ -1179,6 +1191,27 @@ mod tests {
         assert!(actual_normal.is_empty());
         assert!(actual_all_error.contains(expected));
         assert!(actual_readback_error.contains(expected));
+        assert_eq!(actual_persisted_visibility, Some("archived".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unknown_visibility_upsert_is_rejected_without_rewrite() -> anyhow::Result<()> {
+        let repo = repository()?;
+        let unknown_visibility_id = insert_record_with_unknown_visibility(&repo).await?;
+        let fixture = Conversation::new(unknown_visibility_id)
+            .title(Some("Would Rewrite Visibility".to_string()));
+
+        let actual_error = repo
+            .upsert_conversation(fixture)
+            .await
+            .unwrap_err()
+            .to_string();
+        let actual_persisted_visibility =
+            raw_visibility_for_conversation(&repo, unknown_visibility_id).await?;
+        let expected = "unsupported visibility value";
+
+        assert!(actual_error.contains(expected));
         assert_eq!(actual_persisted_visibility, Some("archived".to_string()));
         Ok(())
     }
