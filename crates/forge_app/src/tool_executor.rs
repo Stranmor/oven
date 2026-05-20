@@ -225,6 +225,32 @@ impl<
             WorkspaceExactFactStatusReport,
         };
 
+        enum PreflightExactFactStatus {
+            Active,
+            ManifestMissing,
+            ManifestStale,
+            StatusUnreadable,
+            ProductionSafeInactive,
+        }
+
+        fn classify_preflight_status(
+            report: &WorkspaceExactFactStatusReport,
+        ) -> PreflightExactFactStatus {
+            if report.exact_facts_active || report.status == "active" {
+                return PreflightExactFactStatus::Active;
+            }
+
+            match report.status.as_str() {
+                "not_indexed" => PreflightExactFactStatus::ManifestMissing,
+                "stale_manifest" => PreflightExactFactStatus::ManifestStale,
+                "report_missing_or_corrupt" => PreflightExactFactStatus::StatusUnreadable,
+                "no_artifact_store"
+                | "artifacts_present_none_accepted"
+                | "accepted_but_no_graph_edges" => PreflightExactFactStatus::ProductionSafeInactive,
+                _ => PreflightExactFactStatus::StatusUnreadable,
+            }
+        }
+
         fn no_producer_report(
             preflight_status: Option<WorkspaceExactFactStatusReport>,
             final_status: WorkspaceExactFactReferenceContinuationStatus,
@@ -274,28 +300,36 @@ impl<
             }
         };
 
-        if preflight_status.exact_facts_active || preflight_status.status == "active" {
-            return no_producer_report(
-                Some(preflight_status),
-                WorkspaceExactFactReferenceContinuationStatus::AlreadyActive,
-                None,
-            );
-        }
-
-        let non_produced_status = match preflight_status.status.as_str() {
-            "not_indexed" => {
-                Some(WorkspaceExactFactReferenceContinuationStatus::NotProducedManifestMissing)
+        match classify_preflight_status(&preflight_status) {
+            PreflightExactFactStatus::Active => {
+                return no_producer_report(
+                    Some(preflight_status),
+                    WorkspaceExactFactReferenceContinuationStatus::AlreadyActive,
+                    None,
+                );
             }
-            "stale_manifest" => {
-                Some(WorkspaceExactFactReferenceContinuationStatus::NotProducedManifestStale)
+            PreflightExactFactStatus::ManifestMissing => {
+                return no_producer_report(
+                    Some(preflight_status),
+                    WorkspaceExactFactReferenceContinuationStatus::NotProducedManifestMissing,
+                    None,
+                );
             }
-            "report_missing_or_corrupt" => {
-                Some(WorkspaceExactFactReferenceContinuationStatus::NotProducedStatusUnreadable)
+            PreflightExactFactStatus::ManifestStale => {
+                return no_producer_report(
+                    Some(preflight_status),
+                    WorkspaceExactFactReferenceContinuationStatus::NotProducedManifestStale,
+                    None,
+                );
             }
-            _ => None,
-        };
-        if let Some(final_status) = non_produced_status {
-            return no_producer_report(Some(preflight_status), final_status, None);
+            PreflightExactFactStatus::StatusUnreadable => {
+                return no_producer_report(
+                    Some(preflight_status),
+                    WorkspaceExactFactReferenceContinuationStatus::NotProducedStatusUnreadable,
+                    Some("preflight_status_unreadable"),
+                );
+            }
+            PreflightExactFactStatus::ProductionSafeInactive => {}
         }
 
         let producer_result = self
@@ -2037,6 +2071,37 @@ mod tests {
                 0
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_exact_fact_continuation_unknown_preflight_status_skips_producer()
+    -> anyhow::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let workspace = std::fs::canonicalize(fixture.path())?;
+        let setup = Arc::new(
+            SemSearchFixture::new(sem_search_config(Some("fixture-model")))
+                .with_cwd(workspace.clone())
+                .with_exact_fact_statuses(vec![exact_fact_status(
+                    "future_unclassified_status",
+                    false,
+                    &workspace,
+                )])
+                .await,
+        );
+        let executor = ToolExecutor::new(Arc::clone(&setup));
+
+        let actual = exact_fact_output(&executor, workspace).await?;
+
+        let expected = WorkspaceExactFactReferenceContinuationStatus::NotProducedStatusUnreadable;
+        assert_eq!(actual.final_status, expected);
+        assert_eq!(
+            setup
+                .workspace
+                .exact_fact_producer_calls
+                .load(Ordering::SeqCst),
+            0
+        );
         Ok(())
     }
 
