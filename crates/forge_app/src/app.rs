@@ -12,11 +12,14 @@ use forge_project_model::{
     LearningProvenance as ProjectLearningProvenance,
     LearningRedactionStatus as ProjectLearningRedactionStatus,
     LearningReviewState as ProjectLearningReviewState,
-    LearningSourceKind as ProjectLearningSourceKind, ProjectContextTarget,
-    ProjectModelContextReadinessMetadata, ProjectModelContextRenderBudget,
-    ProjectModelEvidenceLedgerActivationMetadata, ProjectModelEvidenceReadinessMetadata,
-    ProjectModelExactFactReadinessMetadata, ProjectModelSourceNode, TargetResolutionBudget,
-    directory_path_filter, local_project_model_manifest, mentioned_paths,
+    LearningSourceKind as ProjectLearningSourceKind, ProjectContextPathScope,
+    ProjectContextRetrievalPlanDiagnostic, ProjectContextRetrievalReadRequestSummary,
+    ProjectContextRetrievalRequest, ProjectContextRetrievalSelectedSummary, ProjectContextTarget,
+    ProjectContextWriteDecision, ProjectIndexer, ProjectModelContextReadinessMetadata,
+    ProjectModelContextRenderBudget, ProjectModelEvidenceLedgerActivationMetadata,
+    ProjectModelEvidenceReadinessMetadata, ProjectModelExactFactReadinessMetadata,
+    ProjectModelSourceNode, TargetResolutionBudget, directory_path_filter, local_project_model_dir,
+    local_project_model_manifest, mentioned_paths, plan_project_context_retrieval,
     render_project_model_context, render_sources_from_nodes,
 };
 use forge_stream::MpscStream;
@@ -351,6 +354,15 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
 
         let retrieval_empty_targets = Vec::new();
         let has_query = query.as_deref().is_some_and(|query| !query.is_empty());
+        let retrieval_plan_diagnostics = if has_query {
+            self.retrieval_plan_diagnostics(
+                &target_specs,
+                &nearest_skipped_manifest_candidates,
+                query.as_deref().unwrap_or_default(),
+            )
+        } else {
+            Vec::new()
+        };
         let would_inject = has_query && !selected_targets.is_empty();
 
         let skip_reason = if would_inject {
@@ -370,9 +382,140 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
             selected_targets,
             nearest_skipped_manifest_candidates,
             retrieval_empty_targets,
+            retrieval_plan_diagnostics,
             replay_preview_diagnostics,
             would_inject,
             skip_reason,
+        }
+    }
+
+    fn retrieval_plan_diagnostics(
+        &self,
+        target_specs: &[ProjectContextTargetDiagnostic],
+        skipped_manifest_candidates: &[WorkspaceContextManifestDiagnostic],
+        query: &str,
+    ) -> Vec<WorkspaceRetrievalPlanDiagnostic> {
+        let max_sources = ProjectModelContextRenderBudget::default().max_sources;
+        let mut diagnostics = target_specs
+            .iter()
+            .take(Self::MAX_TARGETS)
+            .filter_map(|target_diagnostic| {
+                Self::retrieval_plan_diagnostic_for_workspace(
+                    &target_diagnostic.target.workspace_root,
+                    target_diagnostic.target.path_filter.clone(),
+                    query,
+                    max_sources,
+                )
+            })
+            .collect::<Vec<_>>();
+        diagnostics.extend(
+            skipped_manifest_candidates
+                .iter()
+                .take(Self::MAX_TARGETS.saturating_sub(diagnostics.len()))
+                .filter(|manifest_diagnostic| manifest_diagnostic.manifest_found)
+                .filter_map(|manifest_diagnostic| {
+                    Self::retrieval_plan_diagnostic_for_workspace(
+                        &manifest_diagnostic.workspace_root,
+                        None,
+                        query,
+                        max_sources,
+                    )
+                }),
+        );
+        diagnostics
+    }
+
+    fn retrieval_plan_diagnostic_for_workspace(
+        workspace_root: &PathBuf,
+        path_filter: Option<String>,
+        query: &str,
+        max_sources: usize,
+    ) -> Option<WorkspaceRetrievalPlanDiagnostic> {
+        let indexer = ProjectIndexer::new(workspace_root, local_project_model_dir(workspace_root));
+        let manifest = match indexer.read_manifest() {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                tracing::debug!(error = ?error, path = %workspace_root.display(), "Explain-context retrieval-plan diagnostic could not read manifest");
+                return None;
+            }
+        };
+        let freshness = match indexer.evaluate_manifest_freshness(&manifest) {
+            Ok(freshness) => freshness,
+            Err(error) => {
+                tracing::debug!(error = ?error, path = %workspace_root.display(), "Explain-context retrieval-plan diagnostic could not evaluate freshness");
+                return None;
+            }
+        };
+        let request = ProjectContextRetrievalRequest::new(
+            query.to_string(),
+            max_sources,
+            ProjectContextPathScope::new(path_filter, Vec::new()),
+            true,
+        );
+        let outcome = plan_project_context_retrieval(&manifest, &freshness, request);
+        Some(Self::retrieval_plan_diagnostic_to_domain(
+            ProjectContextRetrievalPlanDiagnostic::from_outcome(&outcome),
+        ))
+    }
+
+    fn retrieval_plan_diagnostic_to_domain(
+        diagnostic: ProjectContextRetrievalPlanDiagnostic,
+    ) -> WorkspaceRetrievalPlanDiagnostic {
+        WorkspaceRetrievalPlanDiagnostic {
+            workspace_root_label: "workspace_root".to_string(),
+            manifest_label: "project_model_manifest".to_string(),
+            planned: diagnostic.planned,
+            refusal_code: diagnostic.refusal_code.map(|code| format!("{code:?}")),
+            refusal_detail: diagnostic.refusal_detail,
+            selected_result_count: diagnostic.selected_result_count,
+            read_request_count: diagnostic.read_request_count,
+            write_decision: diagnostic.write_decision.map(Self::write_decision_label),
+            selected_summaries: diagnostic
+                .selected_summaries
+                .into_iter()
+                .map(Self::selected_summary_to_domain)
+                .collect(),
+            read_request_summaries: diagnostic
+                .read_request_summaries
+                .into_iter()
+                .map(Self::read_request_summary_to_domain)
+                .collect(),
+            retrieval_empty: diagnostic.retrieval_empty,
+            truncated: diagnostic.truncated,
+        }
+    }
+
+    fn write_decision_label(decision: ProjectContextWriteDecision) -> String {
+        match decision {
+            ProjectContextWriteDecision::NoWriteEmptyRetrieval => {
+                "NoWriteEmptyRetrieval".to_string()
+            }
+            ProjectContextWriteDecision::WriteContextPackAfterReadback => {
+                "WriteContextPackAfterReadback".to_string()
+            }
+        }
+    }
+
+    fn selected_summary_to_domain(
+        summary: ProjectContextRetrievalSelectedSummary,
+    ) -> WorkspaceRetrievalPlanSelectedSummary {
+        WorkspaceRetrievalPlanSelectedSummary {
+            evidence_id: summary.evidence_id,
+            path: summary.path,
+            start_line: summary.start_line,
+            end_line: summary.end_line,
+            relevance: summary.relevance,
+        }
+    }
+
+    fn read_request_summary_to_domain(
+        summary: ProjectContextRetrievalReadRequestSummary,
+    ) -> WorkspaceRetrievalPlanReadRequestSummary {
+        WorkspaceRetrievalPlanReadRequestSummary {
+            evidence_id: summary.evidence_id,
+            path: summary.path,
+            start_line: summary.start_line,
+            end_line: summary.end_line,
         }
     }
 
@@ -2501,7 +2644,7 @@ mod tests {
             &self,
             path: PathBuf,
         ) -> Result<WorkspaceEvidenceReplayPreviewDiagnostic> {
-            let manifest_path = path.join(".forge_project_model/project_manifest.json");
+            let manifest_path = local_project_model_manifest(&path);
             let manifest_found = manifest_path.is_file();
             let freshness = if self
                 .stale_paths
@@ -2758,7 +2901,7 @@ mod tests {
             path: &Path,
         ) -> Result<WorkspaceContextManifestDiagnostic> {
             self.index_checks.fetch_add(1, Ordering::SeqCst);
-            let manifest_path = path.join(".forge_project_model/project_manifest.json");
+            let manifest_path = local_project_model_manifest(&path);
             let manifest_found = manifest_path.is_file();
             let freshness = if self.stale_paths.iter().any(|stale_path| stale_path == path) {
                 WorkspaceContextFreshness::Stale {
@@ -2989,15 +3132,13 @@ mod tests {
 
     fn create_indexed_workspace(root: &Path) -> Result<()> {
         fs::create_dir_all(root.join("src"))?;
-        fs::create_dir_all(root.join(".forge_project_model"))?;
         fs::write(
             root.join("src/lib.rs"),
             "pub fn unrelated() {}\n\npub fn automatic_injection_needle() -> usize { 42 }\n",
         )?;
-        fs::write(
-            root.join(".forge_project_model/project_manifest.json"),
-            r#"{"version":1,"root":"fixture","files":[],"file_nodes":[],"symbols":[],"edges":[],"shards":[],"manifest_hash":"fixture"}"#,
-        )?;
+        let indexer = ProjectIndexer::new(root, local_project_model_dir(root));
+        let manifest = indexer.index()?;
+        indexer.write_manifest(&manifest)?;
         Ok(())
     }
 
@@ -3846,7 +3987,11 @@ mod tests {
         let actual = ProjectContextInjection::new(setup.clone(), agent)
             .explain(Some("find automatic injection needle".to_string()))
             .await;
-        let expected = (0usize, Vec::<PathBuf>::new(), true, 1usize);
+        let actual_plan = actual
+            .retrieval_plan_diagnostics
+            .first()
+            .expect("explain should include query-specific retrieval plan diagnostic");
+        let expected = (0usize, Vec::<PathBuf>::new(), true, 1usize, true, false);
 
         assert_eq!(
             (
@@ -3854,9 +3999,113 @@ mod tests {
                 actual.retrieval_empty_targets,
                 actual.would_inject,
                 actual.replay_preview_diagnostics.len(),
+                actual_plan.planned,
+                actual_plan.retrieval_empty,
             ),
             expected,
         );
+        assert!(actual_plan.selected_result_count > 0);
+        assert!(actual_plan.read_request_count > 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_context_absent_query_reports_empty_read_only_plan() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root);
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
+
+        let actual = ProjectContextInjection::new(setup.clone(), agent)
+            .explain(Some("absent-token-for-empty-retrieval-plan".to_string()))
+            .await;
+        let actual_plan = actual
+            .retrieval_plan_diagnostics
+            .first()
+            .expect("explain should include empty retrieval plan diagnostic");
+        let expected = (0usize, true, 0usize, 0usize, Some("NoWriteEmptyRetrieval"));
+
+        assert_eq!(
+            (
+                setup.workspace_queries.load(Ordering::SeqCst),
+                actual_plan.planned,
+                actual_plan.selected_result_count,
+                actual_plan.read_request_count,
+                actual_plan.write_decision.as_deref(),
+            ),
+            expected,
+        );
+        assert!(actual_plan.retrieval_empty);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_context_stale_manifest_reports_planner_refusal_without_io_plan() -> Result<()>
+    {
+        let (_fixture, root) = fixture_workspace()?;
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn unrelated() {}\n\npub fn automatic_injection_needle() -> usize { 43 }\n",
+        )?;
+        let setup = ProjectContextHarness::new_with_stale_paths(root.clone(), vec![root]);
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
+
+        let actual = ProjectContextInjection::new(setup.clone(), agent)
+            .explain(Some("find automatic injection needle".to_string()))
+            .await;
+        let actual_plan = actual
+            .retrieval_plan_diagnostics
+            .first()
+            .expect("stale manifest should include planner refusal diagnostic");
+        let expected = (
+            0usize,
+            false,
+            Some("ManifestNotInjectable"),
+            0usize,
+            None::<&str>,
+            false,
+        );
+
+        assert_eq!(
+            (
+                setup.workspace_queries.load(Ordering::SeqCst),
+                actual_plan.planned,
+                actual_plan.refusal_code.as_deref(),
+                actual_plan.read_request_count,
+                actual_plan.write_decision.as_deref(),
+                actual_plan.retrieval_empty,
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_context_retrieval_plan_diagnostic_is_metadata_only_and_query_not_repeated()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root.clone());
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
+
+        let actual = ProjectContextInjection::new(setup, agent)
+            .explain(Some("find automatic injection needle".to_string()))
+            .await;
+        let actual = serde_json::to_string(&actual.retrieval_plan_diagnostics)?;
+        let expected = (false, false, false, true, true);
+
+        assert_eq!(
+            (
+                actual.contains("pub fn automatic_injection_needle"),
+                actual.contains("project_model_context"),
+                actual.contains("find automatic injection needle"),
+                actual.contains("workspace_root"),
+                actual.contains("project_model_manifest"),
+            ),
+            expected,
+        );
+        assert!(!actual.contains(&root.display().to_string()));
         Ok(())
     }
 

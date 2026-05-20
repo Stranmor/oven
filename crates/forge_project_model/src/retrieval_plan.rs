@@ -13,6 +13,8 @@ use crate::types::{
     StaleEvidencePolicy,
 };
 
+const MAX_DIAGNOSTIC_SUMMARIES: usize = 8;
+
 /// Query request accepted by the project-model retrieval planner.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProjectContextRetrievalRequest {
@@ -113,6 +115,135 @@ pub enum ProjectContextRetrievalPlanningOutcome {
     Refusal(ProjectContextRetrievalRefusal),
     /// Retrieval is planned and safe for IO execution by a service boundary.
     Plan(Box<ProjectContextRetrievalPlan>),
+}
+
+/// Redaction-safe pure diagnostic projection for a retrieval planning outcome.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectContextRetrievalPlanDiagnostic {
+    /// Whether the planner produced an executable plan.
+    pub planned: bool,
+    /// Stable machine-readable refusal code when planning was refused.
+    pub refusal_code: Option<ProjectContextRetrievalRefusalCode>,
+    /// Human-readable redaction-safe refusal detail when planning was refused.
+    pub refusal_detail: Option<String>,
+    /// Number of retrieval results selected by the planner.
+    pub selected_result_count: usize,
+    /// Number of validated read requests planned before readback.
+    pub read_request_count: usize,
+    /// Deterministic write decision when planning succeeded.
+    pub write_decision: Option<ProjectContextWriteDecision>,
+    /// Bounded metadata-only summaries of selected retrieval results.
+    pub selected_summaries: Vec<ProjectContextRetrievalSelectedSummary>,
+    /// Bounded metadata-only summaries of planned read requests.
+    pub read_request_summaries: Vec<ProjectContextRetrievalReadRequestSummary>,
+    /// Whether retrieval selected no evidence.
+    pub retrieval_empty: bool,
+    /// Whether selected or read-request summaries were truncated.
+    pub truncated: bool,
+}
+
+impl ProjectContextRetrievalPlanDiagnostic {
+    /// Builds a redaction-safe diagnostic projection from a pure planning outcome.
+    ///
+    /// # Arguments
+    ///
+    /// * `outcome` - Pure retrieval planning outcome to project into bounded diagnostics.
+    pub fn from_outcome(outcome: &ProjectContextRetrievalPlanningOutcome) -> Self {
+        match outcome {
+            ProjectContextRetrievalPlanningOutcome::Refusal(refusal) => Self {
+                planned: false,
+                refusal_code: Some(refusal.code.clone()),
+                refusal_detail: Some(refusal.detail.clone()),
+                selected_result_count: 0,
+                read_request_count: 0,
+                write_decision: None,
+                selected_summaries: Vec::new(),
+                read_request_summaries: Vec::new(),
+                retrieval_empty: false,
+                truncated: false,
+            },
+            ProjectContextRetrievalPlanningOutcome::Plan(plan) => {
+                let selected_result_count = plan.selected_results.len();
+                let read_request_count = plan.read_requests.len();
+                let selected_summaries = plan
+                    .selected_results
+                    .iter()
+                    .take(MAX_DIAGNOSTIC_SUMMARIES)
+                    .map(ProjectContextRetrievalSelectedSummary::from_result)
+                    .collect::<Vec<_>>();
+                let read_request_summaries = plan
+                    .read_requests
+                    .iter()
+                    .take(MAX_DIAGNOSTIC_SUMMARIES)
+                    .map(ProjectContextRetrievalReadRequestSummary::from_request)
+                    .collect::<Vec<_>>();
+                Self {
+                    planned: true,
+                    refusal_code: None,
+                    refusal_detail: None,
+                    selected_result_count,
+                    read_request_count,
+                    write_decision: Some(plan.write_decision.clone()),
+                    selected_summaries,
+                    read_request_summaries,
+                    retrieval_empty: selected_result_count == 0,
+                    truncated: selected_result_count > MAX_DIAGNOSTIC_SUMMARIES
+                        || read_request_count > MAX_DIAGNOSTIC_SUMMARIES,
+                }
+            }
+        }
+    }
+}
+
+/// Metadata-only selected-result summary for retrieval diagnostics.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectContextRetrievalSelectedSummary {
+    /// Evidence identifier selected by retrieval.
+    pub evidence_id: String,
+    /// Manifest-relative path associated with the selected result.
+    pub path: String,
+    /// Optional one-based inclusive start line.
+    pub start_line: Option<u32>,
+    /// Optional one-based inclusive end line.
+    pub end_line: Option<u32>,
+    /// Planner relevance score.
+    pub relevance: f32,
+}
+
+impl ProjectContextRetrievalSelectedSummary {
+    fn from_result(result: &RetrievalResult) -> Self {
+        Self {
+            evidence_id: result.id.clone(),
+            path: result.path.clone(),
+            start_line: result.provenance.start_line,
+            end_line: result.provenance.end_line,
+            relevance: result.score,
+        }
+    }
+}
+
+/// Metadata-only read-request summary for retrieval diagnostics.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectContextRetrievalReadRequestSummary {
+    /// Evidence identifier planned for readback.
+    pub evidence_id: String,
+    /// Manifest-relative path planned for readback.
+    pub path: String,
+    /// One-based inclusive start line.
+    pub start_line: u32,
+    /// One-based inclusive end line.
+    pub end_line: u32,
+}
+
+impl ProjectContextRetrievalReadRequestSummary {
+    fn from_request(request: &ProjectContextReadRequest) -> Self {
+        Self {
+            evidence_id: request.evidence_id.clone(),
+            path: request.relative_manifest_path().to_string(),
+            start_line: request.start_line,
+            end_line: request.end_line,
+        }
+    }
 }
 
 /// Pure project-context retrieval execution plan.

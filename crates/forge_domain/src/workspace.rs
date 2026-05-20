@@ -212,6 +212,63 @@ pub struct WorkspaceContextCandidateDiagnostic {
     pub skip_reason: Option<String>,
 }
 
+/// Query-specific read-only retrieval-plan diagnostic for explain-context.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceRetrievalPlanDiagnostic {
+    /// Stable redaction-safe label for the canonical workspace root.
+    pub workspace_root_label: String,
+    /// Stable redaction-safe label for the project-model manifest.
+    pub manifest_label: String,
+    /// Whether the project-model planner produced an executable plan.
+    pub planned: bool,
+    /// Stable machine-readable refusal code when planning was refused.
+    pub refusal_code: Option<String>,
+    /// Human-readable redaction-safe refusal detail when planning was refused.
+    pub refusal_detail: Option<String>,
+    /// Number of retrieval results selected by the planner.
+    pub selected_result_count: usize,
+    /// Number of validated read requests planned before readback.
+    pub read_request_count: usize,
+    /// Deterministic write decision label when planning succeeded.
+    pub write_decision: Option<String>,
+    /// Bounded metadata-only summaries of selected retrieval results.
+    pub selected_summaries: Vec<WorkspaceRetrievalPlanSelectedSummary>,
+    /// Bounded metadata-only summaries of planned read requests.
+    pub read_request_summaries: Vec<WorkspaceRetrievalPlanReadRequestSummary>,
+    /// Whether retrieval selected no evidence.
+    pub retrieval_empty: bool,
+    /// Whether selected or read-request summaries were truncated.
+    pub truncated: bool,
+}
+
+/// Metadata-only selected-result summary for explain-context planner diagnostics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceRetrievalPlanSelectedSummary {
+    /// Evidence identifier selected by retrieval.
+    pub evidence_id: String,
+    /// Manifest-relative path associated with the selected result.
+    pub path: String,
+    /// Optional one-based inclusive start line.
+    pub start_line: Option<u32>,
+    /// Optional one-based inclusive end line.
+    pub end_line: Option<u32>,
+    /// Planner relevance score.
+    pub relevance: f32,
+}
+
+/// Metadata-only read-request summary for explain-context planner diagnostics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceRetrievalPlanReadRequestSummary {
+    /// Evidence identifier planned for readback.
+    pub evidence_id: String,
+    /// Manifest-relative path planned for readback.
+    pub path: String,
+    /// One-based inclusive start line.
+    pub start_line: u32,
+    /// One-based inclusive end line.
+    pub end_line: u32,
+}
+
 /// User-facing explanation for automatic project-model context injection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceContextExplanation {
@@ -229,6 +286,11 @@ pub struct WorkspaceContextExplanation {
     /// explained query. This legacy field is preserved for porcelain
     /// compatibility; read-only explain no longer performs retrieval dry-runs.
     pub retrieval_empty_targets: Vec<PathBuf>,
+    /// Query-specific read-only retrieval-plan diagnostics. These diagnostics
+    /// are planner-derived, pre-readback, and never include source content or
+    /// persisted context-pack bodies.
+    #[serde(default)]
+    pub retrieval_plan_diagnostics: Vec<WorkspaceRetrievalPlanDiagnostic>,
     /// Read-only replay-derived preview diagnostics from the existing evidence
     /// ledger. These diagnostics are non-query-specific and do not predict
     /// query_workspace retrieval output.
@@ -258,9 +320,18 @@ mod tests {
             "skip_reason":"legacy"
         }"#;
         let actual: WorkspaceContextExplanation = serde_json::from_str(fixture).unwrap();
-        let expected = Vec::<WorkspaceEvidenceReplayPreviewDiagnostic>::new();
+        let expected = (
+            Vec::<WorkspaceEvidenceReplayPreviewDiagnostic>::new(),
+            Vec::<WorkspaceRetrievalPlanDiagnostic>::new(),
+        );
 
-        assert_eq!(actual.replay_preview_diagnostics, expected);
+        assert_eq!(
+            (
+                actual.replay_preview_diagnostics,
+                actual.retrieval_plan_diagnostics,
+            ),
+            expected,
+        );
     }
 }
 

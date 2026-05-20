@@ -21,6 +21,7 @@ use forge_domain::{
     AuthMethod, ChatResponseContent, ConsoleWriter, ContextMessage, Role, TitleFormat, UserCommand,
     WorkspaceEvidenceLedgerActivationDiagnostic, WorkspaceEvidenceReadinessDiagnostic,
     WorkspaceEvidenceReplayPreviewDiagnostic, WorkspaceExactFactReadinessDiagnostic,
+    WorkspaceRetrievalPlanDiagnostic,
 };
 use forge_fs::ForgeFS;
 use forge_select::{ForgeWidget, SelectRow};
@@ -210,6 +211,56 @@ pub struct UI<A: ConsoleWriter, F: Fn(ForgeConfig) -> A> {
     config: ForgeConfig,
     #[allow(dead_code)] // The guard is kept alive by being held in the struct
     _guard: forge_tracker::Guard,
+}
+
+fn format_retrieval_plan_diagnostic(diagnostic: &WorkspaceRetrievalPlanDiagnostic) -> String {
+    let selected = diagnostic
+        .selected_summaries
+        .iter()
+        .map(|summary| {
+            format!(
+                "{}@{}:{}-{}:{:.3}",
+                summary.evidence_id,
+                summary.path,
+                summary
+                    .start_line
+                    .map(|line| line.to_string())
+                    .unwrap_or_else(|| "?".to_string()),
+                summary
+                    .end_line
+                    .map(|line| line.to_string())
+                    .unwrap_or_else(|| "?".to_string()),
+                summary.relevance,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let read_requests = diagnostic
+        .read_request_summaries
+        .iter()
+        .map(|summary| {
+            format!(
+                "{}@{}:{}-{}",
+                summary.evidence_id, summary.path, summary.start_line, summary.end_line,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "scope=query_specific_read_only_pre_readback_planner_derived workspace_label={} manifest_label={} planned={} refusal_code={} refusal_detail={} selected_results={} read_requests={} write_decision={} retrieval_empty={} truncated={} selected=[{}] planned_reads=[{}]",
+        diagnostic.workspace_root_label,
+        diagnostic.manifest_label,
+        diagnostic.planned,
+        diagnostic.refusal_code.as_deref().unwrap_or("none"),
+        diagnostic.refusal_detail.as_deref().unwrap_or("none"),
+        diagnostic.selected_result_count,
+        diagnostic.read_request_count,
+        diagnostic.write_decision.as_deref().unwrap_or("none"),
+        diagnostic.retrieval_empty,
+        diagnostic.truncated,
+        selected,
+        read_requests,
+    )
 }
 
 impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI<A, F> {
@@ -5740,6 +5791,27 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         }
 
         info = info.add_title(format!(
+            "Query-Specific Retrieval Plan Diagnostics [{}]",
+            explanation.retrieval_plan_diagnostics.len()
+        ));
+        info = info.add_key_value(
+            "Retrieval Plan Scope",
+            "read-only; pre-readback; planner-derived; not a persisted context pack and not source-content proof",
+        );
+        if explanation.retrieval_plan_diagnostics.is_empty() {
+            info = info.add_key_value(
+                "Retrieval Plan",
+                "no query-specific planner diagnostic available for the selected manifest targets",
+            );
+        }
+        for diagnostic in &explanation.retrieval_plan_diagnostics {
+            info = info.add_key_value(
+                "Retrieval Plan",
+                format_retrieval_plan_diagnostic(diagnostic),
+            );
+        }
+
+        info = info.add_title(format!(
             "Replay-Derived Preview Diagnostics [{}]",
             explanation.replay_preview_diagnostics.len()
         ));
@@ -6556,6 +6628,48 @@ mod tests {
         );
         let expected = (true, 1, 1, 0, false, false);
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn retrieval_plan_explain_format_declares_scope_and_counts() {
+        let fixture = WorkspaceRetrievalPlanDiagnostic {
+            workspace_root_label: "workspace_root".to_string(),
+            manifest_label: "project_model_manifest".to_string(),
+            planned: true,
+            refusal_code: None,
+            refusal_detail: None,
+            selected_result_count: 1,
+            read_request_count: 1,
+            write_decision: Some("WriteContextPackAfterReadback".to_string()),
+            selected_summaries: vec![forge_domain::WorkspaceRetrievalPlanSelectedSummary {
+                evidence_id: "src/lib.rs".to_string(),
+                path: "src/lib.rs".to_string(),
+                start_line: Some(1),
+                end_line: Some(3),
+                relevance: 1.25,
+            }],
+            read_request_summaries: vec![forge_domain::WorkspaceRetrievalPlanReadRequestSummary {
+                evidence_id: "src/lib.rs".to_string(),
+                path: "src/lib.rs".to_string(),
+                start_line: 1,
+                end_line: 3,
+            }],
+            retrieval_empty: false,
+            truncated: false,
+        };
+        let actual = format_retrieval_plan_diagnostic(&fixture);
+        let expected = (true, true, true, false, false);
+
+        assert_eq!(
+            (
+                actual.contains("scope=query_specific_read_only_pre_readback_planner_derived"),
+                actual.contains("selected_results=1"),
+                actual.contains("planned_reads=[src/lib.rs@src/lib.rs:1-3]"),
+                actual.contains("pub fn"),
+                actual.contains("find automatic injection needle"),
+            ),
+            expected,
+        );
     }
 
     #[test]
