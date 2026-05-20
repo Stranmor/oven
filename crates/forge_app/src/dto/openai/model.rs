@@ -120,7 +120,11 @@ impl Model {
             provider_id,
             name: self.name,
             description: self.description,
-            context_length: self.context_length,
+            context_length: self.context_length.or_else(|| {
+                self.top_provider
+                    .as_ref()
+                    .and_then(|provider| provider.context_length)
+            }),
             tools_supported,
             supports_parallel_tool_calls,
             supports_reasoning,
@@ -285,6 +289,54 @@ mod tests {
         assert_eq!(domain_model.tools_supported, None);
         assert_eq!(domain_model.supports_parallel_tool_calls, None);
         assert_eq!(domain_model.supports_reasoning, None);
+    }
+
+    #[tokio::test]
+    async fn test_model_conversion_uses_top_provider_context_length_fallback() {
+        let model = Model {
+            id: "test-model".into(),
+            name: Some("Test Model".to_string()),
+            created: None,
+            description: Some("A test model".to_string()),
+            context_length: None,
+            architecture: None,
+            pricing: None,
+            top_provider: Some(TopProvider {
+                context_length: Some(1_048_576),
+                max_completion_tokens: None,
+                is_moderated: false,
+            }),
+            per_request_limits: None,
+            supported_parameters: None,
+        };
+
+        let domain_model: forge_domain::Model = model.into_domain(forge_domain::ProviderId::OPENAI);
+
+        assert_eq!(domain_model.context_length, Some(1_048_576));
+    }
+
+    #[tokio::test]
+    async fn test_model_conversion_prefers_top_level_context_length() {
+        let model = Model {
+            id: "test-model".into(),
+            name: Some("Test Model".to_string()),
+            created: None,
+            description: Some("A test model".to_string()),
+            context_length: Some(128_000),
+            architecture: None,
+            pricing: None,
+            top_provider: Some(TopProvider {
+                context_length: Some(1_048_576),
+                max_completion_tokens: None,
+                is_moderated: false,
+            }),
+            per_request_limits: None,
+            supported_parameters: None,
+        };
+
+        let domain_model: forge_domain::Model = model.into_domain(forge_domain::ProviderId::OPENAI);
+
+        assert_eq!(domain_model.context_length, Some(128_000));
     }
 
     #[tokio::test]

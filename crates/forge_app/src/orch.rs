@@ -251,8 +251,8 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
                     request = request.model(model.as_str().to_string());
                 }
                 let serialized_request = serde_json::to_vec(&request)?;
-                Ok(ProviderRequestEstimate::from_serialized_parts(
-                    serialized_request.len(),
+                Ok(ProviderRequestEstimate::from_serialized_request(
+                    &serialized_request,
                     0,
                     usize::try_from(request.max_tokens).unwrap_or(usize::MAX),
                     request.messages.len(),
@@ -277,8 +277,8 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
                     .and_then(|config| config.max_output_tokens)
                     .and_then(|tokens| usize::try_from(tokens).ok())
                     .unwrap_or(ContextWindowBudget::DEFAULT_OUTPUT_TOKEN_RESERVATION);
-                Ok(ProviderRequestEstimate::from_serialized_parts(
-                    serialized_request.len(),
+                Ok(ProviderRequestEstimate::from_serialized_request(
+                    &serialized_request,
                     0,
                     output_reservation,
                     message_count,
@@ -295,8 +295,8 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
             }
             Some(ProviderResponse::Bedrock) => {
                 let serialized_context = serde_json::to_vec(&context)?;
-                Ok(ProviderRequestEstimate::from_serialized_parts(
-                    serialized_context.len(),
+                Ok(ProviderRequestEstimate::from_serialized_request(
+                    &serialized_context,
                     0,
                     context
                         .max_tokens
@@ -2368,10 +2368,10 @@ mod tests {
     }
 
     #[test]
-    fn test_preflight_blocks_266k_window_230k_prompt_60k_output_request() {
+    fn test_preflight_blocks_266k_window_500k_prompt_60k_output_request() {
         let fixture = orchestrator_fixture(Compact::new().retention_window(1_usize), 266_300);
         let context = Context::default()
-            .add_message(ContextMessage::user(large_text(230_000), None))
+            .add_message(ContextMessage::user(large_text(500_000), None))
             .max_tokens(60_000_usize);
 
         let actual = fixture.preflight_context_window(context);
@@ -2437,7 +2437,7 @@ mod tests {
             .max_tokens(1_usize);
         let estimation_fixture =
             orchestrator_fixture(Compact::new().retention_window(1_usize), 128_000);
-        let domain_estimated_tokens = serde_json::to_vec(&context).unwrap().len();
+        let domain_estimated_tokens = serde_json::to_vec(&context).unwrap().len().div_ceil(4);
         let provider_estimated_tokens = estimation_fixture
             .estimated_request_tokens(&context)
             .unwrap();
@@ -2480,7 +2480,7 @@ mod tests {
             .add_tool(ToolDefinition::new("large_tool").description(large_text(1_000)));
 
         let actual = fixture.estimated_request_tokens(&context).unwrap()
-            > serde_json::to_vec(&context).unwrap().len();
+            > serde_json::to_vec(&context).unwrap().len().div_ceil(4);
         let expected = true;
 
         assert_eq!(actual, expected);
@@ -2648,7 +2648,7 @@ mod tests {
     async fn test_run_recovers_max_compacted_context_by_clamping_output_reservation() {
         let services = DispatchingFixtureServices::new();
         let setup = Context::default()
-            .add_message(ContextMessage::user(large_text(1_300), None))
+            .add_message(ContextMessage::user(large_text(6_000), None))
             .max_tokens(4_000_usize);
         let mut fixture = dispatching_orchestrator_fixture(
             services.clone(),

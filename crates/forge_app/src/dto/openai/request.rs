@@ -264,18 +264,18 @@ pub struct ProviderRequestEstimate {
 }
 
 impl ProviderRequestEstimate {
-    /// Builds a final provider request estimate from serialized request parts.
+    /// Builds a final provider request estimate from a serialized request body.
     ///
     /// # Arguments
-    /// * `serialized_request_bytes` - Final JSON payload byte length before media padding.
+    /// * `serialized_request` - Final JSON payload bytes before media padding.
     /// * `media_token_padding` - Additional media padding included in the input estimate.
     /// * `output_token_reservation` - Output tokens reserved by the final provider request.
     /// * `message_count` - Number of provider messages in the final request.
     /// * `tool_count` - Number of provider tools in the final request.
     /// * `messages_bytes` - Serialized byte length of the provider messages field.
     /// * `tools_bytes` - Serialized byte length of the provider tools field.
-    pub fn from_serialized_parts(
-        serialized_request_bytes: usize,
+    pub fn from_serialized_request(
+        serialized_request: &[u8],
         media_token_padding: usize,
         output_token_reservation: usize,
         message_count: usize,
@@ -283,8 +283,10 @@ impl ProviderRequestEstimate {
         messages_bytes: usize,
         tools_bytes: usize,
     ) -> Self {
+        let serialized_request_bytes = serialized_request.len();
         Self {
-            estimated_input_tokens: serialized_request_bytes.saturating_add(media_token_padding),
+            estimated_input_tokens: estimate_serialized_text_tokens(serialized_request)
+                .saturating_add(media_token_padding),
             serialized_request_bytes,
             media_token_padding,
             output_token_reservation,
@@ -424,8 +426,8 @@ impl Request {
         let request =
             Self::from_context_for_provider(context, model, provider, merge_system_messages)?;
         let serialized_request = serde_json::to_vec(&request)?;
-        Ok(ProviderRequestEstimate::from_serialized_parts(
-            serialized_request.len(),
+        Ok(ProviderRequestEstimate::from_serialized_request(
+            &serialized_request,
             request.media_token_padding(),
             request.output_token_reservation(),
             request.message_count(),
@@ -533,15 +535,14 @@ impl Request {
             .unwrap_or(ContextWindowBudget::DEFAULT_OUTPUT_TOKEN_RESERVATION)
     }
 
-    /// Returns a conservative estimate of the request input tokens after
+    /// Returns a conservative token estimate for the request input after
     /// provider pipeline transformations and JSON serialization.
     ///
     /// # Arguments
     /// * `serialized_request` - Final JSON payload bytes that would be sent to
     ///   the provider.
     pub fn estimated_input_tokens_from_serialized(&self, serialized_request: &[u8]) -> usize {
-        serialized_request
-            .len()
+        estimate_serialized_text_tokens(serialized_request)
             .saturating_add(self.media_token_padding())
     }
 
@@ -726,6 +727,12 @@ impl From<Context> for Request {
             context_window: context.model_context_length,
         }
     }
+}
+
+fn estimate_serialized_text_tokens(serialized_request: &[u8]) -> usize {
+    std::str::from_utf8(serialized_request)
+        .map(|text| text.chars().count().div_ceil(4))
+        .unwrap_or(serialized_request.len())
 }
 
 fn serialized_optional_bytes<T: Serialize>(value: &Option<T>) -> anyhow::Result<usize> {
@@ -949,13 +956,13 @@ mod tests {
     }
 
     #[test]
-    fn test_context_window_guard_must_not_divide_ascii_text_below_character_count() {
-        let content = "x ".repeat(4_500);
+    fn test_context_window_guard_estimates_ascii_json_as_tokens_not_bytes() {
+        let content = "x".repeat(1_000_000);
         let fixture = Request {
             model: Some(ModelId::new("context-guard-model")),
             messages: Some(vec![Message {
                 role: super::Role::User,
-                content: Some(MessageContent::Text(content.clone())),
+                content: Some(MessageContent::Text(content)),
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
@@ -965,21 +972,103 @@ mod tests {
                 reasoning_content: None,
                 extra_content: None,
             }]),
-            context_window: Some(12_000),
-            max_completion_tokens: Some(512),
+            context_window: Some(1_048_576),
+            max_completion_tokens: Some(10_444),
+            ..Default::default()
+        };
+        let serialized = serde_json::to_vec(&fixture).unwrap();
+        let actual = fixture.estimated_input_tokens_from_serialized(&serialized);
+
+        assert!(
+            actual < serialized.len() / 2,
+            "estimated tokens must be a token approximation, not serialized bytes: actual={actual}, bytes={}",
+            serialized.len()
+        );
+        assert!(
+            actual > 240_000,
+            "large JSON text should still have a substantial estimate"
+        );
+    }
+
+    #[test]
+    fn test_context_window_guard_allows_incident_sized_text_heavy_request() {
+        let fixture = Request {
+            model: Some(ModelId::new("gpt-5.5")),
+            messages: Some(vec![Message {
+                role: super::Role::User,
+                content: Some(MessageContent::Text("x".repeat(1_020_000))),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_details: None,
+                reasoning_text: None,
+                reasoning_opaque: None,
+                reasoning_content: None,
+                extra_content: None,
+            }]),
+            tools: Some(
+                (0..12)
+                    .map(|index| Tool::Function {
+                        function: FunctionDescription {
+                            description: Some(format!(
+                                "tool {index} {}",
+                                "description ".repeat(400)
+                            )),
+                            name: ToolName::new(format!("tool_{index}")),
+                            parameters: schemars::schema_for!(serde_json::Value),
+                        },
+                    })
+                    .collect(),
+            ),
+            max_completion_tokens: Some(10_444),
+            context_window: Some(1_048_576),
             ..Default::default()
         };
         let serialized = serde_json::to_vec(&fixture).unwrap();
 
-        let actual =
-            fixture.estimated_input_tokens_from_serialized(&serialized) >= content.chars().count();
-        let expected = true;
-
-        assert_eq!(actual, expected);
+        assert!(serialized.len() > 1_020_000);
+        assert!(fixture.validate_context_window(&serialized).is_ok());
     }
 
     #[test]
-    fn test_context_window_guard_includes_tool_and_media_padding() {
+    fn test_context_window_guard_estimates_tool_schemas_by_tokens_not_bytes() {
+        let fixture = Request {
+            model: Some(ModelId::new("context-guard-model")),
+            messages: Some(vec![Message {
+                role: super::Role::User,
+                content: Some(MessageContent::Text("short".to_string())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_details: None,
+                reasoning_text: None,
+                reasoning_opaque: None,
+                reasoning_content: None,
+                extra_content: None,
+            }]),
+            tools: Some(
+                (0..100)
+                    .map(|index| Tool::Function {
+                        function: FunctionDescription {
+                            description: Some("large schema description ".repeat(100)),
+                            name: ToolName::new(format!("tool_{index}")),
+                            parameters: schemars::schema_for!(serde_json::Value),
+                        },
+                    })
+                    .collect(),
+            ),
+            context_window: Some(128_000),
+            ..Default::default()
+        };
+        let serialized = serde_json::to_vec(&fixture).unwrap();
+        let actual = fixture.estimated_input_tokens_from_serialized(&serialized);
+
+        assert!(actual < serialized.len() / 2);
+        assert!(actual > 50_000);
+    }
+
+    #[test]
+    fn test_context_window_guard_includes_media_padding_in_token_estimate() {
         let request_without_media = Request {
             model: Some(ModelId::new("context-guard-model")),
             messages: Some(vec![Message {
