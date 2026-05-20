@@ -749,6 +749,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn learning_review_rejects_idempotency_collision_for_different_event_kind()
+    -> anyhow::Result<()> {
+        let fixture = fixture_repo(13)?;
+        let conversation_id = ConversationId::generate();
+        let created_at = Utc::now();
+        let candidate = fixture
+            .insert_learning_event(fixture_event(
+                conversation_id,
+                "event-1",
+                "same record different event kind collision",
+                created_at,
+            )?)
+            .await?;
+        let mut colliding_review = LearningLedgerEvent::review(
+            candidate.record_id,
+            LearningEventKind::ReviewAccepted,
+            "review note with candidate idempotency collision",
+            LearningProvenance::conversation(conversation_id, "review-1", "review-fingerprint-1"),
+            created_at + Duration::seconds(1),
+        )?;
+        colliding_review.idempotency_key = candidate.idempotency_key.clone();
+
+        let colliding = fixture
+            .review_learning_candidate_event(colliding_review)
+            .await;
+        let projection = fixture.list_learning_records(None, 10).await?.remove(0);
+        let events = fixture
+            .run_with_connection(move |connection, wid| {
+                learning_ledger_events::table
+                    .filter(learning_ledger_events::workspace_id.eq(workspace_db_id(wid)))
+                    .load::<LearningLedgerEventRecord>(connection)
+                    .map_err(Into::into)
+            })
+            .await?;
+
+        let actual = (colliding.is_err(), projection.review_state, events.len());
+        let expected = (true, LearningReviewState::Candidate, 1usize);
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn learning_queries_are_workspace_isolated() -> anyhow::Result<()> {
         let left = fixture_repo(3)?;
         let right = fixture_repo(4)?;

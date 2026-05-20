@@ -185,9 +185,20 @@ mod tests {
 
         async fn list_branch_targets(
             &self,
-            _conversation_id: &ConversationId,
+            conversation_id: &ConversationId,
         ) -> anyhow::Result<Vec<crate::dto::ConversationBranchTarget>> {
-            Ok(Vec::new())
+            let conversations = self.conversations.lock().await;
+            let source = conversations
+                .get(conversation_id)
+                .ok_or_else(|| forge_domain::Error::ConversationNotFound(*conversation_id))?;
+            let mut context = source
+                .context
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Conversation {conversation_id} has no context"))?;
+            context.conversation_id = Some(source.id);
+            Ok(crate::dto::ConversationBranchTarget::list_from_context(
+                source.id, &context,
+            ))
         }
 
         async fn branch_conversation(
