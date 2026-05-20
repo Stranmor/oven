@@ -188,6 +188,7 @@ mod tests {
             parent_id: None,
             title: title.map(|t| t.to_string()),
             initiator: forge_domain::Initiator::User,
+            visibility: forge_domain::ConversationVisibility::Normal,
             context: Some(Context::default()),
             metrics: Metrics::default().started_at(now),
             metadata: MetaData { created_at: now, updated_at: Some(now) },
