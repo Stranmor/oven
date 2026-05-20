@@ -311,36 +311,47 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
             }
         }
 
-        let mut retrieval_empty_targets = Vec::new();
-        let mut would_inject = false;
-        if let Some(query) = query.as_deref() {
-            let max_sources = ProjectModelContextRenderBudget::default().max_sources;
-            for target_diagnostic in &target_specs {
-                let target = &target_diagnostic.target;
-                let mut params =
-                    SearchParams::new(query, "automatic project-model context injection")
-                        .limit(max_sources);
-                if let Some(path_filter) = target.path_filter.clone() {
-                    params = params.starts_with(path_filter);
-                }
-                match self
-                    .services
-                    .query_workspace(target.workspace_root.clone(), params)
-                    .await
-                {
-                    Ok(nodes) if nodes.is_empty() => {
-                        retrieval_empty_targets.push(target.workspace_root.clone());
-                    }
-                    Ok(_) => {
-                        would_inject = true;
-                    }
-                    Err(error) => {
-                        retrieval_empty_targets.push(target.workspace_root.clone());
-                        tracing::debug!(error = ?error, path = %target.workspace_root.display(), "Explain-context retrieval failed for selected target");
-                    }
+        let mut replay_preview_targets = target_specs
+            .iter()
+            .map(|target_diagnostic| target_diagnostic.diagnostic.clone())
+            .chain(nearest_skipped_manifest_candidates.iter().cloned())
+            .collect::<Vec<_>>();
+        if replay_preview_targets.is_empty() {
+            replay_preview_targets.push(WorkspaceContextManifestDiagnostic {
+                workspace_root: environment.cwd.clone(),
+                manifest_found: false,
+                manifest_path: local_project_model_manifest(&environment.cwd),
+                freshness: WorkspaceContextFreshness::Unknown {
+                    reason: "project-model manifest not found".to_string(),
+                },
+                exact_fact_readiness: None,
+                evidence_readiness: None,
+                evidence_ledger_activation: None,
+            });
+        }
+        let mut replay_preview_diagnostics = Vec::new();
+        for manifest_diagnostic in replay_preview_targets.iter().take(Self::MAX_TARGETS) {
+            match self
+                .services
+                .workspace_evidence_replay_preview_diagnostic(
+                    manifest_diagnostic.workspace_root.clone(),
+                )
+                .await
+            {
+                Ok(diagnostic) => replay_preview_diagnostics.push(diagnostic),
+                Err(error) => {
+                    tracing::debug!(error = ?error, path = %manifest_diagnostic.workspace_root.display(), "Explain-context replay preview diagnostic failed for target");
+                    replay_preview_diagnostics.push(Self::failed_replay_preview_diagnostic(
+                        manifest_diagnostic,
+                        format!("replay preview diagnostic failed: {error}"),
+                    ));
                 }
             }
         }
+
+        let retrieval_empty_targets = Vec::new();
+        let has_query = query.as_deref().is_some_and(|query| !query.is_empty());
+        let would_inject = has_query && !selected_targets.is_empty();
 
         let skip_reason = if would_inject {
             None
@@ -349,7 +360,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
         } else if selected_targets.is_empty() {
             Some("no fresh project-model manifest target selected".to_string())
         } else {
-            Some("retrieval returned no usable project-model context".to_string())
+            Some("read-only explain does not run query-specific retrieval; replay preview is existing ledger evidence only".to_string())
         };
 
         WorkspaceContextExplanation {
@@ -359,8 +370,32 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
             selected_targets,
             nearest_skipped_manifest_candidates,
             retrieval_empty_targets,
+            replay_preview_diagnostics,
             would_inject,
             skip_reason,
+        }
+    }
+
+    fn failed_replay_preview_diagnostic(
+        manifest_diagnostic: &WorkspaceContextManifestDiagnostic,
+        reason: String,
+    ) -> WorkspaceEvidenceReplayPreviewDiagnostic {
+        WorkspaceEvidenceReplayPreviewDiagnostic {
+            status: WorkspaceEvidenceReplayPreviewStatus::NotPreviewedManifestUnknown,
+            workspace_root_label: "workspace_root".to_string(),
+            manifest_label: "project_model_manifest".to_string(),
+            manifest_found: manifest_diagnostic.manifest_found,
+            manifest_freshness: manifest_diagnostic.freshness.label().to_string(),
+            not_previewed_reason: Some(reason),
+            manifest_hash: None,
+            content_policy: None,
+            stale_policy: None,
+            changed_excluded: 0,
+            deleted_excluded: 0,
+            budget: None,
+            selected: Vec::new(),
+            issues: Vec::new(),
+            rendered_preview: None,
         }
     }
 
@@ -747,6 +782,23 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig> + SteerS
         SteerHandle::<S>::new(self.services.clone())
             .accept(request)
             .await
+    }
+
+    /// Reviews a captured learning candidate through the typed append-only learning ledger.
+    ///
+    /// # Arguments
+    /// * `request` - Typed review request with candidate ID, decision, note, and provenance.
+    ///
+    /// # Errors
+    /// Returns an error when the candidate does not exist, is not reviewable, or persistence fails.
+    pub async fn review_learning_candidate(
+        &self,
+        request: LearningReviewRequest,
+    ) -> anyhow::Result<LearningReviewOutcome>
+    where
+        S: LearningService,
+    {
+        self.services.review_learning_candidate(request).await
     }
 
     /// Executes a chat request and returns a stream of responses.
@@ -1193,10 +1245,11 @@ mod tests {
         ConversationId, Environment, Event, FileChunk, FileStatus, FinishReason,
         LEARNING_LEDGER_SCHEMA_VERSION, LearningEventKind, LearningLedgerEvent,
         LearningLedgerFreshness, LearningProvenance, LearningRecordId, LearningRecordProjection,
-        LearningRedactionStatus, LearningReviewState, McpConfig, McpServers, Model, ModelId, Node,
-        NodeData, NodeId, PermissionOperation, Provider, ProviderId, ProviderType, ResultStream,
-        Scope, SearchParams, SteerMessage, SyncProgress, ToolCallContext, ToolCallFull, ToolOutput,
-        ToolResult, WorkspaceAuth, WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
+        LearningRedactionStatus, LearningReviewDecision, LearningReviewRequest,
+        LearningReviewState, McpConfig, McpServers, Model, ModelId, Node, NodeData, NodeId,
+        PermissionOperation, Provider, ProviderId, ProviderType, ResultStream, Scope, SearchParams,
+        SteerMessage, SyncProgress, ToolCallContext, ToolCallFull, ToolOutput, ToolResult,
+        WorkspaceAuth, WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
         WorkspaceEvidenceReadinessDiagnostic, WorkspaceId, WorkspaceInfo,
     };
     use futures::StreamExt;
@@ -1304,6 +1357,59 @@ mod tests {
         }
     }
 
+    impl ChatFlowLearningState {
+        async fn apply_learning_event(&self, event: &LearningLedgerEvent) {
+            let mut records = self.learning_records.lock().await;
+            match event.event_kind {
+                LearningEventKind::CandidateCaptured => {
+                    if records
+                        .iter()
+                        .any(|record| record.record_id == event.record_id)
+                    {
+                        return;
+                    }
+                    records.push(LearningRecordProjection {
+                        record_id: event.record_id,
+                        summary: event.summary.clone(),
+                        review_state: LearningReviewState::Candidate,
+                        redaction_status: event.redaction_status,
+                        provenance: event.provenance.clone(),
+                        created_at: event.created_at,
+                        updated_at: event.created_at,
+                        schema_version: event.schema_version,
+                    });
+                }
+                LearningEventKind::ReviewAccepted => {
+                    if let Some(record) = records
+                        .iter_mut()
+                        .find(|record| record.record_id == event.record_id)
+                    {
+                        record.review_state = LearningReviewState::Accepted;
+                        record.updated_at = event.created_at;
+                    }
+                }
+                LearningEventKind::ReviewRejected => {
+                    if let Some(record) = records
+                        .iter_mut()
+                        .find(|record| record.record_id == event.record_id)
+                    {
+                        record.review_state = LearningReviewState::Rejected;
+                        record.updated_at = event.created_at;
+                    }
+                }
+                LearningEventKind::Superseded => {
+                    if let Some(record) = records
+                        .iter_mut()
+                        .find(|record| record.record_id == event.record_id)
+                    {
+                        record.review_state = LearningReviewState::Superseded;
+                        record.updated_at = event.created_at;
+                    }
+                }
+            }
+        }
+    }
+
     #[async_trait::async_trait]
     impl ConversationService for ChatFlowLearningState {
         async fn find_conversation(&self, id: &ConversationId) -> Result<Option<Conversation>> {
@@ -1336,6 +1442,13 @@ mod tests {
             parent_id: Option<ConversationId>,
         ) -> Result<Option<ConversationId>> {
             Ok(parent_id)
+        }
+
+        async fn list_branch_targets(
+            &self,
+            _conversation_id: &ConversationId,
+        ) -> Result<Vec<crate::dto::ConversationBranchTarget>> {
+            Ok(Vec::new())
         }
 
         async fn modify_conversation<F, T>(&self, id: &ConversationId, f: F) -> Result<T>
@@ -1444,6 +1557,8 @@ mod tests {
                     events.push(event.clone());
                     event
                 });
+            drop(events);
+            self.apply_learning_event(&event).await;
             Ok(event)
         }
 
@@ -1451,7 +1566,17 @@ mod tests {
             &self,
             event: LearningLedgerEvent,
         ) -> Result<LearningLedgerEvent> {
-            self.learning_events.lock().await.push(event.clone());
+            let mut events = self.learning_events.lock().await;
+            let event = events
+                .iter()
+                .find(|existing| existing.idempotency_key == event.idempotency_key)
+                .cloned()
+                .unwrap_or_else(|| {
+                    events.push(event.clone());
+                    event
+                });
+            drop(events);
+            self.apply_learning_event(&event).await;
             Ok(event)
         }
 
@@ -2084,6 +2209,8 @@ mod tests {
         stale_paths: Vec<PathBuf>,
         unknown_paths: Vec<PathBuf>,
         inactive_exact_fact_paths: Vec<PathBuf>,
+        #[allow(dead_code)]
+        replay_preview_empty_paths: Vec<PathBuf>,
         captured_context: Mutex<Option<Context>>,
         workspace_queries: AtomicUsize,
         queried_workspaces: Mutex<Vec<PathBuf>>,
@@ -2095,8 +2222,9 @@ mod tests {
 
     impl ProjectContextHarness {
         fn new(cwd: PathBuf) -> Arc<Self> {
-            Self::new_with_empty_error_stale_unknown_and_inactive_exact_fact_paths(
+            Self::new_with_empty_error_stale_unknown_inactive_exact_fact_and_replay_preview_empty_paths(
                 cwd,
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -2106,9 +2234,10 @@ mod tests {
         }
 
         fn new_with_empty_paths(cwd: PathBuf, empty_paths: Vec<PathBuf>) -> Arc<Self> {
-            Self::new_with_empty_error_stale_unknown_and_inactive_exact_fact_paths(
+            Self::new_with_empty_error_stale_unknown_inactive_exact_fact_and_replay_preview_empty_paths(
                 cwd,
                 empty_paths,
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -2117,10 +2246,11 @@ mod tests {
         }
 
         fn new_with_error_paths(cwd: PathBuf, error_paths: Vec<PathBuf>) -> Arc<Self> {
-            Self::new_with_empty_error_stale_unknown_and_inactive_exact_fact_paths(
+            Self::new_with_empty_error_stale_unknown_inactive_exact_fact_and_replay_preview_empty_paths(
                 cwd,
                 Vec::new(),
                 error_paths,
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -2128,23 +2258,25 @@ mod tests {
         }
 
         fn new_with_stale_paths(cwd: PathBuf, stale_paths: Vec<PathBuf>) -> Arc<Self> {
-            Self::new_with_empty_error_stale_unknown_and_inactive_exact_fact_paths(
+            Self::new_with_empty_error_stale_unknown_inactive_exact_fact_and_replay_preview_empty_paths(
                 cwd,
                 Vec::new(),
                 Vec::new(),
                 stale_paths,
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
             )
         }
 
         fn new_with_unknown_paths(cwd: PathBuf, unknown_paths: Vec<PathBuf>) -> Arc<Self> {
-            Self::new_with_empty_error_stale_unknown_and_inactive_exact_fact_paths(
+            Self::new_with_empty_error_stale_unknown_inactive_exact_fact_and_replay_preview_empty_paths(
                 cwd,
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 unknown_paths,
+                Vec::new(),
                 Vec::new(),
             )
         }
@@ -2153,23 +2285,41 @@ mod tests {
             cwd: PathBuf,
             inactive_exact_fact_paths: Vec<PathBuf>,
         ) -> Arc<Self> {
-            Self::new_with_empty_error_stale_unknown_and_inactive_exact_fact_paths(
+            Self::new_with_empty_error_stale_unknown_inactive_exact_fact_and_replay_preview_empty_paths(
                 cwd,
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 inactive_exact_fact_paths,
+                Vec::new(),
             )
         }
 
-        fn new_with_empty_error_stale_unknown_and_inactive_exact_fact_paths(
+        #[allow(dead_code)]
+        fn new_with_replay_preview_empty_paths(
+            cwd: PathBuf,
+            replay_preview_empty_paths: Vec<PathBuf>,
+        ) -> Arc<Self> {
+            Self::new_with_empty_error_stale_unknown_inactive_exact_fact_and_replay_preview_empty_paths(
+                cwd,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                replay_preview_empty_paths,
+            )
+        }
+
+        fn new_with_empty_error_stale_unknown_inactive_exact_fact_and_replay_preview_empty_paths(
             cwd: PathBuf,
             empty_paths: Vec<PathBuf>,
             error_paths: Vec<PathBuf>,
             stale_paths: Vec<PathBuf>,
             unknown_paths: Vec<PathBuf>,
             inactive_exact_fact_paths: Vec<PathBuf>,
+            replay_preview_empty_paths: Vec<PathBuf>,
         ) -> Arc<Self> {
             Arc::new(Self {
                 cwd,
@@ -2178,6 +2328,7 @@ mod tests {
                 stale_paths,
                 unknown_paths,
                 inactive_exact_fact_paths,
+                replay_preview_empty_paths,
                 captured_context: Mutex::new(None),
                 workspace_queries: AtomicUsize::new(0),
                 queried_workspaces: Mutex::new(Vec::new()),
@@ -2259,9 +2410,157 @@ mod tests {
 
         async fn workspace_evidence_replay_preview_diagnostic(
             &self,
-            _path: PathBuf,
+            path: PathBuf,
         ) -> Result<WorkspaceEvidenceReplayPreviewDiagnostic> {
-            anyhow::bail!("unused workspace evidence replay preview diagnostic")
+            let manifest_path = path.join(".forge_project_model/project_manifest.json");
+            let manifest_found = manifest_path.is_file();
+            let freshness = if self
+                .stale_paths
+                .iter()
+                .any(|stale_path| stale_path == &path)
+            {
+                WorkspaceContextFreshness::Stale {
+                    changed: vec!["src/lib.rs".to_string()],
+                    deleted: Vec::new(),
+                    added: Vec::new(),
+                }
+            } else if self
+                .unknown_paths
+                .iter()
+                .any(|unknown_path| unknown_path == &path)
+            {
+                WorkspaceContextFreshness::Unknown {
+                    reason: "fixture freshness unavailable".to_string(),
+                }
+            } else if manifest_found {
+                WorkspaceContextFreshness::Fresh
+            } else {
+                WorkspaceContextFreshness::Unknown {
+                    reason: "project-model manifest not found".to_string(),
+                }
+            };
+            if !freshness.is_fresh() {
+                let status = match &freshness {
+                    WorkspaceContextFreshness::Stale { .. } => {
+                        WorkspaceEvidenceReplayPreviewStatus::NotPreviewedManifestStale
+                    }
+                    WorkspaceContextFreshness::Unknown { .. } if manifest_found => {
+                        WorkspaceEvidenceReplayPreviewStatus::NotPreviewedManifestUnknown
+                    }
+                    WorkspaceContextFreshness::Unknown { .. } => {
+                        WorkspaceEvidenceReplayPreviewStatus::NotPreviewedManifestMissing
+                    }
+                    WorkspaceContextFreshness::Fresh => {
+                        WorkspaceEvidenceReplayPreviewStatus::NotPreviewedManifestUnknown
+                    }
+                };
+                let not_previewed_reason = match &freshness {
+                    WorkspaceContextFreshness::Stale { changed, deleted, added } => Some(format!(
+                        "manifest stale: changed={}, deleted={}, added={}",
+                        changed.len(),
+                        deleted.len(),
+                        added.len()
+                    )),
+                    WorkspaceContextFreshness::Unknown { reason } => Some(reason.clone()),
+                    WorkspaceContextFreshness::Fresh => None,
+                };
+                return Ok(WorkspaceEvidenceReplayPreviewDiagnostic {
+                    status,
+                    workspace_root_label: "workspace_root".to_string(),
+                    manifest_label: "project_model_manifest".to_string(),
+                    manifest_found,
+                    manifest_freshness: freshness.label().to_string(),
+                    not_previewed_reason,
+                    manifest_hash: None,
+                    content_policy: None,
+                    stale_policy: None,
+                    changed_excluded: 0,
+                    deleted_excluded: 0,
+                    budget: None,
+                    selected: Vec::new(),
+                    issues: Vec::new(),
+                    rendered_preview: None,
+                });
+            }
+            if self
+                .replay_preview_empty_paths
+                .iter()
+                .any(|empty_path| empty_path == &path)
+            {
+                return Ok(WorkspaceEvidenceReplayPreviewDiagnostic {
+                    status: WorkspaceEvidenceReplayPreviewStatus::NotPreviewedEmptyReplay,
+                    workspace_root_label: "workspace_root".to_string(),
+                    manifest_label: "project_model_manifest".to_string(),
+                    manifest_found: true,
+                    manifest_freshness: WorkspaceContextFreshness::Fresh.label().to_string(),
+                    not_previewed_reason: Some("no previewable ledger evidence".to_string()),
+                    manifest_hash: Some("fixture-manifest-hash".to_string()),
+                    content_policy: Some("reference_only".to_string()),
+                    stale_policy: Some("exclude_changed_or_deleted".to_string()),
+                    changed_excluded: 0,
+                    deleted_excluded: 0,
+                    budget: Some(WorkspaceEvidenceReplayBudgetSummary {
+                        original_candidate_count: 0,
+                        selected_count: 0,
+                        excluded_count: 0,
+                        excluded_by_reason: BTreeMap::new(),
+                        truncated: false,
+                        max_artifacts: 8,
+                        max_episode_lines: 64,
+                        max_selected: 3,
+                        stable_ordering: "fixture-stable-ordering".to_string(),
+                    }),
+                    selected: Vec::new(),
+                    issues: Vec::new(),
+                    rendered_preview: None,
+                });
+            }
+            Ok(WorkspaceEvidenceReplayPreviewDiagnostic {
+                status: WorkspaceEvidenceReplayPreviewStatus::PreviewedWithSelection,
+                workspace_root_label: "workspace_root".to_string(),
+                manifest_label: "project_model_manifest".to_string(),
+                manifest_found: true,
+                manifest_freshness: WorkspaceContextFreshness::Fresh.label().to_string(),
+                not_previewed_reason: None,
+                manifest_hash: Some("fixture-manifest-hash".to_string()),
+                content_policy: Some("reference_only".to_string()),
+                stale_policy: Some("exclude_changed_or_deleted".to_string()),
+                changed_excluded: 1,
+                deleted_excluded: 1,
+                budget: Some(WorkspaceEvidenceReplayBudgetSummary {
+                    original_candidate_count: 2,
+                    selected_count: 1,
+                    excluded_count: 1,
+                    excluded_by_reason: BTreeMap::from([("changed_evidence_excluded".to_string(), 1)]),
+                    truncated: false,
+                    max_artifacts: 8,
+                    max_episode_lines: 64,
+                    max_selected: 3,
+                    stable_ordering: "fixture-stable-ordering".to_string(),
+                }),
+                selected: vec![WorkspaceEvidenceReplayReference {
+                    artifact_id: "artifact-fixture".to_string(),
+                    artifact_path: "context_packs/artifact-fixture.json".to_string(),
+                    evidence_id: "evidence-fixture".to_string(),
+                    evidence_path: "src/lib.rs".to_string(),
+                    start_line: Some(3),
+                    end_line: Some(3),
+                    score_kind: "exact_fact".to_string(),
+                    score: 1.0,
+                    provenance_path: "tool_episodes/episode-fixture.jsonl".to_string(),
+                    provenance_start_line: Some(1),
+                    provenance_end_line: Some(1),
+                    provenance_source: "tool_episode".to_string(),
+                    provenance_fingerprint: "fixture-fingerprint".to_string(),
+                    freshness: "fresh".to_string(),
+                    linked_episode_count: 1,
+                    link_issue_count: 0,
+                }],
+                issues: Vec::new(),
+                rendered_preview: Some(
+                    "<project_model_context source=\"evidence_replay_preview\"><source path=\"src/lib.rs\" start_line=\"3\" end_line=\"3\" content_digest=\"fixture-digest\" /></project_model_context>".to_string(),
+                ),
+            })
         }
 
         async fn query_workspace(
@@ -2663,6 +2962,7 @@ mod tests {
                 event.event_kind,
                 event.provenance.conversation_id,
                 event.summary.contains("conversation_saved"),
+                event.summary.contains("user_message_count=1"),
                 event
                     .summary
                     .contains("runtime self-learning proof request"),
@@ -2678,8 +2978,266 @@ mod tests {
             Some(conversation_id),
             true,
             true,
+            false,
             true,
         ));
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chat_flow_promotes_captured_candidate_then_injects_next_chat_learning() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ChatFlowLearningHarness::new(root);
+        let conversation = Conversation::generate();
+        let conversation_id = conversation.id;
+        setup.upsert_conversation(conversation).await?;
+        let app = ForgeApp::new(setup.clone());
+        let mut stream = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            app.chat(
+                setup.state.agent.id.clone(),
+                ChatRequest::new(
+                    Event::new("turnkey self-learning promotion proof"),
+                    conversation_id,
+                ),
+            ),
+        )
+        .await??;
+
+        for _ in 0..32 {
+            if !setup.state.learning_events.lock().await.is_empty() {
+                break;
+            }
+            match tokio::time::timeout(std::time::Duration::from_millis(250), stream.next()).await {
+                Ok(Some(response)) => {
+                    response?;
+                }
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
+        while let Some(response) = stream.next().await {
+            response?;
+        }
+
+        let candidate = setup
+            .state
+            .learning_records
+            .lock()
+            .await
+            .iter()
+            .find(|record| record.review_state == LearningReviewState::Candidate)
+            .cloned()
+            .expect("chat save should project a captured candidate");
+        let review_outcome = app
+            .review_learning_candidate(LearningReviewRequest::new(
+                candidate.record_id,
+                LearningReviewDecision::Accept,
+                "deterministic typed review accepted safe conversation-save learning",
+                LearningProvenance::conversation(
+                    conversation_id,
+                    "typed-review:accept-turnkey-self-learning",
+                    "typed-review-fingerprint",
+                ),
+            ))
+            .await?;
+        let repeated_review_outcome = app
+            .review_learning_candidate(LearningReviewRequest::new(
+                candidate.record_id,
+                LearningReviewDecision::Accept,
+                "repeat deterministic typed review should not append a new event",
+                LearningProvenance::conversation(
+                    conversation_id,
+                    "typed-review:accept-turnkey-self-learning-repeat",
+                    "typed-review-fingerprint-repeat",
+                ),
+            ))
+            .await?;
+        let review_event_count = setup.state.learning_events.lock().await.len();
+        assert_eq!(
+            (
+                repeated_review_outcome.projection.review_state,
+                review_event_count,
+            ),
+            (LearningReviewState::Accepted, 2usize),
+        );
+        let next_conversation = Conversation::generate();
+        let next_conversation_id = next_conversation.id;
+        setup.upsert_conversation(next_conversation).await?;
+        setup.state.captured_provider_context.lock().await.take();
+        let mut next_stream = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            app.chat(
+                setup.state.agent.id.clone(),
+                ChatRequest::new(
+                    Event::new("next chat should use accepted learning"),
+                    next_conversation_id,
+                ),
+            ),
+        )
+        .await??;
+
+        for _ in 0..32 {
+            if setup.state.captured_provider_context.lock().await.is_some() {
+                break;
+            }
+            match tokio::time::timeout(std::time::Duration::from_millis(250), next_stream.next())
+                .await
+            {
+                Ok(Some(response)) => {
+                    response?;
+                }
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
+
+        let captured_context = setup
+            .state
+            .captured_provider_context
+            .lock()
+            .await
+            .clone()
+            .expect("provider context should be captured by fake provider");
+        let learning_message = captured_context
+            .messages
+            .iter()
+            .find_map(|message| match &message.message {
+                ContextMessage::Text(text) if text.is_learning_context() => Some(text),
+                _ => None,
+            })
+            .expect("accepted learning context should be injected into the next provider call");
+        let actual = (
+            review_outcome.event.event_kind,
+            review_outcome.projection.review_state,
+            learning_message.content.contains("conversation_saved"),
+            learning_message
+                .content
+                .contains("turnkey self-learning promotion proof"),
+        );
+        let expected = (
+            LearningEventKind::ReviewAccepted,
+            LearningReviewState::Accepted,
+            true,
+            false,
+        );
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chat_flow_rejected_candidate_remains_excluded_from_next_chat_learning() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ChatFlowLearningHarness::new(root);
+        let conversation = Conversation::generate();
+        let conversation_id = conversation.id;
+        setup.upsert_conversation(conversation).await?;
+        let app = ForgeApp::new(setup.clone());
+        let mut stream = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            app.chat(
+                setup.state.agent.id.clone(),
+                ChatRequest::new(
+                    Event::new("reject this learning candidate"),
+                    conversation_id,
+                ),
+            ),
+        )
+        .await??;
+
+        for _ in 0..32 {
+            if !setup.state.learning_events.lock().await.is_empty() {
+                break;
+            }
+            match tokio::time::timeout(std::time::Duration::from_millis(250), stream.next()).await {
+                Ok(Some(response)) => {
+                    response?;
+                }
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
+        while let Some(response) = stream.next().await {
+            response?;
+        }
+
+        let candidate = setup
+            .state
+            .learning_records
+            .lock()
+            .await
+            .iter()
+            .find(|record| record.review_state == LearningReviewState::Candidate)
+            .cloned()
+            .expect("chat save should project a captured candidate");
+        let review_outcome = app
+            .review_learning_candidate(LearningReviewRequest::new(
+                candidate.record_id,
+                LearningReviewDecision::Reject,
+                "deterministic typed review rejected unsafe or non-useful candidate",
+                LearningProvenance::conversation(
+                    conversation_id,
+                    "typed-review:reject-learning-candidate",
+                    "typed-review-fingerprint",
+                ),
+            ))
+            .await?;
+        let next_conversation = Conversation::generate();
+        let next_conversation_id = next_conversation.id;
+        setup.upsert_conversation(next_conversation).await?;
+        setup.state.captured_provider_context.lock().await.take();
+        let mut next_stream = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            app.chat(
+                setup.state.agent.id.clone(),
+                ChatRequest::new(
+                    Event::new("next chat excludes rejected learning"),
+                    next_conversation_id,
+                ),
+            ),
+        )
+        .await??;
+
+        for _ in 0..32 {
+            if setup.state.captured_provider_context.lock().await.is_some() {
+                break;
+            }
+            match tokio::time::timeout(std::time::Duration::from_millis(250), next_stream.next())
+                .await
+            {
+                Ok(Some(response)) => {
+                    response?;
+                }
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
+
+        let captured_context = setup
+            .state
+            .captured_provider_context
+            .lock()
+            .await
+            .clone()
+            .expect("provider context should be captured by fake provider");
+        let injected = captured_context
+            .messages
+            .iter()
+            .any(|message| match &message.message {
+                ContextMessage::Text(text) => text.is_learning_context(),
+                _ => false,
+            });
+        let actual = (
+            review_outcome.event.event_kind,
+            review_outcome.projection.review_state,
+            injected,
+        );
+        let expected = (
+            LearningEventKind::ReviewRejected,
+            LearningReviewState::Rejected,
+            false,
+        );
         assert_eq!(actual, expected);
         Ok(())
     }
@@ -3208,10 +3766,10 @@ mod tests {
         let model_id = ModelId::new("test-model");
         let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
 
-        let actual = ProjectContextInjection::new(setup, agent)
+        let actual = ProjectContextInjection::new(setup.clone(), agent)
             .explain(Some("find automatic injection needle".to_string()))
             .await;
-        let expected = (root, true, 1usize, 1usize, None::<String>);
+        let expected = (root, true, 1usize, 1usize, None::<String>, 0usize);
 
         assert_eq!(
             (
@@ -3220,8 +3778,189 @@ mod tests {
                 actual.candidates.len(),
                 actual.selected_targets.len(),
                 actual.skip_reason,
+                setup.workspace_queries.load(Ordering::SeqCst),
             ),
             expected
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_context_with_query_is_read_only_and_does_not_query_workspace() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root);
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
+
+        let actual = ProjectContextInjection::new(setup.clone(), agent)
+            .explain(Some("find automatic injection needle".to_string()))
+            .await;
+        let expected = (0usize, Vec::<PathBuf>::new(), true, 1usize);
+
+        assert_eq!(
+            (
+                setup.workspace_queries.load(Ordering::SeqCst),
+                actual.retrieval_empty_targets,
+                actual.would_inject,
+                actual.replay_preview_diagnostics.len(),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inject_still_queries_workspace_for_representative_query() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root);
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let conversation = Conversation::generate().context(Context::default().add_message(
+            ContextMessage::user("find automatic injection needle", Some(model_id)),
+        ));
+
+        ProjectContextInjection::new(setup.clone(), agent)
+            .inject(conversation)
+            .await;
+        let actual = setup.workspace_queries.load(Ordering::SeqCst);
+        let expected = 1usize;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_context_includes_replay_derived_non_query_specific_preview() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root);
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
+
+        let actual = ProjectContextInjection::new(setup, agent)
+            .explain(Some("unrelated query text".to_string()))
+            .await;
+        let actual_preview = actual
+            .replay_preview_diagnostics
+            .first()
+            .expect("explain should include replay-derived preview diagnostic");
+        let expected = (
+            WorkspaceEvidenceReplayPreviewStatus::PreviewedWithSelection,
+            Some("reference_only"),
+            Some(1usize),
+            1usize,
+            true,
+        );
+
+        assert_eq!(
+            (
+                actual_preview.status.clone(),
+                actual_preview.content_policy.as_deref(),
+                actual_preview
+                    .budget
+                    .as_ref()
+                    .map(|budget| budget.selected_count),
+                actual_preview.selected.len(),
+                actual_preview
+                    .rendered_preview
+                    .as_ref()
+                    .is_some_and(|preview| preview.contains("evidence_replay_preview")),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_context_empty_replay_preview_is_not_injection_impossible() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup =
+            ProjectContextHarness::new_with_replay_preview_empty_paths(root.clone(), vec![root]);
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
+
+        let actual = ProjectContextInjection::new(setup, agent)
+            .explain(Some("find automatic injection needle".to_string()))
+            .await;
+        let actual_preview = actual
+            .replay_preview_diagnostics
+            .first()
+            .expect("explain should include empty replay diagnostic");
+        let expected = (
+            true,
+            WorkspaceEvidenceReplayPreviewStatus::NotPreviewedEmptyReplay,
+            Some("no previewable ledger evidence"),
+            false,
+            0usize,
+        );
+
+        assert_eq!(
+            (
+                actual.would_inject,
+                actual_preview.status.clone(),
+                actual_preview.not_previewed_reason.as_deref(),
+                actual_preview.rendered_preview.is_some(),
+                actual_preview.selected.len(),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_context_stale_manifest_is_diagnostic_state_without_writes() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new_with_stale_paths(root.clone(), vec![root]);
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
+
+        let actual = ProjectContextInjection::new(setup.clone(), agent)
+            .explain(Some("find automatic injection needle".to_string()))
+            .await;
+        let actual_preview = actual
+            .replay_preview_diagnostics
+            .first()
+            .expect("stale manifest should still produce read-only replay diagnostic state");
+        let expected = (
+            false,
+            0usize,
+            WorkspaceEvidenceReplayPreviewStatus::NotPreviewedManifestStale,
+            "stale",
+        );
+
+        assert_eq!(
+            (
+                actual.would_inject,
+                setup.workspace_queries.load(Ordering::SeqCst),
+                actual_preview.status.clone(),
+                actual_preview.manifest_freshness.as_str(),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_context_replay_preview_is_metadata_only_and_redacted() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root.clone());
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
+
+        let actual = ProjectContextInjection::new(setup, agent)
+            .explain(Some("find automatic injection needle".to_string()))
+            .await;
+        let actual = serde_json::to_string(&actual.replay_preview_diagnostics)?;
+        let expected = (false, false, false, true, true);
+
+        assert_eq!(
+            (
+                actual.contains("pub fn automatic_injection_needle"),
+                actual.contains("tool payload"),
+                actual.contains(&root.display().to_string()),
+                actual.contains("workspace_root"),
+                actual.contains("project_model_manifest"),
+            ),
+            expected,
         );
         Ok(())
     }

@@ -7,19 +7,20 @@ use forge_domain::{
     AgentId, AnyProvider, Attachment, AuthContextRequest, AuthContextResponse, AuthMethod,
     ChatCompletionMessage, CommandOutput, Context, Conversation, ConversationId, File, FileInfo,
     FileStatus, Image, LearningLedgerEvent, LearningLedgerFreshness, LearningRecordProjection,
-    LearningReviewState, McpConfig, McpServers, Model, ModelId, Node, ProcessId, ProcessReadCursor,
-    ProcessReadOutput, ProcessStartOutput, ProcessStatus, Provider, ProviderId, ResultStream,
-    Scope, SearchParams, SteerMessage, SubagentTaskId, SubagentTaskSession,
-    SubagentTaskSessionFilter, SyncProgress, SyntaxError, Template, ToolCallFull, ToolOutput,
-    WorkspaceAuth, WorkspaceContextManifestDiagnostic, WorkspaceEvidenceReplayDiagnostic,
-    WorkspaceEvidenceReplayPreviewDiagnostic, WorkspaceExactFactReferenceReport,
-    WorkspaceExactFactStatusReport, WorkspaceId, WorkspaceInfo,
+    LearningReviewOutcome, LearningReviewRequest, LearningReviewState, McpConfig, McpServers,
+    Model, ModelId, Node, ProcessId, ProcessReadCursor, ProcessReadOutput, ProcessStartOutput,
+    ProcessStatus, Provider, ProviderId, ResultStream, Scope, SearchParams, SteerMessage,
+    SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter, SyncProgress, SyntaxError,
+    Template, ToolCallFull, ToolOutput, WorkspaceAuth, WorkspaceContextManifestDiagnostic,
+    WorkspaceEvidenceReplayDiagnostic, WorkspaceEvidenceReplayPreviewDiagnostic,
+    WorkspaceExactFactReferenceReport, WorkspaceExactFactStatusReport, WorkspaceId, WorkspaceInfo,
 };
 use forge_eventsource::EventSource;
 use reqwest::Response;
 use reqwest::header::HeaderMap;
 use url::Url;
 
+use crate::dto::ConversationBranchTarget;
 use crate::user::{User, UserUsage};
 use crate::{EnvironmentInfra, Walker};
 
@@ -322,6 +323,18 @@ pub trait ConversationService: Send + Sync {
         F: FnOnce(&mut Conversation) -> T + Send,
         T: Send;
 
+    /// Lists branch targets for a conversation using the domain selectable-target filter.
+    ///
+    /// # Arguments
+    /// * `conversation_id` - Source conversation ID.
+    ///
+    /// # Errors
+    /// Returns an error when the source conversation is missing or has no context.
+    async fn list_branch_targets(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> anyhow::Result<Vec<ConversationBranchTarget>>;
+
     /// Creates a branch-only conversation by excluding the selected message and
     /// everything after it. The source conversation is normalized and preserved.
     ///
@@ -456,6 +469,57 @@ pub trait LearningService: Send + Sync {
         &self,
         event: LearningLedgerEvent,
     ) -> anyhow::Result<LearningLedgerEvent>;
+
+    /// Reviews a captured candidate through a typed append-only event.
+    ///
+    /// # Arguments
+    /// * `request` - Typed review request containing record, decision, and provenance.
+    ///
+    /// # Errors
+    /// Returns an error if the record is unavailable, not a candidate, or persistence fails.
+    async fn review_learning_candidate(
+        &self,
+        request: LearningReviewRequest,
+    ) -> anyhow::Result<LearningReviewOutcome> {
+        let before = self
+            .list_learning_records(None, usize::MAX)
+            .await?
+            .into_iter()
+            .find(|record| record.record_id == request.record_id)
+            .ok_or_else(|| anyhow::anyhow!("learning candidate record not found"))?;
+        let target_state = request.decision.review_state();
+        if before.review_state == target_state {
+            let event = LearningLedgerEvent::review(
+                request.record_id,
+                request.decision.event_kind(),
+                request.review_note,
+                request.provenance,
+                chrono::Utc::now(),
+            )?;
+            return Ok(LearningReviewOutcome { event, projection: before });
+        }
+        if before.review_state != LearningReviewState::Candidate {
+            anyhow::bail!(
+                "learning record cannot be reviewed from state {}",
+                before.review_state
+            );
+        }
+        let event = LearningLedgerEvent::review(
+            request.record_id,
+            request.decision.event_kind(),
+            request.review_note,
+            request.provenance,
+            chrono::Utc::now(),
+        )?;
+        let event = self.insert_learning_event(event).await?;
+        let projection = self
+            .list_learning_records(Some(target_state), usize::MAX)
+            .await?
+            .into_iter()
+            .find(|record| record.record_id == request.record_id)
+            .ok_or_else(|| anyhow::anyhow!("learning review event did not produce target state"))?;
+        Ok(LearningReviewOutcome { event, projection })
+    }
 
     /// Lists projected learning records.
     ///
@@ -979,6 +1043,15 @@ impl<I: Services> ConversationService for I {
         self.conversation_service().modify_conversation(id, f).await
     }
 
+    async fn list_branch_targets(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> anyhow::Result<Vec<ConversationBranchTarget>> {
+        self.conversation_service()
+            .list_branch_targets(conversation_id)
+            .await
+    }
+
     async fn branch_conversation(
         &self,
         conversation_id: &ConversationId,
@@ -1073,6 +1146,15 @@ impl<I: Services> LearningService for I {
         event: LearningLedgerEvent,
     ) -> anyhow::Result<LearningLedgerEvent> {
         self.learning_service().insert_learning_event(event).await
+    }
+
+    async fn review_learning_candidate(
+        &self,
+        request: LearningReviewRequest,
+    ) -> anyhow::Result<LearningReviewOutcome> {
+        self.learning_service()
+            .review_learning_candidate(request)
+            .await
     }
 
     async fn list_learning_records(
@@ -1704,6 +1786,13 @@ mod tests {
                 current_id = next_parent_id;
             }
             Ok(Some(root_id))
+        }
+
+        async fn list_branch_targets(
+            &self,
+            _conversation_id: &ConversationId,
+        ) -> anyhow::Result<Vec<ConversationBranchTarget>> {
+            Ok(Vec::new())
         }
 
         async fn modify_conversation<F, T>(&self, id: &ConversationId, f: F) -> anyhow::Result<T>

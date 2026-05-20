@@ -181,6 +181,13 @@ impl<
         self.services.find_conversation(conversation_id).await
     }
 
+    async fn list_branch_targets(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> anyhow::Result<Vec<forge_app::dto::ConversationBranchTarget>> {
+        self.services.list_branch_targets(conversation_id).await
+    }
+
     async fn branch_conversation(
         &self,
         conversation_id: &ConversationId,

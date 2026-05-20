@@ -134,6 +134,35 @@ pub enum LearningReviewState {
     Superseded,
 }
 
+/// Review decision for a captured learning candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, StrumDisplay, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum LearningReviewDecision {
+    /// Accept the candidate for bounded future injection.
+    Accept,
+    /// Reject the candidate and keep it excluded from injection.
+    Reject,
+}
+
+impl LearningReviewDecision {
+    /// Returns the append-only ledger event kind for this review decision.
+    pub fn event_kind(&self) -> LearningEventKind {
+        match self {
+            Self::Accept => LearningEventKind::ReviewAccepted,
+            Self::Reject => LearningEventKind::ReviewRejected,
+        }
+    }
+
+    /// Returns the projected review state produced by this decision.
+    pub fn review_state(&self) -> LearningReviewState {
+        match self {
+            Self::Accept => LearningReviewState::Accepted,
+            Self::Reject => LearningReviewState::Rejected,
+        }
+    }
+}
+
 /// Redaction status for persisted learning records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, StrumDisplay, EnumString)]
 #[serde(rename_all = "snake_case")]
@@ -322,7 +351,8 @@ impl LearningLedgerEvent {
         provenance.validate()?;
         let redacted = RedactedLearningSummary::from_raw(summary.into());
         let source_id = provenance.source_id()?;
-        let idempotency_key = stable_learning_key(
+        let idempotency_key = stable_review_key(
+            record_id,
             event_kind,
             provenance.source_kind,
             &source_id,
@@ -342,6 +372,52 @@ impl LearningLedgerEvent {
             schema_version: LEARNING_LEDGER_SCHEMA_VERSION,
         })
     }
+}
+
+/// Typed request to review one captured learning candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Setters)]
+#[setters(into)]
+pub struct LearningReviewRequest {
+    /// Candidate record to review.
+    pub record_id: LearningRecordId,
+    /// Conservative review decision.
+    pub decision: LearningReviewDecision,
+    /// Redacted reviewer note used only as event evidence.
+    pub review_note: String,
+    /// Typed review provenance.
+    pub provenance: LearningProvenance,
+}
+
+impl LearningReviewRequest {
+    /// Creates a typed learning review request.
+    ///
+    /// # Arguments
+    /// * `record_id` - Candidate record identifier.
+    /// * `decision` - Review decision to append.
+    /// * `review_note` - Redacted note explaining the review.
+    /// * `provenance` - Typed review provenance.
+    pub fn new(
+        record_id: LearningRecordId,
+        decision: LearningReviewDecision,
+        review_note: impl Into<String>,
+        provenance: LearningProvenance,
+    ) -> Self {
+        Self {
+            record_id,
+            decision,
+            review_note: review_note.into(),
+            provenance,
+        }
+    }
+}
+
+/// Result of reviewing one learning candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LearningReviewOutcome {
+    /// Review event appended or deduplicated by the ledger.
+    pub event: LearningLedgerEvent,
+    /// Projection after the review event was applied.
+    pub projection: LearningRecordProjection,
 }
 
 /// Projected learning record returned by repository queries.
@@ -446,6 +522,27 @@ fn stable_learning_key(
     ))
 }
 
+fn stable_review_key(
+    record_id: LearningRecordId,
+    event_kind: LearningEventKind,
+    source_kind: LearningSourceKind,
+    source_id: &str,
+    source_event_id: &str,
+    content_fingerprint: &str,
+) -> String {
+    digest_hex(format!(
+        "{}:{}",
+        record_id.into_string(),
+        stable_learning_key(
+            event_kind,
+            source_kind,
+            source_id,
+            source_event_id,
+            content_fingerprint
+        )
+    ))
+}
+
 fn digest_hex(value: impl AsRef<[u8]>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.as_ref());
@@ -489,6 +586,35 @@ mod tests {
             true,
             LEARNING_LEDGER_SCHEMA_VERSION,
         );
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn review_idempotency_is_record_scoped_for_identical_review_evidence() {
+        let conversation_id = ConversationId::generate();
+        let provenance =
+            LearningProvenance::conversation(conversation_id, "review-event", "review-fingerprint");
+        let created_at = Utc::now();
+        let left = LearningLedgerEvent::review(
+            LearningRecordId::generate(),
+            LearningEventKind::ReviewAccepted,
+            "accepted by deterministic policy",
+            provenance.clone(),
+            created_at,
+        )
+        .unwrap();
+        let right = LearningLedgerEvent::review(
+            LearningRecordId::generate(),
+            LearningEventKind::ReviewAccepted,
+            "accepted by deterministic policy",
+            provenance,
+            created_at,
+        )
+        .unwrap();
+
+        let actual = left.idempotency_key == right.idempotency_key;
+        let expected = false;
 
         assert_eq!(actual, expected);
     }

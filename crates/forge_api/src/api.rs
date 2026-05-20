@@ -70,6 +70,12 @@ pub trait API: Sync + Send {
     /// Returns the conversation with the given ID
     async fn conversation(&self, conversation_id: &ConversationId) -> Result<Option<Conversation>>;
 
+    /// Lists selectable message targets for branch-only conversation creation.
+    async fn list_branch_targets(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> Result<Vec<forge_app::dto::ConversationBranchTarget>>;
+
     /// Creates a branch-only conversation from a selected prior message.
     async fn branch_conversation(
         &self,

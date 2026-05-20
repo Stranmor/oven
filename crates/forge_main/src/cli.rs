@@ -916,6 +916,16 @@ pub enum ConversationCommand {
         porcelain: bool,
     },
 
+    /// List selectable message targets for branch-only conversation creation.
+    Targets {
+        /// Conversation ID whose selectable targets should be listed.
+        id: ConversationId,
+
+        /// Output JSONL rows with message_id, ordinal, role, and preview fields.
+        #[arg(long)]
+        porcelain: bool,
+    },
+
     /// Clone conversation with a new ID.
     Clone {
         /// Conversation ID to clone.
@@ -1738,6 +1748,28 @@ mod tests {
             _ => false,
         };
         assert!(actual);
+    }
+
+    #[test]
+    fn test_conversation_targets_parse_with_porcelain() {
+        let conversation_id = ConversationId::generate();
+        let fixture = Cli::parse_from([
+            "forge",
+            "conversation",
+            "targets",
+            &conversation_id.to_string(),
+            "--porcelain",
+        ]);
+        let actual = match fixture.subcommands {
+            Some(TopLevelCommand::Conversation(conversation)) => match conversation.command {
+                ConversationCommand::Targets { id, porcelain } => (id, porcelain),
+                _ => (ConversationId::default(), false),
+            },
+            _ => (ConversationId::default(), false),
+        };
+        let expected = (conversation_id, true);
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

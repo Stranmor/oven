@@ -183,6 +183,13 @@ mod tests {
             Ok(f(conversation))
         }
 
+        async fn list_branch_targets(
+            &self,
+            _conversation_id: &ConversationId,
+        ) -> anyhow::Result<Vec<crate::dto::ConversationBranchTarget>> {
+            Ok(Vec::new())
+        }
+
         async fn branch_conversation(
             &self,
             _conversation_id: &ConversationId,

@@ -683,6 +683,28 @@ pub enum AppCommand {
     #[command(skip)]
     AgentSwitch(String),
 
+    /// Create and switch to a branch-only conversation before a selected message.
+    #[strum(props(usage = "Branch before a selected message; source conversation is preserved"))]
+    #[command(name = "branch")]
+    Branch {
+        /// Source conversation ID; defaults to current conversation.
+        #[arg(long = "conversation", short = 'c')]
+        conversation: Option<String>,
+        /// Stable message ID to branch before; opens picker when omitted.
+        message_id: Option<String>,
+    },
+
+    /// User-facing alias for branch-only conversation creation.
+    #[strum(props(usage = "Create an undo branch before a selected message; source is preserved"))]
+    #[command(name = "revert", alias = "undo")]
+    Revert {
+        /// Source conversation ID; defaults to current conversation.
+        #[arg(long = "conversation", short = 'c')]
+        conversation: Option<String>,
+        /// Stable message ID to branch before; opens picker when omitted.
+        message_id: Option<String>,
+    },
+
     /// Paste image from clipboard
     #[strum(props(usage = "Paste image from clipboard"))]
     Paste,
@@ -737,6 +759,8 @@ impl AppCommand {
             AppCommand::Delete => "delete",
             AppCommand::Rename { .. } => "rename",
             AppCommand::AgentSwitch(agent_id) => agent_id,
+            AppCommand::Branch { .. } => "branch",
+            AppCommand::Revert { .. } => "revert",
             AppCommand::Index => "index",
             AppCommand::Subchats => "subchats",
             AppCommand::Paste => "paste",
@@ -1028,6 +1052,55 @@ mod tests {
         // Verify - provided value should override default
         assert_eq!(result, Some(String::from("provided_value")));
     }
+    #[test]
+    fn test_parse_branch_command_with_current_conversation_picker() {
+        // Setup
+        let cmd_manager = ForgeCommandManager::default();
+
+        // Execute
+        let actual = parse_command(&cmd_manager, ":branch");
+        let expected = AppCommand::Branch { conversation: None, message_id: None };
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_parse_branch_command_with_conversation_and_message() {
+        // Setup
+        let cmd_manager = ForgeCommandManager::default();
+        let conversation_id = "550e8400-e29b-41d4-a716-446655440001";
+        let message_id = "00000000-0000-5000-8000-000000000001";
+
+        // Execute
+        let actual = parse_command(
+            &cmd_manager,
+            &format!("/branch --conversation {conversation_id} {message_id}"),
+        );
+        let expected = AppCommand::Branch {
+            conversation: Some(conversation_id.to_string()),
+            message_id: Some(message_id.to_string()),
+        };
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_parse_revert_and_undo_commands() {
+        // Setup
+        let cmd_manager = ForgeCommandManager::default();
+        let message_id = "00000000-0000-5000-8000-000000000002";
+
+        // Execute
+        let actual_revert = parse_command(&cmd_manager, &format!(":revert {message_id}"));
+        let actual_undo = parse_command(&cmd_manager, "/undo");
+        let expected_revert =
+            AppCommand::Revert { conversation: None, message_id: Some(message_id.to_string()) };
+        let expected_undo = AppCommand::Revert { conversation: None, message_id: None };
+
+        assert_eq!(actual_revert, expected_revert);
+        assert_eq!(actual_undo, expected_undo);
+    }
+
     #[test]
     fn test_parse_shell_command() {
         // Setup

@@ -213,7 +213,7 @@ pub struct WorkspaceContextCandidateDiagnostic {
 }
 
 /// User-facing explanation for automatic project-model context injection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceContextExplanation {
     /// Current working directory used for target resolution.
     pub cwd: PathBuf,
@@ -226,12 +226,42 @@ pub struct WorkspaceContextExplanation {
     /// Nearest manifest candidates skipped because manifest readiness blocked injection.
     pub nearest_skipped_manifest_candidates: Vec<WorkspaceContextManifestDiagnostic>,
     /// Selected target roots whose retrieval returned no usable nodes for the
-    /// explained query.
+    /// explained query. This legacy field is preserved for porcelain
+    /// compatibility; read-only explain no longer performs retrieval dry-runs.
     pub retrieval_empty_targets: Vec<PathBuf>,
-    /// Whether automatic project-model context would be injected.
+    /// Read-only replay-derived preview diagnostics from the existing evidence
+    /// ledger. These diagnostics are non-query-specific and do not predict
+    /// query_workspace retrieval output.
+    #[serde(default)]
+    pub replay_preview_diagnostics: Vec<WorkspaceEvidenceReplayPreviewDiagnostic>,
+    /// Whether automatic project-model context would pass the manifest/query gate.
+    /// This does not predict query-specific retrieval output.
     pub would_inject: bool,
     /// Exact top-level reason context would not be injected.
     pub skip_reason: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_context_explanation_deserializes_legacy_payload_without_replay_preview() {
+        let fixture = r#"{
+            "cwd":"/workspace",
+            "query":"needle",
+            "candidates":[],
+            "selected_targets":[],
+            "nearest_skipped_manifest_candidates":[],
+            "retrieval_empty_targets":[],
+            "would_inject":false,
+            "skip_reason":"legacy"
+        }"#;
+        let actual: WorkspaceContextExplanation = serde_json::from_str(fixture).unwrap();
+        let expected = Vec::<WorkspaceEvidenceReplayPreviewDiagnostic>::new();
+
+        assert_eq!(actual.replay_preview_diagnostics, expected);
+    }
 }
 
 /// Redaction-safe diagnostic-only workspace evidence replay status.

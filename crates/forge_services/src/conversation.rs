@@ -7,6 +7,7 @@ use forge_app::domain::{
     Conversation, ConversationId, MessageId, SubagentTaskId, SubagentTaskSession,
     SubagentTaskSessionFilter,
 };
+use forge_app::dto::ConversationBranchTarget;
 use forge_domain::ConversationRepository;
 
 /// Service for managing conversations, including creation, retrieval, and
@@ -89,6 +90,25 @@ impl<S: ConversationRepository> ConversationService for ForgeConversationService
             current_id = next_parent_id;
         }
         Ok(Some(root_id))
+    }
+
+    async fn list_branch_targets(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> Result<Vec<ConversationBranchTarget>> {
+        let source = self
+            .conversation_repository
+            .get_conversation(conversation_id)
+            .await?
+            .ok_or_else(|| forge_app::domain::Error::ConversationNotFound(*conversation_id))?;
+        let mut context = source
+            .context
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Conversation {conversation_id} has no context"))?;
+        context.conversation_id = Some(source.id);
+        Ok(ConversationBranchTarget::list_from_context(
+            source.id, &context,
+        ))
     }
 
     async fn branch_conversation(
@@ -199,7 +219,9 @@ mod tests {
     use std::sync::Mutex;
 
     use forge_app::ConversationService;
-    use forge_app::domain::{Context, ContextMessage, ConversationId, Initiator, MessageEntry};
+    use forge_app::domain::{
+        Context, ContextMessage, ConversationId, Initiator, MessageEntry, Role, TextMessage,
+    };
     use pretty_assertions::assert_eq;
 
     use super::*;
@@ -374,6 +396,105 @@ mod tests {
 
     fn assistant_message(content: impl Into<String>) -> MessageEntry {
         ContextMessage::assistant(content.into(), None, None, None).into()
+    }
+
+    #[tokio::test]
+    async fn test_list_branch_targets_is_read_only_and_preserves_metadata() -> anyhow::Result<()> {
+        let repository = Arc::new(FixtureRepository::default());
+        let service = ForgeConversationService::new(repository.clone());
+        let source_id = ConversationId::generate();
+        let source = Conversation::new(source_id)
+            .title(Some("Source".to_string()))
+            .context(Some(
+                Context::default().conversation_id(source_id).messages(vec![
+                    ContextMessage::system("system").into(),
+                    user_message("hello\nuser"),
+                    assistant_message("hello assistant"),
+                ]),
+            ));
+
+        repository.upsert_conversation(source.clone()).await?;
+        let actual = service.list_branch_targets(&source_id).await?;
+        let persisted_source = repository
+            .get_conversation(&source_id)
+            .await?
+            .expect("source conversation should remain persisted");
+        let expected = vec![
+            (source_id, 1usize, Role::User, "hello user".to_string()),
+            (
+                source_id,
+                2usize,
+                Role::Assistant,
+                "hello assistant".to_string(),
+            ),
+        ];
+        let actual_metadata = actual
+            .iter()
+            .map(|target| {
+                (
+                    target.conversation_id,
+                    target.ordinal,
+                    target.role,
+                    target.preview.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual_metadata, expected);
+        assert_eq!(text_contents(&persisted_source), text_contents(&source));
+        assert!(
+            actual
+                .iter()
+                .all(|target| !target.message_id.into_string().is_empty())
+        );
+        assert!(
+            persisted_source
+                .context
+                .as_ref()
+                .expect("source context should exist")
+                .messages
+                .iter()
+                .all(|entry| entry.id.is_none())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_branch_targets_uses_domain_filter_for_negative_cases() -> anyhow::Result<()>
+    {
+        let repository = Arc::new(FixtureRepository::default());
+        let service = ForgeConversationService::new(repository.clone());
+        let source_id = ConversationId::generate();
+        let source = Conversation::new(source_id).context(Some(
+            Context::default().conversation_id(source_id).messages(vec![
+                ContextMessage::system("system").into(),
+                ContextMessage::Text(TextMessage::learning_context(Role::User, "learning")).into(),
+                ContextMessage::Text(TextMessage::new(Role::User, "droppable").droppable(true))
+                    .into(),
+                ContextMessage::assistant(
+                    "assistant with tool",
+                    None,
+                    None,
+                    Some(vec![
+                        forge_domain::ToolCallFull::new("read").call_id("call_id"),
+                    ]),
+                )
+                .into(),
+                user_message("kept"),
+            ]),
+        ));
+
+        repository.upsert_conversation(source).await?;
+        let actual = service
+            .list_branch_targets(&source_id)
+            .await?
+            .into_iter()
+            .map(|target| (target.ordinal, target.role, target.preview))
+            .collect::<Vec<_>>();
+        let expected = vec![(4usize, Role::User, "kept".to_string())];
+
+        assert_eq!(actual, expected);
+        Ok(())
     }
 
     #[tokio::test]

@@ -20,7 +20,7 @@ use forge_display::MarkdownFormat;
 use forge_domain::{
     AuthMethod, ChatResponseContent, ConsoleWriter, ContextMessage, Role, TitleFormat, UserCommand,
     WorkspaceEvidenceLedgerActivationDiagnostic, WorkspaceEvidenceReadinessDiagnostic,
-    WorkspaceExactFactReadinessDiagnostic,
+    WorkspaceEvidenceReplayPreviewDiagnostic, WorkspaceExactFactReadinessDiagnostic,
 };
 use forge_fs::ForgeFS;
 use forge_select::{ForgeWidget, SelectRow};
@@ -66,6 +66,23 @@ fn mark_internal_agent_session_if_requested(
     if internal_agent_session {
         conversation.ensure_delegated(None);
     }
+}
+
+fn branch_target_select_rows(
+    targets: Vec<forge_app::dto::ConversationBranchTarget>,
+) -> Vec<SelectRow> {
+    targets
+        .into_iter()
+        .map(|target| {
+            SelectRow::new(
+                target.message_id.to_string(),
+                format!(
+                    "{} #{} {} {}",
+                    target.role, target.ordinal, target.message_id, target.preview
+                ),
+            )
+        })
+        .collect::<Vec<_>>()
 }
 
 // File-specific constants
@@ -1056,6 +1073,10 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                 let conversation = self.validate_conversation_exists(&id).await?;
 
                 self.on_show_conv_stats(conversation, porcelain).await?;
+            }
+            ConversationCommand::Targets { id, porcelain } => {
+                self.validate_conversation_exists(&id).await?;
+                self.on_show_branch_targets(id, porcelain).await?;
             }
             ConversationCommand::Clone { id, porcelain } => {
                 let conversation = self.validate_conversation_exists(&id).await?;
@@ -2359,6 +2380,37 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         Ok(())
     }
 
+    async fn on_show_branch_targets(
+        &mut self,
+        conversation_id: ConversationId,
+        porcelain: bool,
+    ) -> anyhow::Result<()> {
+        let targets = self.api.list_branch_targets(&conversation_id).await?;
+        if porcelain {
+            for target in targets {
+                let row = serde_json::json!({
+                    "message_id": target.message_id,
+                    "ordinal": target.ordinal,
+                    "role": target.role,
+                    "preview": target.preview,
+                });
+                self.writeln(serde_json::to_string(&row)?)?;
+            }
+            return Ok(());
+        }
+
+        let mut info = Info::new().add_title(format!("Branch targets for {conversation_id}"));
+        for target in targets {
+            info = info.add_title(format!(
+                "{} #{} {}",
+                target.role, target.ordinal, target.message_id
+            ));
+            info = info.add_value(target.preview);
+        }
+        self.writeln(info)?;
+        Ok(())
+    }
+
     async fn on_command(&mut self, command: AppCommand) -> anyhow::Result<bool> {
         match command {
             AppCommand::Conversations { id } => {
@@ -2557,6 +2609,12 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             }
             AppCommand::Clone { id } => {
                 self.on_slash_clone(id).await?;
+            }
+            AppCommand::Branch { conversation, message_id } => {
+                self.on_slash_branch(conversation, message_id).await?;
+            }
+            AppCommand::Revert { conversation, message_id } => {
+                self.on_slash_branch(conversation, message_id).await?;
             }
             AppCommand::ConversationRename { name } => {
                 let args = if name.is_empty() {
@@ -4761,6 +4819,48 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         Ok(())
     }
 
+    async fn on_slash_branch(
+        &mut self,
+        conversation: Option<String>,
+        message_id: Option<String>,
+    ) -> anyhow::Result<()> {
+        let source_id = match conversation {
+            Some(raw_id) => ConversationId::parse(&raw_id)
+                .context(format!("Invalid conversation ID: {raw_id}"))?,
+            None => self.init_conversation().await?,
+        };
+        self.validate_conversation_exists(&source_id).await?;
+        let target_id = match message_id {
+            Some(raw_id) => forge_domain::MessageId::parse(&raw_id)
+                .context(format!("Invalid message ID: {raw_id}"))?,
+            None => self.select_branch_target(source_id).await?,
+        };
+        let branch = self.api.branch_conversation(&source_id, target_id).await?;
+        self.state.conversation_id = Some(branch.id);
+        self.writeln_title(TitleFormat::info(format!(
+            "Switched to branch {}. Source conversation {} was preserved.",
+            branch.id.into_string().bold(),
+            source_id.into_string().bold()
+        )))?;
+        Ok(())
+    }
+
+    async fn select_branch_target(
+        &mut self,
+        conversation_id: ConversationId,
+    ) -> anyhow::Result<forge_domain::MessageId> {
+        let targets = self.api.list_branch_targets(&conversation_id).await?;
+        if targets.is_empty() {
+            anyhow::bail!("Conversation {conversation_id} has no selectable branch targets");
+        }
+        let rows = branch_target_select_rows(targets);
+        let Some(row) = self.select_raw_row("Branch target", None, rows, 0, None)? else {
+            anyhow::bail!("No branch target selected");
+        };
+        forge_domain::MessageId::parse(row.raw)
+            .context("Selected branch target did not contain a valid message ID")
+    }
+
     fn update_model(&mut self, model: Option<ModelId>) {
         if let Some(ref model) = model {
             tracker::set_model(model.to_string());
@@ -5639,7 +5739,72 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             }
         }
 
+        info = info.add_title(format!(
+            "Replay-Derived Preview Diagnostics [{}]",
+            explanation.replay_preview_diagnostics.len()
+        ));
+        info = info.add_key_value(
+            "Replay Preview Scope",
+            "existing ledger preview; replay-derived; non-query-specific; not a prediction of query_workspace output",
+        );
+        if explanation.replay_preview_diagnostics.is_empty() {
+            info = info.add_key_value(
+                "Replay Preview",
+                "no selected fresh manifest target; no previewable ledger evidence was read",
+            );
+        }
+        for preview in &explanation.replay_preview_diagnostics {
+            info = info.add_key_value(
+                "Replay Preview",
+                Self::format_replay_preview_diagnostic(preview),
+            );
+            if let Some(rendered_preview) = &preview.rendered_preview {
+                info = info.add_key_value("Rendered Replay Preview", rendered_preview);
+            } else if preview.selected.is_empty() {
+                info = info.add_key_value(
+                    "Rendered Replay Preview",
+                    "no previewable ledger evidence; this does not mean injection is impossible or context is unavailable",
+                );
+            }
+        }
+
         self.writeln(info)
+    }
+
+    fn format_replay_preview_diagnostic(
+        preview: &WorkspaceEvidenceReplayPreviewDiagnostic,
+    ) -> String {
+        let budget = preview.budget.as_ref().map_or_else(
+            || "not_available".to_string(),
+            |budget| {
+                format!(
+                    "original_candidates={} selected={} excluded={} truncated={} max_artifacts={} max_episode_lines={} max_selected={} ordering={}",
+                    budget.original_candidate_count,
+                    budget.selected_count,
+                    budget.excluded_count,
+                    budget.truncated,
+                    budget.max_artifacts,
+                    budget.max_episode_lines,
+                    budget.max_selected,
+                    budget.stable_ordering,
+                )
+            },
+        );
+        format!(
+            "scope=replay_derived_non_query_specific status={} manifest_found={} manifest_freshness={} reason={} content_policy={} stale_policy={} changed_excluded={} deleted_excluded={} budget=[{}] selected={} issues={} rendered_preview={}",
+            preview.status.label(),
+            preview.manifest_found,
+            preview.manifest_freshness,
+            preview.not_previewed_reason.as_deref().unwrap_or("none"),
+            preview.content_policy.as_deref().unwrap_or("not_available"),
+            preview.stale_policy.as_deref().unwrap_or("not_available"),
+            preview.changed_excluded,
+            preview.deleted_excluded,
+            budget,
+            preview.selected.len(),
+            preview.issues.len(),
+            preview.rendered_preview.is_some(),
+        )
     }
 
     fn format_exact_fact_readiness(
@@ -5987,6 +6152,31 @@ mod tests {
 
         assert_eq!(conversation.initiator, forge_domain::Initiator::User);
         assert_eq!(conversation.parent_id, None);
+    }
+
+    #[test]
+    fn test_branch_target_select_rows_preserve_message_id_as_raw() {
+        let conversation_id = ConversationId::generate();
+        let message_id = forge_domain::MessageId::parse("00000000-0000-5000-8000-000000000123")
+            .expect("fixture message id should parse");
+        let targets = vec![forge_app::dto::ConversationBranchTarget {
+            conversation_id,
+            message_id,
+            ordinal: 7,
+            role: Role::Assistant,
+            preview: "safe preview".to_string(),
+        }];
+
+        let actual = branch_target_select_rows(targets)
+            .into_iter()
+            .map(|row| (row.raw, row.display))
+            .collect::<Vec<_>>();
+        let expected = vec![(
+            message_id.to_string(),
+            format!("Assistant #7 {message_id} safe preview"),
+        )];
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

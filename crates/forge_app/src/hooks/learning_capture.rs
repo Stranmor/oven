@@ -48,28 +48,21 @@ impl<S> LearningCapture<S> {
         if message_count == 0 {
             return None;
         }
-        let first_user = context
+        let user_message_count = context
             .messages
             .iter()
-            .find_map(|message| match &message.message {
-                ContextMessage::Text(text)
-                    if text.role == Role::User && !text.is_internal_context() =>
-                {
-                    Some(text.content.as_str())
+            .filter(|message| match &message.message {
+                ContextMessage::Text(text) => {
+                    text.role == Role::User && !text.is_internal_context()
                 }
-                _ => None,
+                _ => false,
             })
-            .unwrap_or("no user message");
-        let preview = first_user
-            .split_whitespace()
-            .take(24)
-            .collect::<Vec<_>>()
-            .join(" ");
+            .count();
         Some(format!(
-            "conversation_saved message_count={} context_fingerprint={} first_user_preview={}",
+            "conversation_saved message_count={} user_message_count={} context_fingerprint={}",
             message_count,
-            Self::context_fingerprint(conversation),
-            preview
+            user_message_count,
+            Self::context_fingerprint(conversation)
         ))
     }
 
@@ -188,10 +181,14 @@ mod tests {
         let actual = fixture.events.lock().unwrap().values().next().map(|event| {
             (
                 event.summary.contains("conversation_saved"),
+                event.summary.contains("user_message_count=1"),
+                event
+                    .summary
+                    .contains("capture a deterministic learning candidate"),
                 event.provenance.conversation_id,
             )
         });
-        let expected = Some((true, Some(conversation.id)));
+        let expected = Some((true, true, false, Some(conversation.id)));
         assert_eq!(actual, expected);
         Ok(())
     }
