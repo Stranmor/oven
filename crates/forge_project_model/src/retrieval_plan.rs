@@ -154,7 +154,8 @@ pub struct ProjectContextRetrievalQueryDiagnostics {
 /// Deterministic write decision for project-context retrieval.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProjectContextWriteDecision {
-    /// No readback or pack write should occur because retrieval selected no evidence.
+    /// No readback or pack write should occur because retrieval selected no
+    /// evidence.
     NoWriteEmptyRetrieval,
     /// Persist the context pack after every readback succeeds.
     WriteContextPackAfterReadback,
@@ -186,7 +187,8 @@ impl ProjectContextReadRequest {
     ///
     /// # Arguments
     ///
-    /// * `relative_manifest_path` - Manifest-relative path using safe normal path components.
+    /// * `relative_manifest_path` - Manifest-relative path using safe normal
+    ///   path components.
     /// * `evidence_id` - Evidence identifier to associate with the readback.
     /// * `start_line` - One-based inclusive start line.
     /// * `end_line` - One-based inclusive end line.
@@ -225,7 +227,8 @@ impl ProjectContextReadRequest {
 /// # Arguments
 ///
 /// * `manifest` - Project manifest used for retrieval and evidence resolution.
-/// * `freshness` - Freshness evaluation used for injection gating and stale evidence checks.
+/// * `freshness` - Freshness evaluation used for injection gating and stale
+///   evidence checks.
 /// * `request` - Typed retrieval request.
 pub fn plan_project_context_retrieval(
     manifest: &ProjectManifest,
@@ -385,17 +388,33 @@ fn validate_manifest_relative_path(path: &str) -> Result<()> {
     if parsed.is_absolute() {
         bail!("project context read path must be relative");
     }
+    for segment in path.split('/') {
+        if segment.is_empty() {
+            bail!("project context read path contains empty component");
+        }
+        if segment == "." || segment == ".." {
+            bail!("project context read path contains traversal");
+        }
+    }
+    let mut has_component = false;
     for component in parsed.components() {
         match component {
-            Component::Normal(value) if !value.is_empty() => {}
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                bail!("project context read path contains traversal");
+            Component::Normal(value) if !value.is_empty() => {
+                has_component = true;
             }
             Component::Normal(_) => {
                 bail!("project context read path contains empty component");
             }
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                bail!("project context read path contains traversal");
+            }
         }
+    }
+    if !has_component {
+        bail!("project context read path must contain a normal component");
     }
     Ok(())
 }
@@ -656,6 +675,8 @@ mod tests {
             "../secret",
             "/tmp/secret",
             "",
+            ".",
+            "safe/./secret",
             "safe/../secret",
             "safe\\..\\secret",
         ];
@@ -663,7 +684,7 @@ mod tests {
             .into_iter()
             .map(|path| ProjectContextReadRequest::new(path, "id", 1, 1).is_err())
             .collect::<Vec<_>>();
-        let expected = vec![true, true, true, true, true];
+        let expected = vec![true, true, true, true, true, true, true];
         assert_eq!(actual, expected);
     }
 
