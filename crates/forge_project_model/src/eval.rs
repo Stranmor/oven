@@ -105,6 +105,17 @@ pub fn load_evidence_ledger_activation(
     }
     let episode_read =
         read_tool_episode_lines(indexer.model_dir(), &readiness_budget, &mut builder);
+    let readable_artifact_ids = readable_artifacts
+        .iter()
+        .map(|(artifact_id, _pack)| artifact_id.clone())
+        .collect::<Vec<_>>();
+    let activation_linkage =
+        evaluate_episode_artifact_links(&episode_read.episodes, &readable_artifact_ids);
+    let (issue_summaries, activation_issues_truncated) = activation_issue_summaries(
+        &readiness.issue_summaries,
+        &activation_linkage.issues,
+        budget.max_issue_summaries,
+    );
     let graph = tool_episodes_to_graph(&episode_read.episodes, &readable_artifacts)?;
     let graph_metadata = EvidenceLedgerGraphMetadata::from_graph(&graph);
     let graph_over_budget = graph_metadata.node_count > budget.max_nodes
@@ -113,19 +124,19 @@ pub fn load_evidence_ledger_activation(
     let issue_count = readiness
         .context_pack_issue_count
         .saturating_add(readiness.tool_episode_issue_count)
-        .saturating_add(readiness.missing_link_count);
+        .saturating_add(activation_linkage.issues.len());
     let summary = EvidenceLedgerActivationSummary {
         context_pack_artifact_count: readiness.context_pack_artifact_count,
         readable_context_pack_count: readable_artifacts.len(),
         tool_episode_count: readiness.tool_episode_count,
-        linked_episode_count: readiness.linked_episode_count,
-        missing_link_count: readiness.missing_link_count,
+        linked_episode_count: activation_linkage.linked_count,
+        missing_link_count: activation_linkage.issues.len(),
         graph_node_count: graph_metadata.node_count,
         graph_edge_count: graph_metadata.edge_count,
         worst_case_freshness: readiness.worst_case_freshness.clone(),
         issue_count,
-        issue_summaries: readiness.issue_summaries.clone(),
-        truncated: readiness.truncated || graph_over_budget,
+        issue_summaries,
+        truncated: readiness.truncated || graph_over_budget || activation_issues_truncated,
     };
     Ok(EvidenceLedgerActivation { summary, readiness, graph })
 }
@@ -205,6 +216,48 @@ pub fn diagnose_evidence_readiness(
         worst_case_freshness,
         issue_summaries: builder.issue_summaries,
         truncated: builder.truncated || episode_read.truncated,
+    }
+}
+
+fn activation_issue_summaries(
+    readiness_summaries: &[String],
+    linkage_issues: &[EvidenceLedgerEvalIssue],
+    max_issue_summaries: usize,
+) -> (Vec<String>, bool) {
+    let mut summaries = Vec::new();
+    let mut truncated = false;
+    for summary in readiness_summaries {
+        push_activation_issue_summary(
+            &mut summaries,
+            &mut truncated,
+            max_issue_summaries,
+            summary.clone(),
+        );
+    }
+    for issue in linkage_issues {
+        push_activation_issue_summary(
+            &mut summaries,
+            &mut truncated,
+            max_issue_summaries,
+            format!("episode_artifact_link:{:?}", issue.code),
+        );
+    }
+    (summaries, truncated)
+}
+
+fn push_activation_issue_summary(
+    summaries: &mut Vec<String>,
+    truncated: &mut bool,
+    max_issue_summaries: usize,
+    summary: String,
+) {
+    if summaries.contains(&summary) {
+        return;
+    }
+    if summaries.len() < max_issue_summaries {
+        summaries.push(summary);
+    } else {
+        *truncated = true;
     }
 }
 
@@ -1206,6 +1259,43 @@ mod tests {
         assert!(!actual_json.contains("not json"));
         assert!(!actual_json.contains("secret payload"));
         assert!(!actual_json.contains("raw tool payload"));
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_ledger_activation_does_not_count_corrupt_artifact_as_readable_link() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let artifact_id = ContextPackArtifactId::new("c".repeat(64))?;
+        fs::create_dir_all(fixture.path().join("model").join("context_packs"))?;
+        fs::write(
+            artifact_path(fixture.path(), &artifact_id),
+            "not json secret payload",
+        )?;
+        setup.append_episode(&fixture_episode(&artifact_id))?;
+
+        let actual =
+            load_evidence_ledger_activation(&setup, &EvidenceLedgerActivationBudget::default())?;
+        let expected = (0usize, 0usize, 1usize, 0usize, 2usize, true, true);
+
+        assert_eq!(
+            (
+                actual.summary.readable_context_pack_count,
+                actual.summary.linked_episode_count,
+                actual.summary.missing_link_count,
+                actual.summary.graph_edge_count,
+                actual.summary.issue_count,
+                actual
+                    .summary
+                    .issue_summaries
+                    .contains(&"context_pack:CorruptArtifact".to_string()),
+                actual
+                    .summary
+                    .issue_summaries
+                    .contains(&"episode_artifact_link:MissingLinkedArtifact".to_string()),
+            ),
+            expected,
+        );
         Ok(())
     }
 
