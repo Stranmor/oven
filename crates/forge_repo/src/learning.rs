@@ -104,6 +104,7 @@ impl LearningRepository for LearningRepositoryImpl {
                     .first::<LearningLedgerEventRecord>(connection)
                     .optional()?;
                 if let Some(existing) = existing {
+                    ensure_candidate_idempotency_replay(&existing, &record)?;
                     return existing
                         .try_into_event()
                         .map(LearningLedgerAppendOutcome::existing);
@@ -466,6 +467,32 @@ struct ProjectionBuilder {
     schema_version: i32,
 }
 
+fn ensure_candidate_idempotency_replay(
+    existing: &LearningLedgerEventRecord,
+    replay: &LearningLedgerEventRecord,
+) -> anyhow::Result<()> {
+    if existing.event_kind == LearningEventKind::CandidateCaptured.to_string()
+        && existing.event_kind == replay.event_kind
+        && existing.summary == replay.summary
+        && existing.content_fingerprint == replay.content_fingerprint
+        && existing.redaction_status == replay.redaction_status
+        && existing.source_kind == replay.source_kind
+        && existing.source_id == replay.source_id
+        && existing.source_event_id == replay.source_event_id
+        && existing.source_fingerprint == replay.source_fingerprint
+        && existing.conversation_id == replay.conversation_id
+        && existing.task_id == replay.task_id
+        && existing.tool_name == replay.tool_name
+        && existing.eval_id == replay.eval_id
+        && existing.capture_metadata == replay.capture_metadata
+        && existing.schema_version == replay.schema_version
+    {
+        return Ok(());
+    }
+
+    anyhow::bail!("learning candidate idempotency key collision for a different event")
+}
+
 fn project_records(
     records: Vec<LearningLedgerEventRecord>,
 ) -> anyhow::Result<Vec<LearningRecordProjection>> {
@@ -628,6 +655,35 @@ mod tests {
             forge_domain::LearningLedgerEventFreshness::Existing,
             1usize,
         );
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_insert_rejects_idempotency_collision_for_different_candidate()
+    -> anyhow::Result<()> {
+        let fixture = fixture_repo(18)?;
+        let conversation_id = ConversationId::generate();
+        let created_at = Utc::now();
+        let first = fixture_event(conversation_id, "event-1", "original candidate", created_at)?;
+        let first_outcome = fixture.insert_learning_event(first).await?;
+        let mut colliding = fixture_event(
+            conversation_id,
+            "event-2",
+            "different candidate with forged idempotency key",
+            created_at + Duration::seconds(1),
+        )?;
+        colliding.idempotency_key = first_outcome.event.idempotency_key;
+
+        let colliding_result = fixture.insert_learning_event(colliding).await;
+        let records = fixture.list_learning_records(None, 10).await?;
+        let actual = (
+            colliding_result.is_err(),
+            records.len(),
+            records.first().map(|record| record.summary.clone()),
+        );
+        let expected = (true, 1usize, Some("original candidate".to_string()));
 
         assert_eq!(actual, expected);
         Ok(())
