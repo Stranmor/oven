@@ -104,7 +104,7 @@ impl LearningRepository for LearningRepositoryImpl {
                     .first::<LearningLedgerEventRecord>(connection)
                     .optional()?;
                 if let Some(existing) = existing {
-                    ensure_candidate_idempotency_replay(&existing, &record)?;
+                    ensure_learning_event_idempotency_replay(&existing, &record)?;
                     return existing
                         .try_into_event()
                         .map(LearningLedgerAppendOutcome::existing);
@@ -467,12 +467,13 @@ struct ProjectionBuilder {
     schema_version: i32,
 }
 
-fn ensure_candidate_idempotency_replay(
+fn ensure_learning_event_idempotency_replay(
     existing: &LearningLedgerEventRecord,
     replay: &LearningLedgerEventRecord,
 ) -> anyhow::Result<()> {
-    if existing.event_kind == LearningEventKind::CandidateCaptured.to_string()
-        && existing.event_kind == replay.event_kind
+    if existing.event_kind == replay.event_kind
+        && (existing.event_kind == LearningEventKind::CandidateCaptured.to_string()
+            || existing.record_id == replay.record_id)
         && existing.summary == replay.summary
         && existing.content_fingerprint == replay.content_fingerprint
         && existing.redaction_status == replay.redaction_status
@@ -490,7 +491,7 @@ fn ensure_candidate_idempotency_replay(
         return Ok(());
     }
 
-    anyhow::bail!("learning candidate idempotency key collision for a different event")
+    anyhow::bail!("learning event idempotency key collision for a different event semantics")
 }
 
 fn project_records(
@@ -684,6 +685,49 @@ mod tests {
             records.first().map(|record| record.summary.clone()),
         );
         let expected = (true, 1usize, Some("original candidate".to_string()));
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_insert_is_idempotent_for_duplicate_review_event() -> anyhow::Result<()> {
+        let fixture = fixture_repo(19)?;
+        let conversation_id = ConversationId::generate();
+        let created_at = Utc::now();
+        let candidate = fixture
+            .insert_learning_event(fixture_event(
+                conversation_id,
+                "event-1",
+                "generic review replay candidate",
+                created_at,
+            )?)
+            .await?
+            .event;
+        let review = LearningLedgerEvent::review(
+            candidate.record_id,
+            LearningEventKind::ReviewAccepted,
+            "generic insert review replay",
+            LearningProvenance::conversation(conversation_id, "review-1", "review-fingerprint-1"),
+            created_at + Duration::seconds(1),
+        )?;
+
+        let left = fixture.insert_learning_event(review.clone()).await?;
+        let right = fixture.insert_learning_event(review).await?;
+        let events = fixture
+            .run_with_connection(move |connection, wid| {
+                learning_ledger_events::table
+                    .filter(learning_ledger_events::workspace_id.eq(workspace_db_id(wid)))
+                    .load::<LearningLedgerEventRecord>(connection)
+                    .map_err(Into::into)
+            })
+            .await?;
+        let actual = (left.freshness, right.freshness, events.len());
+        let expected = (
+            forge_domain::LearningLedgerEventFreshness::Inserted,
+            forge_domain::LearningLedgerEventFreshness::Existing,
+            2usize,
+        );
 
         assert_eq!(actual, expected);
         Ok(())
