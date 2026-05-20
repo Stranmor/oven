@@ -3889,7 +3889,14 @@ mod tests {
         LearningRecordProjection {
             record_id: LearningRecordId::generate(),
             summary: summary.to_string(),
-            accepted_summary: None,
+            accepted_summary: if review_state == LearningReviewState::Accepted {
+                Some(
+                    "sanctioned_sanitized_observation:validated_counters_and_fingerprints"
+                        .to_string(),
+                )
+            } else {
+                None
+            },
             review_state,
             redaction_status: LearningRedactionStatus::Clean,
             provenance: LearningProvenance::conversation(
@@ -4237,7 +4244,7 @@ mod tests {
         let actual = vec![
             learning_message
                 .content
-                .contains("accepted runtime learning reaches provider context"),
+                .contains("sanctioned_sanitized_observation:validated_counters_and_fingerprints"),
             learning_message
                 .content
                 .contains("candidate runtime learning must stay out"),
@@ -4287,6 +4294,11 @@ mod tests {
 
         assert!(
             learning_message
+                .content
+                .contains("sanctioned_sanitized_observation:validated_counters_and_fingerprints")
+        );
+        assert!(
+            !learning_message
                 .content
                 .contains("accepted reviewed learning")
         );
@@ -4347,7 +4359,7 @@ mod tests {
         let actual = vec![
             learning_message
                 .content
-                .contains("accepted reviewed learning remains the only injectable record"),
+                .contains("sanctioned_sanitized_observation:validated_counters_and_fingerprints"),
             learning_message.content.contains("sensor_proposal"),
             learning_message.content.contains("sensor_pending"),
             learning_message.content.contains("sensor_reject"),
@@ -4395,12 +4407,21 @@ mod tests {
     async fn learning_context_injection_skips_payload_over_char_budget() -> Result<()> {
         let (_fixture, root) = fixture_workspace()?;
         let setup = ProjectContextHarness::new(root);
-        setup
-            .set_learning_records(vec![fixture_learning_projection(
-                LearningReviewState::Accepted,
-                &"oversized reviewed learning ".repeat(1_000),
-            )])
-            .await;
+        let mut oversized = fixture_learning_projection(
+            LearningReviewState::Accepted,
+            &format!(
+                "conversation_saved {}",
+                "oversized reviewed learning ".repeat(1_000)
+            ),
+        );
+        oversized.accepted_summary = None;
+        oversized.capture_metadata = Some(LearningCaptureMetadata::conversation_save(
+            1,
+            1,
+            "oversized-context-fingerprint",
+            "oversized-summary-fingerprint",
+        ));
+        setup.set_learning_records(vec![oversized]).await;
         let model_id = ModelId::new("test-model");
         let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
         let conversation = Conversation::generate().context(Context::default().add_message(

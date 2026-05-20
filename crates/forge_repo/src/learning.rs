@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use diesel::prelude::*;
+use diesel::sqlite::SqliteConnection;
 use forge_domain::{
     AcceptedLearningSummary, ConversationId, LearningCaptureMetadata, LearningEventId,
     LearningEventKind, LearningEventSeq, LearningLedgerAppendOutcome, LearningLedgerCursor,
@@ -100,8 +101,8 @@ impl LearningRepository for LearningRepositoryImpl {
             event.provenance.validate()?;
             let workspace_id = workspace_db_id(wid);
             let record = LearningLedgerEventRecord::new(event, workspace_id)?;
-            ensure_direct_learning_append_event_allowed(&record)?;
             connection.immediate_transaction::<_, anyhow::Error, _>(|connection| {
+                ensure_direct_learning_append_event_allowed(connection, &record)?;
                 let existing = learning_ledger_events::table
                     .filter(learning_ledger_events::workspace_id.eq(workspace_id))
                     .filter(learning_ledger_events::idempotency_key.eq(&record.idempotency_key))
@@ -113,6 +114,11 @@ impl LearningRepository for LearningRepositoryImpl {
                         .try_into_event()
                         .map(LearningLedgerAppendOutcome::existing);
                 }
+                let records = learning_ledger_events::table
+                    .filter(learning_ledger_events::workspace_id.eq(workspace_id))
+                    .order(learning_ledger_events::event_seq.asc())
+                    .load::<LearningLedgerEventRecord>(connection)?;
+                ensure_direct_learning_append_allowed_for_existing_records(&record, &records)?;
                 diesel::insert_into(learning_ledger_events::table)
                     .values((
                         learning_ledger_events::event_id.eq(&record.event_id),
@@ -685,6 +691,7 @@ fn insert_or_replay_learning_event(
 }
 
 fn ensure_direct_learning_append_event_allowed(
+    connection: &mut SqliteConnection,
     record: &LearningLedgerEventRecord,
 ) -> anyhow::Result<()> {
     if record.event_kind == LearningEventKind::PromotionAudit.to_string() {
@@ -692,14 +699,53 @@ fn ensure_direct_learning_append_event_allowed(
             "sensor promotion audit events require repository promotion proof transaction"
         );
     }
-    if record.event_kind == LearningEventKind::ReviewAccepted.to_string()
-        && is_sanctioned_promotion_reviewer(record.eval_id.as_deref())
-    {
+    if record.event_kind != LearningEventKind::ReviewAccepted.to_string() {
+        return Ok(());
+    }
+    if is_sanctioned_promotion_reviewer(record.eval_id.as_deref()) {
         anyhow::bail!(
             "sensor promotion ReviewAccepted requires repository promotion proof transaction"
         );
     }
+    let sensor_proposal_exists = learning_ledger_events::table
+        .filter(learning_ledger_events::workspace_id.eq(record.workspace_id))
+        .filter(learning_ledger_events::record_id.eq(&record.record_id))
+        .filter(
+            learning_ledger_events::event_kind
+                .eq(LearningEventKind::SensorLessonProposed.to_string()),
+        )
+        .select(learning_ledger_events::event_seq)
+        .first::<i64>(connection)
+        .optional()?
+        .is_some();
+    anyhow::ensure!(
+        !sensor_proposal_exists,
+        "sensor-derived learning candidates require promotion proof before acceptance"
+    );
     Ok(())
+}
+
+fn ensure_direct_learning_append_allowed_for_existing_records(
+    record: &LearningLedgerEventRecord,
+    records: &[LearningLedgerEventRecord],
+) -> anyhow::Result<()> {
+    if is_terminal_review_event_kind(&record.event_kind)
+        && records.iter().any(|existing| {
+            existing.record_id == record.record_id
+                && existing.event_kind == LearningEventKind::SensorLessonProposed.to_string()
+        })
+    {
+        anyhow::bail!(
+            "sensor-derived learning candidates require promotion proof before terminal review"
+        );
+    }
+    Ok(())
+}
+
+fn is_terminal_review_event_kind(event_kind: &str) -> bool {
+    event_kind == LearningEventKind::ReviewAccepted.to_string()
+        || event_kind == LearningEventKind::ReviewRejected.to_string()
+        || event_kind == LearningEventKind::Superseded.to_string()
 }
 
 fn ensure_learning_event_idempotency_replay(
@@ -748,6 +794,13 @@ fn project_records(
                 .then_some((*event_seq, event.clone()))
         })
         .collect::<BTreeMap<_, _>>();
+    let sensor_derived_record_keys = event_records
+        .iter()
+        .filter_map(|(_, event)| {
+            (event.event_kind == LearningEventKind::SensorLessonProposed)
+                .then_some(event.record_id.into_string())
+        })
+        .collect::<BTreeSet<_>>();
     for (_, event) in event_records
         .iter()
         .filter(|(_, event)| event.event_kind == LearningEventKind::PromotionAudit)
@@ -795,6 +848,10 @@ fn project_records(
                         );
                         projection.accepted_summary = Some(accepted_summary);
                     } else {
+                        anyhow::ensure!(
+                            !sensor_derived_record_keys.contains(&record_key),
+                            "sensor-derived learning candidates require promotion proof before acceptance"
+                        );
                         projection.accepted_summary = None;
                     }
                     projection.review_state = LearningReviewState::Accepted;
@@ -2236,6 +2293,36 @@ mod tests {
             .await
             .is_err();
         let expected = true;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_generic_review_acceptance_is_blocked_for_sensor_derived_candidate()
+    -> anyhow::Result<()> {
+        let fixture = fixture_repo(33)?;
+        let created_at = Utc::now();
+        let request = fixture_promotion_request(&fixture, created_at).await?;
+        let generic_review = LearningLedgerEvent::review(
+            request.proposal().candidate_id(),
+            LearningEventKind::ReviewAccepted,
+            "direct generic unsafe acceptance",
+            LearningProvenance::conversation(
+                ConversationId::generate(),
+                "direct-generic-review",
+                "direct-generic-review-fingerprint",
+            ),
+            created_at + Duration::seconds(2),
+        )?;
+
+        let direct_result = fixture.insert_learning_event(generic_review).await;
+        let projection = fixture
+            .get_learning_record(request.proposal().candidate_id())
+            .await?
+            .expect("candidate projection should exist after rejected direct generic review");
+        let actual = (direct_result.is_err(), projection.review_state);
+        let expected = (true, LearningReviewState::Candidate);
 
         assert_eq!(actual, expected);
         Ok(())
