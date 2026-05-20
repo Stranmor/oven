@@ -1,5 +1,6 @@
+use forge_app::ToolResolver;
 use forge_config::ForgeConfig;
-use forge_domain::{AgentId, ToolName};
+use forge_domain::{AgentId, ModelId, ProviderId, ToolDefinition, ToolName};
 use pretty_assertions::assert_eq;
 
 use super::*;
@@ -106,6 +107,62 @@ fn test_parse_builtin_forge_agent_file_is_valid() {
             .template
             .contains("You are Forge")
     );
+}
+
+#[test]
+fn test_builtin_forge_agent_resolves_shell_process_observation_tools() {
+    let setup = include_str!("../agents/forge.md");
+    let fixture =
+        apply_subagent_tool_config(parse_agent_file(setup).unwrap(), &ForgeConfig::default())
+            .unwrap()
+            .into_agent(ProviderId::FORGE, ModelId::new("gpt-5.5"));
+    let tool_resolver = ToolResolver::new(vec![
+        ToolDefinition::new("shell"),
+        ToolDefinition::new("process_status"),
+        ToolDefinition::new("process_read"),
+        ToolDefinition::new("process_list"),
+        ToolDefinition::new("process_kill"),
+        ToolDefinition::new("read"),
+    ]);
+
+    let actual = tool_resolver
+        .resolve(&fixture)
+        .into_iter()
+        .map(|tool| tool.name.to_string())
+        .collect::<Vec<_>>();
+    let expected = vec![
+        "read".to_string(),
+        "shell".to_string(),
+        "process_kill".to_string(),
+        "process_list".to_string(),
+        "process_read".to_string(),
+        "process_status".to_string(),
+    ];
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn test_shell_capable_agent_authorizes_process_lifecycle_tools() {
+    let setup = include_str!("../agents/forge.md");
+    let fixture =
+        apply_subagent_tool_config(parse_agent_file(setup).unwrap(), &ForgeConfig::default())
+            .unwrap()
+            .into_agent(ProviderId::FORGE, ModelId::new("gpt-5.5"));
+
+    let actual = [
+        "shell",
+        "process_status",
+        "process_read",
+        "process_list",
+        "process_kill",
+    ]
+    .into_iter()
+    .map(|tool_name| ToolResolver::is_allowed(&fixture, &ToolName::new(tool_name)))
+    .collect::<Vec<_>>();
+    let expected = vec![true, true, true, true, true];
+
+    assert_eq!(actual, expected);
 }
 
 #[test]

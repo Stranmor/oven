@@ -25,6 +25,14 @@ fn deprecated_tool_aliases() -> HashMap<&'static str, ToolName> {
 }
 
 impl ToolResolver {
+    const SHELL_TOOL_NAME: &'static str = "shell";
+    const PROCESS_OBSERVATION_TOOL_NAMES: &'static [&'static str] = &[
+        "process_status",
+        "process_read",
+        "process_list",
+        "process_kill",
+    ];
+
     /// Creates a new ToolResolver with all available tool definitions
     pub fn new(all_tool_definitions: Vec<ToolDefinition>) -> Self {
         Self { all_tool_definitions }
@@ -69,15 +77,27 @@ impl ToolResolver {
 
     /// Builds glob patterns from the agent's tool patterns, deduplicating
     /// patterns. Supports backward compatibility by automatically adding
-    /// current tool names when deprecated aliases are used.
+    /// current tool names when deprecated aliases are used. Agents allowed to
+    /// execute shell commands also receive managed-process observation tools,
+    /// because shell handoff returns handles that must remain observable by the
+    /// same agent.
     fn build_specs(agent: &Agent) -> Vec<AllowedToolSpec> {
         let aliases = deprecated_tool_aliases();
-        let tool_names = agent
+        let mut tool_names = agent
             .tools
             .iter()
             .flatten()
-            .map(|name| aliases.get(name.as_str()).unwrap_or(name))
+            .map(|name| aliases.get(name.as_str()).unwrap_or(name).clone())
             .collect::<HashSet<_>>();
+
+        if tool_names.contains(&ToolName::new(Self::SHELL_TOOL_NAME)) {
+            tool_names.extend(
+                Self::PROCESS_OBSERVATION_TOOL_NAMES
+                    .iter()
+                    .copied()
+                    .map(ToolName::new),
+            );
+        }
 
         tool_names
             .into_iter()
@@ -346,6 +366,52 @@ mod tests {
         ];
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_shell_tool_resolves_managed_process_observation_tools() {
+        let all_tool_definitions = vec![
+            ToolDefinition::new("shell").description("Shell Tool"),
+            ToolDefinition::new("process_status").description("Process Status Tool"),
+            ToolDefinition::new("process_read").description("Process Read Tool"),
+            ToolDefinition::new("process_list").description("Process List Tool"),
+            ToolDefinition::new("process_kill").description("Process Kill Tool"),
+            ToolDefinition::new("read").description("Read Tool"),
+        ];
+        let tool_resolver = ToolResolver::new(all_tool_definitions);
+        let fixture = Agent::new(
+            AgentId::new("test-agent"),
+            ProviderId::ANTHROPIC,
+            ModelId::new("claude-3-5-sonnet-20241022"),
+        )
+        .tools(vec![ToolName::new("shell")]);
+
+        let actual = tool_resolver.resolve(&fixture);
+        let expected = vec![
+            &tool_resolver.all_tool_definitions[0],
+            &tool_resolver.all_tool_definitions[4],
+            &tool_resolver.all_tool_definitions[3],
+            &tool_resolver.all_tool_definitions[2],
+            &tool_resolver.all_tool_definitions[1],
+        ];
+
+        assert_eq!(actual, expected);
+        assert!(ToolResolver::is_allowed(
+            &fixture,
+            &ToolName::new("process_status")
+        ));
+        assert!(ToolResolver::is_allowed(
+            &fixture,
+            &ToolName::new("process_read")
+        ));
+        assert!(ToolResolver::is_allowed(
+            &fixture,
+            &ToolName::new("process_list")
+        ));
+        assert!(ToolResolver::is_allowed(
+            &fixture,
+            &ToolName::new("process_kill")
+        ));
     }
 
     #[test]
