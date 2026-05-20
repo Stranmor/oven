@@ -36,7 +36,6 @@ pub use durable_vector_index::{
     VectorIndexEntry, VectorSourceKind, vector_entries_from_manifest_embeddings,
 };
 pub use eval::{
-pub use eval::{
     EvidenceLedgerActivationBudget, EvidenceReadinessDiagnosticBudget,
     context_pack_worst_case_freshness, diagnose_evidence_readiness,
     evaluate_context_pack_artifacts, evaluate_context_pack_artifacts_by_id,
@@ -52,11 +51,6 @@ pub use evidence_replay::{
     EvidenceReplayStalePolicyReport, select_evidence_ledger_replay,
 };
 
-    EvidenceReplayBudgetReport, EvidenceReplayContentPolicy, EvidenceReplayFreshnessPolicy,
-    EvidenceReplayIssue, EvidenceReplayIssueCode, EvidenceReplayManifestReference,
-    EvidenceReplayReference, EvidenceReplayScoreKind, EvidenceReplaySelectionPolicy,
-    EvidenceReplayStalePolicyReport, select_evidence_ledger_replay,
-};
 pub use extraction::{
     RustExtraction, extract_cargo_dependency_edges, extract_rust_call_edges,
     extract_rust_import_edges, extract_rust_symbols,
