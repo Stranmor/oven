@@ -3,6 +3,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -32,15 +33,17 @@ use forge_project_model::{
     ExternalFactIngestionIssue, ExternalFactProductionReport, ExternalFactProductionRequest,
     ExternalFactProductionStatus, NativeLspReferenceProducer, NativeLspReferenceRequest,
     NativeLspReferenceRequestDerivation, ProjectContextIntegrationIdentity,
-    ProjectContextPathScope, ProjectContextRetrievalOptions, ProjectContextRetrievalPhaseStatus,
-    ProjectContextRetrievalPlanningOutcome, ProjectContextRetrievalRequest,
-    ProjectContextVectorIndexBoundary, ProjectContextVectorReadiness,
-    ProjectContextVectorUnavailableReason, ProjectContextWriteDecision, ProjectIndexer,
-    ProjectModelContextRenderBudget, Provenance, RustAnalyzerBounds, RustAnalyzerCapability,
-    RustAnalyzerCapabilityProbe, RustAnalyzerCapabilityStatus, RustAnalyzerProbe,
-    StdRustAnalyzerProcess, ToolEpisode, VectorIndexArtifact, VectorIndexArtifactId,
-    VectorIndexEntry, VectorQuery, derive_native_lsp_reference_request, fingerprint,
-    load_evidence_ledger_activation, local_project_model_dir, local_project_model_manifest,
+    ProjectContextPathScope, ProjectContextRerankerBoundary, ProjectContextRerankerReadiness,
+    ProjectContextRerankerUnavailableReason, ProjectContextRetrievalOptions,
+    ProjectContextRetrievalPhaseStatus, ProjectContextRetrievalPlanningOutcome,
+    ProjectContextRetrievalRequest, ProjectContextVectorIndexBoundary,
+    ProjectContextVectorReadiness, ProjectContextVectorUnavailableReason,
+    ProjectContextWriteDecision, ProjectIndexer, ProjectModelContextRenderBudget, Provenance,
+    RustAnalyzerBounds, RustAnalyzerCapability, RustAnalyzerCapabilityProbe,
+    RustAnalyzerCapabilityStatus, RustAnalyzerProbe, StdRustAnalyzerProcess, ToolEpisode,
+    VectorIndexArtifact, VectorIndexArtifactId, VectorIndexEntry, VectorQuery,
+    derive_native_lsp_reference_request, fingerprint, load_evidence_ledger_activation,
+    local_project_model_dir, local_project_model_manifest,
     plan_project_context_retrieval_with_options, read_exact_fact_status,
     redaction_safe_issue_path_label, redaction_safe_provenance_source_label,
     redaction_safe_replay_path_label, render_project_model_context,
@@ -65,6 +68,58 @@ const PREVIEW_MANIFEST_BOUNDED_FRESHNESS_REASON: &str = "manifest_bounded_freshn
 const SEMANTIC_EMBEDDING_TEXT_LIMIT: usize = 4096;
 const QUERY_EMBEDDING_SOURCE_ID: &str = "query";
 const QUERY_EMBEDDING_SOURCE_FINGERPRINT: &str = "query";
+
+/// Runtime-owned reranker readiness selection supplied to project-context retrieval.
+pub enum ProjectContextRuntimeRerankerSelection<'a> {
+    /// No runtime reranker is configured for this service instance.
+    Missing,
+    /// A configured runtime reranker is ready to be used for this request.
+    Ready {
+        /// Reranker adapter implementation.
+        reranker: &'a dyn forge_project_model::Reranker,
+        /// Redaction-safe adapter identity.
+        identity: ProjectContextIntegrationIdentity,
+    },
+    /// A runtime reranker is configured but is not ready for use.
+    Unavailable {
+        /// Redaction-safe adapter identity.
+        identity: ProjectContextIntegrationIdentity,
+        /// Redaction-safe unavailability reason.
+        reason: ProjectContextRerankerUnavailableReason,
+    },
+}
+
+/// Service-level runtime reranker selector boundary.
+pub trait ProjectContextRuntimeRerankerSelector: Send + Sync {
+    /// Selects the currently configured runtime reranker without reading external data.
+    fn select_project_context_reranker(&self) -> ProjectContextRuntimeRerankerSelection<'_>;
+}
+
+/// Production default selector: no runtime reranker is configured yet.
+#[derive(Clone, Debug, Default)]
+pub struct MissingProjectContextRuntimeReranker;
+
+impl ProjectContextRuntimeRerankerSelector for MissingProjectContextRuntimeReranker {
+    fn select_project_context_reranker(&self) -> ProjectContextRuntimeRerankerSelection<'_> {
+        ProjectContextRuntimeRerankerSelection::Missing
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct NotReadyProjectContextReranker {
+    call_count: Arc<AtomicUsize>,
+}
+
+impl forge_project_model::Reranker for NotReadyProjectContextReranker {
+    fn rerank(
+        &self,
+        _query: &str,
+        _candidates: &[forge_project_model::RerankCandidate],
+    ) -> Vec<forge_project_model::RerankScore> {
+        self.call_count.fetch_add(1, AtomicOrdering::SeqCst);
+        Vec::new()
+    }
+}
 
 /// Typed provider-neutral embedding boundary for workspace semantic vectors.
 #[async_trait]
@@ -691,25 +746,53 @@ fn evidence_replay_issue_code_label(code: &EvidenceReplayIssueCode) -> String {
 ///
 /// `F` provides infrastructure capabilities (file I/O, environment, etc.) and
 /// `D` is the file-discovery strategy used to enumerate workspace files.
-pub struct ForgeWorkspaceService<F, D> {
+pub struct ForgeWorkspaceService<F, D, R = MissingProjectContextRuntimeReranker> {
     infra: Arc<F>,
     discovery: Arc<D>,
+    reranker_selector: Arc<R>,
+    unavailable_reranker: NotReadyProjectContextReranker,
 }
 
-impl<F, D> Clone for ForgeWorkspaceService<F, D> {
+impl<F, D, R> Clone for ForgeWorkspaceService<F, D, R> {
     fn clone(&self) -> Self {
         Self {
             infra: Arc::clone(&self.infra),
             discovery: Arc::clone(&self.discovery),
+            reranker_selector: Arc::clone(&self.reranker_selector),
+            unavailable_reranker: self.unavailable_reranker.clone(),
         }
     }
 }
 
-impl<F, D> ForgeWorkspaceService<F, D> {
+impl<F, D> ForgeWorkspaceService<F, D, MissingProjectContextRuntimeReranker> {
     /// Creates a new workspace service with the provided infrastructure and
     /// file-discovery strategy.
     pub fn new(infra: Arc<F>, discovery: Arc<D>) -> Self {
-        Self { infra, discovery }
+        Self {
+            infra,
+            discovery,
+            reranker_selector: Arc::new(MissingProjectContextRuntimeReranker),
+            unavailable_reranker: NotReadyProjectContextReranker::default(),
+        }
+    }
+}
+
+impl<F, D, R> ForgeWorkspaceService<F, D, R> {
+    /// Rebuilds the service with an explicit runtime reranker selector.
+    ///
+    /// # Arguments
+    ///
+    /// * `reranker_selector` - Service-level selector that owns runtime reranker readiness.
+    pub fn with_project_context_reranker_selector<NextR>(
+        self,
+        reranker_selector: Arc<NextR>,
+    ) -> ForgeWorkspaceService<F, D, NextR> {
+        ForgeWorkspaceService {
+            infra: self.infra,
+            discovery: self.discovery,
+            reranker_selector,
+            unavailable_reranker: self.unavailable_reranker,
+        }
     }
 }
 
@@ -722,7 +805,8 @@ impl<
         + CommandInfra
         + WalkerInfra,
     D: FileDiscovery + 'static,
-> ForgeWorkspaceService<F, D>
+    R: ProjectContextRuntimeRerankerSelector + 'static,
+> ForgeWorkspaceService<F, D, R>
 {
     /// Internal sync implementation that emits progress events.
     async fn sync_codebase_internal<E, Fut>(&self, path: PathBuf, emit: E) -> Result<()>
@@ -1151,6 +1235,28 @@ impl<
         ))
     }
 
+    fn select_project_context_reranker_boundary(
+        &self,
+    ) -> Option<ProjectContextRerankerBoundary<'_>> {
+        match self.reranker_selector.select_project_context_reranker() {
+            ProjectContextRuntimeRerankerSelection::Missing => None,
+            ProjectContextRuntimeRerankerSelection::Ready { reranker, identity } => {
+                Some(ProjectContextRerankerBoundary {
+                    reranker,
+                    identity,
+                    readiness: ProjectContextRerankerReadiness::Ready,
+                })
+            }
+            ProjectContextRuntimeRerankerSelection::Unavailable { identity, reason } => {
+                Some(ProjectContextRerankerBoundary {
+                    reranker: &self.unavailable_reranker,
+                    identity,
+                    readiness: ProjectContextRerankerReadiness::Unavailable(reason),
+                })
+            }
+        }
+    }
+
     async fn query_local_workspace(
         &self,
         path: PathBuf,
@@ -1199,6 +1305,7 @@ impl<
                 reason
             );
         }
+        let reranker_selection = self.select_project_context_reranker_boundary();
         let plan = match plan_project_context_retrieval_with_options(
             &manifest,
             &freshness,
@@ -1206,7 +1313,7 @@ impl<
             ProjectContextRetrievalOptions {
                 vector_query: semantic_query.as_ref(),
                 vector_index: durable_vector_selection.boundary(),
-                reranker: None,
+                reranker: reranker_selection,
                 vector_unavailable_reason: durable_vector_selection.unavailable_reason(),
             },
         ) {
@@ -2042,7 +2149,8 @@ impl<
         + WalkerInfra
         + 'static,
     D: FileDiscovery + 'static,
-> WorkspaceService for ForgeWorkspaceService<F, D>
+    R: ProjectContextRuntimeRerankerSelector + 'static,
+> WorkspaceService for ForgeWorkspaceService<F, D, R>
 {
     async fn sync_workspace(&self, path: PathBuf) -> Result<MpscStream<Result<SyncProgress>>> {
         let service = Clone::clone(self);
@@ -2357,6 +2465,106 @@ mod tests {
         probe: RustAnalyzerProbe,
         produce_calls: Arc<std::sync::atomic::AtomicUsize>,
         create_file_during_produce: bool,
+    }
+
+    #[derive(Clone, Debug)]
+    struct FakeRuntimeReranker {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl FakeRuntimeReranker {
+        fn new() -> Self {
+            Self { calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)) }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl forge_project_model::Reranker for FakeRuntimeReranker {
+        fn rerank(
+            &self,
+            _query: &str,
+            candidates: &[forge_project_model::RerankCandidate],
+        ) -> Vec<forge_project_model::RerankScore> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            candidates
+                .iter()
+                .map(|candidate| forge_project_model::RerankScore {
+                    id: candidate.id.clone(),
+                    score: if candidate.text.contains("RuntimeNeedle") {
+                        10.0
+                    } else {
+                        0.0
+                    },
+                })
+                .collect()
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum FakeRuntimeRerankerSelectorState {
+        Missing,
+        Ready(FakeRuntimeReranker),
+        Unavailable,
+    }
+
+    #[derive(Clone, Debug)]
+    struct FakeRuntimeRerankerSelector {
+        state: FakeRuntimeRerankerSelectorState,
+        selections: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl FakeRuntimeRerankerSelector {
+        fn missing() -> Self {
+            Self {
+                state: FakeRuntimeRerankerSelectorState::Missing,
+                selections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        fn ready(reranker: FakeRuntimeReranker) -> Self {
+            Self {
+                state: FakeRuntimeRerankerSelectorState::Ready(reranker),
+                selections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        fn unavailable() -> Self {
+            Self {
+                state: FakeRuntimeRerankerSelectorState::Unavailable,
+                selections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        fn selection_count(&self) -> usize {
+            self.selections.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ProjectContextRuntimeRerankerSelector for FakeRuntimeRerankerSelector {
+        fn select_project_context_reranker(&self) -> ProjectContextRuntimeRerankerSelection<'_> {
+            self.selections.fetch_add(1, Ordering::SeqCst);
+            let identity = ProjectContextIntegrationIdentity {
+                provider: "test-runtime-reranker",
+                artifact: "explicit-mock-runtime",
+            };
+            match &self.state {
+                FakeRuntimeRerankerSelectorState::Missing => {
+                    ProjectContextRuntimeRerankerSelection::Missing
+                }
+                FakeRuntimeRerankerSelectorState::Ready(reranker) => {
+                    ProjectContextRuntimeRerankerSelection::Ready { reranker, identity }
+                }
+                FakeRuntimeRerankerSelectorState::Unavailable => {
+                    ProjectContextRuntimeRerankerSelection::Unavailable {
+                        identity,
+                        reason: ProjectContextRerankerUnavailableReason::RerankerNotReady,
+                    }
+                }
+            }
+        }
     }
 
     #[derive(Clone, Debug)]
@@ -3982,6 +4190,155 @@ mod tests {
                 .unwrap()
                 .context_pack_artifact_count,
             0usize,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_workspace_explicit_ready_runtime_reranker_is_called_and_contributes_score()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let runtime_reranker = FakeRuntimeReranker::new();
+        let selector = FakeRuntimeRerankerSelector::ready(runtime_reranker.clone());
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::new(AtomicBool::new(false)),
+                range_read_fails: false,
+            }),
+            Arc::new(NoopDiscovery),
+        )
+        .with_project_context_reranker_selector(Arc::new(selector.clone()));
+        let params =
+            SearchParams::new("build runtime needle", "runtime reranker proof").limit(1usize);
+
+        let actual = WorkspaceService::query_workspace(&setup, root.clone(), params).await?;
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+        let artifact_id = indexer
+            .list_context_pack_artifacts()?
+            .into_iter()
+            .next()
+            .expect("query should write one context pack");
+        let pack = indexer.read_context_pack(&artifact_id)?;
+        let expected = (1usize, true, true);
+
+        assert_eq!(
+            (
+                selector.selection_count(),
+                runtime_reranker.call_count() > 0,
+                pack.evidence.iter().any(|evidence| evidence.score > 10.0)
+                    && actual.iter().any(|node| match &node.node {
+                        NodeData::FileChunk(chunk) => chunk.content.contains("RuntimeNeedle"),
+                        _ => false,
+                    }),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_workspace_missing_runtime_reranker_keeps_lexical_fallback_stable() -> Result<()>
+    {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let selector = FakeRuntimeRerankerSelector::missing();
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::new(AtomicBool::new(false)),
+                range_read_fails: false,
+            }),
+            Arc::new(NoopDiscovery),
+        )
+        .with_project_context_reranker_selector(Arc::new(selector.clone()));
+        let params =
+            SearchParams::new("build runtime needle", "missing reranker proof").limit(1usize);
+
+        let actual = WorkspaceService::query_workspace(&setup, root, params).await?;
+        let expected = (1usize, Some("src/lib.rs".to_string()));
+
+        assert_eq!(
+            (
+                selector.selection_count(),
+                actual.iter().find_map(|node| match &node.node {
+                    NodeData::FileChunk(chunk) => Some(chunk.file_path.clone()),
+                    _ => None,
+                }),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_workspace_not_ready_runtime_reranker_does_not_call_rerank_and_still_returns()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let selector = FakeRuntimeRerankerSelector::unavailable();
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::new(AtomicBool::new(false)),
+                range_read_fails: false,
+            }),
+            Arc::new(NoopDiscovery),
+        )
+        .with_project_context_reranker_selector(Arc::new(selector.clone()));
+        let params =
+            SearchParams::new("build runtime needle", "not ready reranker proof").limit(1usize);
+
+        let actual = WorkspaceService::query_workspace(&setup, root, params).await?;
+        let expected = (1usize, 1usize);
+
+        assert_eq!((selector.selection_count(), actual.len()), expected);
+        assert_eq!(
+            setup.unavailable_reranker.call_count.load(Ordering::SeqCst),
+            0usize
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sem_search_diagnostic_does_not_select_or_call_runtime_reranker() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let runtime_reranker = FakeRuntimeReranker::new();
+        let selector = FakeRuntimeRerankerSelector::ready(runtime_reranker.clone());
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::new(AtomicBool::new(false)),
+                range_read_fails: false,
+            }),
+            Arc::new(NoopDiscovery),
+        )
+        .with_project_context_reranker_selector(Arc::new(selector.clone()));
+
+        let actual = setup.sem_search_diagnostic_for_model(root, Some("fixture-model"))?;
+        let expected = (0usize, 0usize, "vector_artifact_absent_or_no_match");
+
+        assert_eq!(
+            (
+                selector.selection_count(),
+                runtime_reranker.call_count(),
+                actual.reason_label.as_str(),
+            ),
+            expected,
         );
         Ok(())
     }
