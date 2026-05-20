@@ -19,11 +19,11 @@ use crate::policy::{
     LOCAL_PROJECT_MODEL_EXTERNAL_FACT_REPORT_FILE_NAME, LOCAL_PROJECT_MODEL_MANIFEST_FILE_NAME,
 };
 use crate::types::{
-    ContextPack, ContextPackArtifactId, ExternalFactArtifactIngestionReport,
+    ContextPack, ContextPackArtifactId, EdgeConfidence, ExternalFactArtifactIngestionReport,
     ExternalFactProductionBaseline, FileNode, FileNodeKind, FreshnessProofLevel, FreshnessState,
-    Language, ManifestFreshnessEvaluation, ProjectArtifact, ProjectArtifactConfigFormat,
-    ProjectArtifactKind, ProjectManifest, ShardManifest, ShardStrategy, SourceFile, SymbolNode,
-    ToolEpisode,
+    GraphEdge, GraphEdgeKind, Language, ManifestFreshnessEvaluation, ProjectArtifact,
+    ProjectArtifactConfigFormat, ProjectArtifactKind, ProjectManifest, ShardManifest,
+    ShardStrategy, SourceFile, SymbolNode, ToolEpisode,
 };
 use crate::util::{
     detect_language, edge_sort_key, hash_text, line_count, manifest_hash, normalize_path,
@@ -275,6 +275,8 @@ impl ProjectIndexer {
         let external_facts_fingerprint =
             crate::util::external_facts_fingerprint(&external_fact_batches);
         let artifacts = build_project_artifacts(&files, &cargo_metadata);
+        edges.extend(build_project_artifact_edges(&artifacts));
+        edges.sort_by_key(edge_sort_key);
         let manifest_hash =
             manifest_hash(&files, &external_fact_batches, &external_facts_fingerprint);
         Ok(ProjectManifest {
@@ -896,6 +898,28 @@ fn build_project_artifacts(
     artifacts
 }
 
+fn build_project_artifact_edges(artifacts: &[ProjectArtifact]) -> Vec<GraphEdge> {
+    artifacts
+        .iter()
+        .map(|artifact| {
+            crate::util::edge(
+                &artifact.id,
+                &artifact.linked_file_node_id,
+                GraphEdgeKind::ArtifactDerivedFromFile,
+                1.0,
+                EdgeConfidence::HeuristicHigh,
+                provenance(
+                    &artifact.path,
+                    Some(1),
+                    Some(artifact.line_count.max(1)),
+                    "artifact-indexer:derived-from-file",
+                    &format!("{}:{}", artifact.id, artifact.linked_file_node_id),
+                ),
+            )
+        })
+        .collect()
+}
+
 fn cargo_artifact_evidence_by_path(
     cargo_metadata: &crate::extraction::StaticCargoMetadata,
 ) -> BTreeMap<String, String> {
@@ -1230,11 +1254,12 @@ pub(crate) mod tests {
         CargoDependencyDeclaration, CargoDependencyKind, CargoPackageDependency,
         CargoTargetDeclaration, CargoTargetKind, ContextPackSelection, EdgeConfidence,
         ExternalFactBatch, ExternalFactBatchMetadata, ExternalFactSource, GraphEdgeKind,
-        ProjectArtifactConfigFormat, ProjectArtifactKind, RetrievalQuery, StaleEvidencePolicy,
-        SymbolKind, TypedExternalFacts, TypedExternalReferenceFact, TypedExternalSymbolFact,
-        VectorIndexArtifact, compare_freshness, external_fact_artifact_fingerprint,
-        external_fact_batch_fingerprint, fingerprint, retrieve,
-        vector_entries_from_manifest_embeddings, write_external_fact_artifact,
+        KnowledgeGraph, KnowledgeGraphNodeId, ProjectArtifactConfigFormat, ProjectArtifactKind,
+        RetrievalQuery, StaleEvidencePolicy, SymbolKind, TypedExternalFacts,
+        TypedExternalReferenceFact, TypedExternalSymbolFact, VectorIndexArtifact,
+        compare_freshness, external_fact_artifact_fingerprint, external_fact_batch_fingerprint,
+        fingerprint, retrieve, vector_entries_from_manifest_embeddings,
+        write_external_fact_artifact,
     };
 
     pub(crate) fn fixture_project() -> Result<(TempDir, PathBuf)> {
@@ -2103,6 +2128,50 @@ pub(crate) mod tests {
             ),
             expected,
         );
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_edges_validate_against_linked_file_endpoints() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        fs::write(root.join("AGENTS.md"), "# Policy\n")?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let artifact = manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path == "AGENTS.md")
+            .expect("fixture should include policy artifact");
+
+        let graph = KnowledgeGraph::from_manifest(&manifest)?;
+        let actual = graph.edges.iter().any(|edge| {
+            edge.from == KnowledgeGraphNodeId::Artifact(artifact.id.clone())
+                && edge.to == KnowledgeGraphNodeId::File(artifact.linked_file_node_id.clone())
+                && edge.kind == GraphEdgeKind::ArtifactDerivedFromFile
+        });
+        let expected = true;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_artifact_linked_evidence_is_resolved_by_manifest_evidence_surface() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let artifact = manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path == "Cargo.toml")
+            .expect("Cargo.toml artifact should exist");
+
+        let actual =
+            crate::resolve_manifest_evidence_target(&manifest, &artifact.linked_evidence_id)
+                .map(|target| target.path);
+        let expected = Some("Cargo.toml".to_string());
+
+        assert_eq!(actual, expected);
         Ok(())
     }
 

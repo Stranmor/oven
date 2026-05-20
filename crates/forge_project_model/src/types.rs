@@ -412,6 +412,8 @@ pub enum GraphEdgeKind {
     Calls,
     /// Symbol or file references another symbol.
     References,
+    /// Project artifact metadata is derived from an indexed file.
+    ArtifactDerivedFromFile,
     /// Task depends on file, symbol, shard, decision, retrieved evidence, tool
     /// episode, or eval evidence.
     TaskDependsOn,
@@ -446,6 +448,8 @@ pub enum KnowledgeGraphNodeId {
     /// Retrieved external or internal evidence node keyed by durable evidence
     /// identifier.
     RetrievedEvidence(String),
+    /// Project artifact node keyed by reserved artifact identifier.
+    Artifact(String),
     /// Tool episode node keyed by durable tool episode identifier.
     ToolEpisode(String),
     /// Evaluation case node keyed by durable eval case identifier.
@@ -462,6 +466,7 @@ impl KnowledgeGraphNodeId {
             | Self::Task(value)
             | Self::Decision(value)
             | Self::RetrievedEvidence(value)
+            | Self::Artifact(value)
             | Self::ToolEpisode(value)
             | Self::EvalCase(value) => value.clone(),
         }
@@ -490,6 +495,8 @@ pub enum KnowledgeGraphNodeKind {
     Decision,
     /// Retrieved evidence node.
     RetrievedEvidence,
+    /// Metadata-only project artifact node.
+    Artifact,
     /// Tool episode node.
     ToolEpisode,
     /// Evaluation case node.
@@ -580,6 +587,31 @@ pub struct RetrievedEvidenceGraphNode {
     pub provenance: Provenance,
 }
 
+/// Metadata-only project artifact node payload for the knowledge graph.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactGraphNode {
+    /// Stable typed artifact node identifier.
+    pub id: KnowledgeGraphNodeId,
+    /// Stable project artifact identifier in the reserved `artifact:` namespace.
+    pub artifact_id: String,
+    /// Conservative artifact taxonomy kind.
+    pub kind: ProjectArtifactKind,
+    /// Normalized path relative to the project root.
+    pub path: String,
+    /// Redaction-safe source fingerprint from the indexed source file.
+    pub source_fingerprint: String,
+    /// Indexed source line count.
+    pub line_count: u32,
+    /// Classifier rule that produced this metadata-only artifact.
+    pub classifier_rule: String,
+    /// Conservative classifier confidence from 0 to 100.
+    pub classifier_confidence: u8,
+    /// Linked file node identifier used for graph readback.
+    pub linked_file_node_id: String,
+    /// Provenance for the artifact classification.
+    pub provenance: Provenance,
+}
+
 /// Tool episode node payload for the knowledge graph.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolEpisodeGraphNode {
@@ -621,6 +653,8 @@ pub enum KnowledgeGraphNode {
     Decision(DecisionGraphNode),
     /// Retrieved evidence node.
     RetrievedEvidence(RetrievedEvidenceGraphNode),
+    /// Metadata-only project artifact node.
+    Artifact(ArtifactGraphNode),
     /// Tool episode node.
     ToolEpisode(ToolEpisodeGraphNode),
     /// Evaluation case node.
@@ -637,6 +671,7 @@ impl KnowledgeGraphNode {
             Self::Task(node) => &node.id,
             Self::Decision(node) => &node.id,
             Self::RetrievedEvidence(node) => &node.id,
+            Self::Artifact(node) => &node.id,
             Self::ToolEpisode(node) => &node.id,
             Self::EvalCase(node) => &node.id,
         }
@@ -651,6 +686,7 @@ impl KnowledgeGraphNode {
             Self::Task(_) => KnowledgeGraphNodeKind::Task,
             Self::Decision(_) => KnowledgeGraphNodeKind::Decision,
             Self::RetrievedEvidence(_) => KnowledgeGraphNodeKind::RetrievedEvidence,
+            Self::Artifact(_) => KnowledgeGraphNodeKind::Artifact,
             Self::ToolEpisode(_) => KnowledgeGraphNodeKind::ToolEpisode,
             Self::EvalCase(_) => KnowledgeGraphNodeKind::EvalCase,
         }
@@ -665,6 +701,7 @@ impl KnowledgeGraphNode {
             Self::Task(node) => &node.provenance,
             Self::Decision(node) => &node.provenance,
             Self::RetrievedEvidence(node) => &node.provenance,
+            Self::Artifact(node) => &node.provenance,
             Self::ToolEpisode(node) => &node.provenance,
             Self::EvalCase(node) => &node.provenance,
         }
@@ -785,6 +822,20 @@ impl KnowledgeGraph {
                 provenance: shard.provenance.clone(),
             }));
         }
+        for artifact in &manifest.artifacts {
+            nodes.push(KnowledgeGraphNode::Artifact(ArtifactGraphNode {
+                id: KnowledgeGraphNodeId::Artifact(artifact.id.clone()),
+                artifact_id: artifact.id.clone(),
+                kind: artifact.kind.clone(),
+                path: artifact.path.clone(),
+                source_fingerprint: artifact.source_fingerprint.clone(),
+                line_count: artifact.line_count,
+                classifier_rule: artifact.classifier_rule.clone(),
+                classifier_confidence: artifact.classifier_confidence,
+                linked_file_node_id: artifact.linked_file_node_id.clone(),
+                provenance: artifact.provenance.clone(),
+            }));
+        }
         let mut node_ids = nodes
             .iter()
             .map(|node| node.id().clone())
@@ -797,7 +848,9 @@ impl KnowledgeGraph {
                 let from = typed_legacy_node_id_or_external(&edge.from, &node_ids);
                 let to = typed_legacy_node_id_or_external(&edge.to, &node_ids);
                 for node_id in [from.clone(), to.clone()] {
-                    if !node_ids.contains(&node_id) {
+                    if !node_ids.contains(&node_id)
+                        && matches!(node_id, KnowledgeGraphNodeId::RetrievedEvidence(_))
+                    {
                         external_nodes.insert(
                             node_id.clone(),
                             KnowledgeGraphNode::RetrievedEvidence(RetrievedEvidenceGraphNode {
@@ -830,6 +883,9 @@ fn typed_legacy_node_id_or_external(
     value: &str,
     known_ids: &BTreeSet<KnowledgeGraphNodeId>,
 ) -> KnowledgeGraphNodeId {
+    if value.starts_with("artifact:") {
+        return KnowledgeGraphNodeId::Artifact(value.to_string());
+    }
     typed_legacy_node_id(value, known_ids)
         .unwrap_or_else(|| KnowledgeGraphNodeId::RetrievedEvidence(value.to_string()))
 }
@@ -877,6 +933,10 @@ fn typed_legacy_node_id(
     value: &str,
     known_ids: &BTreeSet<KnowledgeGraphNodeId>,
 ) -> Option<KnowledgeGraphNodeId> {
+    if value.starts_with("artifact:") {
+        return Some(KnowledgeGraphNodeId::Artifact(value.to_string()))
+            .filter(|candidate| known_ids.contains(candidate));
+    }
     let candidates = [
         KnowledgeGraphNodeId::File(value.to_string()),
         KnowledgeGraphNodeId::Symbol(value.to_string()),
@@ -1929,6 +1989,7 @@ fn graph_node_kind_label(kind: &KnowledgeGraphNodeKind) -> &'static str {
         KnowledgeGraphNodeKind::Task => "task",
         KnowledgeGraphNodeKind::Decision => "decision",
         KnowledgeGraphNodeKind::RetrievedEvidence => "retrieved_evidence",
+        KnowledgeGraphNodeKind::Artifact => "artifact",
         KnowledgeGraphNodeKind::ToolEpisode => "tool_episode",
         KnowledgeGraphNodeKind::EvalCase => "eval_case",
     }
@@ -1944,6 +2005,7 @@ fn graph_edge_kind_label(kind: &GraphEdgeKind) -> &'static str {
         GraphEdgeKind::CargoDependency => "cargo_dependency",
         GraphEdgeKind::Calls => "calls",
         GraphEdgeKind::References => "references",
+        GraphEdgeKind::ArtifactDerivedFromFile => "artifact_derived_from_file",
         GraphEdgeKind::TaskDependsOn => "task_depends_on",
         GraphEdgeKind::DecisionSupportedBy => "decision_supported_by",
         GraphEdgeKind::EvidenceCites => "evidence_cites",
@@ -2248,6 +2310,99 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected
         );
+        Ok(())
+    }
+
+    #[test]
+    fn knowledge_graph_promotes_manifest_artifacts_as_metadata_only_nodes_and_file_edges()
+    -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        std::fs::write(
+            root.join("AGENTS.md"),
+            "# TARGET GOAL\nSECRET_TOKEN=raw-control-secret\n",
+        )?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+
+        let graph = KnowledgeGraph::from_manifest(&manifest)?;
+        let actual_artifact_nodes = graph
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                KnowledgeGraphNode::Artifact(artifact) => Some(artifact),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let actual_json = serde_json::to_string(&actual_artifact_nodes)?;
+
+        assert_eq!(actual_artifact_nodes.len(), manifest.artifacts.len());
+        assert_eq!(actual_json.contains("raw-control-secret"), false);
+        assert_eq!(actual_json.contains("SECRET_TOKEN"), false);
+        assert_eq!(actual_json.contains("TARGET GOAL"), false);
+        assert_eq!(
+            manifest
+                .artifacts
+                .iter()
+                .all(|artifact| graph.edges.iter().any(|edge| {
+                    edge.from == KnowledgeGraphNodeId::Artifact(artifact.id.clone())
+                        && edge.to
+                            == KnowledgeGraphNodeId::File(artifact.linked_file_node_id.clone())
+                        && edge.kind == GraphEdgeKind::ArtifactDerivedFromFile
+                })),
+            true
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_reserved_artifact_edge_fails_validation_instead_of_becoming_evidence() {
+        let manifest = ProjectManifest {
+            edges: vec![GraphEdge {
+                from: "artifact:v1:missing:deadbeef".to_string(),
+                to: "src/lib.rs".to_string(),
+                kind: GraphEdgeKind::ArtifactDerivedFromFile,
+                confidence: 1.0,
+                confidence_kind: EdgeConfidence::HeuristicHigh,
+                provenance: provenance("src/lib.rs", Some(1), Some(1), "test", "missing-artifact"),
+            }],
+            files: vec![SourceFile {
+                path: "src/lib.rs".to_string(),
+                language: Language::Rust,
+                bytes: 12,
+                lines: 1,
+                content_hash: fingerprint("file"),
+                provenance: provenance("src/lib.rs", Some(1), Some(1), "test", "file"),
+            }],
+            ..ProjectManifest::default()
+        };
+
+        let actual = KnowledgeGraph::from_manifest(&manifest).is_err();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn artifact_legacy_ids_keep_reserved_namespace_precedence_over_retrieved_evidence() -> Result<()>
+    {
+        let (fixture, root) = fixture_project()?;
+        std::fs::write(root.join("AGENTS.md"), "# Policy\n")?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let graph = KnowledgeGraph::from_manifest(&manifest)?;
+        let artifact = manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path == "AGENTS.md")
+            .expect("fixture should include policy artifact");
+
+        let actual = graph
+            .nodes
+            .iter()
+            .find(|node| node.id().as_legacy_id() == artifact.id);
+        let expected = Some(KnowledgeGraphNodeKind::Artifact);
+
+        assert_eq!(actual.map(KnowledgeGraphNode::kind), expected);
         Ok(())
     }
 

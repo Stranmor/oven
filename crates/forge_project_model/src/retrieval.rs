@@ -802,6 +802,51 @@ mod tests {
     }
 
     #[test]
+    fn artifact_lexical_seed_expands_to_linked_file_when_graph_expansion_enabled() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        std::fs::write(
+            root.join("AGENTS.md"),
+            "# TARGET GOAL\nSECRET_TOKEN=raw-control-secret\n",
+        )?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let artifact = manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path == "AGENTS.md")
+            .expect("fixture should include policy artifact");
+        let query = RetrievalQuery {
+            text: Some("policy control surface".to_string()),
+            path: None,
+            path_prefix: None,
+            symbol: None,
+            limit: 10,
+            include_graph_expansion: true,
+        };
+
+        let actual = retrieve(&manifest, &query)
+            .into_iter()
+            .map(|result| (result.id, result.path, result.score_parts))
+            .collect::<Vec<_>>();
+        let expected = (true, true);
+
+        assert_eq!(
+            (
+                actual
+                    .iter()
+                    .any(|(id, path, _)| id == &artifact.id && path == "AGENTS.md"),
+                actual
+                    .iter()
+                    .any(|(id, path, score_parts)| id == "AGENTS.md"
+                        && path == "AGENTS.md"
+                        && score_parts.contains_key("graph")),
+            ),
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
     fn planner_enables_only_available_boundaries() {
         let setup = RetrievalQuery {
             text: Some("Root".to_string()),
