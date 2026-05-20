@@ -20,20 +20,21 @@ use forge_domain::{
     WorkspaceIndexRepository,
 };
 use forge_project_model::{
-    ContextPack, ContextPackArtifactId, ContextPackSelection, EvidenceFreshness,
-    EvidenceLedgerReplayReport, EvidenceReadinessDiagnostic, EvidenceReplayContentPolicy,
-    EvidenceReplayFreshnessPolicy, EvidenceReplayIssueCode, EvidenceReplayScoreKind,
-    ExternalFactArtifactIngestionReport, ExternalFactIngestionIssue, ExternalFactProductionReport,
-    ExternalFactProductionRequest, ExternalFactProductionStatus, NativeLspReferenceProducer,
-    NativeLspReferenceRequest, NativeLspReferenceRequestDerivation, ProjectIndexer,
-    ProjectModelContextRenderBudget, Provenance, RetrievalQuery, RustAnalyzerBounds,
-    RustAnalyzerCapability, RustAnalyzerCapabilityProbe, RustAnalyzerCapabilityStatus,
-    RustAnalyzerProbe, StaleEvidencePolicy, StdRustAnalyzerProcess, ToolEpisode,
-    derive_native_lsp_reference_request, evidence_line_range, fingerprint,
-    load_evidence_ledger_activation, local_project_model_dir, local_project_model_manifest,
+    ContextPackArtifactId, EvidenceFreshness, EvidenceLedgerReplayReport,
+    EvidenceReadinessDiagnostic, EvidenceReplayContentPolicy, EvidenceReplayFreshnessPolicy,
+    EvidenceReplayIssueCode, EvidenceReplayScoreKind, ExternalFactArtifactIngestionReport,
+    ExternalFactIngestionIssue, ExternalFactProductionReport, ExternalFactProductionRequest,
+    ExternalFactProductionStatus, NativeLspReferenceProducer, NativeLspReferenceRequest,
+    NativeLspReferenceRequestDerivation, ProjectContextPathScope,
+    ProjectContextRetrievalPlanningOutcome, ProjectContextRetrievalRequest,
+    ProjectContextWriteDecision, ProjectIndexer, ProjectModelContextRenderBudget, Provenance,
+    RustAnalyzerBounds, RustAnalyzerCapability, RustAnalyzerCapabilityProbe,
+    RustAnalyzerCapabilityStatus, RustAnalyzerProbe, StdRustAnalyzerProcess, ToolEpisode,
+    derive_native_lsp_reference_request, fingerprint, load_evidence_ledger_activation,
+    local_project_model_dir, local_project_model_manifest, plan_project_context_retrieval,
     read_exact_fact_status, redaction_safe_issue_path_label,
     redaction_safe_provenance_source_label, redaction_safe_replay_path_label,
-    render_project_model_context, render_sources_from_evidence_replay, retrieve,
+    render_project_model_context, render_sources_from_evidence_replay,
     select_evidence_ledger_replay,
 };
 use forge_stream::MpscStream;
@@ -765,61 +766,62 @@ impl<
                 manifest_path.display()
             )
         })?;
-        let retrieval_query = RetrievalQuery {
-            text: Some(params.query.to_string()),
-            path: None,
-            path_prefix: params.starts_with.clone(),
-            symbol: None,
-            limit: params.limit.unwrap_or(10),
-            include_graph_expansion: true,
-        };
         let freshness = indexer.evaluate_manifest_freshness(&manifest)?;
-        if !freshness.can_inject() {
-            anyhow::bail!(
-                "Workspace project model is not fresh at {}. Run `forge workspace sync {}` before using project-model context.",
-                manifest_path.display(),
-                root.display()
-            );
-        }
-        let results = retrieve(&manifest, &retrieval_query)
-            .into_iter()
-            .filter(|result| matches_path_filters(&result.path, &params))
-            .collect::<Vec<_>>();
-        let pack = ContextPack::from_selection(
-            &manifest,
-            ContextPackSelection {
-                retrieval_results: results,
-                shards: Vec::new(),
-                evidence: Vec::new(),
-                freshness: freshness.state.clone(),
-                stale_policy: StaleEvidencePolicy::Reject,
-            },
-        )?;
+        let request = ProjectContextRetrievalRequest::new(
+            params.query.to_string(),
+            params.limit.unwrap_or(10),
+            ProjectContextPathScope::new(
+                params.starts_with.clone(),
+                params.ends_with.clone().unwrap_or_default(),
+            ),
+            true,
+        );
+        let plan = match plan_project_context_retrieval(&manifest, &freshness, request) {
+            ProjectContextRetrievalPlanningOutcome::Plan(plan) => plan,
+            ProjectContextRetrievalPlanningOutcome::Refusal(refusal) => {
+                anyhow::bail!(
+                    "Workspace project model retrieval refused at {} for {}: {}",
+                    manifest_path.display(),
+                    root.display(),
+                    refusal.detail
+                );
+            }
+        };
         let mut nodes = Vec::new();
-        for evidence in &pack.evidence {
-            let (start_line, end_line) = evidence_line_range(&manifest, &evidence.id)
-                .with_context(|| format!("resolve evidence line range {}", evidence.id))?;
-            let absolute_path = root.join(&evidence.path);
+        for read_request in &plan.read_requests {
+            let absolute_path = root.join(read_request.relative_manifest_path());
             let (content, _) = self
                 .infra
-                .range_read_utf8(&absolute_path, u64::from(start_line), u64::from(end_line))
+                .range_read_utf8(
+                    &absolute_path,
+                    u64::from(read_request.start_line),
+                    u64::from(read_request.end_line),
+                )
                 .await
                 .with_context(|| format!("read {}", absolute_path.display()))?;
             nodes.push(Node {
-                node_id: NodeId::new(evidence.id.clone()),
+                node_id: NodeId::new(read_request.evidence_id.clone()),
                 node: NodeData::FileChunk(FileChunk {
-                    file_path: evidence.path.clone(),
+                    file_path: read_request.relative_manifest_path().to_string(),
                     content,
-                    start_line,
-                    end_line,
+                    start_line: read_request.start_line,
+                    end_line: read_request.end_line,
                 }),
-                relevance: Some(evidence.score),
+                relevance: plan
+                    .return_order
+                    .iter()
+                    .find(|item| item.evidence_id == read_request.evidence_id)
+                    .map(|item| item.relevance),
                 distance: None,
             });
         }
-        if !nodes.is_empty() {
-            let _artifact_path = indexer.write_context_pack(&pack)?;
-            let artifact_id = indexer.context_pack_artifact_id(&pack)?;
+        if plan.write_decision == ProjectContextWriteDecision::WriteContextPackAfterReadback {
+            let pack = plan
+                .context_pack
+                .as_ref()
+                .context("project-model retrieval plan requested write without context pack")?;
+            let _artifact_path = indexer.write_context_pack(pack)?;
+            let artifact_id = indexer.context_pack_artifact_id(pack)?;
             let episode = project_model_search_episode(
                 &params,
                 &manifest.manifest_hash,
@@ -882,20 +884,6 @@ fn project_model_search_episode(
             fingerprint: fingerprint(&output_seed),
         },
     }
-}
-
-fn matches_path_filters(path: &str, params: &SearchParams<'_>) -> bool {
-    if let Some(prefix) = &params.starts_with
-        && !path.starts_with(prefix)
-    {
-        return false;
-    }
-    if let Some(suffixes) = &params.ends_with
-        && !suffixes.iter().any(|suffix| path.ends_with(suffix))
-    {
-        return false;
-    }
-    true
 }
 
 trait NativeLspReferenceProductionDriver {
@@ -1510,16 +1498,17 @@ mod tests {
         WorkspaceFiles, WorkspaceInfo,
     };
     use forge_project_model::{
-        EvidenceLedgerReplayReport, EvidenceReplayBudget, EvidenceReplayBudgetReport,
-        EvidenceReplayContentPolicy, EvidenceReplayFreshnessPolicy, EvidenceReplayReference,
-        EvidenceReplayScoreKind, EvidenceReplayStalePolicyReport, ExactFactArtifactStoreState,
-        ExactFactStatus, ExactFactStatusReport, ExternalFactArtifactIngestionReport,
-        ExternalFactBatch, ExternalFactBatchMetadata, ExternalFactIngestionIssueCode,
-        ExternalFactProductionReport, ExternalFactProductionStatus, ExternalFactSource,
-        FreshnessState, GraphEdgeKind, NativeLspReferenceRequest, RustAnalyzerCapability,
-        RustAnalyzerCapabilityStatus, RustAnalyzerProbe, SymbolKind, TypedExternalFacts,
-        TypedExternalReferenceFact, TypedExternalSymbolFact, external_fact_artifact_fingerprint,
-        external_fact_batch_fingerprint, write_external_fact_artifact,
+        ContextPack, ContextPackSelection, EvidenceLedgerReplayReport, EvidenceReplayBudget,
+        EvidenceReplayBudgetReport, EvidenceReplayContentPolicy, EvidenceReplayFreshnessPolicy,
+        EvidenceReplayReference, EvidenceReplayScoreKind, EvidenceReplayStalePolicyReport,
+        ExactFactArtifactStoreState, ExactFactStatus, ExactFactStatusReport, ExternalFactBatch,
+        ExternalFactBatchMetadata, ExternalFactIngestionIssueCode, ExternalFactProductionReport,
+        ExternalFactProductionStatus, ExternalFactSource, FreshnessState, GraphEdgeKind,
+        NativeLspReferenceRequest, RetrievalQuery, RustAnalyzerCapability,
+        RustAnalyzerCapabilityStatus, RustAnalyzerProbe, StaleEvidencePolicy, SymbolKind,
+        TypedExternalFacts, TypedExternalReferenceFact, TypedExternalSymbolFact,
+        external_fact_artifact_fingerprint, external_fact_batch_fingerprint, retrieve,
+        write_external_fact_artifact,
     };
     use futures::{Stream, StreamExt};
     use tempfile::TempDir;
@@ -1922,6 +1911,26 @@ mod tests {
         fs::write(
             root.join("src").join("lib.rs"),
             "pub struct RuntimeNeedle {\n    pub value: usize,\n}\n\npub fn build_runtime_needle() -> RuntimeNeedle {\n    RuntimeNeedle { value: 7 }\n}\n",
+        )?;
+        Ok((fixture, root))
+    }
+
+    fn fixture_scoped_workspace() -> Result<(TempDir, PathBuf)> {
+        let fixture = TempDir::new()?;
+        let root = fixture.path().join("workspace");
+        fs::create_dir_all(root.join("src").join("in"))?;
+        fs::create_dir_all(root.join("src").join("out"))?;
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"scoped_fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )?;
+        fs::write(
+            root.join("src").join("in").join("target.rs"),
+            "pub fn target() {\n    let _ = \"scopedneedle\";\n}\n",
+        )?;
+        fs::write(
+            root.join("src").join("out").join("loud.rs"),
+            "pub fn loud() {\n    let _ = \"scopedneedle scopedneedle scopedneedle scopedneedle scopedneedle\";\n}\n",
         )?;
         Ok((fixture, root))
     }
@@ -2690,6 +2699,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_workspace_delegates_prefix_suffix_scope_before_truncation_to_planner()
+    -> Result<()> {
+        let (_fixture, root) = fixture_scoped_workspace()?;
+        write_fixture_project_model(&root)?;
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::new(AtomicBool::new(false)),
+                range_read_fails: false,
+            }),
+            Arc::new(NoopDiscovery),
+        );
+        let params = SearchParams::new("scopedneedle", "scope proof")
+            .limit(1usize)
+            .starts_with("src/in/".to_string())
+            .ends_with(vec![".rs".to_string()]);
+
+        let actual = WorkspaceService::query_workspace(&setup, root, params).await?;
+        let expected = vec!["src/in/target.rs".to_string()];
+        assert_eq!(
+            actual
+                .iter()
+                .filter_map(|node| match &node.node {
+                    NodeData::FileChunk(chunk) => Some(chunk.file_path.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn query_workspace_persists_deterministic_context_pack_after_node_readback() -> Result<()>
     {
         let (_fixture, root) = fixture_workspace()?;
@@ -2917,7 +2962,7 @@ mod tests {
             }
             Err(error) => error.to_string(),
         };
-        let expected = "Workspace project model is not fresh";
+        let expected = "Workspace project model retrieval refused";
 
         assert!(actual_error.contains(expected));
         assert!(!range_read_called.load(Ordering::SeqCst));

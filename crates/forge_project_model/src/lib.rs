@@ -14,6 +14,7 @@ mod policy;
 mod producer;
 mod render;
 mod retrieval;
+mod retrieval_plan;
 mod status;
 mod types;
 mod util;
@@ -88,6 +89,13 @@ pub use render::{
     ProjectModelExactFactReadinessMetadata, render_project_model_context,
 };
 pub use retrieval::{plan_retrieval, retrieve, retrieve_with_boundaries};
+pub use retrieval_plan::{
+    ProjectContextPathScope, ProjectContextReadRequest, ProjectContextRetrievalPlan,
+    ProjectContextRetrievalPlanningOutcome, ProjectContextRetrievalQueryDiagnostics,
+    ProjectContextRetrievalRefusal, ProjectContextRetrievalRefusalCode,
+    ProjectContextRetrievalRequest, ProjectContextReturnOrderItem, ProjectContextWriteDecision,
+    plan_project_context_retrieval,
+};
 pub use status::{
     ExactFactArtifactStoreMetadata, ExactFactArtifactStoreState, ExactFactStatus,
     ExactFactStatusReport, read_exact_fact_artifact_store_metadata, read_exact_fact_status,
