@@ -245,7 +245,8 @@ mod tests {
 
     use forge_domain::{
         Context, ContextMessage, ConversationId, LearningLedgerEvent, LearningLedgerFreshness,
-        LearningRecordProjection, LearningReviewOutcome, LearningReviewState, ModelId,
+        LearningProvenance, LearningRecordProjection, LearningReviewOutcome, LearningReviewState,
+        ModelId,
     };
     use pretty_assertions::assert_eq;
 
@@ -448,6 +449,114 @@ mod tests {
         capture.capture_saved_conversation(&conversation).await;
 
         assert_eq!(fixture.events.lock().unwrap().len(), 0usize);
+        Ok(())
+    }
+
+    fn fixture_capture_event(
+        conversation: &Conversation,
+        source_event_id: String,
+        metadata: LearningCaptureMetadata,
+    ) -> anyhow::Result<LearningLedgerEvent> {
+        let draft = LearningCapture::<FixtureLearningService>::candidate_draft(conversation)
+            .expect("fixture conversation should produce a draft");
+        let mut event = LearningLedgerEvent::capture_candidate(
+            draft.summary,
+            LearningProvenance::conversation(
+                conversation.id,
+                source_event_id,
+                metadata.context_fingerprint.clone(),
+            ),
+            chrono::Utc::now(),
+        )?;
+        event.capture_metadata = Some(metadata);
+        Ok(event)
+    }
+
+    #[tokio::test]
+    async fn learning_capture_does_not_auto_promote_old_backlog_candidate_with_matching_summary()
+    -> anyhow::Result<()> {
+        let fixture = Arc::new(FixtureLearningService::default());
+        let capture = LearningCapture::new(fixture.clone());
+        let conversation = fixture_conversation();
+        let draft = LearningCapture::<FixtureLearningService>::candidate_draft(&conversation)
+            .expect("fixture conversation should produce a draft");
+        let old_event = fixture_capture_event(
+            &conversation,
+            "conversation:old-backlog:context:matching-summary".to_string(),
+            draft.metadata.clone(),
+        )?;
+        fixture
+            .events
+            .lock()
+            .unwrap()
+            .insert(old_event.idempotency_key.clone(), old_event.clone());
+
+        capture
+            .auto_review_current_capture(&conversation, &draft, old_event)
+            .await;
+
+        let actual = fixture.events.lock().unwrap().len();
+        let expected = 1usize;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_capture_does_not_auto_promote_spoofed_metadata() -> anyhow::Result<()> {
+        let fixture = Arc::new(FixtureLearningService::default());
+        let capture = LearningCapture::new(fixture.clone());
+        let conversation = fixture_conversation();
+        let draft = LearningCapture::<FixtureLearningService>::candidate_draft(&conversation)
+            .expect("fixture conversation should produce a draft");
+        let mut spoofed_metadata = draft.metadata.clone();
+        spoofed_metadata.summary_fingerprint = "spoofed-summary-fingerprint".to_string();
+        let event = fixture_capture_event(
+            &conversation,
+            draft.source_event_id.clone(),
+            spoofed_metadata,
+        )?;
+        fixture
+            .events
+            .lock()
+            .unwrap()
+            .insert(event.idempotency_key.clone(), event.clone());
+
+        capture
+            .auto_review_current_capture(&conversation, &draft, event)
+            .await;
+
+        let actual = fixture.events.lock().unwrap().len();
+        let expected = 1usize;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_capture_does_not_auto_promote_redacted_candidate() -> anyhow::Result<()> {
+        let fixture = Arc::new(FixtureLearningService::default());
+        let capture = LearningCapture::new(fixture.clone());
+        let conversation = fixture_conversation();
+        let draft = LearningCapture::<FixtureLearningService>::candidate_draft(&conversation)
+            .expect("fixture conversation should produce a draft");
+        let mut event = fixture_capture_event(
+            &conversation,
+            draft.source_event_id.clone(),
+            draft.metadata.clone(),
+        )?;
+        event.redaction_status = LearningRedactionStatus::Redacted;
+        fixture
+            .events
+            .lock()
+            .unwrap()
+            .insert(event.idempotency_key.clone(), event.clone());
+
+        capture
+            .auto_review_current_capture(&conversation, &draft, event)
+            .await;
+
+        let actual = fixture.events.lock().unwrap().len();
+        let expected = 1usize;
+        assert_eq!(actual, expected);
         Ok(())
     }
 }

@@ -1245,11 +1245,11 @@ mod tests {
         ConversationId, Environment, Event, FileChunk, FileStatus, FinishReason,
         LEARNING_LEDGER_SCHEMA_VERSION, LearningCaptureMetadata, LearningEventKind,
         LearningLedgerEvent, LearningLedgerFreshness, LearningProvenance, LearningRecordId,
-        LearningRecordProjection, LearningRedactionStatus, LearningReviewDecision,
-        LearningReviewRequest, LearningReviewState, McpConfig, McpServers, Model, ModelId, Node,
-        NodeData, NodeId, PermissionOperation, Provider, ProviderId, ProviderType, ResultStream,
-        Scope, SearchParams, SteerMessage, SyncProgress, ToolCallContext, ToolCallFull, ToolOutput,
-        ToolResult, WorkspaceAuth, WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
+        LearningRecordProjection, LearningRedactionStatus, LearningReviewState, McpConfig,
+        McpServers, Model, ModelId, Node, NodeData, NodeId, PermissionOperation, Provider,
+        ProviderId, ProviderType, ResultStream, Scope, SearchParams, SteerMessage, SyncProgress,
+        ToolCallContext, ToolCallFull, ToolOutput, ToolResult, WorkspaceAuth,
+        WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
         WorkspaceEvidenceReadinessDiagnostic, WorkspaceId, WorkspaceInfo,
     };
     use futures::StreamExt;
@@ -3061,25 +3061,25 @@ mod tests {
             .iter()
             .find(|event| event.event_kind == LearningEventKind::CandidateCaptured)
             .map(|event| {
-            (
-                events.len(),
-                event.event_kind,
-                event.provenance.conversation_id,
-                event.summary.contains("conversation_saved"),
-                event.summary.contains("user_message_count=1"),
-                event
-                    .summary
-                    .contains("runtime self-learning proof request"),
-                records
-                    .iter()
-                    .any(|record| record.record_id == event.record_id
-                        && record.review_state == LearningReviewState::Accepted),
-                saved
-                    .context
-                    .as_ref()
-                    .is_some_and(|context| context.messages.len() >= 2),
-            )
-        });
+                (
+                    events.len(),
+                    event.event_kind,
+                    event.provenance.conversation_id,
+                    event.summary.contains("conversation_saved"),
+                    event.summary.contains("user_message_count=1"),
+                    event
+                        .summary
+                        .contains("runtime self-learning proof request"),
+                    records.iter().any(|record| {
+                        record.record_id == event.record_id
+                            && record.review_state == LearningReviewState::Accepted
+                    }),
+                    saved
+                        .context
+                        .as_ref()
+                        .is_some_and(|context| context.messages.len() >= 2),
+                )
+            });
         let expected = Some((
             2usize,
             LearningEventKind::CandidateCaptured,
@@ -3130,47 +3130,35 @@ mod tests {
             response?;
         }
 
-        let candidate = setup
+        let accepted = setup
             .state
             .learning_records
             .lock()
             .await
             .iter()
-            .find(|record| record.review_state == LearningReviewState::Candidate)
+            .find(|record| record.review_state == LearningReviewState::Accepted)
             .cloned()
-            .expect("chat save should project a captured candidate");
-        let review_outcome = app
-            .review_learning_candidate(LearningReviewRequest::new(
-                candidate.record_id,
-                LearningReviewDecision::Accept,
-                "deterministic typed review accepted safe conversation-save learning",
-                LearningProvenance::conversation(
-                    conversation_id,
-                    "typed-review:accept-turnkey-self-learning",
-                    "typed-review-fingerprint",
-                ),
-            ))
-            .await?;
-        let repeated_review_outcome = app
-            .review_learning_candidate(LearningReviewRequest::new(
-                candidate.record_id,
-                LearningReviewDecision::Accept,
-                "repeat deterministic typed review should not append a new event",
-                LearningProvenance::conversation(
-                    conversation_id,
-                    "typed-review:accept-turnkey-self-learning-repeat",
-                    "typed-review-fingerprint-repeat",
-                ),
-            ))
-            .await?;
+            .expect("chat save should auto-accept a safe current capture");
+        let review_event = setup
+            .state
+            .learning_events
+            .lock()
+            .await
+            .iter()
+            .find(|event| event.event_kind == LearningEventKind::ReviewAccepted)
+            .cloned()
+            .expect("auto-review should append an accepted review event");
         let review_event_count = setup.state.learning_events.lock().await.len();
         assert_eq!(
-            (
-                repeated_review_outcome.projection.review_state,
-                review_event_count,
-            ),
-            (LearningReviewState::Accepted, 2usize),
+            (accepted.record_id, review_event_count),
+            (review_event.record_id, 2usize)
         );
+        let saved = setup
+            .find_conversation(&conversation_id)
+            .await?
+            .expect("conversation should remain saved after chat flow");
+        save_conversation_and_capture_learning(setup.clone(), saved).await?;
+        assert_eq!(setup.state.learning_events.lock().await.len(), 2usize);
         let next_conversation = Conversation::generate();
         let next_conversation_id = next_conversation.id;
         setup.upsert_conversation(next_conversation).await?;
@@ -3218,8 +3206,8 @@ mod tests {
             })
             .expect("accepted learning context should be injected into the next provider call");
         let actual = (
-            review_outcome.event.event_kind,
-            review_outcome.projection.review_state,
+            review_event.event_kind,
+            accepted.review_state,
             learning_message.content.contains("conversation_saved"),
             learning_message
                 .content
@@ -3239,59 +3227,13 @@ mod tests {
     async fn chat_flow_rejected_candidate_remains_excluded_from_next_chat_learning() -> Result<()> {
         let (_fixture, root) = fixture_workspace()?;
         let setup = ChatFlowLearningHarness::new(root);
-        let conversation = Conversation::generate();
-        let conversation_id = conversation.id;
-        setup.upsert_conversation(conversation).await?;
+        setup
+            .set_learning_records(vec![fixture_learning_projection(
+                LearningReviewState::Rejected,
+                "rejected runtime learning must stay out",
+            )])
+            .await;
         let app = ForgeApp::new(setup.clone());
-        let mut stream = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            app.chat(
-                setup.state.agent.id.clone(),
-                ChatRequest::new(
-                    Event::new("reject this learning candidate"),
-                    conversation_id,
-                ),
-            ),
-        )
-        .await??;
-
-        for _ in 0..32 {
-            if !setup.state.learning_events.lock().await.is_empty() {
-                break;
-            }
-            match tokio::time::timeout(std::time::Duration::from_millis(250), stream.next()).await {
-                Ok(Some(response)) => {
-                    response?;
-                }
-                Ok(None) => break,
-                Err(_) => {}
-            }
-        }
-        while let Some(response) = stream.next().await {
-            response?;
-        }
-
-        let candidate = setup
-            .state
-            .learning_records
-            .lock()
-            .await
-            .iter()
-            .find(|record| record.review_state == LearningReviewState::Candidate)
-            .cloned()
-            .expect("chat save should project a captured candidate");
-        let review_outcome = app
-            .review_learning_candidate(LearningReviewRequest::new(
-                candidate.record_id,
-                LearningReviewDecision::Reject,
-                "deterministic typed review rejected unsafe or non-useful candidate",
-                LearningProvenance::conversation(
-                    conversation_id,
-                    "typed-review:reject-learning-candidate",
-                    "typed-review-fingerprint",
-                ),
-            ))
-            .await?;
         let next_conversation = Conversation::generate();
         let next_conversation_id = next_conversation.id;
         setup.upsert_conversation(next_conversation).await?;
@@ -3337,16 +3279,8 @@ mod tests {
                 ContextMessage::Text(text) => text.is_learning_context(),
                 _ => false,
             });
-        let actual = (
-            review_outcome.event.event_kind,
-            review_outcome.projection.review_state,
-            injected,
-        );
-        let expected = (
-            LearningEventKind::ReviewRejected,
-            LearningReviewState::Rejected,
-            false,
-        );
+        let actual = injected;
+        let expected = false;
         assert_eq!(actual, expected);
         Ok(())
     }
