@@ -1038,19 +1038,21 @@ impl<
             return WorkspaceSemanticInjectionReadiness::VectorIndexCorruptOrNotReady;
         };
         let mut matching_dimensions = Vec::new();
+        let mut has_unreadable_artifact = false;
         for id in ids {
-            let artifact = match read_current_vector_artifact_metadata(
-                indexer,
-                manifest,
-                embedding_model_id,
-                &id,
-            ) {
-                Ok(Some(artifact)) => artifact,
-                Ok(None) => continue,
-                Err(_error) => {
-                    return WorkspaceSemanticInjectionReadiness::VectorIndexCorruptOrNotReady;
-                }
-            };
+            let artifact =
+                match read_vector_artifact_scan_outcome(indexer, manifest, embedding_model_id, &id)
+                {
+                    Ok(VectorArtifactScanOutcome::Current(artifact)) => artifact,
+                    Ok(VectorArtifactScanOutcome::Stale) => continue,
+                    Ok(VectorArtifactScanOutcome::Unreadable) => {
+                        has_unreadable_artifact = true;
+                        continue;
+                    }
+                    Err(_error) => {
+                        return WorkspaceSemanticInjectionReadiness::VectorIndexCorruptOrNotReady;
+                    }
+                };
             let dimension = artifact.dimension;
             match forge_project_model::DurableVectorIndex::new(manifest, artifact) {
                 Ok(_index) => matching_dimensions.push(dimension),
@@ -1060,6 +1062,9 @@ impl<
             }
         }
         match matching_dimensions.as_slice() {
+            [] if has_unreadable_artifact => {
+                WorkspaceSemanticInjectionReadiness::VectorIndexCorruptOrNotReady
+            }
             [] => WorkspaceSemanticInjectionReadiness::VectorIndexAbsentOrNoMatch,
             [dimension] => {
                 WorkspaceSemanticInjectionReadiness::VectorIndexReady { dimension: *dimension }
@@ -1209,23 +1214,34 @@ struct ValidatedVectorEntries {
     entries: Vec<VectorIndexEntry>,
 }
 
-fn read_current_vector_artifact_metadata(
+enum VectorArtifactScanOutcome {
+    Current(VectorIndexArtifact),
+    Stale,
+    Unreadable,
+}
+
+fn read_vector_artifact_scan_outcome(
     indexer: &ProjectIndexer,
     manifest: &forge_project_model::ProjectManifest,
     embedding_model_id: &str,
     id: &VectorIndexArtifactId,
-) -> Result<Option<VectorIndexArtifact>> {
+) -> Result<VectorArtifactScanOutcome> {
     let path = indexer
         .model_dir()
         .join("vector_indexes")
         .join(format!("{}.json", id.as_str()));
-    let json = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let artifact = serde_json::from_str::<VectorIndexArtifact>(&json)
-        .context("deserialize vector index metadata")?;
+    let json = match fs::read_to_string(&path) {
+        Ok(json) => json,
+        Err(_error) => return Ok(VectorArtifactScanOutcome::Unreadable),
+    };
+    let artifact = match serde_json::from_str::<VectorIndexArtifact>(&json) {
+        Ok(artifact) => artifact,
+        Err(_error) => return Ok(VectorArtifactScanOutcome::Unreadable),
+    };
     if artifact.manifest_hash != manifest.manifest_hash
         || artifact.embedding_model_id != embedding_model_id
     {
-        return Ok(None);
+        return Ok(VectorArtifactScanOutcome::Stale);
     }
     let actual_id = indexer.vector_index_artifact_id(&artifact)?;
     if &actual_id != id {
@@ -1235,7 +1251,7 @@ fn read_current_vector_artifact_metadata(
             actual_id
         );
     }
-    Ok(Some(artifact))
+    Ok(VectorArtifactScanOutcome::Current(artifact))
 }
 
 fn semantic_embedding_request_from_manifest(
@@ -1425,12 +1441,16 @@ fn select_durable_vector_index(
         );
     };
     let mut matching = Vec::new();
+    let mut has_unreadable_artifact = false;
     for id in ids {
         let artifact =
-            match read_current_vector_artifact_metadata(indexer, manifest, embedding_model_id, &id)
-            {
-                Ok(Some(artifact)) => artifact,
-                Ok(None) => continue,
+            match read_vector_artifact_scan_outcome(indexer, manifest, embedding_model_id, &id) {
+                Ok(VectorArtifactScanOutcome::Current(artifact)) => artifact,
+                Ok(VectorArtifactScanOutcome::Stale) => continue,
+                Ok(VectorArtifactScanOutcome::Unreadable) => {
+                    has_unreadable_artifact = true;
+                    continue;
+                }
                 Err(_error) => {
                     return DurableVectorSelection::unavailable(
                         ProjectContextVectorUnavailableReason::IndexNotReady,
@@ -1440,6 +1460,9 @@ fn select_durable_vector_index(
         matching.push(artifact);
     }
     match matching.len() {
+        0 if has_unreadable_artifact => DurableVectorSelection::unavailable(
+            ProjectContextVectorUnavailableReason::IndexNotReady,
+        ),
         0 => DurableVectorSelection::unavailable(
             ProjectContextVectorUnavailableReason::NoMatchingVectorIndex,
         ),
@@ -3691,6 +3714,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn semantic_injection_readiness_ignores_stale_corrupt_nonmatching_vector_artifacts()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        write_fixture_vector_index(&root, "fixture-model", "RuntimeNeedle")?;
+        fs::write(
+            root.join("src").join("lib.rs"),
+            "pub struct RuntimeNeedle {\n    pub value: usize,\n}\n\npub fn build_runtime_needle() -> RuntimeNeedle {\n    RuntimeNeedle { value: 7 }\n}\n\npub fn current_runtime_needle() -> RuntimeNeedle {\n    RuntimeNeedle { value: 11 }\n}\n",
+        )?;
+        write_fixture_project_model(&root)?;
+        write_fixture_vector_index(&root, "fixture-model", "current_runtime_needle")?;
+        let vector_dir = local_project_model_dir(&root).join("vector_indexes");
+        fs::write(vector_dir.join(format!("{}.json", "f".repeat(64))), "{")?;
+        let setup = fixture_sync_service(&root);
+
+        let actual = WorkspaceService::semantic_injection_readiness(
+            &setup,
+            root,
+            Some("fixture-model".to_string()),
+        )
+        .await?;
+        let expected = WorkspaceSemanticInjectionReadiness::VectorIndexReady { dimension: 2 };
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn query_workspace_ignores_stale_nonmatching_vector_artifacts() -> Result<()> {
         let (_fixture, root) = fixture_workspace()?;
         write_fixture_project_model(&root)?;
@@ -3728,6 +3779,118 @@ mod tests {
             }),
             expected,
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_workspace_ignores_stale_corrupt_nonmatching_vector_artifacts() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        write_fixture_vector_index(&root, "fixture-model", "RuntimeNeedle")?;
+        fs::write(
+            root.join("src").join("lib.rs"),
+            "pub struct RuntimeNeedle {\n    pub value: usize,\n}\n\npub fn build_runtime_needle() -> RuntimeNeedle {\n    RuntimeNeedle { value: 7 }\n}\n\npub fn current_runtime_needle() -> RuntimeNeedle {\n    RuntimeNeedle { value: 11 }\n}\n",
+        )?;
+        write_fixture_project_model(&root)?;
+        write_fixture_vector_index(&root, "fixture-model", "current_runtime_needle")?;
+        let vector_dir = local_project_model_dir(&root).join("vector_indexes");
+        fs::write(vector_dir.join(format!("{}.json", "f".repeat(64))), "{")?;
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::new(AtomicBool::new(false)),
+                range_read_fails: false,
+            }),
+            Arc::new(NoopDiscovery),
+        );
+        let params = SearchParams::new("lexicalmissneedle", "stale corrupt vector runtime proof")
+            .limit(1usize)
+            .query_embedding(vec![1.0, 0.0])
+            .embedding_model_id("fixture-model".to_string());
+
+        let actual = WorkspaceService::query_workspace(&setup, root, params).await?;
+        let expected = Some("src/lib.rs".to_string());
+        assert_eq!(
+            actual.iter().find_map(|node| match &node.node {
+                NodeData::FileChunk(chunk) if chunk.content.contains("current_runtime_needle") => {
+                    Some(chunk.file_path.clone())
+                }
+                _ => None,
+            }),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn semantic_injection_readiness_rejects_readable_current_corrupt_vector_artifact()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        write_fixture_vector_index(&root, "fixture-model", "RuntimeNeedle")?;
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+        let artifact_id = indexer
+            .list_vector_indexes()?
+            .pop()
+            .expect("fixture should write one vector artifact");
+        let artifact_path = local_project_model_dir(&root)
+            .join("vector_indexes")
+            .join(format!("{}.json", artifact_id.as_str()));
+        let mut artifact = indexer.read_vector_index(&indexer.read_manifest()?, &artifact_id)?;
+        artifact.index_fingerprint = "corrupt-current-fingerprint".to_string();
+        fs::write(artifact_path, artifact.to_stable_json()?)?;
+        let setup = fixture_sync_service(&root);
+
+        let actual = WorkspaceService::semantic_injection_readiness(
+            &setup,
+            root,
+            Some("fixture-model".to_string()),
+        )
+        .await?;
+        let expected = WorkspaceSemanticInjectionReadiness::VectorIndexCorruptOrNotReady;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_workspace_rejects_readable_current_corrupt_vector_artifact() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        write_fixture_vector_index(&root, "fixture-model", "RuntimeNeedle")?;
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+        let artifact_id = indexer
+            .list_vector_indexes()?
+            .pop()
+            .expect("fixture should write one vector artifact");
+        let artifact_path = local_project_model_dir(&root)
+            .join("vector_indexes")
+            .join(format!("{}.json", artifact_id.as_str()));
+        let mut artifact = indexer.read_vector_index(&indexer.read_manifest()?, &artifact_id)?;
+        artifact.index_fingerprint = "corrupt-current-fingerprint".to_string();
+        fs::write(artifact_path, artifact.to_stable_json()?)?;
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::new(AtomicBool::new(false)),
+                range_read_fails: false,
+            }),
+            Arc::new(NoopDiscovery),
+        );
+        let params = SearchParams::new("lexicalmissneedle", "current corrupt vector runtime proof")
+            .limit(1usize)
+            .query_embedding(vec![1.0, 0.0])
+            .embedding_model_id("fixture-model".to_string());
+
+        let actual = WorkspaceService::query_workspace(&setup, root, params).await;
+        let expected = "IndexNotReady";
+        assert!(actual.unwrap_err().to_string().contains(expected));
         Ok(())
     }
 
