@@ -1211,13 +1211,13 @@ mod tests {
         let actual = match fixture.subcommands {
             Some(TopLevelCommand::Workspace(group)) => match group.command {
                 WorkspaceCommand::Query { semantic, embedding_model_id, .. } => {
-                    (semantic, embedding_model_id)
+                    Some((semantic, embedding_model_id))
                 }
-                _ => panic!("expected workspace query command"),
+                _ => None,
             },
-            _ => panic!("expected workspace command"),
+            _ => None,
         };
-        let expected = (true, Some("fixture-model".to_string()));
+        let expected = Some((true, Some("fixture-model".to_string())));
         assert_eq!(actual, expected);
     }
 
@@ -1236,12 +1236,12 @@ mod tests {
             Some(TopLevelCommand::Workspace(group)) => match group.command {
                 WorkspaceCommand::VectorIndex {
                     command: WorkspaceVectorIndexCommand::Build { path, embedding_model_id },
-                } => (path, embedding_model_id),
-                _ => panic!("expected workspace vector-index build command"),
+                } => Some((path, embedding_model_id)),
+                _ => None,
             },
-            _ => panic!("expected workspace command"),
+            _ => None,
         };
-        let expected = (PathBuf::from("."), "fixture-model".to_string());
+        let expected = Some((PathBuf::from("."), "fixture-model".to_string()));
         assert_eq!(actual, expected);
     }
 

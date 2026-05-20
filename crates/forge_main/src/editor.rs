@@ -160,10 +160,10 @@ pub struct ReadLineError(std::io::Error);
 
 /// Custom edit mode that wraps Emacs and intercepts paste events.
 ///
-/// When the terminal sends a bracketed-paste (e.g. from a drag-and-drop),
-/// this mode checks whether the pasted text is an existing file path and,
-/// if so, wraps it in `@[...]` before it reaches the reedline buffer. This
-/// gives the user immediate visual feedback in the input field.
+/// When the terminal sends a bracketed-paste event, this mode normalizes the
+/// pasted text before it reaches the reedline buffer. Plain pasted file paths
+/// intentionally remain literal text; users can still opt into attachment
+/// handling by typing or pasting the explicit `@[...]` marker syntax.
 struct ForgeEditMode {
     inner: Emacs,
 }
