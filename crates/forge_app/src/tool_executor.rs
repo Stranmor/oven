@@ -372,6 +372,12 @@ impl<
                             let trimmed = model_id.trim().to_string();
                             (!trimmed.is_empty()).then_some(trimmed)
                         });
+                let explicit_model_id = input.embedding_model_id.as_deref().map(str::trim);
+                if explicit_model_id.is_some_and(str::is_empty) {
+                    anyhow::bail!(
+                        "workspace_vector_index_build_continuation rejected embedding_model_id: explicit model is not configured for this build path"
+                    );
+                }
                 let Some(embedding_model_id) = configured_model_id.clone() else {
                     let preflight_diagnostic = self
                         .services
@@ -386,11 +392,7 @@ impl<
                     };
                     return Ok(ToolOperation::WorkspaceVectorIndexBuildContinuation { output });
                 };
-                if let Some(explicit_model_id) = input
-                    .embedding_model_id
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|model_id| !model_id.is_empty())
+                if let Some(explicit_model_id) = explicit_model_id
                     && explicit_model_id != embedding_model_id
                 {
                     anyhow::bail!(
@@ -2020,6 +2022,60 @@ mod tests {
         let actual = executor
             .call_internal(
                 workspace_vector_build_tool(workspace, Some("other-model")),
+                &tool_context(),
+            )
+            .await;
+
+        assert!(
+            actual
+                .unwrap_err()
+                .to_string()
+                .contains("explicit model is not configured")
+        );
+        assert_eq!(setup.workspace.build_calls.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_vector_build_continuation_rejects_blank_explicit_model() -> anyhow::Result<()>
+    {
+        let fixture = tempfile::tempdir()?;
+        let workspace = std::fs::canonicalize(fixture.path())?;
+        let setup = Arc::new(
+            SemSearchFixture::new(sem_search_config(Some("fixture-model")))
+                .with_cwd(workspace.clone()),
+        );
+        let executor = ToolExecutor::new(Arc::clone(&setup));
+
+        let actual = executor
+            .call_internal(
+                workspace_vector_build_tool(workspace, Some("   ")),
+                &tool_context(),
+            )
+            .await;
+
+        assert!(
+            actual
+                .unwrap_err()
+                .to_string()
+                .contains("explicit model is not configured")
+        );
+        assert_eq!(setup.workspace.build_calls.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_vector_build_continuation_rejects_blank_explicit_model_without_config()
+    -> anyhow::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let workspace = std::fs::canonicalize(fixture.path())?;
+        let setup =
+            Arc::new(SemSearchFixture::new(sem_search_config(None)).with_cwd(workspace.clone()));
+        let executor = ToolExecutor::new(Arc::clone(&setup));
+
+        let actual = executor
+            .call_internal(
+                workspace_vector_build_tool(workspace, Some("   ")),
                 &tool_context(),
             )
             .await;
