@@ -920,9 +920,23 @@ fn vector_activation<'a>(
 fn invalid_query_embedding_value_reason(
     query: &VectorQuery,
 ) -> Option<ProjectContextRetrievalPhaseInvalidReason> {
-    if !query.embedding.iter().all(|value| value.is_finite()) {
-        Some(ProjectContextRetrievalPhaseInvalidReason::NonFiniteQueryEmbedding)
-    } else if query.embedding.iter().all(|value| *value == 0.0) {
+    if query.embedding.iter().any(|value| !value.is_finite()) {
+        return Some(ProjectContextRetrievalPhaseInvalidReason::NonFiniteQueryEmbedding);
+    }
+
+    let mut squared_norm = 0.0f32;
+    for value in &query.embedding {
+        let square = value * value;
+        if !square.is_finite() {
+            return Some(ProjectContextRetrievalPhaseInvalidReason::NonFiniteQueryEmbedding);
+        }
+        squared_norm += square;
+        if !squared_norm.is_finite() {
+            return Some(ProjectContextRetrievalPhaseInvalidReason::NonFiniteQueryEmbedding);
+        }
+    }
+
+    if squared_norm <= 0.0 {
         Some(ProjectContextRetrievalPhaseInvalidReason::ZeroQueryEmbeddingNorm)
     } else {
         None
@@ -1810,6 +1824,49 @@ mod tests {
         assert_eq!(
             actual_plan.query_diagnostics.phase_diagnostics.vector, expected,
             "non-finite vector queries must be reported as invalid, not active with empty hits"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn overflow_query_embedding_norm_is_rejected_instead_of_reported_active() -> Result<()> {
+        let (_fixture, _root, manifest) = indexed_fixture()?;
+        let root_symbol = manifest
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "Root")
+            .expect("fixture should include Root symbol");
+        let vector_index = DeterministicVectorIndex::new(BTreeMap::from([(
+            root_symbol.id.clone(),
+            vec![1.0, 0.0],
+        )]));
+        let vector_query = VectorQuery { embedding: vec![f32::MAX, 0.0] };
+        let request = ProjectContextRetrievalRequest::new(
+            "Root model",
+            3,
+            ProjectContextPathScope::default(),
+            true,
+        );
+
+        let actual = plan_project_context_retrieval_with_options(
+            &manifest,
+            &freshness(&manifest),
+            request,
+            ProjectContextRetrievalOptions {
+                vector_query: Some(&vector_query),
+                vector_index: Some(ready_vector_boundary(&vector_index, 2)),
+                reranker: None,
+                vector_unavailable_reason: None,
+            },
+        );
+        let actual_plan = expect_plan(actual);
+        let expected = ProjectContextRetrievalPhaseStatus::Invalid(
+            ProjectContextRetrievalPhaseInvalidReason::NonFiniteQueryEmbedding,
+        );
+
+        assert_eq!(
+            actual_plan.query_diagnostics.phase_diagnostics.vector, expected,
+            "finite values whose norm arithmetic overflows must be invalid, not active with empty hits"
         );
         Ok(())
     }
