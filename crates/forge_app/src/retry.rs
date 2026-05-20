@@ -44,7 +44,7 @@ pub fn is_provider_context_window_error(error: &anyhow::Error) -> bool {
             .downcast_ref::<OpenAiError>()
             .is_some_and(|error| match error {
                 OpenAiError::Response(response) => {
-                    error_response_has_context_window_signal(response)
+                    error_response_has_strict_context_length_exceeded(response)
                 }
                 OpenAiError::InvalidStatusCode(_) => false,
             })
@@ -107,33 +107,11 @@ fn error_response_has_strict_context_length_exceeded(error: &ErrorResponse) -> b
     code_matches || message_matches || nested_matches
 }
 
-fn error_response_has_context_window_signal(error: &ErrorResponse) -> bool {
-    let code_matches = error
-        .code
-        .as_ref()
-        .and_then(ErrorCode::as_str)
-        .is_some_and(text_has_context_window_signal);
-    let message_matches = error
-        .message
-        .as_deref()
-        .is_some_and(text_has_context_window_signal);
-    let nested_matches = error
-        .error
-        .as_deref()
-        .is_some_and(error_response_has_context_window_signal);
-
-    code_matches || message_matches || nested_matches
-}
-
 fn text_has_context_length_exceeded_signal(text: &str) -> bool {
     let normalized = text.to_lowercase();
     normalized.contains("context_length_exceeded")
         || normalized.contains("maximum context length")
         || normalized.contains("context length") && normalized.contains("exceed")
-}
-
-fn text_has_context_window_signal(text: &str) -> bool {
-    text_has_context_length_exceeded_signal(text) || text.to_lowercase().contains("context window")
 }
 
 #[cfg(test)]
@@ -198,6 +176,22 @@ mod tests {
         })
         .to_string();
         let fixture = anyhow::Error::from(OpenAiError::InvalidStatusCode(400)).context(body);
+
+        let actual = is_provider_context_window_error(&fixture);
+        let expected = false;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_provider_context_window_error_rejects_typed_quota_response_with_context_window_text() {
+        let fixture = anyhow!(OpenAiError::Response(
+            ErrorResponse::default()
+                .code(ErrorCode::String("quota_exceeded".to_string()))
+                .message(
+                    "requested context window tier quota exceeded for current plan".to_string()
+                ),
+        ));
 
         let actual = is_provider_context_window_error(&fixture);
         let expected = false;
