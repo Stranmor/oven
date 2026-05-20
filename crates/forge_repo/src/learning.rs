@@ -100,6 +100,7 @@ impl LearningRepository for LearningRepositoryImpl {
             event.provenance.validate()?;
             let workspace_id = workspace_db_id(wid);
             let record = LearningLedgerEventRecord::new(event, workspace_id)?;
+            ensure_direct_learning_append_event_allowed(&record)?;
             connection.immediate_transaction::<_, anyhow::Error, _>(|connection| {
                 let existing = learning_ledger_events::table
                     .filter(learning_ledger_events::workspace_id.eq(workspace_id))
@@ -683,6 +684,24 @@ fn insert_or_replay_learning_event(
         .try_into_event()
 }
 
+fn ensure_direct_learning_append_event_allowed(
+    record: &LearningLedgerEventRecord,
+) -> anyhow::Result<()> {
+    if record.event_kind == LearningEventKind::PromotionAudit.to_string() {
+        anyhow::bail!(
+            "sensor promotion audit events require repository promotion proof transaction"
+        );
+    }
+    if record.event_kind == LearningEventKind::ReviewAccepted.to_string()
+        && is_sanctioned_promotion_reviewer(record.eval_id.as_deref())
+    {
+        anyhow::bail!(
+            "sensor promotion ReviewAccepted requires repository promotion proof transaction"
+        );
+    }
+    Ok(())
+}
+
 fn ensure_learning_event_idempotency_replay(
     existing: &LearningLedgerEventRecord,
     replay: &LearningLedgerEventRecord,
@@ -759,10 +778,14 @@ fn project_records(
             }
             LearningEventKind::ReviewAccepted => {
                 if let Some(projection) = projections.get_mut(&record_key) {
-                    projection.review_state = LearningReviewState::Accepted;
                     if let Some((accepted_summary, required_audit_key)) =
                         accepted_summary_from_review_event(&event)?
                     {
+                        anyhow::ensure!(
+                            projection.review_state == LearningReviewState::Candidate,
+                            "sensor promotion review cannot override terminal review state {}",
+                            projection.review_state
+                        );
                         let has_audit = promotion_audits
                             .get(&record_key)
                             .is_some_and(|audits| audits.contains(&required_audit_key));
@@ -774,6 +797,7 @@ fn project_records(
                     } else {
                         projection.accepted_summary = None;
                     }
+                    projection.review_state = LearningReviewState::Accepted;
                     projection.updated_at = event.created_at;
                 }
             }
@@ -2267,14 +2291,19 @@ mod tests {
             created_at + Duration::seconds(2),
         )?;
 
-        fixture.insert_learning_event(fake_audit).await?;
-        fixture.insert_learning_event(forged_review).await?;
+        let fake_audit_result = fixture.insert_learning_event(fake_audit).await;
+        let forged_review_result = fixture.insert_learning_event(forged_review).await;
+        let projection = fixture
+            .get_learning_record(candidate.record_id)
+            .await?
+            .expect("candidate projection should exist after rejected forgery");
 
-        let actual = fixture
-            .list_learning_records(Some(LearningReviewState::Accepted), 10)
-            .await
-            .is_err();
-        let expected = true;
+        let actual = (
+            fake_audit_result.is_err(),
+            forged_review_result.is_err(),
+            projection.review_state,
+        );
+        let expected = (true, true, LearningReviewState::Candidate);
 
         assert_eq!(actual, expected);
         Ok(())
@@ -2301,6 +2330,47 @@ mod tests {
 
         let actual = fixture.promote_sensor_lesson(request).await.is_err();
         let expected = true;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_stale_promotion_events_do_not_override_later_terminal_review()
+    -> anyhow::Result<()> {
+        let fixture = fixture_repo(32)?;
+        let created_at = Utc::now();
+        let request = fixture_promotion_request(&fixture, created_at).await?;
+        let rejection = LearningLedgerEvent::review(
+            request.proposal().candidate_id(),
+            LearningEventKind::ReviewRejected,
+            "terminal rejection wins before stale direct promotion events",
+            LearningProvenance::conversation(
+                ConversationId::generate(),
+                "direct-reject-review",
+                "direct-reject-review-fingerprint",
+            ),
+            created_at + Duration::seconds(3),
+        )?;
+        fixture.review_learning_candidate_event(rejection).await?;
+
+        let audit_result = fixture
+            .insert_learning_event(request.audit_event().clone())
+            .await;
+        let review_result = fixture
+            .insert_learning_event(request.review_event().clone())
+            .await;
+        let projection = fixture
+            .get_learning_record(request.proposal().candidate_id())
+            .await?
+            .expect("candidate projection should exist after rejected direct promotion events");
+
+        let actual = (
+            audit_result.is_err(),
+            review_result.is_err(),
+            projection.review_state,
+        );
+        let expected = (true, true, LearningReviewState::Rejected);
 
         assert_eq!(actual, expected);
         Ok(())
