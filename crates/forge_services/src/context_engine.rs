@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -36,9 +37,9 @@ use forge_project_model::{
     ProjectContextVectorUnavailableReason, ProjectContextWriteDecision, ProjectIndexer,
     ProjectModelContextRenderBudget, Provenance, RustAnalyzerBounds, RustAnalyzerCapability,
     RustAnalyzerCapabilityProbe, RustAnalyzerCapabilityStatus, RustAnalyzerProbe,
-    StdRustAnalyzerProcess, ToolEpisode, VectorIndexArtifact, VectorIndexEntry, VectorQuery,
-    derive_native_lsp_reference_request, fingerprint, load_evidence_ledger_activation,
-    local_project_model_dir, local_project_model_manifest,
+    StdRustAnalyzerProcess, ToolEpisode, VectorIndexArtifact, VectorIndexArtifactId,
+    VectorIndexEntry, VectorQuery, derive_native_lsp_reference_request, fingerprint,
+    load_evidence_ledger_activation, local_project_model_dir, local_project_model_manifest,
     plan_project_context_retrieval_with_options, read_exact_fact_status,
     redaction_safe_issue_path_label, redaction_safe_provenance_source_label,
     redaction_safe_replay_path_label, render_project_model_context,
@@ -1038,21 +1039,23 @@ impl<
         };
         let mut matching_dimensions = Vec::new();
         for id in ids {
-            let artifact = match indexer.read_vector_index(manifest, &id) {
-                Ok(artifact) => artifact,
+            let artifact = match read_current_vector_artifact_metadata(
+                indexer,
+                manifest,
+                embedding_model_id,
+                &id,
+            ) {
+                Ok(Some(artifact)) => artifact,
+                Ok(None) => continue,
                 Err(_error) => {
                     return WorkspaceSemanticInjectionReadiness::VectorIndexCorruptOrNotReady;
                 }
             };
-            if artifact.manifest_hash == manifest.manifest_hash
-                && artifact.embedding_model_id == embedding_model_id
-            {
-                let dimension = artifact.dimension;
-                match forge_project_model::DurableVectorIndex::new(manifest, artifact) {
-                    Ok(_index) => matching_dimensions.push(dimension),
-                    Err(_error) => {
-                        return WorkspaceSemanticInjectionReadiness::VectorIndexCorruptOrNotReady;
-                    }
+            let dimension = artifact.dimension;
+            match forge_project_model::DurableVectorIndex::new(manifest, artifact) {
+                Ok(_index) => matching_dimensions.push(dimension),
+                Err(_error) => {
+                    return WorkspaceSemanticInjectionReadiness::VectorIndexCorruptOrNotReady;
                 }
             }
         }
@@ -1204,6 +1207,35 @@ impl<
 struct ValidatedVectorEntries {
     dimension: usize,
     entries: Vec<VectorIndexEntry>,
+}
+
+fn read_current_vector_artifact_metadata(
+    indexer: &ProjectIndexer,
+    manifest: &forge_project_model::ProjectManifest,
+    embedding_model_id: &str,
+    id: &VectorIndexArtifactId,
+) -> Result<Option<VectorIndexArtifact>> {
+    let path = indexer
+        .model_dir()
+        .join("vector_indexes")
+        .join(format!("{}.json", id.as_str()));
+    let json = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let artifact = serde_json::from_str::<VectorIndexArtifact>(&json)
+        .context("deserialize vector index metadata")?;
+    if artifact.manifest_hash != manifest.manifest_hash
+        || artifact.embedding_model_id != embedding_model_id
+    {
+        return Ok(None);
+    }
+    let actual_id = indexer.vector_index_artifact_id(&artifact)?;
+    if &actual_id != id {
+        anyhow::bail!(
+            "vector index artifact id mismatch: expected {}, got {}",
+            id,
+            actual_id
+        );
+    }
+    Ok(Some(artifact))
 }
 
 fn semantic_embedding_request_from_manifest(
@@ -1394,19 +1426,18 @@ fn select_durable_vector_index(
     };
     let mut matching = Vec::new();
     for id in ids {
-        let artifact = match indexer.read_vector_index(manifest, &id) {
-            Ok(artifact) => artifact,
-            Err(_error) => {
-                return DurableVectorSelection::unavailable(
-                    ProjectContextVectorUnavailableReason::IndexNotReady,
-                );
-            }
-        };
-        if artifact.manifest_hash == manifest.manifest_hash
-            && artifact.embedding_model_id == embedding_model_id
-        {
-            matching.push(artifact);
-        }
+        let artifact =
+            match read_current_vector_artifact_metadata(indexer, manifest, embedding_model_id, &id)
+            {
+                Ok(Some(artifact)) => artifact,
+                Ok(None) => continue,
+                Err(_error) => {
+                    return DurableVectorSelection::unavailable(
+                        ProjectContextVectorUnavailableReason::IndexNotReady,
+                    );
+                }
+            };
+        matching.push(artifact);
     }
     match matching.len() {
         0 => DurableVectorSelection::unavailable(
@@ -3630,6 +3661,73 @@ mod tests {
         );
 
         assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn semantic_injection_readiness_ignores_stale_nonmatching_vector_artifacts() -> Result<()>
+    {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        write_fixture_vector_index(&root, "fixture-model", "RuntimeNeedle")?;
+        fs::write(
+            root.join("src").join("lib.rs"),
+            "pub struct RuntimeNeedle {\n    pub value: usize,\n}\n\npub fn build_runtime_needle() -> RuntimeNeedle {\n    RuntimeNeedle { value: 7 }\n}\n\npub fn current_runtime_needle() -> RuntimeNeedle {\n    RuntimeNeedle { value: 11 }\n}\n",
+        )?;
+        write_fixture_project_model(&root)?;
+        write_fixture_vector_index(&root, "fixture-model", "current_runtime_needle")?;
+        let setup = fixture_sync_service(&root);
+
+        let actual = WorkspaceService::semantic_injection_readiness(
+            &setup,
+            root,
+            Some("fixture-model".to_string()),
+        )
+        .await?;
+        let expected = WorkspaceSemanticInjectionReadiness::VectorIndexReady { dimension: 2 };
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_workspace_ignores_stale_nonmatching_vector_artifacts() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        write_fixture_vector_index(&root, "fixture-model", "RuntimeNeedle")?;
+        fs::write(
+            root.join("src").join("lib.rs"),
+            "pub struct RuntimeNeedle {\n    pub value: usize,\n}\n\npub fn build_runtime_needle() -> RuntimeNeedle {\n    RuntimeNeedle { value: 7 }\n}\n\npub fn current_runtime_needle() -> RuntimeNeedle {\n    RuntimeNeedle { value: 11 }\n}\n",
+        )?;
+        write_fixture_project_model(&root)?;
+        write_fixture_vector_index(&root, "fixture-model", "current_runtime_needle")?;
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::new(AtomicBool::new(false)),
+                range_read_fails: false,
+            }),
+            Arc::new(NoopDiscovery),
+        );
+        let params = SearchParams::new("lexicalmissneedle", "stale vector runtime proof")
+            .limit(1usize)
+            .query_embedding(vec![1.0, 0.0])
+            .embedding_model_id("fixture-model".to_string());
+
+        let actual = WorkspaceService::query_workspace(&setup, root, params).await?;
+        let expected = Some("src/lib.rs".to_string());
+        assert_eq!(
+            actual.iter().find_map(|node| match &node.node {
+                NodeData::FileChunk(chunk) if chunk.content.contains("current_runtime_needle") => {
+                    Some(chunk.file_path.clone())
+                }
+                _ => None,
+            }),
+            expected,
+        );
         Ok(())
     }
 
