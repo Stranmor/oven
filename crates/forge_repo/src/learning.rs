@@ -5,10 +5,11 @@ use std::sync::Arc;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use diesel::prelude::*;
 use forge_domain::{
-    ConversationId, LearningEventId, LearningEventKind, LearningLedgerEvent,
-    LearningLedgerFreshness, LearningProvenance, LearningRecordId, LearningRecordProjection,
-    LearningRedactionStatus, LearningRepository, LearningReviewOutcome, LearningReviewState,
-    LearningSourceKind, RedactedLearningSummary, SubagentTaskId, WorkspaceHash,
+    ConversationId, LearningCaptureMetadata, LearningEventId, LearningEventKind,
+    LearningLedgerEvent, LearningLedgerFreshness, LearningProvenance, LearningRecordId,
+    LearningRecordProjection, LearningRedactionStatus, LearningRepository, LearningReviewOutcome,
+    LearningReviewState, LearningSourceKind, RedactedLearningSummary, SubagentTaskId,
+    WorkspaceHash,
 };
 use sha2::{Digest, Sha256};
 
@@ -57,6 +58,8 @@ struct LearningLedgerEventRecord {
     pub tool_name: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     pub eval_id: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    pub capture_metadata: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Timestamp)]
     pub created_at: NaiveDateTime,
     #[diesel(sql_type = diesel::sql_types::Integer)]
@@ -121,6 +124,7 @@ impl LearningRepository for LearningRepositoryImpl {
                         learning_ledger_events::task_id.eq(&record.task_id),
                         learning_ledger_events::tool_name.eq(&record.tool_name),
                         learning_ledger_events::eval_id.eq(&record.eval_id),
+                        learning_ledger_events::capture_metadata.eq(&record.capture_metadata),
                         learning_ledger_events::created_at.eq(record.created_at),
                         learning_ledger_events::schema_version.eq(record.schema_version),
                     ))
@@ -202,6 +206,7 @@ impl LearningRepository for LearningRepositoryImpl {
                             learning_ledger_events::task_id.eq(&record.task_id),
                             learning_ledger_events::tool_name.eq(&record.tool_name),
                             learning_ledger_events::eval_id.eq(&record.eval_id),
+                            learning_ledger_events::capture_metadata.eq(&record.capture_metadata),
                             learning_ledger_events::created_at.eq(record.created_at),
                             learning_ledger_events::schema_version.eq(record.schema_version),
                         ))
@@ -224,6 +229,23 @@ impl LearningRepository for LearningRepositoryImpl {
                     })?;
                 Ok(LearningReviewOutcome { event, projection })
             })
+        })
+        .await
+    }
+
+    async fn get_learning_record(
+        &self,
+        record_id: LearningRecordId,
+    ) -> anyhow::Result<Option<LearningRecordProjection>> {
+        self.run_with_connection(move |connection, wid| {
+            let workspace_id = workspace_db_id(wid);
+            let records = learning_ledger_events::table
+                .filter(learning_ledger_events::workspace_id.eq(workspace_id))
+                .order(learning_ledger_events::event_seq.asc())
+                .load::<LearningLedgerEventRecord>(connection)?;
+            Ok(project_records(records)?
+                .into_iter()
+                .find(|projection| projection.record_id == record_id))
         })
         .await
     }
@@ -348,6 +370,11 @@ impl LearningLedgerEventRecord {
                 LearningRedactionStatus::Clean
             }
         });
+        let capture_metadata = event
+            .capture_metadata
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         Ok(Self {
             event_seq: 0,
             event_id: event.event_id.into_string(),
@@ -366,6 +393,7 @@ impl LearningLedgerEventRecord {
             task_id: event.provenance.task_id.map(|id| id.into_string()),
             tool_name: redacted_tool_name.map(|redacted| redacted.summary),
             eval_id: redacted_eval_id.map(|redacted| redacted.summary),
+            capture_metadata,
             created_at: event.created_at.naive_utc(),
             schema_version: event.schema_version,
         })
@@ -384,6 +412,11 @@ impl LearningLedgerEventRecord {
             content_fingerprint: self.content_fingerprint,
             redaction_status,
             provenance,
+            capture_metadata: self
+                .capture_metadata
+                .as_deref()
+                .map(serde_json::from_str::<LearningCaptureMetadata>)
+                .transpose()?,
             created_at: from_naive(self.created_at),
             schema_version: self.schema_version,
         })
@@ -417,6 +450,7 @@ struct ProjectionBuilder {
     review_state: LearningReviewState,
     redaction_status: LearningRedactionStatus,
     provenance: LearningProvenance,
+    capture_metadata: Option<LearningCaptureMetadata>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     schema_version: i32,
@@ -437,6 +471,7 @@ fn project_records(
                     review_state: LearningReviewState::Candidate,
                     redaction_status: event.redaction_status,
                     provenance: event.provenance,
+                    capture_metadata: event.capture_metadata,
                     created_at: event.created_at,
                     updated_at: event.created_at,
                     schema_version: event.schema_version,
@@ -470,6 +505,7 @@ fn project_records(
             review_state: projection.review_state,
             redaction_status: projection.redaction_status,
             provenance: projection.provenance,
+            capture_metadata: projection.capture_metadata,
             created_at: projection.created_at,
             updated_at: projection.updated_at,
             schema_version: projection.schema_version,
@@ -899,6 +935,7 @@ mod tests {
                 "event-raw-secret",
                 "source fingerprint contains token sk-123456789012345678901234",
             ),
+            capture_metadata: None,
             created_at: Utc::now(),
             schema_version: LEARNING_LEDGER_SCHEMA_VERSION,
         };
@@ -944,6 +981,7 @@ mod tests {
                 source_event_id: "event token sk-123456789012345678901234".to_string(),
                 source_fingerprint: "safe-source-fingerprint".to_string(),
             },
+            capture_metadata: None,
             created_at: Utc::now(),
             schema_version: LEARNING_LEDGER_SCHEMA_VERSION,
         };

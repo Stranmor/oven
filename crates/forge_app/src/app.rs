@@ -1243,13 +1243,13 @@ mod tests {
         Agent, AgentId, AnyProvider, AuthContextRequest, AuthContextResponse, AuthMethod,
         ChatCompletionMessage, ChatRequest, Content, Context, ContextMessage, Conversation,
         ConversationId, Environment, Event, FileChunk, FileStatus, FinishReason,
-        LEARNING_LEDGER_SCHEMA_VERSION, LearningEventKind, LearningLedgerEvent,
-        LearningLedgerFreshness, LearningProvenance, LearningRecordId, LearningRecordProjection,
-        LearningRedactionStatus, LearningReviewDecision, LearningReviewRequest,
-        LearningReviewState, McpConfig, McpServers, Model, ModelId, Node, NodeData, NodeId,
-        PermissionOperation, Provider, ProviderId, ProviderType, ResultStream, Scope, SearchParams,
-        SteerMessage, SyncProgress, ToolCallContext, ToolCallFull, ToolOutput, ToolResult,
-        WorkspaceAuth, WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
+        LEARNING_LEDGER_SCHEMA_VERSION, LearningCaptureMetadata, LearningEventKind,
+        LearningLedgerEvent, LearningLedgerFreshness, LearningProvenance, LearningRecordId,
+        LearningRecordProjection, LearningRedactionStatus, LearningReviewDecision,
+        LearningReviewRequest, LearningReviewState, McpConfig, McpServers, Model, ModelId, Node,
+        NodeData, NodeId, PermissionOperation, Provider, ProviderId, ProviderType, ResultStream,
+        Scope, SearchParams, SteerMessage, SyncProgress, ToolCallContext, ToolCallFull, ToolOutput,
+        ToolResult, WorkspaceAuth, WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
         WorkspaceEvidenceReadinessDiagnostic, WorkspaceId, WorkspaceInfo,
     };
     use futures::StreamExt;
@@ -1374,6 +1374,7 @@ mod tests {
                         review_state: LearningReviewState::Candidate,
                         redaction_status: event.redaction_status,
                         provenance: event.provenance.clone(),
+                        capture_metadata: event.capture_metadata.clone(),
                         created_at: event.created_at,
                         updated_at: event.created_at,
                         schema_version: event.schema_version,
@@ -1549,16 +1550,18 @@ mod tests {
             conversation_id: ConversationId,
             source_event_id: String,
             summary: String,
+            metadata: LearningCaptureMetadata,
         ) -> Result<LearningLedgerEvent> {
-            let event = LearningLedgerEvent::capture_candidate(
+            let mut event = LearningLedgerEvent::capture_candidate(
                 summary,
                 LearningProvenance::conversation(
                     conversation_id,
                     source_event_id,
-                    "runtime-proof-source-fingerprint",
+                    metadata.context_fingerprint.clone(),
                 ),
                 chrono::Utc::now(),
             )?;
+            event.capture_metadata = Some(metadata);
             let mut events = self.learning_events.lock().await;
             let event = events
                 .iter()
@@ -1643,6 +1646,19 @@ mod tests {
                     anyhow::anyhow!("learning review projection not found after append")
                 })?;
             Ok(LearningReviewOutcome { event, projection })
+        }
+
+        async fn get_learning_record(
+            &self,
+            record_id: LearningRecordId,
+        ) -> Result<Option<LearningRecordProjection>> {
+            Ok(self
+                .learning_records
+                .lock()
+                .await
+                .iter()
+                .find(|record| record.record_id == record_id)
+                .cloned())
         }
 
         async fn list_learning_records(
@@ -2873,6 +2889,7 @@ mod tests {
             _conversation_id: ConversationId,
             _source_event_id: String,
             _summary: String,
+            _metadata: LearningCaptureMetadata,
         ) -> Result<LearningLedgerEvent> {
             anyhow::bail!("unused learning capture")
         }
@@ -2889,6 +2906,13 @@ mod tests {
             _event: LearningLedgerEvent,
         ) -> Result<LearningReviewOutcome> {
             anyhow::bail!("unused learning review")
+        }
+
+        async fn get_learning_record(
+            &self,
+            _record_id: LearningRecordId,
+        ) -> Result<Option<LearningRecordProjection>> {
+            Ok(None)
         }
 
         async fn list_learning_records(
@@ -2984,6 +3008,7 @@ mod tests {
                 "learning-event-1",
                 "learning-source-fingerprint",
             ),
+            capture_metadata: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             schema_version: LEARNING_LEDGER_SCHEMA_VERSION,
@@ -3022,13 +3047,20 @@ mod tests {
                 Err(_) => {}
             }
         }
+        while let Some(response) = stream.next().await {
+            response?;
+        }
 
         let saved = setup
             .find_conversation(&conversation_id)
             .await?
             .expect("conversation should be saved after chat flow");
         let events = setup.state.learning_events.lock().await.clone();
-        let actual = events.first().map(|event| {
+        let records = setup.state.learning_records.lock().await.clone();
+        let actual = events
+            .iter()
+            .find(|event| event.event_kind == LearningEventKind::CandidateCaptured)
+            .map(|event| {
             (
                 events.len(),
                 event.event_kind,
@@ -3038,6 +3070,10 @@ mod tests {
                 event
                     .summary
                     .contains("runtime self-learning proof request"),
+                records
+                    .iter()
+                    .any(|record| record.record_id == event.record_id
+                        && record.review_state == LearningReviewState::Accepted),
                 saved
                     .context
                     .as_ref()
@@ -3045,12 +3081,13 @@ mod tests {
             )
         });
         let expected = Some((
-            1usize,
+            2usize,
             LearningEventKind::CandidateCaptured,
             Some(conversation_id),
             true,
             true,
             false,
+            true,
             true,
         ));
         assert_eq!(actual, expected);

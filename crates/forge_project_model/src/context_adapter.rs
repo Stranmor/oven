@@ -5,8 +5,9 @@ use std::path::{Component, Path};
 use crate::evidence_replay::{EvidenceLedgerReplayReport, EvidenceReplayIssueCode};
 use crate::render::ProjectModelContextSource;
 use crate::types::{
-    ContextPack, ContextPackEvidence, EvidenceFreshness, ProjectManifest, ShardManifest,
-    SourceFile, SymbolNode,
+    CargoFeatureMetadata, CargoPackageDependency, CargoPackageMetadata, CargoTargetMetadata,
+    CargoWorkspaceMetadata, ContextPack, ContextPackEvidence, EvidenceFreshness, ProjectManifest,
+    ShardManifest, SourceFile, SymbolNode,
 };
 
 const EVIDENCE_REPLAY_METADATA_ONLY_REASON: &str = "evidence_replay_reference_only";
@@ -357,17 +358,25 @@ pub fn render_source_from_evidence(
     manifest: &ProjectManifest,
     evidence: &ContextPackEvidence,
 ) -> ProjectModelContextSource {
+    let target = resolve_manifest_evidence_target(manifest, &evidence.id);
+    let path = target
+        .as_ref()
+        .map(|target| target.path.clone())
+        .unwrap_or_else(|| evidence.path.clone());
     let mut source = ProjectModelContextSource::new(
-        evidence.path.clone(),
+        path,
         evidence_freshness_label(&evidence.freshness),
         evidence.provenance.source.clone(),
         evidence.id.clone(),
     )
     .score(Some(evidence.score));
-    if let Some((start_line, end_line)) = evidence_line_range(manifest, &evidence.id) {
-        source = source.line_range(start_line, end_line);
-    }
-    if let Some(content_hash) = evidence_content_hash(manifest, &evidence.id, &evidence.path) {
+    if let Some(target) = target {
+        if let Some((start_line, end_line)) = target.line_range {
+            source = source.line_range(start_line, end_line);
+        }
+        source = source.content_hash(target.content_hash);
+    } else if let Some(content_hash) = evidence_content_hash(manifest, &evidence.id, &evidence.path)
+    {
         source = source.content_hash(content_hash);
     }
     source
@@ -380,25 +389,7 @@ pub fn render_source_from_evidence(
 /// * `manifest` - Manifest searched for matching evidence.
 /// * `evidence_id` - Retrieval, symbol, shard, or file identifier.
 pub fn evidence_line_range(manifest: &ProjectManifest, evidence_id: &str) -> Option<(u32, u32)> {
-    manifest
-        .symbols
-        .iter()
-        .find(|symbol| symbol.id == evidence_id)
-        .map(symbol_line_range)
-        .or_else(|| {
-            manifest
-                .shards
-                .iter()
-                .find(|shard| shard.id == evidence_id)
-                .map(shard_line_range)
-        })
-        .or_else(|| {
-            manifest
-                .files
-                .iter()
-                .find(|file| file.path == evidence_id)
-                .map(file_line_range)
-        })
+    resolve_manifest_evidence_target(manifest, evidence_id).and_then(|target| target.line_range)
 }
 
 fn evidence_replay_reference_is_allowed(freshness: &EvidenceFreshness) -> bool {
@@ -408,13 +399,51 @@ fn evidence_replay_reference_is_allowed(freshness: &EvidenceFreshness) -> bool {
     )
 }
 
-struct ManifestEvidenceTarget {
-    path: String,
-    line_range: Option<(u32, u32)>,
-    content_hash: String,
+/// Resolved manifest-owned evidence target for readback and rendering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManifestEvidenceTarget {
+    /// Manifest-relative owner path for this evidence.
+    pub path: String,
+    /// One-based inclusive line range for source readback.
+    pub line_range: Option<(u32, u32)>,
+    /// Content hash of the owning file or shard.
+    pub content_hash: String,
 }
 
-fn resolve_manifest_evidence_target(
+/// Returns true when an evidence identifier uses the reserved Cargo namespace.
+///
+/// # Arguments
+///
+/// * `evidence_id` - Candidate evidence identifier.
+pub fn is_reserved_cargo_evidence_id(evidence_id: &str) -> bool {
+    evidence_id.starts_with("cargo:")
+}
+
+/// Builds a stable opaque Cargo evidence identifier for a typed manifest item.
+///
+/// # Arguments
+///
+/// * `kind` - Stable Cargo metadata evidence kind.
+/// * `fields` - Length-delimited stable fields describing the typed DTO item.
+pub fn cargo_metadata_evidence_id(kind: &str, fields: &[&str]) -> String {
+    let mut seed = format!("cargo-evidence-v1\0kind:{}:{}", kind.len(), kind);
+    for field in fields {
+        seed.push('\0');
+        seed.push_str(&field.len().to_string());
+        seed.push(':');
+        seed.push_str(field);
+    }
+    format!("cargo:v1:{kind}:{}", crate::util::fingerprint(&seed))
+}
+
+/// Resolves manifest-owned evidence to the path, range, and content hash that
+/// should be used for service readback and metadata rendering.
+///
+/// # Arguments
+///
+/// * `manifest` - Manifest owning the evidence namespace.
+/// * `evidence_id` - File, symbol, shard, or Cargo metadata evidence id.
+pub fn resolve_manifest_evidence_target(
     manifest: &ProjectManifest,
     evidence_id: &str,
 ) -> Option<ManifestEvidenceTarget> {
@@ -440,15 +469,179 @@ fn resolve_manifest_evidence_target(
             content_hash: shard.content_hash.clone(),
         });
     }
+    if let Some(file) = manifest.files.iter().find(|file| file.path == evidence_id) {
+        return Some(ManifestEvidenceTarget {
+            path: file.path.clone(),
+            line_range: Some(file_line_range(file)),
+            content_hash: file.content_hash.clone(),
+        });
+    }
+    resolve_cargo_metadata_evidence_target(manifest, evidence_id)
+}
+
+fn resolve_cargo_metadata_evidence_target(
+    manifest: &ProjectManifest,
+    evidence_id: &str,
+) -> Option<ManifestEvidenceTarget> {
+    if !is_reserved_cargo_evidence_id(evidence_id) {
+        return None;
+    }
+    if let Some(workspace) = &manifest.cargo_workspace
+        && cargo_workspace_evidence_id(workspace) == evidence_id
+    {
+        return cargo_manifest_target(manifest, &workspace.manifest_path);
+    }
+    for package in &manifest.cargo_packages {
+        if cargo_package_evidence_id(package) == evidence_id {
+            return cargo_manifest_target(manifest, &package.manifest_path);
+        }
+        for target in &package.targets {
+            if cargo_target_evidence_id(package, target) == evidence_id {
+                return cargo_manifest_target(manifest, &package.manifest_path);
+            }
+        }
+        for feature in &package.features {
+            if cargo_feature_evidence_id(package, feature) == evidence_id {
+                return cargo_manifest_target(manifest, &package.manifest_path);
+            }
+        }
+    }
+    for dependency in &manifest.cargo_package_dependencies {
+        if cargo_dependency_evidence_id(dependency) == evidence_id {
+            return cargo_manifest_target(manifest, &dependency.manifest_path);
+        }
+    }
+    None
+}
+
+fn cargo_manifest_target(
+    manifest: &ProjectManifest,
+    manifest_path: &str,
+) -> Option<ManifestEvidenceTarget> {
     manifest
         .files
         .iter()
-        .find(|file| file.path == evidence_id)
+        .find(|file| file.path == manifest_path)
         .map(|file| ManifestEvidenceTarget {
             path: file.path.clone(),
             line_range: Some(file_line_range(file)),
             content_hash: file.content_hash.clone(),
         })
+}
+
+/// Builds the stable Cargo workspace evidence id.
+///
+/// # Arguments
+///
+/// * `workspace` - Manifest-owned Cargo workspace metadata.
+pub fn cargo_workspace_evidence_id(workspace: &CargoWorkspaceMetadata) -> String {
+    let members = workspace.members.join("\0");
+    let package_manifest_paths = workspace.package_manifest_paths.join("\0");
+    cargo_metadata_evidence_id(
+        "workspace",
+        &[
+            &workspace.manifest_path,
+            &workspace.root_path,
+            &members,
+            &package_manifest_paths,
+        ],
+    )
+}
+
+/// Builds the stable Cargo package evidence id.
+///
+/// # Arguments
+///
+/// * `package` - Manifest-owned Cargo package metadata.
+pub fn cargo_package_evidence_id(package: &CargoPackageMetadata) -> String {
+    cargo_metadata_evidence_id(
+        "package",
+        &[
+            &package.manifest_path,
+            &package.package_root,
+            &package.name,
+            package.version.as_deref().unwrap_or_default(),
+            package.edition.as_deref().unwrap_or_default(),
+        ],
+    )
+}
+
+/// Builds the stable Cargo target evidence id.
+///
+/// # Arguments
+///
+/// * `package` - Package owning the target.
+/// * `target` - Manifest-owned Cargo target metadata.
+pub fn cargo_target_evidence_id(
+    package: &CargoPackageMetadata,
+    target: &CargoTargetMetadata,
+) -> String {
+    cargo_metadata_evidence_id(
+        "target",
+        &[
+            &package.manifest_path,
+            &package.name,
+            &target.name,
+            &format!("{:?}", target.kind),
+            &target.path,
+            &format!("{:?}", target.declaration),
+        ],
+    )
+}
+
+/// Builds the stable Cargo feature evidence id.
+///
+/// # Arguments
+///
+/// * `package` - Package owning the feature.
+/// * `feature` - Manifest-owned Cargo feature metadata.
+pub fn cargo_feature_evidence_id(
+    package: &CargoPackageMetadata,
+    feature: &CargoFeatureMetadata,
+) -> String {
+    let members = feature.members.join("\0");
+    cargo_metadata_evidence_id(
+        "feature",
+        &[
+            &package.manifest_path,
+            &package.name,
+            &feature.name,
+            &members,
+        ],
+    )
+}
+
+/// Builds the stable Cargo dependency evidence id.
+///
+/// # Arguments
+///
+/// * `dependency` - Manifest-owned Cargo dependency metadata.
+pub fn cargo_dependency_evidence_id(dependency: &CargoPackageDependency) -> String {
+    let features = dependency.features.join("\0");
+    cargo_metadata_evidence_id(
+        "dependency",
+        &[
+            &dependency.manifest_path,
+            dependency.declaring_package.as_deref().unwrap_or_default(),
+            &dependency.dependency_key,
+            &dependency.package_name,
+            &format!("{:?}", dependency.kind),
+            dependency.target.as_deref().unwrap_or_default(),
+            dependency.version.as_deref().unwrap_or_default(),
+            dependency.path.as_deref().unwrap_or_default(),
+            if dependency.optional {
+                "optional"
+            } else {
+                "required"
+            },
+            &features,
+            &format!("{:?}", dependency.declaration),
+            dependency
+                .linked_package_manifest_path
+                .as_deref()
+                .unwrap_or_default(),
+        ],
+    )
 }
 
 fn path_is_safe_relative_label(path: &str) -> bool {
@@ -467,22 +660,9 @@ fn evidence_content_hash(
     evidence_id: &str,
     evidence_path: &str,
 ) -> Option<String> {
-    if let Some(symbol) = manifest
-        .symbols
-        .iter()
-        .find(|symbol| symbol.id == evidence_id)
-    {
-        return manifest
-            .files
-            .iter()
-            .find(|file| file.path == symbol.path)
-            .map(|file| file.content_hash.clone());
-    }
-    manifest
-        .shards
-        .iter()
-        .find(|shard| shard.id == evidence_id)
-        .map(|shard| shard.content_hash.clone())
+    resolve_manifest_evidence_target(manifest, evidence_id)
+        .filter(|target| target.path == evidence_path)
+        .map(|target| target.content_hash)
         .or_else(|| {
             manifest
                 .files

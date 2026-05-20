@@ -33,6 +33,7 @@ diesel::table! {
         task_id -> Nullable<Text>,
         tool_name -> Nullable<Text>,
         eval_id -> Nullable<Text>,
+        capture_metadata -> Nullable<Text>,
         created_at -> Timestamp,
         schema_version -> Integer,
     }

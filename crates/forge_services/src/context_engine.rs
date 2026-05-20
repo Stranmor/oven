@@ -2714,7 +2714,7 @@ mod tests {
             }),
             Arc::new(NoopDiscovery),
         );
-        let params = SearchParams::new("scopedneedle", "scope proof")
+        let params = SearchParams::new("target Function", "scope proof")
             .limit(1usize)
             .starts_with("src/in/".to_string())
             .ends_with(vec![".rs".to_string()]);
@@ -2734,6 +2734,48 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn query_workspace_file_chunk_content_comes_from_service_readback_not_lexical_document()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let range_read_called = Arc::new(AtomicBool::new(false));
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::clone(&range_read_called),
+                range_read_fails: false,
+            }),
+            Arc::new(NoopDiscovery),
+        );
+        let params = SearchParams::new("runtime_fixture package", "cargo metadata readback proof")
+            .limit(1usize)
+            .ends_with(vec!["Cargo.toml".to_string()]);
+
+        let actual = WorkspaceService::query_workspace(&setup, root, params).await?;
+        let chunk = actual
+            .iter()
+            .find_map(|node| match &node.node {
+                NodeData::FileChunk(chunk) if chunk.file_path == "Cargo.toml" => {
+                    Some(chunk.clone())
+                }
+                _ => None,
+            })
+            .expect("Cargo metadata retrieval should read back owning Cargo.toml");
+        let expected = (true, true, false);
+        assert_eq!(
+            (
+                range_read_called.load(Ordering::SeqCst),
+                chunk.content.contains("[package]"),
+                chunk.content.contains("cargo package name runtime_fixture"),
+            ),
+            expected,
+        );
+        Ok(())
+    }
     #[tokio::test]
     async fn query_workspace_persists_deterministic_context_pack_after_node_readback() -> Result<()>
     {

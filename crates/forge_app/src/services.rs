@@ -6,14 +6,15 @@ use derive_setters::Setters;
 use forge_domain::{
     AgentId, AnyProvider, Attachment, AuthContextRequest, AuthContextResponse, AuthMethod,
     ChatCompletionMessage, CommandOutput, Context, Conversation, ConversationId, File, FileInfo,
-    FileStatus, Image, LearningLedgerEvent, LearningLedgerFreshness, LearningRecordProjection,
-    LearningReviewOutcome, LearningReviewRequest, LearningReviewState, McpConfig, McpServers,
-    Model, ModelId, Node, ProcessId, ProcessReadCursor, ProcessReadOutput, ProcessStartOutput,
-    ProcessStatus, Provider, ProviderId, ResultStream, Scope, SearchParams, SteerMessage,
-    SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter, SyncProgress, SyntaxError,
-    Template, ToolCallFull, ToolOutput, WorkspaceAuth, WorkspaceContextManifestDiagnostic,
-    WorkspaceEvidenceReplayDiagnostic, WorkspaceEvidenceReplayPreviewDiagnostic,
-    WorkspaceExactFactReferenceReport, WorkspaceExactFactStatusReport, WorkspaceId, WorkspaceInfo,
+    FileStatus, Image, LearningCaptureMetadata, LearningLedgerEvent, LearningLedgerFreshness,
+    LearningRecordId, LearningRecordProjection, LearningReviewOutcome, LearningReviewRequest,
+    LearningReviewState, McpConfig, McpServers, Model, ModelId, Node, ProcessId, ProcessReadCursor,
+    ProcessReadOutput, ProcessStartOutput, ProcessStatus, Provider, ProviderId, ResultStream,
+    Scope, SearchParams, SteerMessage, SubagentTaskId, SubagentTaskSession,
+    SubagentTaskSessionFilter, SyncProgress, SyntaxError, Template, ToolCallFull, ToolOutput,
+    WorkspaceAuth, WorkspaceContextManifestDiagnostic, WorkspaceEvidenceReplayDiagnostic,
+    WorkspaceEvidenceReplayPreviewDiagnostic, WorkspaceExactFactReferenceReport,
+    WorkspaceExactFactStatusReport, WorkspaceId, WorkspaceInfo,
 };
 use forge_eventsource::EventSource;
 use reqwest::Response;
@@ -448,6 +449,7 @@ pub trait LearningService: Send + Sync {
     /// * `conversation_id` - Source conversation identifier.
     /// * `source_event_id` - Stable source event identifier.
     /// * `summary` - Candidate summary to redact before persistence.
+    /// * `metadata` - Typed capture metadata from the current capture path.
     ///
     /// # Errors
     /// Returns an error if validation or persistence fails.
@@ -456,10 +458,10 @@ pub trait LearningService: Send + Sync {
         conversation_id: ConversationId,
         source_event_id: String,
         summary: String,
+        metadata: LearningCaptureMetadata,
     ) -> anyhow::Result<LearningLedgerEvent>;
 
     /// Inserts an append-only learning event.
-    ///
     /// # Arguments
     /// * `event` - Event to append or deduplicate.
     ///
@@ -510,6 +512,18 @@ pub trait LearningService: Send + Sync {
         }
         Ok(outcome)
     }
+    /// Returns one projected learning record by identifier.
+    ///
+    /// # Arguments
+    /// * `record_id` - Record identifier to project.
+    ///
+    /// # Errors
+    /// Returns an error if query fails.
+    async fn get_learning_record(
+        &self,
+        record_id: LearningRecordId,
+    ) -> anyhow::Result<Option<LearningRecordProjection>>;
+
     /// Lists projected learning records.
     ///
     /// # Arguments
@@ -1124,9 +1138,15 @@ impl<I: Services> LearningService for I {
         conversation_id: ConversationId,
         source_event_id: String,
         summary: String,
+        metadata: LearningCaptureMetadata,
     ) -> anyhow::Result<LearningLedgerEvent> {
         self.learning_service()
-            .capture_candidate_from_conversation(conversation_id, source_event_id, summary)
+            .capture_candidate_from_conversation(
+                conversation_id,
+                source_event_id,
+                summary,
+                metadata,
+            )
             .await
     }
 
@@ -1153,6 +1173,13 @@ impl<I: Services> LearningService for I {
         self.learning_service()
             .review_learning_candidate(request)
             .await
+    }
+
+    async fn get_learning_record(
+        &self,
+        record_id: LearningRecordId,
+    ) -> anyhow::Result<Option<LearningRecordProjection>> {
+        self.learning_service().get_learning_record(record_id).await
     }
 
     async fn list_learning_records(
@@ -1939,6 +1966,7 @@ mod tests {
             _conversation_id: ConversationId,
             _source_event_id: String,
             _summary: String,
+            _metadata: LearningCaptureMetadata,
         ) -> anyhow::Result<LearningLedgerEvent> {
             anyhow::bail!("unused learning service")
         }
@@ -1954,6 +1982,13 @@ mod tests {
             &self,
             _event: LearningLedgerEvent,
         ) -> anyhow::Result<LearningReviewOutcome> {
+            anyhow::bail!("unused learning service")
+        }
+
+        async fn get_learning_record(
+            &self,
+            _record_id: LearningRecordId,
+        ) -> anyhow::Result<Option<LearningRecordProjection>> {
             anyhow::bail!("unused learning service")
         }
 

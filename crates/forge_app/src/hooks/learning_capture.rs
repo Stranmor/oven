@@ -1,6 +1,12 @@
 use std::sync::Arc;
 
-use forge_domain::{ContextMessage, Conversation, Role};
+use forge_domain::{
+    CONVERSATION_SAVE_CAPTURE_VERSION, ContextMessage, Conversation,
+    DETERMINISTIC_CONVERSATION_SAVE_AUTO_ACCEPT_REASON,
+    DETERMINISTIC_CONVERSATION_SAVE_AUTO_REVIEWER_V1, LearningCaptureMetadata, LearningEventKind,
+    LearningLedgerEvent, LearningProvenance, LearningRedactionStatus, LearningReviewState,
+    LearningSourceKind, Role, learning_digest_hex,
+};
 use sha2::{Digest, Sha256};
 
 use crate::LearningService;
@@ -29,48 +35,179 @@ impl<S> LearningCapture<S> {
     where
         S: LearningService,
     {
-        let Some(summary) = Self::candidate_summary(conversation) else {
+        let Some(draft) = Self::candidate_draft(conversation) else {
             return;
         };
-        let source_event_id = Self::source_event_id(conversation);
-        if let Err(error) = self
+        match self
             .services
-            .capture_candidate_from_conversation(conversation.id, source_event_id, summary)
+            .capture_candidate_from_conversation(
+                conversation.id,
+                draft.source_event_id.clone(),
+                draft.summary.clone(),
+                draft.metadata.clone(),
+            )
             .await
         {
-            tracing::debug!(error = ?error, conversation_id = %conversation.id, "Learning candidate capture failed; preserving saved conversation");
+            Ok(event) => {
+                self.auto_review_current_capture(conversation, &draft, event)
+                    .await;
+            }
+            Err(error) => {
+                tracing::debug!(error = ?error, conversation_id = %conversation.id, "Learning candidate capture failed; preserving saved conversation");
+            }
         }
     }
 
-    fn candidate_summary(conversation: &Conversation) -> Option<String> {
+    async fn auto_review_current_capture(
+        &self,
+        conversation: &Conversation,
+        draft: &ConversationCaptureDraft,
+        event: LearningLedgerEvent,
+    ) where
+        S: LearningService,
+    {
+        if !Self::is_current_capture_event(conversation, draft, &event) {
+            return;
+        }
+        let candidate_record = match self.services.get_learning_record(event.record_id).await {
+            Ok(Some(record)) => record,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::debug!(error = ?error, conversation_id = %conversation.id, "Learning auto-review skipped because candidate projection lookup failed");
+                return;
+            }
+        };
+        if candidate_record.review_state != LearningReviewState::Candidate {
+            return;
+        }
+        let review_note = format!(
+            "reviewer={} reason_code={}",
+            DETERMINISTIC_CONVERSATION_SAVE_AUTO_REVIEWER_V1,
+            DETERMINISTIC_CONVERSATION_SAVE_AUTO_ACCEPT_REASON
+        );
+        let review_source_event_id = format!(
+            "{}:record:{}:capture:{}",
+            DETERMINISTIC_CONVERSATION_SAVE_AUTO_REVIEWER_V1,
+            event.record_id.into_string(),
+            event.idempotency_key
+        );
+        let review_source_fingerprint = learning_digest_hex(format!(
+            "{}:{}:{}",
+            DETERMINISTIC_CONVERSATION_SAVE_AUTO_REVIEWER_V1,
+            DETERMINISTIC_CONVERSATION_SAVE_AUTO_ACCEPT_REASON,
+            event.content_fingerprint
+        ));
+        let review_event = match LearningLedgerEvent::review(
+            event.record_id,
+            LearningEventKind::ReviewAccepted,
+            review_note,
+            LearningProvenance::eval(
+                DETERMINISTIC_CONVERSATION_SAVE_AUTO_REVIEWER_V1,
+                review_source_event_id,
+                review_source_fingerprint,
+            ),
+            chrono::Utc::now(),
+        ) {
+            Ok(event) => event,
+            Err(error) => {
+                tracing::debug!(error = ?error, conversation_id = %conversation.id, "Learning auto-review event construction failed");
+                return;
+            }
+        };
+        if let Err(error) = self
+            .services
+            .review_learning_candidate_event(review_event)
+            .await
+        {
+            tracing::debug!(error = ?error, conversation_id = %conversation.id, "Learning auto-review append failed; candidate remains pending");
+        }
+    }
+
+    fn is_current_capture_event(
+        conversation: &Conversation,
+        draft: &ConversationCaptureDraft,
+        event: &LearningLedgerEvent,
+    ) -> bool {
+        let Some(metadata) = event.capture_metadata.as_ref() else {
+            return false;
+        };
+        event.event_kind == LearningEventKind::CandidateCaptured
+            && event.schema_version == forge_domain::LEARNING_LEDGER_SCHEMA_VERSION
+            && event.redaction_status == LearningRedactionStatus::Clean
+            && event.provenance.source_kind == LearningSourceKind::Conversation
+            && event.provenance.conversation_id == Some(conversation.id)
+            && event.provenance.source_event_id == draft.source_event_id
+            && event.summary == draft.summary
+            && event.content_fingerprint == draft.metadata.summary_fingerprint
+            && metadata == &draft.metadata
+            && metadata.validate_current().is_ok()
+            && metadata.capture_version == CONVERSATION_SAVE_CAPTURE_VERSION
+            && metadata.summary_fingerprint == learning_digest_hex(&event.summary)
+            && Self::candidate_summary_from_metadata(metadata) == event.summary
+    }
+
+    fn candidate_draft(conversation: &Conversation) -> Option<ConversationCaptureDraft> {
         let context = conversation.context.as_ref()?;
-        let message_count = context.messages.len();
+        let message_count = i32::try_from(context.messages.len()).ok()?;
         if message_count == 0 {
             return None;
         }
-        let user_message_count = context
-            .messages
-            .iter()
-            .filter(|message| match &message.message {
-                ContextMessage::Text(text) => {
-                    text.role == Role::User && !text.is_internal_context()
-                }
-                _ => false,
-            })
-            .count();
-        Some(format!(
-            "conversation_saved message_count={} user_message_count={} context_fingerprint={}",
+        let user_message_count = i32::try_from(
+            context
+                .messages
+                .iter()
+                .filter(|message| match &message.message {
+                    ContextMessage::Text(text) => {
+                        text.role == Role::User && !text.is_internal_context()
+                    }
+                    _ => false,
+                })
+                .count(),
+        )
+        .ok()?;
+        let context_fingerprint = Self::context_fingerprint(conversation);
+        let summary = Self::candidate_summary_from_parts(
             message_count,
             user_message_count,
-            Self::context_fingerprint(conversation)
-        ))
+            &context_fingerprint,
+        );
+        let metadata = LearningCaptureMetadata::conversation_save(
+            message_count,
+            user_message_count,
+            context_fingerprint,
+            learning_digest_hex(&summary),
+        );
+        Some(ConversationCaptureDraft {
+            source_event_id: Self::source_event_id(conversation, &metadata.context_fingerprint),
+            summary,
+            metadata,
+        })
     }
 
-    fn source_event_id(conversation: &Conversation) -> String {
+    fn candidate_summary_from_metadata(metadata: &LearningCaptureMetadata) -> String {
+        Self::candidate_summary_from_parts(
+            metadata.message_count,
+            metadata.user_message_count,
+            &metadata.context_fingerprint,
+        )
+    }
+
+    fn candidate_summary_from_parts(
+        message_count: i32,
+        user_message_count: i32,
+        context_fingerprint: &str,
+    ) -> String {
+        format!(
+            "conversation_saved message_count={} user_message_count={} context_fingerprint={}",
+            message_count, user_message_count, context_fingerprint
+        )
+    }
+
+    fn source_event_id(conversation: &Conversation, context_fingerprint: &str) -> String {
         format!(
             "conversation:{}:context:{}",
             conversation.id.into_string(),
-            Self::context_fingerprint(conversation)
+            context_fingerprint
         )
     }
 
@@ -93,6 +230,12 @@ impl<S> LearningCapture<S> {
         }
         hex::encode(hasher.finalize())
     }
+}
+
+struct ConversationCaptureDraft {
+    source_event_id: String,
+    summary: String,
+    metadata: LearningCaptureMetadata,
 }
 
 #[cfg(test)]
@@ -121,19 +264,21 @@ mod tests {
             conversation_id: ConversationId,
             source_event_id: String,
             summary: String,
+            metadata: LearningCaptureMetadata,
         ) -> anyhow::Result<LearningLedgerEvent> {
             if self.fail_capture {
                 anyhow::bail!("fixture capture failure");
             }
-            let event = LearningLedgerEvent::capture_candidate(
+            let mut event = LearningLedgerEvent::capture_candidate(
                 summary,
                 forge_domain::LearningProvenance::conversation(
                     conversation_id,
                     source_event_id,
-                    "fixture-source-fingerprint",
+                    metadata.context_fingerprint.clone(),
                 ),
                 chrono::Utc::now(),
             )?;
+            event.capture_metadata = Some(metadata);
             let mut events = self.events.lock().unwrap();
             let entry = events.entry(event.idempotency_key.clone()).or_insert(event);
             Ok(entry.clone())
@@ -148,9 +293,59 @@ mod tests {
 
         async fn review_learning_candidate_event(
             &self,
-            _event: LearningLedgerEvent,
+            event: LearningLedgerEvent,
         ) -> anyhow::Result<LearningReviewOutcome> {
-            anyhow::bail!("unused review")
+            let mut events = self.events.lock().unwrap();
+            let event = events
+                .entry(event.idempotency_key.clone())
+                .or_insert(event)
+                .clone();
+            let candidate = events
+                .values()
+                .find(|candidate| candidate.record_id == event.record_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("candidate should exist"))?;
+            Ok(LearningReviewOutcome {
+                event: event.clone(),
+                projection: LearningRecordProjection {
+                    record_id: candidate.record_id,
+                    summary: candidate.summary,
+                    review_state: LearningReviewState::Accepted,
+                    redaction_status: candidate.redaction_status,
+                    provenance: candidate.provenance,
+                    capture_metadata: candidate.capture_metadata,
+                    created_at: candidate.created_at,
+                    updated_at: event.created_at,
+                    schema_version: candidate.schema_version,
+                },
+            })
+        }
+
+        async fn get_learning_record(
+            &self,
+            record_id: forge_domain::LearningRecordId,
+        ) -> anyhow::Result<Option<LearningRecordProjection>> {
+            Ok(self
+                .events
+                .lock()
+                .unwrap()
+                .values()
+                .find(|event| {
+                    event.record_id == record_id
+                        && event.event_kind == LearningEventKind::CandidateCaptured
+                })
+                .cloned()
+                .map(|event| LearningRecordProjection {
+                    record_id: event.record_id,
+                    summary: event.summary,
+                    review_state: LearningReviewState::Candidate,
+                    redaction_status: event.redaction_status,
+                    provenance: event.provenance,
+                    capture_metadata: event.capture_metadata,
+                    created_at: event.created_at,
+                    updated_at: event.created_at,
+                    schema_version: event.schema_version,
+                }))
         }
 
         async fn list_learning_records(
@@ -185,16 +380,22 @@ mod tests {
 
         capture.capture_saved_conversation(&conversation).await;
 
-        let actual = fixture.events.lock().unwrap().values().next().map(|event| {
-            (
-                event.summary.contains("conversation_saved"),
-                event.summary.contains("user_message_count=1"),
-                event
-                    .summary
-                    .contains("capture a deterministic learning candidate"),
-                event.provenance.conversation_id,
-            )
-        });
+        let actual = fixture
+            .events
+            .lock()
+            .unwrap()
+            .values()
+            .find(|event| event.event_kind == LearningEventKind::CandidateCaptured)
+            .map(|event| {
+                (
+                    event.summary.contains("conversation_saved"),
+                    event.summary.contains("user_message_count=1"),
+                    event
+                        .summary
+                        .contains("capture a deterministic learning candidate"),
+                    event.provenance.conversation_id,
+                )
+            });
         let expected = Some((true, true, false, Some(conversation.id)));
         assert_eq!(actual, expected);
         Ok(())
@@ -211,7 +412,7 @@ mod tests {
         capture.capture_saved_conversation(&conversation).await;
 
         let actual = fixture.events.lock().unwrap().len();
-        let expected = 1usize;
+        let expected = 2usize;
         assert_eq!(actual, expected);
         Ok(())
     }
@@ -229,7 +430,7 @@ mod tests {
         capture.capture_saved_conversation(&reloaded).await;
 
         let actual = fixture.events.lock().unwrap().len();
-        let expected = 1usize;
+        let expected = 2usize;
         assert_eq!(actual, expected);
         Ok(())
     }

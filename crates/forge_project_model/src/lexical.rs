@@ -2,7 +2,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::types::{LexicalDocument, LexicalDocumentKind, LexicalSearchHit, ProjectManifest};
+use crate::context_adapter::{
+    cargo_dependency_evidence_id, cargo_feature_evidence_id, cargo_package_evidence_id,
+    cargo_target_evidence_id, cargo_workspace_evidence_id,
+};
+use crate::types::{
+    CargoDependencyKind, CargoPackageDependency, CargoPackageMetadata, LexicalDocument,
+    LexicalDocumentKind, LexicalSearchHit, ProjectManifest,
+};
 
 const K1: f32 = 1.2;
 const B: f32 = 0.75;
@@ -100,6 +107,7 @@ impl LexicalIndex {
             if score > 0.0 {
                 let kind_weight = match document.document.kind {
                     LexicalDocumentKind::Symbol => 1.25,
+                    LexicalDocumentKind::CargoMetadata => 1.1,
                     LexicalDocumentKind::Shard => 1.0,
                     LexicalDocumentKind::File => 0.8,
                 };
@@ -177,8 +185,142 @@ pub fn documents_from_manifest(manifest: &ProjectManifest) -> Vec<LexicalDocumen
             provenance: shard.provenance.clone(),
         });
     }
+    documents.extend(cargo_documents_from_manifest(manifest));
     documents.sort_by(|left, right| left.id.cmp(&right.id));
     documents
+}
+
+fn cargo_documents_from_manifest(manifest: &ProjectManifest) -> Vec<LexicalDocument> {
+    let mut documents = Vec::new();
+    if let Some(workspace) = &manifest.cargo_workspace {
+        documents.push(LexicalDocument {
+            id: cargo_workspace_evidence_id(workspace),
+            path: workspace.manifest_path.clone(),
+            symbol: None,
+            kind: LexicalDocumentKind::CargoMetadata,
+            text: [
+                "cargo workspace".to_string(),
+                format!("manifest {}", workspace.manifest_path),
+                format!("root {}", workspace.root_path),
+                format!("members {}", workspace.members.join(" ")),
+                format!(
+                    "package_manifest_paths {}",
+                    workspace.package_manifest_paths.join(" ")
+                ),
+            ]
+            .join(" "),
+            provenance: workspace.provenance.clone(),
+        });
+    }
+    for package in &manifest.cargo_packages {
+        documents.push(cargo_package_document(package));
+        for target in &package.targets {
+            documents.push(LexicalDocument {
+                id: cargo_target_evidence_id(package, target),
+                path: package.manifest_path.clone(),
+                symbol: None,
+                kind: LexicalDocumentKind::CargoMetadata,
+                text: [
+                    "cargo target".to_string(),
+                    format!("package {}", package.name),
+                    format!("name {}", target.name),
+                    format!("kind {:?}", target.kind),
+                    format!("path {}", target.path),
+                    format!("declaration {:?}", target.declaration),
+                ]
+                .join(" "),
+                provenance: target.provenance.clone(),
+            });
+        }
+        for feature in &package.features {
+            documents.push(LexicalDocument {
+                id: cargo_feature_evidence_id(package, feature),
+                path: package.manifest_path.clone(),
+                symbol: None,
+                kind: LexicalDocumentKind::CargoMetadata,
+                text: [
+                    "cargo feature".to_string(),
+                    format!("package {}", package.name),
+                    format!("name {}", feature.name),
+                    format!("members {}", feature.members.join(" ")),
+                ]
+                .join(" "),
+                provenance: feature.provenance.clone(),
+            });
+        }
+    }
+    for dependency in &manifest.cargo_package_dependencies {
+        documents.push(cargo_dependency_document(dependency));
+    }
+    documents
+}
+
+fn cargo_package_document(package: &CargoPackageMetadata) -> LexicalDocument {
+    LexicalDocument {
+        id: cargo_package_evidence_id(package),
+        path: package.manifest_path.clone(),
+        symbol: None,
+        kind: LexicalDocumentKind::CargoMetadata,
+        text: [
+            "cargo package".to_string(),
+            format!("name {}", package.name),
+            format!("manifest {}", package.manifest_path),
+            format!("root {}", package.package_root),
+            format!("version {}", package.version.as_deref().unwrap_or_default()),
+            format!("edition {}", package.edition.as_deref().unwrap_or_default()),
+        ]
+        .join(" "),
+        provenance: package.provenance.clone(),
+    }
+}
+
+fn cargo_dependency_document(dependency: &CargoPackageDependency) -> LexicalDocument {
+    LexicalDocument {
+        id: cargo_dependency_evidence_id(dependency),
+        path: dependency.manifest_path.clone(),
+        symbol: None,
+        kind: LexicalDocumentKind::CargoMetadata,
+        text: [
+            "cargo dependency".to_string(),
+            format!(
+                "declaring_package {}",
+                dependency.declaring_package.as_deref().unwrap_or_default()
+            ),
+            format!("key {}", dependency.dependency_key),
+            format!("package {}", dependency.package_name),
+            format!("kind {}", cargo_dependency_kind_label(&dependency.kind)),
+            format!(
+                "target {}",
+                dependency.target.as_deref().unwrap_or_default()
+            ),
+            format!(
+                "version {}",
+                dependency.version.as_deref().unwrap_or_default()
+            ),
+            format!("path {}", dependency.path.as_deref().unwrap_or_default()),
+            format!("optional {}", dependency.optional),
+            format!("features {}", dependency.features.join(" ")),
+            format!("declaration {:?}", dependency.declaration),
+            format!(
+                "linked_package_manifest_path {}",
+                dependency
+                    .linked_package_manifest_path
+                    .as_deref()
+                    .unwrap_or_default()
+            ),
+        ]
+        .join(" "),
+        provenance: dependency.provenance.clone(),
+    }
+}
+
+fn cargo_dependency_kind_label(kind: &CargoDependencyKind) -> &'static str {
+    match kind {
+        CargoDependencyKind::Normal => "normal dependencies",
+        CargoDependencyKind::Dev => "dev dev-dependencies",
+        CargoDependencyKind::Build => "build build-dependencies",
+        CargoDependencyKind::Unsupported => "unsupported",
+    }
 }
 
 fn shard_search_text(manifest: &ProjectManifest, shard: &crate::types::ShardManifest) -> String {
@@ -256,13 +398,134 @@ fn split_identifier(part: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs as fixture_file_system;
+
     use anyhow::Result;
     use pretty_assertions::assert_eq;
 
     use super::*;
     use crate::indexer::tests::fixture_project;
-    use crate::{ProjectIndexer, SymbolKind};
+    use crate::{
+        CargoDependencyDeclaration, CargoDependencyKind, CargoFeatureMetadata,
+        CargoPackageDependency, CargoPackageMetadata, CargoTargetDeclaration, CargoTargetKind,
+        CargoTargetMetadata, CargoWorkspaceMetadata, Language, ProjectIndexer, Provenance,
+        SourceFile, SymbolKind, fingerprint,
+    };
 
+    #[test]
+    fn documents_from_manifest_creates_cargo_docs_from_manifest_owned_dtos_only() -> Result<()> {
+        let fixture = tempfile::TempDir::new()?;
+        let root = fixture.path().join("project");
+        fixture_file_system::create_dir_all(&root)?;
+        fixture_file_system::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"mutated-on-disk\"\n# comment that must not be indexed\n",
+        )?;
+        let setup = cargo_manifest_fixture(&root);
+        let before = documents_from_manifest(&setup)
+            .into_iter()
+            .filter(|document| document.kind == LexicalDocumentKind::CargoMetadata)
+            .collect::<Vec<_>>();
+        fixture_file_system::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"changed-on-disk\"\nraw_toml_body_token\n",
+        )?;
+        fixture_file_system::remove_file(root.join("Cargo.toml"))?;
+
+        let actual = documents_from_manifest(&setup)
+            .into_iter()
+            .filter(|document| document.kind == LexicalDocumentKind::CargoMetadata)
+            .collect::<Vec<_>>();
+        let expected = before;
+        assert_eq!(actual, expected);
+        assert!(
+            actual
+                .iter()
+                .all(|document| document.id.starts_with("cargo:v1:"))
+        );
+        assert!(actual.iter().all(|document| document.path == "Cargo.toml"));
+        assert!(actual.iter().all(|document| document.symbol.is_none()));
+        assert!(
+            actual
+                .iter()
+                .all(|document| !document.text.contains("raw_toml_body_token"))
+        );
+        assert!(
+            actual
+                .iter()
+                .all(|document| !document.text.contains("comment that must not be indexed"))
+        );
+        Ok(())
+    }
+
+    fn cargo_manifest_fixture(root: &std::path::Path) -> ProjectManifest {
+        ProjectManifest {
+            version: 1,
+            root: root.to_path_buf(),
+            files: vec![SourceFile {
+                path: "Cargo.toml".to_string(),
+                language: Language::Toml,
+                bytes: 128,
+                lines: 20,
+                content_hash: fingerprint("cargo-toml"),
+                provenance: cargo_provenance("Cargo.toml", "indexer"),
+            }],
+            cargo_workspace: Some(CargoWorkspaceMetadata {
+                manifest_path: "Cargo.toml".to_string(),
+                root_path: "".to_string(),
+                members: vec!["crates/app".to_string()],
+                package_manifest_paths: vec!["Cargo.toml".to_string()],
+                provenance: cargo_provenance("Cargo.toml", "cargo_metadata:workspace"),
+            }),
+            cargo_packages: vec![CargoPackageMetadata {
+                manifest_path: "Cargo.toml".to_string(),
+                package_root: "".to_string(),
+                name: "fixture-app".to_string(),
+                version: Some("0.1.0".to_string()),
+                edition: Some("2021".to_string()),
+                targets: vec![CargoTargetMetadata {
+                    name: "fixture_bin".to_string(),
+                    kind: CargoTargetKind::Bin,
+                    path: "src/main.rs".to_string(),
+                    declaration: CargoTargetDeclaration::Declared,
+                    provenance: cargo_provenance("Cargo.toml", "cargo_metadata:target"),
+                }],
+                features: vec![CargoFeatureMetadata {
+                    name: "extras".to_string(),
+                    members: vec!["serde/derive".to_string()],
+                    provenance: cargo_provenance("Cargo.toml", "cargo_metadata:feature"),
+                }],
+                provenance: cargo_provenance("Cargo.toml", "cargo_metadata:package"),
+            }],
+            cargo_package_dependencies: vec![CargoPackageDependency {
+                manifest_path: "Cargo.toml".to_string(),
+                declaring_package: Some("fixture-app".to_string()),
+                dependency_key: "serde_renamed".to_string(),
+                package_name: "serde".to_string(),
+                kind: CargoDependencyKind::Normal,
+                target: None,
+                version: Some("1".to_string()),
+                path: None,
+                optional: false,
+                features: vec!["derive".to_string()],
+                declaration: CargoDependencyDeclaration::DeclaredExternal,
+                linked_package_manifest_path: None,
+                provenance: cargo_provenance("Cargo.toml", "cargo_metadata:dependency"),
+            }],
+            manifest_hash: fingerprint("cargo-manifest"),
+            ..ProjectManifest::default()
+        }
+    }
+
+    fn cargo_provenance(path: &str, source: &str) -> Provenance {
+        Provenance {
+            path: path.to_string(),
+            start_line: Some(1),
+            end_line: Some(1),
+            source: source.to_string(),
+            fingerprint: fingerprint(&format!("{path}:{source}")),
+        }
+    }
     #[test]
     fn shard_documents_include_resolved_symbol_terms() -> Result<()> {
         let (fixture, root) = fixture_project()?;

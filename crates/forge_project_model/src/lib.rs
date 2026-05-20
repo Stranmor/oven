@@ -21,11 +21,14 @@ mod util;
 mod vector;
 
 pub use context_adapter::{
-    EvidenceReplayPreviewError, ProjectModelContextRenderRoot, ProjectModelSourceNode,
-    evidence_line_range, redaction_safe_issue_path_label, redaction_safe_provenance_source_label,
+    EvidenceReplayPreviewError, ManifestEvidenceTarget, ProjectModelContextRenderRoot,
+    ProjectModelSourceNode, cargo_dependency_evidence_id, cargo_feature_evidence_id,
+    cargo_metadata_evidence_id, cargo_package_evidence_id, cargo_target_evidence_id,
+    cargo_workspace_evidence_id, evidence_line_range, is_reserved_cargo_evidence_id,
+    redaction_safe_issue_path_label, redaction_safe_provenance_source_label,
     redaction_safe_replay_path_label, render_source_from_evidence,
     render_sources_from_context_pack, render_sources_from_evidence_replay,
-    render_sources_from_nodes,
+    render_sources_from_nodes, resolve_manifest_evidence_target,
 };
 pub use durable_vector_index::{
     DURABLE_VECTOR_INDEX_VERSION, DurableVectorIndex, VectorIndexArtifact, VectorIndexArtifactId,

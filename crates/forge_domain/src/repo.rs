@@ -5,10 +5,10 @@ use url::Url;
 
 use crate::{
     AnyProvider, AuthCredential, ChatCompletionMessage, Context, Conversation, ConversationId,
-    LearningLedgerEvent, LearningLedgerFreshness, LearningRecordProjection, LearningReviewOutcome,
-    LearningReviewState, MigrationResult, Model, ModelId, Provider, ProviderId, ProviderTemplate,
-    ResultStream, SearchMatch, Skill, Snapshot, SubagentTaskId, SubagentTaskSession,
-    SubagentTaskSessionFilter, WorkspaceAuth, WorkspaceId,
+    LearningLedgerEvent, LearningLedgerFreshness, LearningRecordId, LearningRecordProjection,
+    LearningReviewOutcome, LearningReviewState, MigrationResult, Model, ModelId, Provider,
+    ProviderId, ProviderTemplate, ResultStream, SearchMatch, Skill, Snapshot, SubagentTaskId,
+    SubagentTaskSession, SubagentTaskSessionFilter, WorkspaceAuth, WorkspaceId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,6 +195,18 @@ pub trait LearningRepository: Send + Sync {
         &self,
         event: LearningLedgerEvent,
     ) -> Result<LearningReviewOutcome>;
+
+    /// Returns one projected learning record by identifier.
+    ///
+    /// # Arguments
+    /// * `record_id` - Record identifier to project.
+    ///
+    /// # Errors
+    /// Returns an error if projection query fails.
+    async fn get_learning_record(
+        &self,
+        record_id: LearningRecordId,
+    ) -> Result<Option<LearningRecordProjection>>;
 
     /// Lists projected learning records for the current workspace.
     ///

@@ -387,7 +387,9 @@ impl Request {
     /// * `merge_system_messages` - Whether system messages should be merged before dispatch.
     ///
     /// # Errors
-    /// Returns an error when image payloads cannot be canonicalized for the provider request.
+    /// Returns an error when image payloads cannot be canonicalized or when a
+    /// function tool parameter schema cannot be proven to have an object root
+    /// accepted by OpenAI-compatible providers.
     pub fn from_context_for_provider(
         context: Context,
         model: &ModelId,

@@ -13,12 +13,13 @@ use forge_config::ForgeConfig;
 use forge_domain::{
     AnyProvider, AuthCredential, ChatCompletionMessage, ChatRepository, CommandExecutionOutput,
     Context, Conversation, ConversationId, ConversationRepository, Environment, FileInfo,
-    FuzzySearchRepository, LearningLedgerEvent, LearningLedgerFreshness, LearningRecordProjection,
-    LearningRepository, LearningReviewOutcome, LearningReviewState, McpServerConfig,
-    MigrationResult, Model, ModelId, ProcessId, ProcessReadCursor, ProcessReadOutput,
-    ProcessStartOutput, ProcessStatus, Provider, ProviderId, ProviderRepository, ResultStream,
-    SearchMatch, Skill, SkillRepository, Snapshot, SnapshotRepository, SubagentTaskId,
-    SubagentTaskSession, SubagentTaskSessionFilter, TextPatchBlock, TextPatchRepository,
+    FuzzySearchRepository, LearningLedgerEvent, LearningLedgerFreshness, LearningRecordId,
+    LearningRecordProjection, LearningRepository, LearningReviewOutcome, LearningReviewState,
+    McpServerConfig, MigrationResult, Model, ModelId, ProcessId, ProcessReadCursor,
+    ProcessReadOutput, ProcessStartOutput, ProcessStatus, Provider, ProviderId, ProviderRepository,
+    ResultStream, SearchMatch, Skill, SkillRepository, Snapshot, SnapshotRepository,
+    SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter, TextPatchBlock,
+    TextPatchRepository,
 };
 use forge_eventsource::EventSource;
 // Re-export CacacheStorage from forge_infra
@@ -230,6 +231,15 @@ impl<F: Send + Sync> LearningRepository for ForgeRepo<F> {
     ) -> anyhow::Result<LearningReviewOutcome> {
         self.learning_repository
             .review_learning_candidate_event(event)
+            .await
+    }
+
+    async fn get_learning_record(
+        &self,
+        record_id: LearningRecordId,
+    ) -> anyhow::Result<Option<LearningRecordProjection>> {
+        self.learning_repository
+            .get_learning_record(record_id)
             .await
     }
 

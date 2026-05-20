@@ -334,11 +334,171 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
-    use crate::ProjectIndexer;
     use crate::indexer::tests::fixture_project;
     use crate::vector::{DeterministicReranker, DeterministicVectorIndex};
+    use crate::{
+        CargoDependencyDeclaration, CargoDependencyKind, CargoPackageDependency,
+        CargoPackageMetadata, CargoTargetDeclaration, CargoTargetKind, CargoTargetMetadata,
+        Language, ProjectIndexer, Provenance, SourceFile, fingerprint,
+    };
     use crate::{DurableVectorIndex, VectorIndexArtifact, vector_entries_from_manifest_embeddings};
 
+    #[test]
+    fn package_query_retrieves_cargo_metadata_evidence_with_owning_manifest_path() {
+        let setup = cargo_retrieval_manifest();
+        let query = RetrievalQuery {
+            text: Some("fixture_app package".to_string()),
+            limit: 3,
+            include_graph_expansion: false,
+            ..RetrievalQuery::default()
+        };
+
+        let actual = retrieve(&setup, &query);
+        let expected = Some("Cargo.toml".to_string());
+        assert_eq!(
+            actual
+                .iter()
+                .find(|result| result.id.starts_with("cargo:v1:package:"))
+                .map(|result| result.path.clone()),
+            expected,
+        );
+    }
+
+    #[test]
+    fn dependency_query_retrieves_by_dependency_key_and_package_name_when_they_differ() {
+        let setup = cargo_retrieval_manifest();
+        let key_query = RetrievalQuery {
+            text: Some("serde_alias dependency".to_string()),
+            limit: 1,
+            include_graph_expansion: false,
+            ..RetrievalQuery::default()
+        };
+        let package_query = RetrievalQuery {
+            text: Some("serde dependency".to_string()),
+            limit: 1,
+            include_graph_expansion: false,
+            ..RetrievalQuery::default()
+        };
+
+        let actual = (
+            retrieve(&setup, &key_query),
+            retrieve(&setup, &package_query),
+        );
+        let expected = (true, true);
+        assert_eq!(
+            (
+                actual
+                    .0
+                    .iter()
+                    .any(|result| result.id.starts_with("cargo:v1:dependency:")),
+                actual
+                    .1
+                    .iter()
+                    .any(|result| result.id.starts_with("cargo:v1:dependency:")),
+            ),
+            expected,
+        );
+    }
+
+    #[test]
+    fn target_query_retrieves_by_target_name_kind_and_path() {
+        let setup = cargo_retrieval_manifest();
+        let query = RetrievalQuery {
+            text: Some("fixture_bin bin src/main.rs".to_string()),
+            limit: 1,
+            include_graph_expansion: false,
+            ..RetrievalQuery::default()
+        };
+
+        let actual = retrieve(&setup, &query);
+        let expected = Some("Cargo.toml".to_string());
+        assert_eq!(
+            actual
+                .iter()
+                .find(|result| result.id.starts_with("cargo:v1:target:"))
+                .map(|result| result.path.clone()),
+            expected,
+        );
+    }
+
+    #[test]
+    fn cargo_metadata_lexical_seed_with_graph_expansion_does_not_panic_or_dangle() {
+        let setup = cargo_retrieval_manifest();
+        let query = RetrievalQuery {
+            text: Some("fixture_app package".to_string()),
+            limit: 5,
+            include_graph_expansion: true,
+            ..RetrievalQuery::default()
+        };
+
+        let actual = retrieve(&setup, &query);
+        let expected = true;
+        assert_eq!(
+            actual
+                .iter()
+                .any(|result| result.id.starts_with("cargo:v1:package:")
+                    && result.path == "Cargo.toml"),
+            expected,
+        );
+    }
+
+    fn cargo_retrieval_manifest() -> ProjectManifest {
+        ProjectManifest {
+            version: 1,
+            root: "/workspace".into(),
+            files: vec![SourceFile {
+                path: "Cargo.toml".to_string(),
+                language: Language::Toml,
+                bytes: 100,
+                lines: 12,
+                content_hash: fingerprint("cargo-toml"),
+                provenance: cargo_provenance("indexer"),
+            }],
+            cargo_packages: vec![CargoPackageMetadata {
+                manifest_path: "Cargo.toml".to_string(),
+                package_root: "".to_string(),
+                name: "fixture_app".to_string(),
+                version: Some("0.1.0".to_string()),
+                edition: Some("2021".to_string()),
+                targets: vec![CargoTargetMetadata {
+                    name: "fixture_bin".to_string(),
+                    kind: CargoTargetKind::Bin,
+                    path: "src/main.rs".to_string(),
+                    declaration: CargoTargetDeclaration::Declared,
+                    provenance: cargo_provenance("cargo_metadata:target"),
+                }],
+                features: Vec::new(),
+                provenance: cargo_provenance("cargo_metadata:package"),
+            }],
+            cargo_package_dependencies: vec![CargoPackageDependency {
+                manifest_path: "Cargo.toml".to_string(),
+                declaring_package: Some("fixture_app".to_string()),
+                dependency_key: "serde_alias".to_string(),
+                package_name: "serde".to_string(),
+                kind: CargoDependencyKind::Normal,
+                target: None,
+                version: Some("1".to_string()),
+                path: None,
+                optional: false,
+                features: Vec::new(),
+                declaration: CargoDependencyDeclaration::DeclaredExternal,
+                linked_package_manifest_path: None,
+                provenance: cargo_provenance("cargo_metadata:dependency"),
+            }],
+            manifest_hash: fingerprint("cargo-retrieval"),
+            ..ProjectManifest::default()
+        }
+    }
+
+    fn cargo_provenance(source: &str) -> Provenance {
+        Provenance {
+            path: "Cargo.toml".to_string(),
+            start_line: Some(1),
+            end_line: Some(1),
+            source: source.to_string(),
+            fingerprint: fingerprint(source),
+        }
+    }
     #[test]
     fn source_body_only_query_no_longer_matches_metadata_lexical() -> Result<()> {
         let fixture = tempfile::TempDir::new()?;
@@ -404,9 +564,13 @@ mod tests {
                 .join("src")
                 .join("lexical.rs"),
         )?;
+        let production_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("lexical module should have production source before tests");
         let actual = ["std::fs", "fs::", "read_to_string"]
             .into_iter()
-            .filter(|needle| source.contains(needle))
+            .filter(|needle| production_source.contains(needle))
             .collect::<Vec<_>>();
         let expected: Vec<&str> = Vec::new();
         assert_eq!(actual, expected);

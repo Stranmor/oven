@@ -1312,6 +1312,8 @@ pub enum LexicalDocumentKind {
     Shard,
     /// Symbol metadata document.
     Symbol,
+    /// Manifest-owned Cargo metadata document.
+    CargoMetadata,
 }
 
 /// BM25-like lexical search hit.

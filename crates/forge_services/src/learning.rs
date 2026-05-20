@@ -4,9 +4,9 @@ use anyhow::Result;
 use chrono::Utc;
 use forge_app::LearningService;
 use forge_app::domain::{
-    ConversationId, LearningLedgerEvent, LearningLedgerFreshness, LearningProvenance,
-    LearningRecordProjection, LearningRepository, LearningReviewOutcome, LearningReviewState,
-    RedactedLearningSummary,
+    ConversationId, LearningCaptureMetadata, LearningLedgerEvent, LearningLedgerFreshness,
+    LearningProvenance, LearningRecordProjection, LearningRepository, LearningReviewOutcome,
+    LearningReviewState, RedactedLearningSummary,
 };
 
 /// Domain service for capture/query operations over the append-only learning
@@ -33,17 +33,21 @@ impl<R: LearningRepository> LearningService for ForgeLearningService<R> {
         conversation_id: ConversationId,
         source_event_id: String,
         summary: String,
+        metadata: LearningCaptureMetadata,
     ) -> Result<LearningLedgerEvent> {
+        metadata.validate_current()?;
         let redacted = RedactedLearningSummary::from_raw(&summary);
-        let event = LearningLedgerEvent::capture_candidate(
+        let mut event = LearningLedgerEvent::capture_candidate(
             summary,
             LearningProvenance::conversation(
                 conversation_id,
                 source_event_id,
-                redacted.fingerprint,
+                metadata.context_fingerprint.clone(),
             ),
             Utc::now(),
         )?;
+        event.capture_metadata = Some(metadata);
+        event.content_fingerprint = redacted.fingerprint;
         self.repository.insert_learning_event(event).await
     }
 
@@ -59,6 +63,13 @@ impl<R: LearningRepository> LearningService for ForgeLearningService<R> {
         event: LearningLedgerEvent,
     ) -> Result<LearningReviewOutcome> {
         self.repository.review_learning_candidate_event(event).await
+    }
+
+    async fn get_learning_record(
+        &self,
+        record_id: forge_app::domain::LearningRecordId,
+    ) -> Result<Option<LearningRecordProjection>> {
+        self.repository.get_learning_record(record_id).await
     }
 
     async fn list_learning_records(
@@ -118,12 +129,36 @@ mod tests {
                     review_state: LearningReviewState::Accepted,
                     redaction_status: event.redaction_status,
                     provenance: event.provenance.clone(),
+                    capture_metadata: event.capture_metadata.clone(),
                     created_at: event.created_at,
                     updated_at: event.created_at,
                     schema_version: event.schema_version,
                 },
                 event,
             })
+        }
+
+        async fn get_learning_record(
+            &self,
+            record_id: LearningRecordId,
+        ) -> Result<Option<LearningRecordProjection>> {
+            Ok(self
+                .events
+                .lock()
+                .unwrap()
+                .values()
+                .find(|event| event.record_id == record_id)
+                .map(|event| LearningRecordProjection {
+                    record_id: event.record_id,
+                    summary: event.summary.clone(),
+                    review_state: LearningReviewState::Candidate,
+                    redaction_status: event.redaction_status,
+                    provenance: event.provenance.clone(),
+                    capture_metadata: event.capture_metadata.clone(),
+                    created_at: event.created_at,
+                    updated_at: event.created_at,
+                    schema_version: event.schema_version,
+                }))
         }
 
         async fn list_learning_records(
@@ -153,6 +188,12 @@ mod tests {
                 conversation_id,
                 "event-1".to_string(),
                 "token sk-123456789012345678901234 should be redacted".to_string(),
+                LearningCaptureMetadata::conversation_save(
+                    1,
+                    1,
+                    "context-fingerprint",
+                    "summary-fingerprint",
+                ),
             )
             .await?;
         let second = service
@@ -160,6 +201,12 @@ mod tests {
                 conversation_id,
                 "event-1".to_string(),
                 "token sk-123456789012345678901234 should be redacted".to_string(),
+                LearningCaptureMetadata::conversation_save(
+                    1,
+                    1,
+                    "context-fingerprint",
+                    "summary-fingerprint",
+                ),
             )
             .await?;
 
@@ -192,6 +239,7 @@ mod tests {
                 "event-2",
                 "source-fingerprint-2",
             ),
+            capture_metadata: None,
             created_at: Utc::now(),
             schema_version: forge_app::domain::LEARNING_LEDGER_SCHEMA_VERSION,
         };

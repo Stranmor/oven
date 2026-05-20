@@ -179,16 +179,36 @@ fn has_open_additional_properties(schema: &serde_json::Value) -> bool {
 /// Otherwise the schema is normalized in strict mode.
 ///
 /// # Errors
-/// Returns an error if schema serialization fails.
-fn codex_tool_parameters(schema: &schemars::Schema) -> anyhow::Result<(serde_json::Value, bool)> {
+/// Returns an error if schema serialization fails or the schema root is not an
+/// object accepted by OpenAI-compatible function tool parameters.
+fn codex_tool_parameters(
+    tool_name: &str,
+    schema: &schemars::Schema,
+) -> anyhow::Result<(serde_json::Value, bool)> {
     let mut params =
         serde_json::to_value(schema).with_context(|| "Failed to serialize tool schema")?;
 
     let is_strict = !has_open_additional_properties(&params);
 
     enforce_strict_schema(&mut params, is_strict);
+    validate_function_tool_parameters(tool_name, &params)?;
 
     Ok((params, is_strict))
+}
+
+fn validate_function_tool_parameters(tool_name: &str, params: &Value) -> anyhow::Result<()> {
+    let root_type = params
+        .as_object()
+        .and_then(|schema| schema.get("type"))
+        .and_then(Value::as_str);
+    if root_type != Some("object") {
+        anyhow::bail!(
+            "OpenAI Responses request blocked before dispatch: tool function '{}' has parameters root schema type '{}', but function parameters must be a JSON Schema object. Fix the ToolDefinition.input_schema at its source.",
+            tool_name,
+            root_type.unwrap_or("<missing-or-non-string>")
+        );
+    }
+    Ok(())
 }
 
 /// Builds per-Responses-input-item cache eligibility metadata from the domain
@@ -548,7 +568,8 @@ impl FromDomain<ChatContext> for oai::CreateResponse {
                     .tools
                     .into_iter()
                     .map(|tool| {
-                        let (parameters, is_strict) = codex_tool_parameters(&tool.input_schema)?;
+                        let (parameters, is_strict) =
+                            codex_tool_parameters(tool.name.as_str(), &tool.input_schema)?;
 
                         Ok(oai::Tool::Function(oai::FunctionTool {
                             name: tool.name.to_string(),
@@ -934,7 +955,7 @@ mod tests {
         }))
         .unwrap();
 
-        let (actual, actual_strict) = codex_tool_parameters(&fixture)?;
+        let (actual, actual_strict) = codex_tool_parameters("test_tool", &fixture)?;
 
         let expected = json!({
             "type": "object",
@@ -991,7 +1012,7 @@ mod tests {
         }))
         .unwrap();
 
-        let (actual, actual_strict) = codex_tool_parameters(&fixture)?;
+        let (actual, actual_strict) = codex_tool_parameters("test_tool", &fixture)?;
 
         let expected = json!({
             "type": "object",
@@ -1049,6 +1070,29 @@ mod tests {
     }
 
     #[test]
+    fn test_codex_response_conversion_rejects_root_string_tool_schema_before_dispatch() {
+        let fixture_schema = schemars::Schema::try_from(json!({
+            "type": "string"
+        }))
+        .unwrap();
+        let fixture_tool = forge_app::domain::ToolDefinition::new("arch-sentinel")
+            .description("Architecture critic")
+            .input_schema(fixture_schema);
+        let fixture_context = ChatContext::default()
+            .add_message(ContextMessage::user("Hello", None))
+            .add_tool(fixture_tool)
+            .tool_choice(ToolChoice::Auto);
+
+        let actual = oai::CreateResponse::from_domain(fixture_context)
+            .unwrap_err()
+            .to_string();
+        let expected = true;
+
+        assert_eq!(actual.contains("arch-sentinel"), expected);
+        assert_eq!(actual.contains("root schema type 'string'"), expected);
+    }
+
+    #[test]
     fn test_codex_tool_parameters_removes_mcp_schema_draft_marker() -> anyhow::Result<()> {
         let fixture = schemars::Schema::try_from(json!({
             "$schema": "http://json-schema.org/draft-07/schema#",
@@ -1066,7 +1110,7 @@ mod tests {
         }))
         .unwrap();
 
-        let (actual, actual_strict) = codex_tool_parameters(&fixture)?;
+        let (actual, actual_strict) = codex_tool_parameters("test_tool", &fixture)?;
 
         let expected = json!({
             "additionalProperties": false,
@@ -1120,7 +1164,7 @@ mod tests {
         }))
         .unwrap();
 
-        let (actual, actual_strict) = codex_tool_parameters(&fixture)?;
+        let (actual, actual_strict) = codex_tool_parameters("test_tool", &fixture)?;
 
         let expected = json!({
             "additionalProperties": false,
@@ -1198,7 +1242,7 @@ mod tests {
         }))
         .unwrap();
 
-        let (actual, actual_strict) = codex_tool_parameters(&fixture)?;
+        let (actual, actual_strict) = codex_tool_parameters("test_tool", &fixture)?;
 
         let expected = json!({
             "type": "object",
@@ -1879,6 +1923,23 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn test_responses_request_rejects_root_string_tool_schema_before_dispatch() {
+        let fixture_schema = schemars::Schema::try_from(json!({"type": "string"})).unwrap();
+        let fixture_tool = forge_app::domain::ToolDefinition::new("bad_tool")
+            .description("Bad schema")
+            .input_schema(fixture_schema);
+        let fixture = ChatContext::default().tools(vec![fixture_tool]);
+
+        let actual = oai::CreateResponse::from_domain(fixture)
+            .unwrap_err()
+            .to_string();
+        let expected = true;
+
+        assert_eq!(actual.contains("bad_tool"), expected);
+        assert_eq!(actual.contains("root schema type 'string'"), expected);
     }
 
     #[test]

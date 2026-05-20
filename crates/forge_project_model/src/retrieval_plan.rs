@@ -5,7 +5,7 @@ use std::path::{Component, Path};
 
 use anyhow::{Result, bail};
 
-use crate::context_adapter::evidence_line_range;
+use crate::context_adapter::resolve_manifest_evidence_target;
 use crate::retrieval::retrieve;
 use crate::types::{
     ContextPack, ContextPackEvidence, ContextPackSelection, FreshnessProofLevel,
@@ -307,7 +307,21 @@ pub fn plan_project_context_retrieval(
 
     let mut read_requests = Vec::new();
     for evidence in &context_pack.evidence {
-        let (start_line, end_line) = match evidence_line_range(manifest, &evidence.id) {
+        let target = match resolve_manifest_evidence_target(manifest, &evidence.id) {
+            Some(target) => target,
+            None => {
+                return ProjectContextRetrievalPlanningOutcome::Refusal(
+                    ProjectContextRetrievalRefusal {
+                        code: ProjectContextRetrievalRefusalCode::EvidenceRangeMissing,
+                        detail: format!(
+                            "project-model evidence line range is missing: {}",
+                            evidence.id
+                        ),
+                    },
+                );
+            }
+        };
+        let (start_line, end_line) = match target.line_range {
             Some(line_range) => line_range,
             None => {
                 return ProjectContextRetrievalPlanningOutcome::Refusal(
@@ -321,12 +335,8 @@ pub fn plan_project_context_retrieval(
                 );
             }
         };
-        match ProjectContextReadRequest::new(
-            evidence.path.clone(),
-            evidence.id.clone(),
-            start_line,
-            end_line,
-        ) {
+        match ProjectContextReadRequest::new(target.path, evidence.id.clone(), start_line, end_line)
+        {
             Ok(read_request) => read_requests.push(read_request),
             Err(error) => {
                 return ProjectContextRetrievalPlanningOutcome::Refusal(
@@ -426,9 +436,131 @@ mod tests {
 
     use super::*;
     use crate::indexer::tests::fixture_project;
-    use crate::types::{FreshnessState, Provenance, SourceFile};
+    use crate::types::{
+        CargoDependencyDeclaration, CargoDependencyKind, CargoPackageDependency,
+        CargoPackageMetadata, CargoTargetDeclaration, CargoTargetKind, CargoTargetMetadata,
+        FreshnessState, Language, Provenance, SourceFile,
+    };
     use crate::{ProjectIndexer, ShardManifest, SymbolKind, SymbolNode, fingerprint};
 
+    #[test]
+    fn planner_builds_whole_file_read_request_for_cargo_metadata_evidence() {
+        let setup = cargo_plan_manifest();
+        let request = ProjectContextRetrievalRequest::new(
+            "fixture_app package",
+            1,
+            ProjectContextPathScope::default(),
+            false,
+        );
+
+        let actual = plan_project_context_retrieval(&setup, &freshness(&setup), request);
+        let expected = Some(("Cargo.toml".to_string(), 1u32, 16u32));
+        assert_eq!(
+            match actual {
+                ProjectContextRetrievalPlanningOutcome::Plan(plan) =>
+                    plan.read_requests.first().map(|request| {
+                        (
+                            request.relative_manifest_path().to_string(),
+                            request.start_line,
+                            request.end_line,
+                        )
+                    }),
+                ProjectContextRetrievalPlanningOutcome::Refusal(refusal) => {
+                    panic!("unexpected refusal: {:?}", refusal)
+                }
+            },
+            expected,
+        );
+    }
+
+    #[test]
+    fn invalid_or_suspicious_cargo_metadata_ids_do_not_produce_read_requests() {
+        let setup = cargo_plan_manifest();
+        let candidates = [
+            "cargo:dependency:../x",
+            "cargo:v1:dependency:../x",
+            "cargo:v1:unknown:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "cargo:v1:dependency:raw:separator:collision",
+        ];
+        let actual = candidates
+            .into_iter()
+            .map(|id| resolve_manifest_evidence_target(&setup, id).is_none())
+            .collect::<Vec<_>>();
+        let expected = vec![true, true, true, true];
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn stale_freshness_refusal_is_unchanged_for_cargo_metadata_hits() {
+        let setup = cargo_plan_manifest();
+        let evaluation = ManifestFreshnessEvaluation {
+            state: FreshnessState {
+                changed: vec!["Cargo.toml".to_string()],
+                fresh: true,
+                ..fresh_state(&setup)
+            },
+            proof_level: FreshnessProofLevel::FullFilesystem,
+        };
+        let request = ProjectContextRetrievalRequest::new(
+            "fixture_app package",
+            1,
+            ProjectContextPathScope::default(),
+            false,
+        );
+
+        let actual = plan_project_context_retrieval(&setup, &evaluation, request);
+        let expected = Some(ProjectContextRetrievalRefusalCode::StaleEvidenceRejected);
+        assert_eq!(refusal_code(actual), expected);
+    }
+
+    #[test]
+    fn cargo_like_normal_ids_cannot_shadow_valid_metadata_ids() {
+        let mut setup = cargo_plan_manifest();
+        setup.files.push(SourceFile {
+            path: "src/cargo.rs".to_string(),
+            language: Language::Rust,
+            bytes: 10,
+            lines: 2,
+            content_hash: fingerprint("cargo-like-source"),
+            provenance: provenance("src/cargo.rs", Some(1), Some(2), "test", "file"),
+        });
+        setup.symbols.push(SymbolNode {
+            id: "symbol:src/cargo.rs:Function:cargo:v1:package:fake".to_string(),
+            name: "cargo:v1:package:fake".to_string(),
+            kind: SymbolKind::Function,
+            path: "src/cargo.rs".to_string(),
+            parent: None,
+            start_line: 1,
+            end_line: 2,
+            provenance: provenance("src/cargo.rs", Some(1), Some(2), "test", "symbol"),
+        });
+        setup.shards.push(ShardManifest {
+            id: "shard:cargo:v1:package:fake".to_string(),
+            path: "src/cargo.rs".to_string(),
+            start_line: 1,
+            end_line: 2,
+            content_hash: fingerprint("cargo-like-shard"),
+            symbol_ids: Vec::new(),
+            provenance: provenance("src/cargo.rs", Some(1), Some(2), "test", "shard"),
+        });
+
+        let actual = (
+            resolve_manifest_evidence_target(&setup, "cargo:v1:package:fake").is_none(),
+            resolve_manifest_evidence_target(
+                &setup,
+                "symbol:src/cargo.rs:Function:cargo:v1:package:fake",
+            )
+            .map(|target| target.path),
+            resolve_manifest_evidence_target(&setup, "shard:cargo:v1:package:fake")
+                .map(|target| target.path),
+        );
+        let expected = (
+            true,
+            Some("src/cargo.rs".to_string()),
+            Some("src/cargo.rs".to_string()),
+        );
+        assert_eq!(actual, expected);
+    }
     #[test]
     fn planner_applies_prefix_and_suffix_before_truncation_without_underfill() -> Result<()> {
         let fixture = tempfile::TempDir::new()?;
@@ -649,14 +781,10 @@ mod tests {
             .evidence
             .iter()
             .map(|evidence| {
-                let (start, end) = evidence_line_range(&manifest, &evidence.id).unwrap();
-                ProjectContextReadRequest::new(
-                    evidence.path.clone(),
-                    evidence.id.clone(),
-                    start,
-                    end,
-                )
-                .unwrap()
+                let target = resolve_manifest_evidence_target(&manifest, &evidence.id).unwrap();
+                let (start, end) = target.line_range.unwrap();
+                ProjectContextReadRequest::new(target.path, evidence.id.clone(), start, end)
+                    .unwrap()
             })
             .map(|request| (request.evidence_id, request.start_line, request.end_line))
             .collect::<Vec<_>>();
@@ -743,6 +871,54 @@ mod tests {
         assert_eq!(actual_return, expected_return);
         assert_ne!(return_ids, pack_order);
         Ok(())
+    }
+
+    fn cargo_plan_manifest() -> ProjectManifest {
+        ProjectManifest {
+            version: 1,
+            root: "/workspace".into(),
+            files: vec![SourceFile {
+                path: "Cargo.toml".to_string(),
+                language: Language::Toml,
+                bytes: 200,
+                lines: 16,
+                content_hash: fingerprint("cargo-plan-toml"),
+                provenance: provenance("Cargo.toml", Some(1), Some(16), "test", "file"),
+            }],
+            cargo_packages: vec![CargoPackageMetadata {
+                manifest_path: "Cargo.toml".to_string(),
+                package_root: "".to_string(),
+                name: "fixture_app".to_string(),
+                version: Some("0.1.0".to_string()),
+                edition: Some("2021".to_string()),
+                targets: vec![CargoTargetMetadata {
+                    name: "fixture_bin".to_string(),
+                    kind: CargoTargetKind::Bin,
+                    path: "src/main.rs".to_string(),
+                    declaration: CargoTargetDeclaration::Declared,
+                    provenance: provenance("Cargo.toml", Some(8), Some(10), "test", "target"),
+                }],
+                features: Vec::new(),
+                provenance: provenance("Cargo.toml", Some(1), Some(5), "test", "package"),
+            }],
+            cargo_package_dependencies: vec![CargoPackageDependency {
+                manifest_path: "Cargo.toml".to_string(),
+                declaring_package: Some("fixture_app".to_string()),
+                dependency_key: "serde_alias".to_string(),
+                package_name: "serde".to_string(),
+                kind: CargoDependencyKind::Normal,
+                target: None,
+                version: Some("1".to_string()),
+                path: None,
+                optional: false,
+                features: Vec::new(),
+                declaration: CargoDependencyDeclaration::DeclaredExternal,
+                linked_package_manifest_path: None,
+                provenance: provenance("Cargo.toml", Some(12), Some(12), "test", "dependency"),
+            }],
+            manifest_hash: fingerprint("cargo-plan"),
+            ..ProjectManifest::default()
+        }
     }
 
     fn indexed_fixture() -> Result<(tempfile::TempDir, std::path::PathBuf, ProjectManifest)> {
