@@ -568,6 +568,48 @@ impl LearningSensorReviewInput {
     }
 }
 
+/// Reviewer identity accepted by the bounded learning Sensor validation path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Setters)]
+#[serde(deny_unknown_fields)]
+#[setters(into)]
+pub struct LearningSensorReviewerIdentity {
+    /// Stable reviewer identity.
+    pub reviewer_id: String,
+    /// Reviewer implementation version.
+    pub reviewer_version: i32,
+}
+
+impl LearningSensorReviewerIdentity {
+    /// Creates a learning Sensor reviewer identity.
+    ///
+    /// # Arguments
+    /// * `reviewer_id` - Stable reviewer identity.
+    /// * `reviewer_version` - Reviewer implementation version.
+    pub fn new(reviewer_id: impl Into<String>, reviewer_version: i32) -> Self {
+        Self { reviewer_id: reviewer_id.into(), reviewer_version }
+    }
+
+    /// Returns the deterministic fake reviewer identity.
+    pub fn fake() -> Self {
+        Self::new(
+            FAKE_LEARNING_SENSOR_REVIEWER_ID,
+            FAKE_LEARNING_SENSOR_REVIEWER_VERSION,
+        )
+    }
+
+    /// Validates identity fields for Sensor event construction.
+    ///
+    /// # Errors
+    /// Returns an error when the identity is empty, oversized, or version-invalid.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        ensure_learning_sensor_text("reviewer_id", &self.reviewer_id, 128)?;
+        if self.reviewer_version <= 0 {
+            anyhow::bail!("learning sensor reviewer_version must be positive");
+        }
+        Ok(())
+    }
+}
+
 /// Untrusted output from the pure learning Sensor reviewer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Setters)]
 #[serde(deny_unknown_fields)]
@@ -627,11 +669,33 @@ impl LearningSensorReviewOutput {
         reviewer_id: &str,
         reviewer_version: i32,
     ) -> anyhow::Result<()> {
+        self.validate_against_identity(
+            input,
+            &LearningSensorReviewerIdentity::new(reviewer_id, reviewer_version),
+        )
+    }
+
+    /// Validates untrusted Sensor output against a typed reviewer identity and input.
+    ///
+    /// # Arguments
+    /// * `input` - Sanitized input that was sent to the Sensor.
+    /// * `identity` - Expected reviewer identity.
+    ///
+    /// # Errors
+    /// Returns an error when the output is mismatched or unsafe to append.
+    pub fn validate_against_identity(
+        &self,
+        input: &LearningSensorReviewInput,
+        identity: &LearningSensorReviewerIdentity,
+    ) -> anyhow::Result<()> {
         input.validate()?;
+        identity.validate()?;
         if self.schema_version != LEARNING_SENSOR_REVIEW_SCHEMA_VERSION {
             anyhow::bail!("learning sensor output schema version mismatch");
         }
-        if self.reviewer_id != reviewer_id || self.reviewer_version != reviewer_version {
+        if self.reviewer_id != identity.reviewer_id
+            || self.reviewer_version != identity.reviewer_version
+        {
             anyhow::bail!("learning sensor reviewer identity mismatch");
         }
         if self.input_fingerprint != input.fingerprint()? {
@@ -688,11 +752,29 @@ impl LearningSensorReviewOutput {
         input: &LearningSensorReviewInput,
         created_at: DateTime<Utc>,
     ) -> anyhow::Result<LearningLedgerEvent> {
-        self.validate_against(
+        self.into_sensor_event_with_identity(
             input,
-            FAKE_LEARNING_SENSOR_REVIEWER_ID,
-            FAKE_LEARNING_SENSOR_REVIEWER_VERSION,
-        )?;
+            &LearningSensorReviewerIdentity::fake(),
+            created_at,
+        )
+    }
+
+    /// Builds the append-only non-injection ledger event using a typed reviewer identity.
+    ///
+    /// # Arguments
+    /// * `input` - Sanitized input reviewed by the Sensor.
+    /// * `identity` - Expected reviewer identity.
+    /// * `created_at` - Event timestamp.
+    ///
+    /// # Errors
+    /// Returns an error when validation fails.
+    pub fn into_sensor_event_with_identity(
+        &self,
+        input: &LearningSensorReviewInput,
+        identity: &LearningSensorReviewerIdentity,
+        created_at: DateTime<Utc>,
+    ) -> anyhow::Result<LearningLedgerEvent> {
+        self.validate_against_identity(input, identity)?;
         let input_fingerprint = input.fingerprint()?;
         let payload_fingerprint = self.normalized_payload_fingerprint();
         let event_kind = self.decision.event_kind();
@@ -1588,6 +1670,54 @@ mod tests {
         let invalid_version = output.into_sensor_event(&input, Utc::now());
         let actual = (left != reason_changed, invalid_version.is_err());
         let expected = (true, true);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn sensor_reviewer_identity_generalizes_fake_conversion_to_non_injection_events() {
+        let projection = fixture_learning_projection(LearningReviewState::Candidate);
+        let input = LearningSensorReviewInput::fake_fixture(
+            &projection,
+            "Durable typed observation",
+            "The sanitized evidence has substantive recurring behavior",
+        );
+        let output = FakeLearningSensorReviewer.review(input.clone()).unwrap();
+        let identity = LearningSensorReviewerIdentity::fake();
+
+        output.validate_against_identity(&input, &identity).unwrap();
+        let actual = output
+            .into_sensor_event_with_identity(&input, &identity, Utc::now())
+            .unwrap()
+            .event_kind;
+        let expected = LearningEventKind::SensorLessonProposed;
+
+        assert_eq!(actual, expected);
+        assert_ne!(actual, LearningEventKind::ReviewAccepted);
+    }
+
+    #[test]
+    fn sensor_output_rejects_accept_like_enum_values() {
+        let projection = fixture_learning_projection(LearningReviewState::Candidate);
+        let input = LearningSensorReviewInput::from_candidate_projection(&projection);
+        let fixture = |decision: &str| {
+            format!(
+                r#"{{"schema_version":{},"reviewer_id":"{}","reviewer_version":{},"input_fingerprint":"{}","decision":"{}","reason_code":"blocked_accept_path","proposal_title":null,"proposal_body":null}}"#,
+                LEARNING_SENSOR_REVIEW_SCHEMA_VERSION,
+                FAKE_LEARNING_SENSOR_REVIEWER_ID,
+                FAKE_LEARNING_SENSOR_REVIEWER_VERSION,
+                input.fingerprint().unwrap(),
+                decision
+            )
+        };
+
+        let actual = ["accept", "accepted", "review_accepted"]
+            .iter()
+            .map(|decision| {
+                serde_json::from_str::<LearningSensorReviewOutput>(&fixture(decision)).is_err()
+            })
+            .collect::<Vec<_>>();
+        let expected = vec![true, true, true];
 
         assert_eq!(actual, expected);
     }

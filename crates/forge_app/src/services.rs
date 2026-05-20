@@ -539,6 +539,29 @@ pub trait LearningService: Send + Sync {
         input: LearningSensorReviewInput,
         output: LearningSensorReviewOutput,
     ) -> anyhow::Result<LearningLedgerAppendOutcome> {
+        self.append_learning_sensor_review_with_identity(
+            input,
+            output,
+            forge_domain::LearningSensorReviewerIdentity::fake(),
+        )
+        .await
+    }
+
+    /// Appends a validated non-injection Sensor review event for a typed reviewer identity.
+    ///
+    /// # Arguments
+    /// * `input` - Sanitized input that was sent to the pure Sensor.
+    /// * `output` - Untrusted Sensor output to validate and append.
+    /// * `identity` - Expected reviewer identity for validation and provenance.
+    ///
+    /// # Errors
+    /// Returns an error when validation fails, the candidate is stale, or persistence fails.
+    async fn append_learning_sensor_review_with_identity(
+        &self,
+        input: LearningSensorReviewInput,
+        output: LearningSensorReviewOutput,
+        identity: forge_domain::LearningSensorReviewerIdentity,
+    ) -> anyhow::Result<LearningLedgerAppendOutcome> {
         let current = self
             .get_learning_record(input.candidate_id)
             .await?
@@ -552,7 +575,8 @@ pub trait LearningService: Send + Sync {
         if forge_domain::learning_projection_hash(&current) != input.sanitized_projection_hash {
             anyhow::bail!("learning sensor candidate projection hash mismatch");
         }
-        let event = output.into_sensor_event(&input, chrono::Utc::now())?;
+        let event =
+            output.into_sensor_event_with_identity(&input, &identity, chrono::Utc::now())?;
         self.insert_learning_event(event).await
     }
 
