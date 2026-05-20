@@ -4,10 +4,12 @@ use anyhow::Result;
 use chrono::Utc;
 use forge_app::LearningService;
 use forge_app::domain::{
-    ConversationId, LearningCaptureMetadata, LearningLedgerAppendOutcome, LearningLedgerEvent,
-    LearningLedgerFreshness, LearningProvenance, LearningRecordProjection, LearningRepository,
-    LearningReviewOutcome, LearningReviewState, RedactedLearningSummary,
+    ConversationId, FakeLearningSensorReviewer, LearningCaptureMetadata,
+    LearningLedgerAppendOutcome, LearningLedgerEvent, LearningLedgerFreshness, LearningProvenance,
+    LearningRecordProjection, LearningRepository, LearningReviewOutcome, LearningReviewState,
+    LearningSensorReviewInput, RedactedLearningSummary,
 };
+use forge_domain::LearningSensorReviewer;
 
 /// Domain service for capture/query operations over the append-only learning
 /// ledger.
@@ -23,6 +25,23 @@ impl<R> ForgeLearningService<R> {
     /// * `repository` - Learning repository dependency.
     pub fn new(repository: Arc<R>) -> Self {
         Self { repository }
+    }
+}
+
+impl<R: LearningRepository> ForgeLearningService<R> {
+    /// Runs the deterministic fake Sensor reviewer over sanitized candidate evidence.
+    ///
+    /// # Arguments
+    /// * `input` - Sanitized Sensor review input.
+    ///
+    /// # Errors
+    /// Returns an error when validation, stale-state checks, or persistence fail.
+    pub async fn review_with_fake_sensor(
+        &self,
+        input: LearningSensorReviewInput,
+    ) -> Result<LearningLedgerAppendOutcome> {
+        let output = FakeLearningSensorReviewer.review(input.clone())?;
+        self.append_learning_sensor_review(input, output).await
     }
 }
 
@@ -99,7 +118,11 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
-    use forge_app::domain::{LearningEventId, LearningRecordId, LearningRedactionStatus};
+    use forge_app::domain::{
+        LEARNING_SENSOR_REVIEW_SCHEMA_VERSION, LearningEventId, LearningEventKind,
+        LearningRecordId, LearningRedactionStatus, LearningSensorDecisionKind,
+        LearningSensorReviewOutput,
+    };
 
     #[derive(Default)]
     struct FixtureLearningRepository {
@@ -229,6 +252,163 @@ mod tests {
             forge_app::domain::LearningLedgerEventFreshness::Inserted,
             forge_app::domain::LearningLedgerEventFreshness::Existing,
         );
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_service_fake_sensor_metadata_only_appends_pending_not_proposal() -> Result<()>
+    {
+        let fixture = Arc::new(FixtureLearningRepository::default());
+        let service = ForgeLearningService::new(fixture);
+        let conversation_id = ConversationId::generate();
+        let candidate = service
+            .capture_candidate_from_conversation(
+                conversation_id,
+                "event-sensor-1".to_string(),
+                "conversation_saved message_count=1 user_message_count=1 context_fingerprint=abc"
+                    .to_string(),
+                LearningCaptureMetadata::conversation_save(1, 1, "abc", "summary-fingerprint"),
+            )
+            .await?
+            .event;
+        let projection = service
+            .get_learning_record(candidate.record_id)
+            .await?
+            .expect("candidate projection should exist");
+        let input = LearningSensorReviewInput::from_candidate_projection(&projection);
+
+        let actual = service
+            .review_with_fake_sensor(input)
+            .await?
+            .event
+            .event_kind;
+        let expected = LearningEventKind::SensorReviewPending;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_service_fake_sensor_fixture_appends_proposal_but_not_accepted() -> Result<()>
+    {
+        let fixture = Arc::new(FixtureLearningRepository::default());
+        let service = ForgeLearningService::new(fixture);
+        let conversation_id = ConversationId::generate();
+        let candidate = service
+            .capture_candidate_from_conversation(
+                conversation_id,
+                "event-sensor-2".to_string(),
+                "conversation_saved message_count=1 user_message_count=1 context_fingerprint=def"
+                    .to_string(),
+                LearningCaptureMetadata::conversation_save(1, 1, "def", "summary-fingerprint"),
+            )
+            .await?
+            .event;
+        let projection = service
+            .get_learning_record(candidate.record_id)
+            .await?
+            .expect("candidate projection should exist");
+        let input = LearningSensorReviewInput::fake_fixture(
+            &projection,
+            "Durable typed observation",
+            "A recurring typed fixture observation exists",
+        );
+
+        let outcome = service.review_with_fake_sensor(input).await?;
+        let record = service
+            .get_learning_record(candidate.record_id)
+            .await?
+            .expect("candidate projection should remain present");
+        let actual = (outcome.event.event_kind, record.review_state);
+        let expected = (
+            LearningEventKind::SensorLessonProposed,
+            LearningReviewState::Candidate,
+        );
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_service_rejects_mismatched_sensor_output_without_accepting() -> Result<()> {
+        let fixture = Arc::new(FixtureLearningRepository::default());
+        let service = ForgeLearningService::new(fixture);
+        let conversation_id = ConversationId::generate();
+        let candidate = service
+            .capture_candidate_from_conversation(
+                conversation_id,
+                "event-sensor-3".to_string(),
+                "conversation_saved message_count=1 user_message_count=1 context_fingerprint=ghi"
+                    .to_string(),
+                LearningCaptureMetadata::conversation_save(1, 1, "ghi", "summary-fingerprint"),
+            )
+            .await?
+            .event;
+        let projection = service
+            .get_learning_record(candidate.record_id)
+            .await?
+            .expect("candidate projection should exist");
+        let input = LearningSensorReviewInput::fake_fixture(
+            &projection,
+            "Durable typed observation",
+            "A recurring typed fixture observation exists",
+        );
+        let output = LearningSensorReviewOutput {
+            schema_version: LEARNING_SENSOR_REVIEW_SCHEMA_VERSION,
+            reviewer_id: "wrong".to_string(),
+            reviewer_version: 1,
+            input_fingerprint: input.fingerprint()?,
+            decision: LearningSensorDecisionKind::ProposeLesson,
+            reason_code: "typed_fixture_substantive_evidence".to_string(),
+            proposal_title: Some("Durable typed observation".to_string()),
+            proposal_body: Some("A recurring typed fixture observation exists".to_string()),
+        };
+
+        let rejected = service
+            .append_learning_sensor_review(input, output)
+            .await
+            .is_err();
+        let record = service
+            .get_learning_record(candidate.record_id)
+            .await?
+            .expect("candidate projection should remain present");
+        let actual = (rejected, record.review_state);
+        let expected = (true, LearningReviewState::Candidate);
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_service_rejects_stale_sensor_projection_hash_without_append() -> Result<()> {
+        let fixture = Arc::new(FixtureLearningRepository::default());
+        let service = ForgeLearningService::new(fixture);
+        let conversation_id = ConversationId::generate();
+        let candidate = service
+            .capture_candidate_from_conversation(
+                conversation_id,
+                "event-sensor-4".to_string(),
+                "conversation_saved message_count=1 user_message_count=1 context_fingerprint=jkl"
+                    .to_string(),
+                LearningCaptureMetadata::conversation_save(1, 1, "jkl", "summary-fingerprint"),
+            )
+            .await?
+            .event;
+        let projection = service
+            .get_learning_record(candidate.record_id)
+            .await?
+            .expect("candidate projection should exist");
+        let mut input = LearningSensorReviewInput::fake_fixture(
+            &projection,
+            "Durable typed observation",
+            "A recurring typed fixture observation exists",
+        );
+        input.sanitized_projection_hash = "stale".to_string();
+
+        let actual = service.review_with_fake_sensor(input).await.is_err();
+        let expected = true;
 
         assert_eq!(actual, expected);
         Ok(())

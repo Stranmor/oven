@@ -535,6 +535,13 @@ fn project_records(
                     projection.updated_at = event.created_at;
                 }
             }
+            LearningEventKind::SensorLessonProposed
+            | LearningEventKind::SensorReviewPending
+            | LearningEventKind::SensorReviewRejected => {
+                if let Some(projection) = projections.get_mut(&record_key) {
+                    projection.updated_at = event.created_at;
+                }
+            }
             LearningEventKind::Superseded => {
                 if let Some(projection) = projections.get_mut(&record_key) {
                     projection.review_state = LearningReviewState::Superseded;
@@ -578,8 +585,11 @@ fn review_target_state(event_kind: LearningEventKind) -> anyhow::Result<Learning
         LearningEventKind::ReviewAccepted => Ok(LearningReviewState::Accepted),
         LearningEventKind::ReviewRejected => Ok(LearningReviewState::Rejected),
         LearningEventKind::Superseded => Ok(LearningReviewState::Superseded),
-        LearningEventKind::CandidateCaptured => {
-            anyhow::bail!("candidate capture event cannot review learning record")
+        LearningEventKind::CandidateCaptured
+        | LearningEventKind::SensorLessonProposed
+        | LearningEventKind::SensorReviewPending
+        | LearningEventKind::SensorReviewRejected => {
+            anyhow::bail!("event kind {} cannot review learning record", event_kind)
         }
     }
 }
@@ -608,7 +618,10 @@ mod tests {
     use std::sync::Arc;
 
     use chrono::Duration;
-    use forge_domain::{LEARNING_LEDGER_SCHEMA_VERSION, RedactedLearningSummary};
+    use forge_domain::{
+        FakeLearningSensorReviewer, LEARNING_LEDGER_SCHEMA_VERSION, LearningSensorReviewInput,
+        LearningSensorReviewer, RedactedLearningSummary,
+    };
     use pretty_assertions::assert_eq;
 
     use super::*;
@@ -1442,6 +1455,182 @@ mod tests {
             .first()
             .and_then(|projection| projection.capture_metadata.clone());
         let expected = None;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_sensor_proposal_event_does_not_transition_to_accepted() -> anyhow::Result<()>
+    {
+        let fixture = fixture_repo(23)?;
+        let conversation_id = ConversationId::generate();
+        let created_at = Utc::now();
+        let candidate = fixture
+            .insert_learning_event(fixture_event(
+                conversation_id,
+                "event-1",
+                "sensor proposal stays non accepted",
+                created_at,
+            )?)
+            .await?
+            .event;
+        let projection = fixture
+            .get_learning_record(candidate.record_id)
+            .await?
+            .expect("candidate projection should exist");
+        let input = LearningSensorReviewInput::fake_fixture(
+            &projection,
+            "Durable typed observation",
+            "A recurring typed fixture observation exists",
+        );
+        let output = FakeLearningSensorReviewer.review(input.clone())?;
+        let event = output.into_sensor_event(&input, created_at + Duration::seconds(1))?;
+
+        fixture.insert_learning_event(event).await?;
+
+        let projection = fixture
+            .get_learning_record(candidate.record_id)
+            .await?
+            .expect("candidate projection should exist after sensor event");
+        let accepted = fixture
+            .list_learning_records(Some(LearningReviewState::Accepted), 10)
+            .await?;
+        let actual = (projection.review_state, accepted.len());
+        let expected = (LearningReviewState::Candidate, 0usize);
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_sensor_event_replay_is_idempotent() -> anyhow::Result<()> {
+        let fixture = fixture_repo(24)?;
+        let conversation_id = ConversationId::generate();
+        let created_at = Utc::now();
+        let candidate = fixture
+            .insert_learning_event(fixture_event(
+                conversation_id,
+                "event-1",
+                "sensor idempotent replay",
+                created_at,
+            )?)
+            .await?
+            .event;
+        let projection = fixture
+            .get_learning_record(candidate.record_id)
+            .await?
+            .expect("candidate projection should exist");
+        let input = LearningSensorReviewInput::fake_fixture(
+            &projection,
+            "Durable typed observation",
+            "A recurring typed fixture observation exists",
+        );
+        let output = FakeLearningSensorReviewer.review(input.clone())?;
+        let first_event = output.into_sensor_event(&input, created_at + Duration::seconds(1))?;
+        let second_event = output.into_sensor_event(&input, created_at + Duration::seconds(2))?;
+
+        let first = fixture.insert_learning_event(first_event).await?;
+        let second = fixture.insert_learning_event(second_event).await?;
+        let events = fixture
+            .run_with_connection(move |connection, wid| {
+                learning_ledger_events::table
+                    .filter(learning_ledger_events::workspace_id.eq(workspace_db_id(wid)))
+                    .load::<LearningLedgerEventRecord>(connection)
+                    .map_err(Into::into)
+            })
+            .await?;
+        let actual = (first.freshness, second.freshness, events.len());
+        let expected = (
+            forge_domain::LearningLedgerEventFreshness::Inserted,
+            forge_domain::LearningLedgerEventFreshness::Existing,
+            2usize,
+        );
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_freshness_for_accepted_ignores_sensor_events() -> anyhow::Result<()> {
+        let fixture = fixture_repo(25)?;
+        let conversation_id = ConversationId::generate();
+        let created_at = Utc::now();
+        let candidate = fixture
+            .insert_learning_event(fixture_event(
+                conversation_id,
+                "event-1",
+                "sensor events excluded from accepted freshness",
+                created_at,
+            )?)
+            .await?
+            .event;
+        let before = fixture
+            .learning_freshness(Some(LearningReviewState::Accepted))
+            .await?;
+        let projection = fixture
+            .get_learning_record(candidate.record_id)
+            .await?
+            .expect("candidate projection should exist");
+        let input = LearningSensorReviewInput::fake_fixture(
+            &projection,
+            "Durable typed observation",
+            "A recurring typed fixture observation exists",
+        );
+        let output = FakeLearningSensorReviewer.review(input.clone())?;
+        fixture
+            .insert_learning_event(
+                output.into_sensor_event(&input, created_at + Duration::seconds(1))?,
+            )
+            .await?;
+        let after = fixture
+            .learning_freshness(Some(LearningReviewState::Accepted))
+            .await?;
+
+        let actual = before.review_state_fingerprint == after.review_state_fingerprint;
+        let expected = true;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_sensor_stale_projection_hash_is_detectable_before_append()
+    -> anyhow::Result<()> {
+        let fixture = fixture_repo(26)?;
+        let conversation_id = ConversationId::generate();
+        let created_at = Utc::now();
+        let candidate = fixture
+            .insert_learning_event(fixture_event(
+                conversation_id,
+                "event-1",
+                "sensor stale candidate",
+                created_at,
+            )?)
+            .await?
+            .event;
+        let projection = fixture
+            .get_learning_record(candidate.record_id)
+            .await?
+            .expect("candidate projection should exist");
+        let mut input = LearningSensorReviewInput::fake_fixture(
+            &projection,
+            "Durable typed observation",
+            "A recurring typed fixture observation exists",
+        );
+        input.sanitized_projection_hash = "stale".to_string();
+        let stale_detected =
+            forge_domain::learning_projection_hash(&projection) != input.sanitized_projection_hash;
+        let events = fixture
+            .run_with_connection(move |connection, wid| {
+                learning_ledger_events::table
+                    .filter(learning_ledger_events::workspace_id.eq(workspace_db_id(wid)))
+                    .load::<LearningLedgerEventRecord>(connection)
+                    .map_err(Into::into)
+            })
+            .await?;
+        let actual = (stale_detected, events.len());
+        let expected = (true, 1usize);
+
         assert_eq!(actual, expected);
         Ok(())
     }

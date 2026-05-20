@@ -90,6 +90,12 @@ pub trait API: Sync + Send {
     /// internal agent sessions for diagnostic surfaces.
     async fn get_conversations_including_agent(&self) -> Result<Vec<Conversation>>;
 
+    /// Lists root conversations for the active workspace by visibility.
+    async fn get_conversations_by_visibility(
+        &self,
+        visibility: forge_domain::ConversationVisibilityFilter,
+    ) -> Result<Vec<Conversation>>;
+
     /// Lists sub-conversations (subagent chats) for a parent conversation
     async fn get_sub_conversations(&self, parent_id: &ConversationId) -> Result<Vec<Conversation>>;
 

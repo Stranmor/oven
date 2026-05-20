@@ -8,7 +8,7 @@ use forge_app::domain::{
     SubagentTaskSessionFilter,
 };
 use forge_app::dto::ConversationBranchTarget;
-use forge_domain::ConversationRepository;
+use forge_domain::{ConversationRepository, ConversationVisibilityFilter};
 
 /// Service for managing conversations, including creation, retrieval, and
 /// updates
@@ -163,6 +163,15 @@ impl<S: ConversationRepository> ConversationService for ForgeConversationService
             .await
     }
 
+    async fn get_conversations_by_visibility(
+        &self,
+        visibility: ConversationVisibilityFilter,
+    ) -> Result<Vec<Conversation>> {
+        self.conversation_repository
+            .get_all_conversations_by_visibility(visibility)
+            .await
+    }
+
     async fn get_sub_conversations(&self, parent_id: &ConversationId) -> Result<Vec<Conversation>> {
         self.conversation_repository
             .get_sub_conversations(parent_id)
@@ -302,6 +311,25 @@ mod tests {
 
         async fn get_all_conversations_including_agent(&self) -> anyhow::Result<Vec<Conversation>> {
             self.get_all_conversations().await
+        }
+
+        async fn get_all_conversations_by_visibility(
+            &self,
+            visibility: forge_app::domain::ConversationVisibilityFilter,
+        ) -> anyhow::Result<Vec<Conversation>> {
+            let conversations = self.get_all_conversations_including_agent().await?;
+            Ok(conversations
+                .into_iter()
+                .filter(|conversation| match visibility {
+                    forge_app::domain::ConversationVisibilityFilter::Normal => {
+                        conversation.is_normal_visibility()
+                    }
+                    forge_app::domain::ConversationVisibilityFilter::Background => {
+                        conversation.is_background()
+                    }
+                    forge_app::domain::ConversationVisibilityFilter::All => true,
+                })
+                .collect())
         }
 
         async fn get_sub_conversations(

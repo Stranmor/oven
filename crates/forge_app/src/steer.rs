@@ -217,6 +217,25 @@ mod tests {
             self.get_conversations().await
         }
 
+        async fn get_conversations_by_visibility(
+            &self,
+            visibility: forge_domain::ConversationVisibilityFilter,
+        ) -> anyhow::Result<Vec<Conversation>> {
+            let conversations = self.get_conversations_including_agent().await?;
+            Ok(conversations
+                .into_iter()
+                .filter(|conversation| match visibility {
+                    forge_domain::ConversationVisibilityFilter::Normal => {
+                        conversation.is_normal_visibility()
+                    }
+                    forge_domain::ConversationVisibilityFilter::Background => {
+                        conversation.is_background()
+                    }
+                    forge_domain::ConversationVisibilityFilter::All => true,
+                })
+                .collect())
+        }
+
         async fn get_sub_conversations(
             &self,
             parent_id: &ConversationId,

@@ -1541,6 +1541,16 @@ mod tests {
                         record.updated_at = event.created_at;
                     }
                 }
+                LearningEventKind::SensorLessonProposed
+                | LearningEventKind::SensorReviewPending
+                | LearningEventKind::SensorReviewRejected => {
+                    if let Some(record) = records
+                        .iter_mut()
+                        .find(|record| record.record_id == event.record_id)
+                    {
+                        record.updated_at = event.created_at;
+                    }
+                }
                 LearningEventKind::Superseded => {
                     if let Some(record) = records
                         .iter_mut()
@@ -1632,6 +1642,25 @@ mod tests {
 
         async fn get_conversations_including_agent(&self) -> Result<Vec<Conversation>> {
             self.get_conversations().await
+        }
+
+        async fn get_conversations_by_visibility(
+            &self,
+            visibility: forge_domain::ConversationVisibilityFilter,
+        ) -> Result<Vec<Conversation>> {
+            let conversations = self.get_conversations_including_agent().await?;
+            Ok(conversations
+                .into_iter()
+                .filter(|conversation| match visibility {
+                    forge_domain::ConversationVisibilityFilter::Normal => {
+                        conversation.is_normal_visibility()
+                    }
+                    forge_domain::ConversationVisibilityFilter::Background => {
+                        conversation.is_background()
+                    }
+                    forge_domain::ConversationVisibilityFilter::All => true,
+                })
+                .collect())
         }
 
         async fn get_sub_conversations(
@@ -1753,8 +1782,14 @@ mod tests {
                 LearningEventKind::ReviewAccepted => LearningReviewState::Accepted,
                 LearningEventKind::ReviewRejected => LearningReviewState::Rejected,
                 LearningEventKind::Superseded => LearningReviewState::Superseded,
-                LearningEventKind::CandidateCaptured => {
-                    anyhow::bail!("candidate capture event cannot review learning record")
+                LearningEventKind::CandidateCaptured
+                | LearningEventKind::SensorLessonProposed
+                | LearningEventKind::SensorReviewPending
+                | LearningEventKind::SensorReviewRejected => {
+                    anyhow::bail!(
+                        "event kind {} cannot review learning record",
+                        event.event_kind
+                    )
                 }
             };
             let before = self
@@ -3557,6 +3592,64 @@ mod tests {
         );
         assert_eq!(learning_message.droppable, true);
         assert_eq!(learning_message.is_cache_eligible(), false);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_context_injection_excludes_sensor_proposal_pending_and_reject_audit_events()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root);
+        setup
+            .set_learning_records(vec![
+                fixture_learning_projection(
+                    LearningReviewState::Candidate,
+                    "sensor_proposal reviewer=fake_learning_sensor_reviewer title=proposal must not inject",
+                ),
+                fixture_learning_projection(
+                    LearningReviewState::Candidate,
+                    "sensor_pending reviewer=fake_learning_sensor_reviewer reason=insufficient_substantive_evidence",
+                ),
+                fixture_learning_projection(
+                    LearningReviewState::Rejected,
+                    "sensor_reject reviewer=fake_learning_sensor_reviewer reason=invalid_output",
+                ),
+                fixture_learning_projection(
+                    LearningReviewState::Accepted,
+                    "accepted reviewed learning remains the only injectable record",
+                ),
+            ])
+            .await;
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let conversation = Conversation::generate().context(Context::default().add_message(
+            ContextMessage::user("find automatic injection needle", Some(model_id)),
+        ));
+
+        let actual = ProjectContextInjection::new(setup, agent)
+            .inject_learning(conversation)
+            .await
+            .context
+            .unwrap();
+        let learning_message = actual
+            .messages
+            .iter()
+            .find_map(|message| match &message.message {
+                ContextMessage::Text(text) if text.is_learning_context() => Some(text),
+                _ => None,
+            })
+            .expect("accepted learning context should be injected");
+        let actual = vec![
+            learning_message
+                .content
+                .contains("accepted reviewed learning remains the only injectable record"),
+            learning_message.content.contains("sensor_proposal"),
+            learning_message.content.contains("sensor_pending"),
+            learning_message.content.contains("sensor_reject"),
+        ];
+        let expected = vec![true, false, false, false];
+
+        assert_eq!(actual, expected);
         Ok(())
     }
 

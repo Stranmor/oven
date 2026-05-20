@@ -8,13 +8,14 @@ use forge_domain::{
     ChatCompletionMessage, CommandOutput, Context, Conversation, ConversationId, File, FileInfo,
     FileStatus, Image, LearningCaptureMetadata, LearningLedgerAppendOutcome, LearningLedgerEvent,
     LearningLedgerFreshness, LearningRecordId, LearningRecordProjection, LearningReviewOutcome,
-    LearningReviewRequest, LearningReviewState, McpConfig, McpServers, Model, ModelId, Node,
-    ProcessId, ProcessReadCursor, ProcessReadOutput, ProcessStartOutput, ProcessStatus, Provider,
-    ProviderId, ResultStream, Scope, SearchParams, SteerMessage, SubagentTaskId,
-    SubagentTaskSession, SubagentTaskSessionFilter, SyncProgress, SyntaxError, Template,
-    ToolCallFull, ToolOutput, WorkspaceAuth, WorkspaceContextManifestDiagnostic,
-    WorkspaceEvidenceReplayDiagnostic, WorkspaceEvidenceReplayPreviewDiagnostic,
-    WorkspaceExactFactReferenceReport, WorkspaceExactFactStatusReport, WorkspaceId, WorkspaceInfo,
+    LearningReviewRequest, LearningReviewState, LearningSensorReviewInput,
+    LearningSensorReviewOutput, McpConfig, McpServers, Model, ModelId, Node, ProcessId,
+    ProcessReadCursor, ProcessReadOutput, ProcessStartOutput, ProcessStatus, Provider, ProviderId,
+    ResultStream, Scope, SearchParams, SteerMessage, SubagentTaskId, SubagentTaskSession,
+    SubagentTaskSessionFilter, SyncProgress, SyntaxError, Template, ToolCallFull, ToolOutput,
+    WorkspaceAuth, WorkspaceContextManifestDiagnostic, WorkspaceEvidenceReplayDiagnostic,
+    WorkspaceEvidenceReplayPreviewDiagnostic, WorkspaceExactFactReferenceReport,
+    WorkspaceExactFactStatusReport, WorkspaceId, WorkspaceInfo,
 };
 use forge_eventsource::EventSource;
 use reqwest::Response;
@@ -365,6 +366,18 @@ pub trait ConversationService: Send + Sync {
     /// Returns an error if listing conversations fails.
     async fn get_conversations_including_agent(&self) -> anyhow::Result<Vec<Conversation>>;
 
+    /// Find root conversations for selected visibility classes.
+    ///
+    /// # Arguments
+    /// * `visibility` - Visibility classes to include.
+    ///
+    /// # Errors
+    /// Returns an error if listing conversations fails.
+    async fn get_conversations_by_visibility(
+        &self,
+        visibility: forge_domain::ConversationVisibilityFilter,
+    ) -> anyhow::Result<Vec<Conversation>>;
+
     /// Find sub-conversations (subagent chats) for a parent conversation.
     ///
     /// # Arguments
@@ -512,6 +525,37 @@ pub trait LearningService: Send + Sync {
         }
         Ok(outcome)
     }
+
+    /// Appends a validated non-injection Sensor review event.
+    ///
+    /// # Arguments
+    /// * `input` - Sanitized input that was sent to the pure Sensor.
+    /// * `output` - Untrusted Sensor output to validate and append.
+    ///
+    /// # Errors
+    /// Returns an error when validation fails, the candidate is stale, or persistence fails.
+    async fn append_learning_sensor_review(
+        &self,
+        input: LearningSensorReviewInput,
+        output: LearningSensorReviewOutput,
+    ) -> anyhow::Result<LearningLedgerAppendOutcome> {
+        let current = self
+            .get_learning_record(input.candidate_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("learning sensor candidate not found"))?;
+        if current.review_state != LearningReviewState::Candidate {
+            anyhow::bail!(
+                "learning sensor candidate is no longer reviewable: {}",
+                current.review_state
+            );
+        }
+        if forge_domain::learning_projection_hash(&current) != input.sanitized_projection_hash {
+            anyhow::bail!("learning sensor candidate projection hash mismatch");
+        }
+        let event = output.into_sensor_event(&input, chrono::Utc::now())?;
+        self.insert_learning_event(event).await
+    }
+
     /// Returns one projected learning record by identifier.
     ///
     /// # Arguments
@@ -1072,6 +1116,15 @@ impl<I: Services> ConversationService for I {
     async fn get_conversations_including_agent(&self) -> anyhow::Result<Vec<Conversation>> {
         self.conversation_service()
             .get_conversations_including_agent()
+            .await
+    }
+
+    async fn get_conversations_by_visibility(
+        &self,
+        visibility: forge_domain::ConversationVisibilityFilter,
+    ) -> anyhow::Result<Vec<Conversation>> {
+        self.conversation_service()
+            .get_conversations_by_visibility(visibility)
             .await
     }
 
@@ -1857,6 +1910,25 @@ mod tests {
 
         async fn get_conversations_including_agent(&self) -> anyhow::Result<Vec<Conversation>> {
             self.get_conversations().await
+        }
+
+        async fn get_conversations_by_visibility(
+            &self,
+            visibility: forge_domain::ConversationVisibilityFilter,
+        ) -> anyhow::Result<Vec<Conversation>> {
+            let conversations = self.get_conversations_including_agent().await?;
+            Ok(conversations
+                .into_iter()
+                .filter(|conversation| match visibility {
+                    forge_domain::ConversationVisibilityFilter::Normal => {
+                        conversation.is_normal_visibility()
+                    }
+                    forge_domain::ConversationVisibilityFilter::Background => {
+                        conversation.is_background()
+                    }
+                    forge_domain::ConversationVisibilityFilter::All => true,
+                })
+                .collect())
         }
 
         async fn get_sub_conversations(

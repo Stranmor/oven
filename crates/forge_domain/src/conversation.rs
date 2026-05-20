@@ -47,6 +47,29 @@ pub enum Initiator {
     Agent,
 }
 
+/// Controls which conversation surfaces show a conversation by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ConversationVisibility {
+    /// Visible on normal user-facing conversation surfaces.
+    #[default]
+    Normal,
+    /// Hidden from normal history and resume surfaces unless explicitly audited.
+    Background,
+}
+
+/// Selects conversation visibility classes for history queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConversationVisibilityFilter {
+    /// Only normal foreground conversations.
+    #[default]
+    Normal,
+    /// Only background cron/headless conversations.
+    Background,
+    /// All visibility classes.
+    All,
+}
+
 #[derive(Debug, Setters, Serialize, Deserialize, Clone)]
 #[setters(into)]
 pub struct Conversation {
@@ -55,6 +78,8 @@ pub struct Conversation {
     pub title: Option<String>,
     pub context: Option<Context>,
     pub initiator: Initiator,
+    #[serde(default)]
+    pub visibility: ConversationVisibility,
     pub metrics: Metrics,
     pub metadata: MetaData,
 }
@@ -81,6 +106,7 @@ impl Conversation {
             parent_id: None,
             metrics,
             initiator: Initiator::User,
+            visibility: ConversationVisibility::Normal,
             metadata: MetaData::new(created_at),
             title: None,
             context: None,
@@ -214,6 +240,21 @@ impl Conversation {
             .unwrap_or_default()
     }
 
+    /// Returns whether the conversation is hidden from normal user-facing surfaces.
+    pub fn is_background(&self) -> bool {
+        self.visibility == ConversationVisibility::Background
+    }
+
+    /// Returns whether the conversation is visible on normal user-facing surfaces.
+    pub fn is_normal_visibility(&self) -> bool {
+        self.visibility == ConversationVisibility::Normal
+    }
+
+    /// Marks the conversation as background work.
+    pub fn mark_background(&mut self) {
+        self.visibility = ConversationVisibility::Background;
+    }
+
     /// Returns whether the conversation was spawned by another agent.
     pub fn is_agent_initiated(&self) -> bool {
         self.initiator == Initiator::Agent
@@ -221,7 +262,10 @@ impl Conversation {
 
     /// Returns whether the conversation is a primary human/user chat.
     pub fn is_primary_user_conversation(&self) -> bool {
-        self.context.is_some() && self.parent_id.is_none() && !self.is_agent_initiated()
+        self.context.is_some()
+            && self.parent_id.is_none()
+            && !self.is_agent_initiated()
+            && self.is_normal_visibility()
     }
 
     /// Ensures this conversation is marked as delegated agent work.
@@ -250,6 +294,32 @@ mod tests {
         let conversation = Conversation::generate();
         let actual = conversation.related_conversation_ids();
         assert_eq!(actual, vec![]);
+    }
+
+    #[test]
+    fn test_conversation_deserializes_missing_visibility_as_normal() {
+        let id = ConversationId::generate();
+        let fixture = format!(
+            r#"{{"id":"{}","parent_id":null,"title":null,"context":null,"initiator":"user","metrics":{{"started_at":"2026-05-20T08:00:00Z","file_operations":{{}},"files_accessed":[],"todos":[]}},"metadata":{{"created_at":"2026-05-20T08:00:00Z","updated_at":null}}}}"#,
+            id.into_string()
+        );
+
+        let actual: Conversation = serde_json::from_str(&fixture).unwrap();
+        let expected = ConversationVisibility::Normal;
+
+        assert_eq!(actual.visibility, expected);
+    }
+
+    #[test]
+    fn test_background_conversation_is_not_primary_user_conversation() {
+        let context = Context::default();
+        let mut fixture = Conversation::generate().context(Some(context));
+        fixture.mark_background();
+
+        let actual = fixture.is_primary_user_conversation();
+        let expected = false;
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

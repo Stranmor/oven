@@ -11,6 +11,7 @@ diesel::table! {
         metrics -> Nullable<Text>,
         parent_id -> Nullable<Text>,
         initiator -> Nullable<Text>,
+        visibility -> Nullable<Text>,
     }
 }
 

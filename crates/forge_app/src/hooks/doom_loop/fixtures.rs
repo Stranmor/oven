@@ -52,6 +52,7 @@ pub(super) fn conversation_with_context_messages(messages: Vec<ContextMessage>) 
         title: None,
         context: Some(context),
         initiator: forge_domain::Initiator::User,
+        visibility: forge_domain::ConversationVisibility::Normal,
         metrics: Default::default(),
         metadata: forge_domain::MetaData::new(chrono::Utc::now()),
     }

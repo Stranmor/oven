@@ -1017,6 +1017,7 @@ pub(super) struct ConversationRecord {
     pub metrics: Option<String>,
     pub parent_id: Option<String>,
     pub initiator: Option<String>,
+    pub visibility: Option<String>,
 }
 
 impl ConversationRecord {
@@ -1025,6 +1026,10 @@ impl ConversationRecord {
         let initiator = match conversation.initiator {
             forge_domain::Initiator::User => None, // NULL in DB = user
             forge_domain::Initiator::Agent => Some("agent".to_string()),
+        };
+        let visibility = match conversation.visibility {
+            forge_domain::ConversationVisibility::Normal => None,
+            forge_domain::ConversationVisibility::Background => Some("background".to_string()),
         };
         let context = conversation
             .context
@@ -1046,6 +1051,7 @@ impl ConversationRecord {
             metrics,
             parent_id: conversation.parent_id.map(|id| id.into_string()),
             initiator,
+            visibility,
         }
     }
 }
@@ -1093,10 +1099,16 @@ impl TryFrom<ConversationRecord> for forge_domain::Conversation {
             _ => forge_domain::Initiator::User,
         };
 
+        let visibility = match record.visibility.as_deref() {
+            Some("background") => forge_domain::ConversationVisibility::Background,
+            _ => forge_domain::ConversationVisibility::Normal,
+        };
+
         let mut conv = forge_domain::Conversation::new(id)
             .context(context)
             .title(record.title)
             .initiator(initiator)
+            .visibility(visibility)
             .metrics(metrics)
             .metadata(
                 forge_domain::MetaData::new(record.created_at.and_utc())

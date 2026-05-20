@@ -1960,16 +1960,8 @@ mod tests {
             .add_base64_url(stale_image)
             .add_message(ContextMessage::user("fresh pasted screenshot", None))
             .add_base64_url(current_image.clone())
-            .add_tool(
-                ToolDefinition::new("large_tool_one")
-                    .description(large_text(8_000))
-                    .input_schema(schemars::schema_for!(())),
-            )
-            .add_tool(
-                ToolDefinition::new("large_tool_two")
-                    .description(large_text(8_000))
-                    .input_schema(schemars::schema_for!(())),
-            )
+            .add_tool(ToolDefinition::new("large_tool_one").description(large_text(8_000)))
+            .add_tool(ToolDefinition::new("large_tool_two").description(large_text(8_000)))
             .max_tokens(50_000_usize);
         let fixture =
             observer_orchestrator_fixture(Compact::new().retention_window(64_usize), 100_000);
@@ -2004,8 +1996,7 @@ mod tests {
         for index in 0..20 {
             setup = setup.add_tool(
                 ToolDefinition::new(format!("large_tool_{index:02}"))
-                    .description(large_text(1_000))
-                    .input_schema(schemars::schema_for!(())),
+                    .description(large_text(1_000)),
             );
         }
         let fixture = orchestrator_fixture(Compact::new().retention_window(64_usize), 120_000);
@@ -2044,11 +2035,7 @@ mod tests {
             .add_message(ContextMessage::system(large_text(60_000)))
             .add_message(ContextMessage::user("use tools with this image", None))
             .add_base64_url(current_image)
-            .add_tool(
-                ToolDefinition::new("large_tool")
-                    .description(large_text(1_000))
-                    .input_schema(schemars::schema_for!(())),
-            )
+            .add_tool(ToolDefinition::new("large_tool").description(large_text(1_000)))
             .max_tokens(4_096_usize);
         let fixture = orchestrator_fixture(Compact::new().retention_window(64_usize), 95_000);
 
@@ -2095,11 +2082,7 @@ mod tests {
             ))
             .add_base64_url(Image::new_base64("B".repeat(20_000), "image/png"))
             .tool_choice(ToolChoice::Call(missing_tool.clone()))
-            .add_tool(
-                ToolDefinition::new("available_tool")
-                    .description(large_text(1_000))
-                    .input_schema(schemars::schema_for!(())),
-            )
+            .add_tool(ToolDefinition::new("available_tool").description(large_text(1_000)))
             .max_tokens(512_usize);
         let fixture = orchestrator_fixture(Compact::new().retention_window(64_usize), 50_000);
 
@@ -2150,11 +2133,7 @@ mod tests {
             ))
             .add_base64_url(Image::new_base64("B".repeat(20_000), "image/png"))
             .tool_choice(ToolChoice::Call(required_tool.clone()))
-            .add_tool(
-                ToolDefinition::new(required_tool.as_str())
-                    .description(large_text(1_000))
-                    .input_schema(schemars::schema_for!(())),
-            )
+            .add_tool(ToolDefinition::new(required_tool.as_str()).description(large_text(1_000)))
             .max_tokens(512_usize);
         let agent = Agent::new(
             AgentId::new("context_guard_agent"),
@@ -2217,16 +2196,8 @@ mod tests {
             .add_base64_url(stale_image)
             .add_message(ContextMessage::user("fresh pasted screenshot", None))
             .add_base64_url(current_image)
-            .add_tool(
-                ToolDefinition::new("large_tool_one")
-                    .description(large_text(8_000))
-                    .input_schema(schemars::schema_for!(())),
-            )
-            .add_tool(
-                ToolDefinition::new("large_tool_two")
-                    .description(large_text(8_000))
-                    .input_schema(schemars::schema_for!(())),
-            )
+            .add_tool(ToolDefinition::new("large_tool_one").description(large_text(8_000)))
+            .add_tool(ToolDefinition::new("large_tool_two").description(large_text(8_000)))
             .max_tokens(50_000_usize);
         let fixture = orchestrator_fixture(Compact::new().retention_window(64_usize), 100_000);
 
@@ -2259,15 +2230,11 @@ mod tests {
         for index in 0..20 {
             setup = setup.add_tool(
                 ToolDefinition::new(format!("a_large_tool_{index:02}"))
-                    .description(large_text(1_000))
-                    .input_schema(schemars::schema_for!(())),
+                    .description(large_text(1_000)),
             );
         }
-        setup = setup.add_tool(
-            ToolDefinition::new(required_tool.as_str())
-                .description(large_text(1_000))
-                .input_schema(schemars::schema_for!(())),
-        );
+        setup = setup
+            .add_tool(ToolDefinition::new(required_tool.as_str()).description(large_text(1_000)));
         let fixture = orchestrator_fixture(Compact::new().retention_window(64_usize), 95_000);
 
         let actual = fixture.preflight_context_window(setup).unwrap();
@@ -2303,11 +2270,7 @@ mod tests {
             .add_message(ContextMessage::system(large_text(10_000)))
             .add_message(ContextMessage::user("inspect image", None))
             .add_base64_url(Image::new_base64("B".repeat(80_000), "image/png"))
-            .add_tool(
-                ToolDefinition::new("large_tool")
-                    .description(large_text(1_000))
-                    .input_schema(schemars::schema_for!(())),
-            )
+            .add_tool(ToolDefinition::new("large_tool").description(large_text(1_000)))
             .max_tokens(512_usize);
         let fixture = orchestrator_fixture(Compact::new().retention_window(64_usize), 8_000);
 
@@ -2470,11 +2433,7 @@ mod tests {
         let context = Context::default()
             .add_message(ContextMessage::system("system prompt"))
             .add_message(ContextMessage::user(large_text(8_000), None))
-            .add_tool(
-                ToolDefinition::new("schema_heavy_tool")
-                    .description(large_text(750))
-                    .input_schema(schemars::schema_for!(())),
-            )
+            .add_tool(ToolDefinition::new("schema_heavy_tool").description(large_text(750)))
             .max_tokens(1_usize);
         let estimation_fixture =
             orchestrator_fixture(Compact::new().retention_window(1_usize), 128_000);
@@ -2518,11 +2477,7 @@ mod tests {
         );
         let context = Context::default()
             .add_message(ContextMessage::user("short", None))
-            .add_tool(
-                ToolDefinition::new("large_tool")
-                    .description(large_text(1_000))
-                    .input_schema(schemars::schema_for!(())),
-            );
+            .add_tool(ToolDefinition::new("large_tool").description(large_text(1_000)));
 
         let actual = fixture.estimated_request_tokens(&context).unwrap()
             > serde_json::to_vec(&context).unwrap().len();
@@ -2618,11 +2573,7 @@ mod tests {
         let fixture = orchestrator_fixture(Compact::new().retention_window(1_usize), 64_000);
         let context = Context::default()
             .add_message(ContextMessage::user("short", None))
-            .add_tool(
-                ToolDefinition::new("large_tool")
-                    .description(large_text(1_000))
-                    .input_schema(schemars::schema_for!(())),
-            );
+            .add_tool(ToolDefinition::new("large_tool").description(large_text(1_000)));
 
         let actual =
             fixture.estimated_request_tokens(&context).unwrap() > context.token_count_approx();
@@ -2652,11 +2603,7 @@ mod tests {
         let setup = Context::default()
             .add_message(ContextMessage::system("system prompt"))
             .add_message(ContextMessage::user("user prompt", None))
-            .add_tool(
-                ToolDefinition::new("schema_tool")
-                    .description("tool description")
-                    .input_schema(schemars::schema_for!(())),
-            )
+            .add_tool(ToolDefinition::new("schema_tool").description("tool description"))
             .max_tokens(512_usize);
         let active_provider = provider_fixture(ProviderId::FIREWORKS_AI);
         let synthetic_provider = provider_fixture(ProviderId::OPENAI);
@@ -2681,11 +2628,7 @@ mod tests {
         let fixture = orchestrator_fixture(Compact::new().retention_window(1_usize), 8_000);
         let setup = Context::default()
             .add_message(ContextMessage::user(large_text(7_000), None))
-            .add_tool(
-                ToolDefinition::new("large_tool")
-                    .description(large_text(500))
-                    .input_schema(schemars::schema_for!(())),
-            )
+            .add_tool(ToolDefinition::new("large_tool").description(large_text(500)))
             .max_tokens(512_usize);
 
         let actual = fixture
@@ -2754,11 +2697,7 @@ mod tests {
         let setup = Context::default()
             .add_message(droppable_user_message(large_text(12_000)))
             .add_message(ContextMessage::user("fresh user request", None))
-            .add_tool(
-                ToolDefinition::new("schema_heavy_tool")
-                    .description(large_text(5_000))
-                    .input_schema(schemars::schema_for!(())),
-            )
+            .add_tool(ToolDefinition::new("schema_heavy_tool").description(large_text(5_000)))
             .max_tokens(512_usize);
         let conversation = forge_domain::Conversation::generate().context(setup);
         let mut fixture = Orchestrator::new(
@@ -2833,11 +2772,7 @@ mod tests {
             .add_message(ContextMessage::system("system prompt"))
             .add_message(droppable_user_message(large_text(12_000)))
             .add_message(ContextMessage::user("fresh user request", None))
-            .add_tool(
-                ToolDefinition::new("schema_heavy_tool")
-                    .description(large_text(5_000))
-                    .input_schema(schemars::schema_for!(())),
-            )
+            .add_tool(ToolDefinition::new("schema_heavy_tool").description(large_text(5_000)))
             .max_tokens(512_usize);
         let estimation_fixture =
             orchestrator_fixture(Compact::new().retention_window(1_usize), 128_000);

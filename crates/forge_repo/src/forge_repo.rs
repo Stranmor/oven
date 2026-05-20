@@ -12,8 +12,8 @@ use forge_app::{
 use forge_config::ForgeConfig;
 use forge_domain::{
     AnyProvider, AuthCredential, ChatCompletionMessage, ChatRepository, CommandExecutionOutput,
-    Context, Conversation, ConversationId, ConversationRepository, Environment, FileInfo,
-    FuzzySearchRepository, LearningLedgerAppendOutcome, LearningLedgerEvent,
+    Context, Conversation, ConversationId, ConversationRepository, ConversationVisibilityFilter,
+    Environment, FileInfo, FuzzySearchRepository, LearningLedgerAppendOutcome, LearningLedgerEvent,
     LearningLedgerFreshness, LearningRecordId, LearningRecordProjection, LearningRepository,
     LearningReviewOutcome, LearningReviewState, McpServerConfig, MigrationResult, Model, ModelId,
     ProcessId, ProcessReadCursor, ProcessReadOutput, ProcessStartOutput, ProcessStatus, Provider,
@@ -157,6 +157,15 @@ impl<F: Send + Sync> ConversationRepository for ForgeRepo<F> {
     async fn get_all_conversations_including_agent(&self) -> anyhow::Result<Vec<Conversation>> {
         self.conversation_repository
             .get_all_conversations_including_agent()
+            .await
+    }
+
+    async fn get_all_conversations_by_visibility(
+        &self,
+        visibility: ConversationVisibilityFilter,
+    ) -> anyhow::Result<Vec<Conversation>> {
+        self.conversation_repository
+            .get_all_conversations_by_visibility(visibility)
             .await
     }
 

@@ -208,6 +208,15 @@ impl<
         self.services.get_conversations_including_agent().await
     }
 
+    async fn get_conversations_by_visibility(
+        &self,
+        visibility: forge_domain::ConversationVisibilityFilter,
+    ) -> anyhow::Result<Vec<Conversation>> {
+        self.services
+            .get_conversations_by_visibility(visibility)
+            .await
+    }
+
     async fn get_sub_conversations(
         &self,
         parent_id: &ConversationId,

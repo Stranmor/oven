@@ -77,6 +77,13 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub internal_agent_session: bool,
 
+    /// Mark a new headless/piped conversation as a background session.
+    ///
+    /// Background sessions remain explicitly accessible by ID but are hidden
+    /// from normal history, selectors, and last-conversation resume surfaces.
+    #[arg(long, default_value_t = false)]
+    pub background_session: bool,
+
     /// Top-level subcommands.
     #[command(subcommand)]
     pub subcommands: Option<TopLevelCommand>,
@@ -842,6 +849,30 @@ impl From<ConversationInitiatorFilter> for forge_domain::Initiator {
     }
 }
 
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
+pub enum ConversationVisibilityFilter {
+    /// Normal foreground conversations.
+    Normal,
+    /// Background cron/headless conversations.
+    Background,
+    /// All conversation visibility classes.
+    All,
+}
+
+impl From<ConversationVisibilityFilter> for forge_domain::ConversationVisibilityFilter {
+    fn from(value: ConversationVisibilityFilter) -> Self {
+        match value {
+            ConversationVisibilityFilter::Normal => {
+                forge_domain::ConversationVisibilityFilter::Normal
+            }
+            ConversationVisibilityFilter::Background => {
+                forge_domain::ConversationVisibilityFilter::Background
+            }
+            ConversationVisibilityFilter::All => forge_domain::ConversationVisibilityFilter::All,
+        }
+    }
+}
+
 #[derive(Subcommand, Debug, Clone)]
 pub enum ConversationCommand {
     /// List conversation history.
@@ -857,6 +888,10 @@ pub enum ConversationCommand {
         /// Filter the diagnostic list by initiator.
         #[arg(long)]
         initiator: Option<ConversationInitiatorFilter>,
+
+        /// Filter the diagnostic list by conversation visibility.
+        #[arg(long, default_value = "normal")]
+        visibility: ConversationVisibilityFilter,
     },
 
     /// Create a new conversation.
@@ -1705,6 +1740,48 @@ mod tests {
         let fixture = Cli::parse_from(["forge", "--agent", "hermes-smm-editor"]);
         assert_eq!(fixture.agent, Some(AgentId::new("hermes-smm-editor")));
         assert!(!fixture.internal_agent_session);
+    }
+
+    #[test]
+    fn test_background_session_flag_parses_without_internal_agent_flag() {
+        let fixture = Cli::parse_from(["forge", "--background-session", "-p", "cron task"]);
+        let actual = (fixture.background_session, fixture.internal_agent_session);
+        let expected = (true, false);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_conversation_list_visibility_background_filter() {
+        let fixture = Cli::parse_from([
+            "forge",
+            "conversation",
+            "list",
+            "--visibility",
+            "background",
+        ]);
+        let actual = match fixture.subcommands {
+            Some(TopLevelCommand::Conversation(conversation)) => match conversation.command {
+                ConversationCommand::List { visibility, .. } => visibility,
+                _ => ConversationVisibilityFilter::Normal,
+            },
+            _ => ConversationVisibilityFilter::Normal,
+        };
+        let expected = ConversationVisibilityFilter::Background;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_conversation_list_visibility_defaults_to_normal() {
+        let fixture = Cli::parse_from(["forge", "conversation", "list"]);
+        let actual = match fixture.subcommands {
+            Some(TopLevelCommand::Conversation(conversation)) => match conversation.command {
+                ConversationCommand::List { visibility, .. } => visibility,
+                _ => ConversationVisibilityFilter::All,
+            },
+            _ => ConversationVisibilityFilter::All,
+        };
+        let expected = ConversationVisibilityFilter::Normal;
+        assert_eq!(actual, expected);
     }
 
     #[test]

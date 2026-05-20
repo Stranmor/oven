@@ -5,10 +5,11 @@ use url::Url;
 
 use crate::{
     AnyProvider, AuthCredential, ChatCompletionMessage, Context, Conversation, ConversationId,
-    LearningLedgerAppendOutcome, LearningLedgerEvent, LearningLedgerFreshness, LearningRecordId,
-    LearningRecordProjection, LearningReviewOutcome, LearningReviewState, MigrationResult, Model,
-    ModelId, Provider, ProviderId, ProviderTemplate, ResultStream, SearchMatch, Skill, Snapshot,
-    SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter, WorkspaceAuth, WorkspaceId,
+    ConversationVisibilityFilter, LearningLedgerAppendOutcome, LearningLedgerEvent,
+    LearningLedgerFreshness, LearningRecordId, LearningRecordProjection, LearningReviewOutcome,
+    LearningReviewState, MigrationResult, Model, ModelId, Provider, ProviderId, ProviderTemplate,
+    ResultStream, SearchMatch, Skill, Snapshot, SubagentTaskId, SubagentTaskSession,
+    SubagentTaskSessionFilter, WorkspaceAuth, WorkspaceId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +100,18 @@ pub trait ConversationRepository: Send + Sync {
     /// # Errors
     /// Returns an error if the operation fails
     async fn get_all_conversations_including_agent(&self) -> Result<Vec<Conversation>>;
+
+    /// Retrieves root conversations with context for the selected visibility classes.
+    ///
+    /// # Arguments
+    /// * `visibility` - Visibility classes to include in the result.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails
+    async fn get_all_conversations_by_visibility(
+        &self,
+        visibility: ConversationVisibilityFilter,
+    ) -> Result<Vec<Conversation>>;
 
     /// Retrieves sub-conversations for a parent conversation.
     ///

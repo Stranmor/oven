@@ -35,8 +35,9 @@ use tokio_stream::StreamExt;
 use url::Url;
 
 use crate::cli::{
-    Cli, CommitCommandGroup, ConversationCommand, ConversationInitiatorFilter, ListCommand,
-    McpCommand, SelectCommand, TaskCommand, TopLevelCommand,
+    Cli, CommitCommandGroup, ConversationCommand, ConversationInitiatorFilter,
+    ConversationVisibilityFilter, ListCommand, McpCommand, SelectCommand, TaskCommand,
+    TopLevelCommand,
 };
 use crate::completion_notification::{
     CompletionNotificationContext, play_completion_notification, project_label,
@@ -66,6 +67,12 @@ fn mark_internal_agent_session_if_requested(
 ) {
     if internal_agent_session {
         conversation.ensure_delegated(None);
+    }
+}
+
+fn mark_background_session_if_requested(conversation: &mut Conversation, background_session: bool) {
+    if background_session {
+        conversation.mark_background();
     }
 }
 
@@ -661,6 +668,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                             } else {
                                 Some(ConversationInitiatorFilter::User)
                             },
+                            ConversationVisibilityFilter::Normal,
                         )
                         .await?;
                     }
@@ -1055,8 +1063,8 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         conversation_group: crate::cli::ConversationCommandGroup,
     ) -> anyhow::Result<()> {
         match conversation_group.command {
-            ConversationCommand::List { porcelain, include_agent, initiator } => {
-                self.on_show_conversations(porcelain, include_agent, initiator)
+            ConversationCommand::List { porcelain, include_agent, initiator, visibility } => {
+                self.on_show_conversations(porcelain, include_agent, initiator, visibility)
                     .await?;
             }
             ConversationCommand::New => {
@@ -2373,11 +2381,20 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         porcelain: bool,
         include_agent: bool,
         initiator: Option<ConversationInitiatorFilter>,
+        visibility: ConversationVisibilityFilter,
     ) -> anyhow::Result<()> {
-        let conversations = if include_agent || initiator.is_some() {
-            self.api.get_conversations_including_agent().await?
-        } else {
-            self.api.get_conversations().await?
+        let conversations = match visibility {
+            ConversationVisibilityFilter::Normal if include_agent || initiator.is_some() => {
+                self.api.get_conversations_including_agent().await?
+            }
+            ConversationVisibilityFilter::Normal => self.api.get_conversations().await?,
+            other => {
+                self.api
+                    .get_conversations_by_visibility(
+                        forge_domain::ConversationVisibilityFilter::from(other),
+                    )
+                    .await?
+            }
         };
 
         if conversations.is_empty() {
@@ -2397,6 +2414,20 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                 }
             } else if !include_agent && conv.is_agent_initiated() {
                 continue;
+            }
+
+            if visibility != ConversationVisibilityFilter::All {
+                let expected = forge_domain::ConversationVisibilityFilter::from(visibility);
+                let visible = match expected {
+                    forge_domain::ConversationVisibilityFilter::Normal => {
+                        conv.is_normal_visibility()
+                    }
+                    forge_domain::ConversationVisibilityFilter::Background => conv.is_background(),
+                    forge_domain::ConversationVisibilityFilter::All => true,
+                };
+                if !visible {
+                    continue;
+                }
             }
 
             let title = conv
@@ -4129,6 +4160,10 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                     &mut conversation,
                     self.cli.internal_agent_session,
                 );
+                mark_background_session_if_requested(
+                    &mut conversation,
+                    self.cli.background_session,
+                );
                 self.api.upsert_conversation(conversation).await?;
                 is_new = true;
             }
@@ -4156,6 +4191,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                 &mut conversation,
                 self.cli.internal_agent_session,
             );
+            mark_background_session_if_requested(&mut conversation, self.cli.background_session);
             let id = conversation.id;
             is_new = true;
             self.api.upsert_conversation(conversation).await?;
@@ -6214,6 +6250,31 @@ mod tests {
 
         assert_eq!(conversation.initiator, forge_domain::Initiator::Agent);
         assert_eq!(conversation.parent_id, None);
+    }
+
+    #[test]
+    fn background_session_marks_new_conversation_as_background_without_changing_initiator() {
+        let mut conversation = Conversation::new(ConversationId::generate());
+
+        mark_background_session_if_requested(&mut conversation, true);
+
+        assert_eq!(
+            conversation.visibility,
+            forge_domain::ConversationVisibility::Background
+        );
+        assert_eq!(conversation.initiator, forge_domain::Initiator::User);
+    }
+
+    #[test]
+    fn no_background_flag_leaves_new_conversation_normal() {
+        let mut conversation = Conversation::new(ConversationId::generate());
+
+        mark_background_session_if_requested(&mut conversation, false);
+
+        assert_eq!(
+            conversation.visibility,
+            forge_domain::ConversationVisibility::Normal
+        );
     }
 
     #[test]
