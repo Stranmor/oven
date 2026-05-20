@@ -1,9 +1,4 @@
-use gh_workflow::*;
-
-use crate::jobs::release_build_job::release_build_job;
-
-/// Create a build job for drafts
-pub fn create_build_release_job_for_publishing() -> Job {
-    release_build_job("${{ github.event.release.tag_name }}", true)
-}
-
+//! Legacy release publishing build wrapper intentionally removed for fork safety.
+//!
+//! This tombstone keeps the old source path inert so reconnecting it cannot
+//! restore external release publishing behavior.

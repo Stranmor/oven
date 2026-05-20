@@ -1,5 +1,5 @@
 # Public repository note
 
-This file previously contained local operator auto-update incident details. Those details are intentionally not part of the public repository presentation.
+This placeholder intentionally contains no environment-specific operational history or recovery notes.
 
-For current local update policy and agent safety constraints, use the private/local agent rules that are loaded in the operator environment. Do not reconstruct local service paths, timers, or operator-specific incident history from public documentation.
+Fork-local operational policy belongs outside public repository documentation.

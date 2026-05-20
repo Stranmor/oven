@@ -26,6 +26,20 @@ fn assert_workflow_is_read_only_dispatch(path: &str) {
     assert!(!fixture.contains("tailcallhq/"));
 }
 
+fn assert_generator_source_has_no_disabled_mutators(path: &str) {
+    let fixture = workflow_text(path);
+
+    assert!(!fixture.contains("contents(Level::Write)"));
+    assert!(!fixture.contains("issues(Level::Write)"));
+    assert!(!fixture.contains("pull_requests(Level::Write)"));
+    assert!(!fixture.contains("pull_request_target"));
+    assert!(!fixture.contains("release-drafter"));
+    assert!(!fixture.contains("actions/stale"));
+    assert!(!fixture.contains("antinomyhq/"));
+    assert!(!fixture.contains("NPM_TOKEN"));
+    assert!(!fixture.contains("HOMEBREW_ACCESS"));
+}
+
 #[test]
 fn generate() {
     workflow::generate_ci_workflow();
@@ -76,4 +90,17 @@ fn test_bounty_workflow() {
     workflow::generate_bounty_workflow();
 
     assert_workflow_is_read_only_dispatch(".github/workflows/bounty.yml");
+}
+
+#[test]
+fn test_disabled_generator_sources_do_not_keep_mutating_job_builders() {
+    for path in [
+        "crates/forge_ci/src/jobs/bounty_job.rs",
+        "crates/forge_ci/src/jobs/build.rs",
+        "crates/forge_ci/src/jobs/draft_release_update_job.rs",
+        "crates/forge_ci/src/jobs/release_homebrew.rs",
+        "crates/forge_ci/src/jobs/release_npm.rs",
+    ] {
+        assert_generator_source_has_no_disabled_mutators(path);
+    }
 }

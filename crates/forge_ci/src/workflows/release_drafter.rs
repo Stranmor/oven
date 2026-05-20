@@ -1,7 +1,7 @@
 use gh_workflow::generate::Generate;
 use gh_workflow::*;
 
-/// Generate a disabled release-drafter workflow for this fork.
+/// Generate a disabled release planning workflow for this fork.
 pub fn generate_release_drafter_workflow() {
     let disabled_job = Job::new("Release drafting disabled")
         .permissions(Permissions::default().contents(Level::Read))
