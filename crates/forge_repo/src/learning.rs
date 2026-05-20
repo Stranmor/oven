@@ -729,6 +729,19 @@ fn ensure_direct_learning_append_allowed_for_existing_records(
     record: &LearningLedgerEventRecord,
     records: &[LearningLedgerEventRecord],
 ) -> anyhow::Result<()> {
+    if record.event_kind == LearningEventKind::SensorLessonProposed.to_string() {
+        if let Some(projection) = project_records(records.to_vec())?
+            .into_iter()
+            .find(|projection| projection.record_id.into_string() == record.record_id)
+        {
+            anyhow::ensure!(
+                projection.review_state == LearningReviewState::Candidate,
+                "sensor lesson proposals cannot be appended after terminal review state {}",
+                projection.review_state
+            );
+        }
+        return Ok(());
+    }
     if is_terminal_review_event_kind(&record.event_kind)
         && records.iter().any(|existing| {
             existing.record_id == record.record_id
@@ -794,24 +807,7 @@ fn project_records(
                 .then_some((*event_seq, event.clone()))
         })
         .collect::<BTreeMap<_, _>>();
-    let sensor_derived_record_keys = event_records
-        .iter()
-        .filter_map(|(_, event)| {
-            (event.event_kind == LearningEventKind::SensorLessonProposed)
-                .then_some(event.record_id.into_string())
-        })
-        .collect::<BTreeSet<_>>();
-    for (_, event) in event_records
-        .iter()
-        .filter(|(_, event)| event.event_kind == LearningEventKind::PromotionAudit)
-    {
-        if let Some(audit_key) = promotion_audit_key_from_event(event, &proposal_events)? {
-            promotion_audits
-                .entry(event.record_id.into_string())
-                .or_default()
-                .insert(audit_key);
-        }
-    }
+    let mut sensor_derived_record_keys = BTreeSet::new();
     for (_, event) in event_records {
         let record_key = event.record_id.into_string();
         match event.event_kind {
@@ -875,9 +871,13 @@ fn project_records(
                     projection.updated_at = event.created_at;
                 }
             }
-            LearningEventKind::SensorLessonProposed
-            | LearningEventKind::SensorReviewPending
-            | LearningEventKind::SensorReviewRejected => {
+            LearningEventKind::SensorLessonProposed => {
+                sensor_derived_record_keys.insert(record_key.clone());
+                if let Some(projection) = projections.get_mut(&record_key) {
+                    projection.updated_at = event.created_at;
+                }
+            }
+            LearningEventKind::SensorReviewPending | LearningEventKind::SensorReviewRejected => {
                 if let Some(projection) = projections.get_mut(&record_key) {
                     projection.updated_at = event.created_at;
                 }
@@ -2458,6 +2458,93 @@ mod tests {
             projection.review_state,
         );
         let expected = (true, true, LearningReviewState::Rejected);
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projection_rejects_promotion_review_that_is_only_authorized_by_future_audit()
+    -> anyhow::Result<()> {
+        let fixture = fixture_repo(35)?;
+        let created_at = Utc::now();
+        let request = fixture_promotion_request(&fixture, created_at).await?;
+        let workspace_id = workspace_db_id(fixture.wid);
+        let mut records = fixture
+            .run_with_connection(move |connection, wid| {
+                learning_ledger_events::table
+                    .filter(learning_ledger_events::workspace_id.eq(workspace_db_id(wid)))
+                    .order(learning_ledger_events::event_seq.asc())
+                    .load::<LearningLedgerEventRecord>(connection)
+                    .map_err(Into::into)
+            })
+            .await?;
+        let next_review_seq = i64::try_from(records.len() + 1)?;
+        let mut review_record =
+            LearningLedgerEventRecord::new(request.review_event().clone(), workspace_id)?;
+        review_record.event_seq = next_review_seq;
+        records.push(review_record);
+        let next_audit_seq = i64::try_from(records.len() + 1)?;
+        let mut audit_record =
+            LearningLedgerEventRecord::new(request.audit_event().clone(), workspace_id)?;
+        audit_record.event_seq = next_audit_seq;
+        records.push(audit_record);
+
+        let actual = project_records(records).is_err();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_sensor_proposal_after_terminal_review_is_blocked_or_projection_survives()
+    -> anyhow::Result<()> {
+        let fixture = fixture_repo(34)?;
+        let conversation_id = ConversationId::generate();
+        let created_at = Utc::now();
+        let candidate = fixture
+            .insert_learning_event(fixture_event(
+                conversation_id,
+                "event-1",
+                "terminal candidate before stale sensor proposal",
+                created_at,
+            )?)
+            .await?
+            .event;
+        let projection = fixture
+            .get_learning_record(candidate.record_id)
+            .await?
+            .expect("candidate projection should exist");
+        let input = LearningSensorReviewInput::from_sanitized_chat_observation(
+            &projection,
+            fixture_sanitized_observation().validate()?,
+        );
+        let output = FakeLearningSensorReviewer.review(input.clone())?;
+        let stale_sensor_event =
+            output.into_sensor_event(&input, created_at + Duration::seconds(2))?;
+        let generic_review = LearningLedgerEvent::review(
+            candidate.record_id,
+            LearningEventKind::ReviewAccepted,
+            "generic terminal acceptance before stale sensor proposal",
+            LearningProvenance::conversation(
+                conversation_id,
+                "terminal-review-before-stale-sensor",
+                "terminal-review-before-stale-sensor-fingerprint",
+            ),
+            created_at + Duration::seconds(1),
+        )?;
+        fixture
+            .review_learning_candidate_event(generic_review)
+            .await?;
+
+        let stale_sensor_result = fixture.insert_learning_event(stale_sensor_event).await;
+        let projection_after_stale_sensor = fixture.get_learning_record(candidate.record_id).await;
+        let actual = (
+            stale_sensor_result.is_err(),
+            projection_after_stale_sensor.is_ok(),
+        );
+        let expected = (true, true);
 
         assert_eq!(actual, expected);
         Ok(())
