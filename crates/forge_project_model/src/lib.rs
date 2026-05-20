@@ -3,6 +3,7 @@
 mod context_adapter;
 mod durable_vector_index;
 mod eval;
+mod evidence_replay;
 mod extraction;
 mod freshness;
 mod indexer;
@@ -33,6 +34,13 @@ pub use eval::{
     evaluate_episode_artifact_links, evaluate_freshness, evaluate_graph_coverage,
     evaluate_provenance_completeness, evaluate_retrieval, evaluate_tool_episodes,
     load_evidence_ledger_activation, tool_episode_graph_id, tool_episodes_to_graph,
+};
+pub use evidence_replay::{
+    EvidenceLedgerReplayReport, EvidenceLedgerReplayRequest, EvidenceReplayBudget,
+    EvidenceReplayBudgetReport, EvidenceReplayContentPolicy, EvidenceReplayFreshnessPolicy,
+    EvidenceReplayIssue, EvidenceReplayIssueCode, EvidenceReplayManifestReference,
+    EvidenceReplayReference, EvidenceReplayScoreKind, EvidenceReplaySelectionPolicy,
+    EvidenceReplayStalePolicyReport, select_evidence_ledger_replay,
 };
 pub use extraction::{
     RustExtraction, extract_cargo_dependency_edges, extract_rust_call_edges,

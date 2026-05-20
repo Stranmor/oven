@@ -54,6 +54,11 @@ impl ProjectIndexer {
         Self { root, model_dir }
     }
 
+    /// Returns the project root used by this indexer.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Returns the project-model storage directory used by this indexer.
     ///
     /// The returned path is useful for typed artifact producers that must write
