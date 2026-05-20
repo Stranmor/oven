@@ -58,6 +58,7 @@ pub use data_gen::*;
 pub use error::*;
 pub use git_app::*;
 pub use infra::*;
+pub use retry::is_provider_context_window_error;
 pub use services::*;
 pub use steer::*;
 pub use template_engine::*;

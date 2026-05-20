@@ -30,11 +30,15 @@ where
     }
 }
 
-/// Determines if an error should trigger a retry attempt.
+/// Determines whether a provider error chain represents an exhausted context
+/// window condition.
 ///
-/// This function checks if the error is a retryable domain error.
-/// Currently, only `Error::Retryable` errors will trigger retries.
-pub(crate) fn is_provider_context_window_error(error: &anyhow::Error) -> bool {
+/// The detector accepts typed OpenAI context errors and typed HTTP status
+/// errors whose attached provider JSON body strictly reports
+/// `context_length_exceeded`. Generic 400 errors and quota-related messages are
+/// rejected so callers can retry normal transient failures without looping on
+/// unrecoverable oversized prompts.
+pub fn is_provider_context_window_error(error: &anyhow::Error) -> bool {
     let has_typed_context_signal = error.chain().any(|cause| {
         cause
             .downcast_ref::<OpenAiError>()
