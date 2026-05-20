@@ -32,7 +32,7 @@ use forge_project_model::{
     EvidenceReplayScoreKind, ExternalFactArtifactIngestionReport, ExternalFactIngestionIssue,
     ExternalFactProductionReport, ExternalFactProductionRequest, ExternalFactProductionStatus,
     NativeLspReferenceProducer, NativeLspReferenceRequest, NativeLspReferenceRequestDerivation,
-    ProjectContextIntegrationIdentity, ProjectContextPackCommit, ProjectContextPackPersistedProof,
+    ProjectContextIntegrationIdentity, ProjectContextPackCommit,
     ProjectContextPackReadbackDecision, ProjectContextPathScope, ProjectContextReadbackOutcome,
     ProjectContextRerankerBoundary, ProjectContextRerankerReadiness,
     ProjectContextRerankerUnavailableReason, ProjectContextRetrievalOptions,
@@ -1425,15 +1425,7 @@ impl<
                 }
             }
             ProjectContextPackReadbackDecision::Write(verified_commit) => {
-                let write_instruction = verified_commit.write_instruction();
-                let artifact_path = indexer.write_context_pack(write_instruction.context_pack())?;
-                let artifact_id =
-                    indexer.context_pack_artifact_id(write_instruction.context_pack())?;
-                let proof = ProjectContextPackPersistedProof::new(
-                    artifact_id,
-                    artifact_path.display().to_string(),
-                    write_instruction.context_pack(),
-                );
+                let proof = indexer.persist_verified_context_pack(&verified_commit)?;
                 let node_ids = nodes
                     .iter()
                     .map(|node| node.node_id.as_str().to_string())

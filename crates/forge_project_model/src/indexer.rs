@@ -8,6 +8,9 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 
+use crate::commit_boundary::{
+    ProjectContextPackCommit, ProjectContextPackPersistedProof, ReadbackVerified,
+};
 use crate::durable_vector_index::{VectorIndexArtifact, VectorIndexArtifactId};
 use crate::extraction::{
     CargoManifestInput, extract_cargo_dependency_edges, extract_rust_import_edges,
@@ -407,6 +410,25 @@ impl ProjectIndexer {
             anyhow::bail!("context pack artifact readback mismatch: {}", id);
         }
         Ok(path)
+    }
+
+    /// Persists a readback-verified context-pack commit and returns a proof tied to storage IO.
+    ///
+    /// # Arguments
+    ///
+    /// * `commit` - Context-pack commit whose evidence readbacks were verified by the commit boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the verified pack cannot be written, identified, or read back.
+    pub fn persist_verified_context_pack(
+        &self,
+        commit: &ProjectContextPackCommit<ReadbackVerified>,
+    ) -> Result<ProjectContextPackPersistedProof> {
+        let write_instruction = commit.write_instruction();
+        let artifact_path = self.write_context_pack(write_instruction.context_pack())?;
+        let artifact_id = self.context_pack_artifact_id(write_instruction.context_pack())?;
+        Ok(commit.persisted_proof(artifact_id, artifact_path.display().to_string()))
     }
 
     /// Reads a persisted context pack artifact by deterministic identifier.

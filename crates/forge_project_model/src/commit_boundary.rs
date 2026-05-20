@@ -198,14 +198,7 @@ pub struct ProjectContextPackPersistedProof {
 }
 
 impl ProjectContextPackPersistedProof {
-    /// Builds a persisted proof after the storage layer has written and read back the pack.
-    ///
-    /// # Arguments
-    ///
-    /// * `artifact_id` - Deterministic persisted context-pack artifact id.
-    /// * `artifact_path` - Redaction-safe persisted artifact path label.
-    /// * `context_pack` - Context pack that was written and read back successfully.
-    pub fn new(
+    fn from_persisted_commit(
         artifact_id: ContextPackArtifactId,
         artifact_path: impl Into<String>,
         context_pack: &ContextPack,
@@ -288,6 +281,12 @@ pub enum ProjectContextPackCommitError {
     /// Two readback outcomes reported the same evidence id.
     #[error("duplicate project-model readback outcome: {evidence_id}")]
     DuplicateReadbackOutcome { evidence_id: String },
+    /// A context-pack evidence entry was not covered by a planned read request.
+    #[error("unplanned project-model context-pack evidence: {evidence_id}")]
+    UnplannedContextPackEvidence { evidence_id: String },
+    /// Two context-pack evidence entries share an evidence id and cannot be verified independently.
+    #[error("duplicate project-model context-pack evidence: {evidence_id}")]
+    DuplicateContextPackEvidence { evidence_id: String },
 }
 
 impl ProjectContextPackCommit<ReadRequestsSelected> {
@@ -379,6 +378,23 @@ impl ProjectContextPackCommit<ReadRequestsSelected> {
                 });
             }
         }
+        let mut context_pack_evidence_ids = BTreeSet::new();
+        for evidence in &context_pack.evidence {
+            if !context_pack_evidence_ids.insert(evidence.id.clone()) {
+                return Err(
+                    ProjectContextPackCommitError::DuplicateContextPackEvidence {
+                        evidence_id: evidence.id.clone(),
+                    },
+                );
+            }
+            if !planned_by_id.contains_key(&evidence.id) {
+                return Err(
+                    ProjectContextPackCommitError::UnplannedContextPackEvidence {
+                        evidence_id: evidence.id.clone(),
+                    },
+                );
+            }
+        }
         let mut outcome_by_id = BTreeMap::new();
         for outcome in outcomes {
             let evidence_id = outcome.evidence_id.clone();
@@ -399,6 +415,13 @@ impl ProjectContextPackCommit<ReadRequestsSelected> {
             {
                 return Err(ProjectContextPackCommitError::ReadbackPathRangeMismatch {
                     evidence_id,
+                });
+            }
+        }
+        for evidence_id in &context_pack_evidence_ids {
+            if !outcome_by_id.contains_key(evidence_id) {
+                return Err(ProjectContextPackCommitError::MissingRequiredReadback {
+                    evidence_id: evidence_id.clone(),
                 });
             }
         }
@@ -451,11 +474,11 @@ impl ProjectContextPackCommit<ReadRequestsSelected> {
             .difference(&verified_replay_ids)
             .cloned()
             .collect::<BTreeSet<_>>();
-        let filtered_context_pack = if failed_replay_ids.is_empty() {
-            context_pack
-        } else {
-            filter_failed_replay_evidence(context_pack, &failed_replay_ids)
-        };
+        let filtered_context_pack = filter_context_pack_to_verified_evidence(
+            context_pack,
+            &context_pack_evidence_ids,
+            &failed_replay_ids,
+        );
         if filtered_context_pack.evidence.is_empty() {
             return Ok(ProjectContextPackReadbackDecision::NoWrite(
                 ProjectContextPackNoWrite {
@@ -484,6 +507,30 @@ impl ProjectContextPackCommit<ReadbackVerified> {
             }
         };
         ProjectContextPackWriteInstruction { context_pack: verified.context_pack.clone() }
+    }
+
+    /// Builds a persisted proof after storage has written and read back this verified pack.
+    ///
+    /// # Arguments
+    ///
+    /// * `artifact_id` - Deterministic persisted context-pack artifact id returned by storage.
+    /// * `artifact_path` - Redaction-safe persisted artifact path label returned by storage.
+    pub(crate) fn persisted_proof(
+        &self,
+        artifact_id: ContextPackArtifactId,
+        artifact_path: impl Into<String>,
+    ) -> ProjectContextPackPersistedProof {
+        let verified = match &self.state {
+            ProjectContextPackCommitState::Verified(verified) => verified,
+            ProjectContextPackCommitState::Selected(_) => {
+                unreachable!("verified typestate cannot hold selected state")
+            }
+        };
+        ProjectContextPackPersistedProof::from_persisted_commit(
+            artifact_id,
+            artifact_path,
+            &verified.context_pack,
+        )
     }
 }
 
@@ -533,13 +580,14 @@ impl ProjectContextPackPersistedProof {
     }
 }
 
-fn filter_failed_replay_evidence(
+fn filter_context_pack_to_verified_evidence(
     mut context_pack: ContextPack,
+    verified_evidence_ids: &BTreeSet<String>,
     failed_replay_ids: &BTreeSet<String>,
 ) -> ContextPack {
-    context_pack
-        .evidence
-        .retain(|evidence| !failed_replay_ids.contains(&evidence.id));
+    context_pack.evidence.retain(|evidence| {
+        verified_evidence_ids.contains(&evidence.id) && !failed_replay_ids.contains(&evidence.id)
+    });
     context_pack.provenance = context_pack
         .evidence
         .iter()
@@ -741,12 +789,35 @@ mod tests {
     }
 
     #[test]
+    fn context_pack_evidence_without_planned_read_request_is_rejected() {
+        let setup = plan(
+            Some(pack(vec![
+                evidence("verified", "src/verified.rs"),
+                evidence("unverified", "src/unverified.rs"),
+            ])),
+            vec![request("verified", "src/verified.rs")],
+            ProjectContextWriteDecision::WriteContextPackAfterReadback,
+        );
+        let actual =
+            ProjectContextPackCommit::from_retrieval_plan(&setup, replay_boundary(Vec::new()))
+                .unwrap()
+                .verify_readbacks(vec![ProjectContextReadbackOutcome::succeeded(
+                    &setup.read_requests[0],
+                )])
+                .unwrap_err();
+        let expected = ProjectContextPackCommitError::UnplannedContextPackEvidence {
+            evidence_id: "unverified".to_string(),
+        };
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn successful_persisted_context_pack_proof_required_before_episode_payload_construction() {
         let setup_pack = pack(vec![evidence("main", "src/main.rs")]);
-        let proof = ProjectContextPackPersistedProof::new(
+        let proof = verified_commit(&setup_pack).persisted_proof(
             crate::ContextPackArtifactId::new("a".repeat(64)).unwrap(),
             "context_packs/proof.json",
-            &setup_pack,
         );
         let actual =
             proof.project_model_search_episode_instruction(ProjectModelSearchEpisodeInput {
@@ -839,6 +910,32 @@ mod tests {
                 fingerprint: fingerprint(&format!("{path}:1-3")),
             },
             score: 1.0,
+        }
+    }
+
+    fn verified_commit(context_pack: &ContextPack) -> ProjectContextPackCommit<ReadbackVerified> {
+        let setup = plan(
+            Some(context_pack.clone()),
+            context_pack
+                .evidence
+                .iter()
+                .map(|evidence| request(&evidence.id, &evidence.path))
+                .collect(),
+            ProjectContextWriteDecision::WriteContextPackAfterReadback,
+        );
+        match ProjectContextPackCommit::from_retrieval_plan(&setup, replay_boundary(Vec::new()))
+            .unwrap()
+            .verify_readbacks(
+                setup
+                    .read_requests
+                    .iter()
+                    .map(ProjectContextReadbackOutcome::succeeded)
+                    .collect(),
+            )
+            .unwrap()
+        {
+            ProjectContextPackReadbackDecision::Write(commit) => commit,
+            ProjectContextPackReadbackDecision::NoWrite(_) => panic!("expected write decision"),
         }
     }
 
