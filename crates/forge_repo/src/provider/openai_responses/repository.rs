@@ -299,11 +299,17 @@ impl<T: HttpInfra> OpenAIResponsesProvider<T> {
                             }
                         }
                         Err(forge_eventsource::Error::StreamEnded) => None,
-                        Err(forge_eventsource::Error::InvalidStatusCode(_, response))
-                        | Err(forge_eventsource::Error::InvalidContentType(_, response)) => {
+                        Err(forge_eventsource::Error::InvalidStatusCode(_, response)) => {
+                            let status = response.status();
                             let (_, reason) = read_http_error_reason(*response).await;
-                            Some(Err(anyhow::anyhow!(reason)
-                                .context(format_http_context(None, "POST", &url))))
+                            Some(Err(status_code_error(status, reason)
+                                .context(format_http_context(Some(status), "POST", &url))))
+                        }
+                        Err(forge_eventsource::Error::InvalidContentType(_, response)) => {
+                            let status = response.status();
+                            let (_, reason) = read_http_error_reason(*response).await;
+                            Some(Err(status_code_error(status, reason)
+                                .context(format_http_context(Some(status), "POST", &url))))
                         }
                         Err(e) => {
                             Some(Err(anyhow::Error::from(e)
@@ -697,6 +703,34 @@ mod tests {
         }
     }
 
+    async fn eventsource_invalid_status_error(body: serde_json::Value) -> anyhow::Error {
+        let mut fixture = MockServer::new().await;
+        let mock = fixture
+            .mock_post_error("/v1/responses", &body.to_string(), 400)
+            .await;
+        let provider = openai_responses(
+            "test-api-key",
+            &format!("{}/v1/chat/completions", fixture.url()),
+        );
+        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let provider_impl = OpenAIResponsesProvider::new(provider, infra);
+        let context = ChatContext::default()
+            .add_message(ContextMessage::user("trigger provider error", None))
+            .model_context_length(128_000_u64);
+
+        let mut actual = provider_impl
+            .chat(&ModelId::from("gpt-5.5"), context)
+            .await
+            .expect("EventSource construction should succeed before provider status is polled");
+        let actual = actual
+            .next()
+            .await
+            .expect("Provider status error should be emitted as first stream item")
+            .expect_err("Provider status stream item should be an error");
+        mock.assert_async().await;
+        actual
+    }
+
     /// Test fixture for creating a sample OpenAI Responses API response.
     fn openai_response_fixture() -> serde_json::Value {
         serde_json::json!({
@@ -745,6 +779,60 @@ mod tests {
 
         let expected = true;
         assert_eq!(actual.to_string().contains(&fixture), expected);
+    }
+
+    #[tokio::test]
+    async fn test_eventsource_invalid_status_context_window_error_is_detector_visible() {
+        let fixture = serde_json::json!({
+            "error": {
+                "message": "This model's maximum context length was exceeded.",
+                "code": "context_length_exceeded"
+            }
+        });
+
+        let actual = eventsource_invalid_status_error(fixture).await;
+        let expected = true;
+
+        assert_eq!(
+            forge_app::is_provider_context_window_error(&actual),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn test_eventsource_invalid_status_generic_bad_request_is_not_context_window() {
+        let fixture = serde_json::json!({
+            "error": {
+                "message": "Generic invalid request",
+                "code": 400
+            }
+        });
+
+        let actual = eventsource_invalid_status_error(fixture).await;
+        let expected = false;
+
+        assert_eq!(
+            forge_app::is_provider_context_window_error(&actual),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn test_eventsource_invalid_status_quota_error_is_not_context_window() {
+        let fixture = serde_json::json!({
+            "error": {
+                "message": "requested context window tier quota exceeded for current plan",
+                "code": "quota_exceeded"
+            }
+        });
+
+        let actual = eventsource_invalid_status_error(fixture).await;
+        let expected = false;
+
+        assert_eq!(
+            forge_app::is_provider_context_window_error(&actual),
+            expected
+        );
     }
 
     #[test]
