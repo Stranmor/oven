@@ -7,8 +7,9 @@ use anyhow::Context;
 use console::style;
 use forge_domain::{
     Agent, AgentId, AgentInput, ChatResponse, ChatResponseContent, Environment, InputModality,
-    McpServers, Model, Provider, SystemContext, TemplateConfig, ToolCallContext, ToolCallFull,
-    ToolCatalog, ToolDefinition, ToolKind, ToolName, ToolOutput, ToolResult,
+    McpServers, Model, Provider, SemSearchAvailability, SystemContext, TemplateConfig,
+    ToolCallContext, ToolCallFull, ToolCatalog, ToolDefinition, ToolKind, ToolName, ToolOutput,
+    ToolResult,
 };
 use forge_template::Element;
 use futures::future::join_all;
@@ -33,8 +34,7 @@ use crate::{
 struct ToolDefinitionsCacheKey {
     cwd: PathBuf,
     agent_id: AgentId,
-    indexed: bool,
-    authenticated: bool,
+    sem_search_readiness_fingerprint: String,
     research_subagent: bool,
     max_read_lines: u64,
     max_line_chars: usize,
@@ -335,17 +335,15 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
         model: &Model,
         provider: &Provider<Url>,
         sources: &ToolDefinitionsCacheSources,
+        sem_search_availability: &SemSearchAvailability,
     ) -> anyhow::Result<ToolDefinitionsCacheKey> {
         let environment = self.services.get_environment();
         let cwd = environment.cwd;
-        let indexed = self.services.is_indexed(&cwd).await?;
-        let authenticated = self.services.is_authenticated().await?;
         let config = self.services.get_config()?;
         Ok(ToolDefinitionsCacheKey {
             cwd,
             agent_id: agent_id.clone(),
-            indexed,
-            authenticated,
+            sem_search_readiness_fingerprint: sem_search_availability.semantic_fingerprint(),
             research_subagent: config.research_subagent,
             max_read_lines: config.max_read_lines,
             max_line_chars: config.max_line_chars,
@@ -381,8 +379,22 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
         provider: &Provider<Url>,
     ) -> anyhow::Result<Vec<ToolDefinition>> {
         let sources = self.tool_definitions_cache_sources().await?;
+        let config = self.services.get_config()?;
+        let sem_search_availability = self
+            .services
+            .sem_search_availability(
+                self.services.get_environment().cwd,
+                config.semantic_embedding_model_id.clone(),
+            )
+            .await?;
         let key = self
-            .tool_definitions_cache_key(agent_id, model, provider, &sources)
+            .tool_definitions_cache_key(
+                agent_id,
+                model,
+                provider,
+                &sources,
+                &sem_search_availability,
+            )
             .await?;
         if let Some(cached) = self.tool_definitions_cache.lock().await.as_ref()
             && cached.key == key
@@ -391,7 +403,11 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
         }
 
         let definitions: Vec<ToolDefinition> = self
-            .tools_overview_from_sources(Some(model.clone()), sources)
+            .tools_overview_from_sources_with_sem_search(
+                Some(model.clone()),
+                sources,
+                sem_search_availability,
+            )
             .await?
             .into();
         *self.tool_definitions_cache.lock().await =
@@ -423,13 +439,28 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
         model: Option<Model>,
         sources: ToolDefinitionsCacheSources,
     ) -> anyhow::Result<ToolsOverview> {
+        let environment = self.services.get_environment();
+        let config = self.services.get_config()?;
+        let sem_search_availability = self
+            .services
+            .sem_search_availability(
+                environment.cwd.clone(),
+                config.semantic_embedding_model_id.clone(),
+            )
+            .await?;
+        self.tools_overview_from_sources_with_sem_search(model, sources, sem_search_availability)
+            .await
+    }
+
+    async fn tools_overview_from_sources_with_sem_search(
+        &self,
+        model: Option<Model>,
+        sources: ToolDefinitionsCacheSources,
+        sem_search_availability: SemSearchAvailability,
+    ) -> anyhow::Result<ToolsOverview> {
         let ToolDefinitionsCacheSources { mcp_tools, agent_tools, mut agents } = sources;
 
-        // Check if current working directory is indexed
         let environment = self.services.get_environment();
-        let cwd = environment.cwd.clone();
-        let is_indexed = self.services.is_indexed(&cwd).await?;
-        let is_authenticated = self.services.is_authenticated().await?;
 
         // Build TemplateConfig from ForgeConfig for tool description templates
         let config = self.services.get_config()?;
@@ -453,7 +484,7 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
 
         Ok(ToolsOverview::new()
             .system(Self::get_system_tools(
-                is_indexed && is_authenticated,
+                sem_search_availability.should_advertise(),
                 &environment,
                 model,
                 agents,
@@ -656,8 +687,7 @@ mod tests {
         ToolDefinitionsCacheKey {
             cwd: PathBuf::from("/workspace"),
             agent_id: AgentId::new("chat-agent"),
-            indexed: true,
-            authenticated: true,
+            sem_search_readiness_fingerprint: "ready:manifest:artifact:2".to_string(),
             research_subagent: true,
             max_read_lines: 2000,
             max_line_chars: 2000,

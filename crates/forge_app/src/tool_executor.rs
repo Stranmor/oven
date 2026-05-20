@@ -214,12 +214,23 @@ impl<
                 let embedding_model_id = config
                     .semantic_embedding_model_id
                     .clone()
-                    .filter(|model_id| !model_id.trim().is_empty())
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "semantic search embedding model id is not configured: set semantic_embedding_model_id"
-                        )
-                    })?;
+                    .filter(|model_id| !model_id.trim().is_empty());
+                let readiness = services
+                    .sem_search_availability(cwd.clone(), embedding_model_id.clone())
+                    .await?;
+                readiness.ensure_ready()?;
+                let ready_dimension = match readiness {
+                    forge_domain::SemSearchAvailability::Ready { dimension, .. } => dimension,
+                    forge_domain::SemSearchAvailability::Unsupported { .. }
+                    | forge_domain::SemSearchAvailability::Unknown { .. } => {
+                        unreachable!("non-ready sem_search state should fail preflight")
+                    }
+                };
+                let embedding_model_id = embedding_model_id.ok_or_else(|| {
+                    anyhow!(
+                        "semantic search embedding model id is not configured: set semantic_embedding_model_id"
+                    )
+                })?;
                 let mut params = Vec::with_capacity(input.queries.len());
                 for search_query in &input.queries {
                     let output = services
@@ -253,6 +264,13 @@ impl<
                         anyhow::bail!(
                             "semantic search query embedding dimension mismatch: expected {}, got {}",
                             output.dimension,
+                            query_vector.embedding.len()
+                        );
+                    }
+                    if query_vector.embedding.len() != ready_dimension {
+                        anyhow::bail!(
+                            "semantic search query embedding dimension mismatch with ready vector artifact: expected {}, got {}",
+                            ready_dimension,
                             query_vector.embedding.len()
                         );
                     }
@@ -499,11 +517,12 @@ mod tests {
         LearningReviewState, McpConfig, McpServers, Metrics, Model, ModelConfig, ModelId, Node,
         NodeData, NodeId, PermissionOperation, ProjectSemanticEmbeddingOutput,
         ProjectSemanticEmbeddingVector, Provider, ProviderId, ResultStream, Scope, SearchParams,
-        Shell, SteerMessage, SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter,
-        SyncProgress, ToolCallContext, ToolCallFull, WorkspaceAuth, WorkspaceContextFreshness,
-        WorkspaceContextManifestDiagnostic, WorkspaceEvidenceReplayDiagnostic,
-        WorkspaceEvidenceReplayPreviewDiagnostic, WorkspaceExactFactStatusReport, WorkspaceId,
-        WorkspaceInfo, WorkspaceSemanticInjectionReadiness, WorkspaceVectorIndexBuildReport,
+        SemSearchAvailability, Shell, SteerMessage, SubagentTaskId, SubagentTaskSession,
+        SubagentTaskSessionFilter, SyncProgress, ToolCallContext, ToolCallFull, WorkspaceAuth,
+        WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
+        WorkspaceEvidenceReplayDiagnostic, WorkspaceEvidenceReplayPreviewDiagnostic,
+        WorkspaceExactFactStatusReport, WorkspaceId, WorkspaceInfo,
+        WorkspaceSemanticInjectionReadiness, WorkspaceVectorIndexBuildReport,
     };
     use pretty_assertions::assert_eq;
     use tokio::sync::Mutex;
@@ -542,6 +561,7 @@ mod tests {
         query_calls: Arc<Mutex<Vec<SemSearchParamSnapshot>>>,
         build_calls: Arc<AtomicUsize>,
         query_error: Option<String>,
+        readiness: SemSearchAvailability,
     }
 
     impl SemSearchFixture {
@@ -554,6 +574,12 @@ mod tests {
                     query_calls: Arc::new(Mutex::new(Vec::new())),
                     build_calls: Arc::new(AtomicUsize::new(0)),
                     query_error: None,
+                    readiness: SemSearchAvailability::Ready {
+                        workspace_root: PathBuf::from("/workspace"),
+                        manifest_hash: "fixture-manifest".to_string(),
+                        vector_artifact_id: "fixture-vector-artifact".to_string(),
+                        dimension: 2,
+                    },
                 },
                 unused: SemSearchUnusedService,
             }
@@ -561,6 +587,11 @@ mod tests {
 
         fn with_query_error(mut self, error: &str) -> Self {
             self.workspace.query_error = Some(error.to_string());
+            self
+        }
+
+        fn with_readiness(mut self, readiness: SemSearchAvailability) -> Self {
+            self.workspace.readiness = readiness;
             self
         }
     }
@@ -667,6 +698,23 @@ mod tests {
             _embedding_model_id: Option<String>,
         ) -> anyhow::Result<WorkspaceSemanticInjectionReadiness> {
             Ok(WorkspaceSemanticInjectionReadiness::VectorIndexReady { dimension: 2 })
+        }
+
+        async fn sem_search_availability(
+            &self,
+            _path: PathBuf,
+            embedding_model_id: Option<String>,
+        ) -> anyhow::Result<SemSearchAvailability> {
+            if embedding_model_id
+                .as_deref()
+                .filter(|model_id| !model_id.trim().is_empty())
+                .is_none()
+            {
+                return Ok(SemSearchAvailability::Unsupported {
+                    reason: "semantic_embedding_model_id_not_configured".to_string(),
+                });
+            }
+            Ok(self.readiness.clone())
         }
 
         async fn query_workspace(
@@ -1490,12 +1538,9 @@ mod tests {
             .call_internal(sem_search_tool("semantic unavailable"), &tool_context())
             .await;
 
-        assert!(
-            actual
-                .unwrap_err()
-                .to_string()
-                .contains("semantic search embedding model id is not configured")
-        );
+        assert!(actual.unwrap_err().to_string().contains(
+            "sem_search unavailable: unsupported: semantic_embedding_model_id_not_configured"
+        ));
         assert_eq!(setup.workspace.embedding_calls.lock().await.len(), 0);
         assert_eq!(setup.workspace.query_calls.lock().await.len(), 0);
         assert_eq!(setup.workspace.build_calls.load(Ordering::SeqCst), 0);
@@ -1527,6 +1572,65 @@ mod tests {
         );
         assert_eq!(setup.workspace.embedding_calls.lock().await.len(), 1);
         assert_eq!(setup.workspace.query_calls.lock().await.len(), 1);
+        assert_eq!(setup.workspace.build_calls.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sem_search_unknown_readiness_fails_before_embedding_provider() -> anyhow::Result<()> {
+        let setup = Arc::new(
+            SemSearchFixture::new(sem_search_config(Some("fixture-model"))).with_readiness(
+                SemSearchAvailability::Unknown { reason: "vector_index_ambiguous".to_string() },
+            ),
+        );
+        let executor = ToolExecutor::new(Arc::clone(&setup));
+
+        let actual = executor
+            .call_internal(sem_search_tool("semantic unavailable"), &tool_context())
+            .await;
+
+        assert!(
+            actual
+                .unwrap_err()
+                .to_string()
+                .contains("sem_search unavailable: unknown: vector_index_ambiguous")
+        );
+        assert_eq!(setup.workspace.embedding_calls.lock().await.len(), 0);
+        assert_eq!(setup.workspace.query_calls.lock().await.len(), 0);
+        assert_eq!(setup.workspace.build_calls.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sem_search_ready_dimension_mismatch_fails_after_embedding_before_query()
+    -> anyhow::Result<()> {
+        let setup = Arc::new(
+            SemSearchFixture::new(sem_search_config(Some("fixture-model"))).with_readiness(
+                SemSearchAvailability::Ready {
+                    workspace_root: PathBuf::from("/workspace"),
+                    manifest_hash: "fixture-manifest".to_string(),
+                    vector_artifact_id: "fixture-vector-artifact".to_string(),
+                    dimension: 3,
+                },
+            ),
+        );
+        let executor = ToolExecutor::new(Arc::clone(&setup));
+
+        let actual = executor
+            .call_internal(
+                sem_search_tool("semantic dimension mismatch"),
+                &tool_context(),
+            )
+            .await;
+
+        assert!(
+            actual
+                .unwrap_err()
+                .to_string()
+                .contains("dimension mismatch with ready vector artifact")
+        );
+        assert_eq!(setup.workspace.embedding_calls.lock().await.len(), 1);
+        assert_eq!(setup.workspace.query_calls.lock().await.len(), 0);
         assert_eq!(setup.workspace.build_calls.load(Ordering::SeqCst), 0);
         Ok(())
     }

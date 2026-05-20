@@ -47,6 +47,64 @@ pub struct ProjectSemanticEmbeddingOutput {
     pub vectors: Vec<ProjectSemanticEmbeddingVector>,
 }
 
+/// Typed read-only readiness classification for direct `sem_search` availability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SemSearchAvailability {
+    /// A fresh manifest and exactly one matching durable vector artifact are ready.
+    Ready {
+        /// Canonical workspace root used for semantic retrieval.
+        workspace_root: PathBuf,
+        /// Fresh project-model manifest hash.
+        manifest_hash: String,
+        /// Deterministic durable vector artifact identifier.
+        vector_artifact_id: String,
+        /// Fixed vector dimension required by the selected artifact.
+        dimension: usize,
+    },
+    /// Semantic search is intentionally unavailable and should normally not be advertised.
+    Unsupported {
+        /// Stable redaction-safe reason.
+        reason: String,
+    },
+    /// Readiness could not be proven; direct calls must fail during typed preflight.
+    Unknown {
+        /// Stable redaction-safe reason.
+        reason: String,
+    },
+}
+
+impl SemSearchAvailability {
+    /// Returns true when the tool may be advertised to expose a direct-call diagnostic path.
+    pub fn should_advertise(&self) -> bool {
+        matches!(self, Self::Ready { .. } | Self::Unknown { .. })
+    }
+
+    /// Returns the minimal stable fingerprint for tool-definition cache invalidation.
+    pub fn semantic_fingerprint(&self) -> String {
+        match self {
+            Self::Ready { manifest_hash, vector_artifact_id, dimension, .. } => {
+                format!("ready:{manifest_hash}:{vector_artifact_id}:{dimension}")
+            }
+            Self::Unsupported { reason } => format!("unsupported:{reason}"),
+            Self::Unknown { reason } => format!("unknown:{reason}"),
+        }
+    }
+
+    /// Converts non-ready states into a typed preflight error.
+    ///
+    /// # Errors
+    /// Returns an error when semantic search is unsupported or unknown.
+    pub fn ensure_ready(&self) -> anyhow::Result<()> {
+        match self {
+            Self::Ready { .. } => Ok(()),
+            Self::Unsupported { reason } => {
+                anyhow::bail!("sem_search unavailable: unsupported: {reason}")
+            }
+            Self::Unknown { reason } => anyhow::bail!("sem_search unavailable: unknown: {reason}"),
+        }
+    }
+}
+
 /// Typed readiness classification for automatic semantic project-context injection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkspaceSemanticInjectionReadiness {

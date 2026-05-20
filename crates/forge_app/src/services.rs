@@ -12,9 +12,9 @@ use forge_domain::{
     LearningSensorReviewOutput, McpConfig, McpServers, Model, ModelId, Node, ProcessId,
     ProcessReadCursor, ProcessReadOutput, ProcessStartOutput, ProcessStatus,
     ProjectSemanticEmbeddingOutput, Provider, ProviderId, ResultStream, Scope, SearchParams,
-    SteerMessage, SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter, SyncProgress,
-    SyntaxError, Template, ToolCallFull, ToolOutput, WorkspaceAuth,
-    WorkspaceContextManifestDiagnostic, WorkspaceEvidenceReplayDiagnostic,
+    SemSearchAvailability, SteerMessage, SubagentTaskId, SubagentTaskSession,
+    SubagentTaskSessionFilter, SyncProgress, SyntaxError, Template, ToolCallFull, ToolOutput,
+    WorkspaceAuth, WorkspaceContextManifestDiagnostic, WorkspaceEvidenceReplayDiagnostic,
     WorkspaceEvidenceReplayPreviewDiagnostic, WorkspaceExactFactReferenceReport,
     WorkspaceExactFactStatusReport, WorkspaceId, WorkspaceInfo,
     WorkspaceSemanticInjectionReadiness, WorkspaceVectorIndexBuildReport,
@@ -723,6 +723,13 @@ pub trait WorkspaceService: Send + Sync {
         path: PathBuf,
         embedding_model_id: Option<String>,
     ) -> anyhow::Result<WorkspaceSemanticInjectionReadiness>;
+
+    /// Checks read-only sem_search readiness for the current workspace and embedding model.
+    async fn sem_search_availability(
+        &self,
+        path: PathBuf,
+        embedding_model_id: Option<String>,
+    ) -> anyhow::Result<SemSearchAvailability>;
 
     /// Query the indexed workspace with semantic search
     async fn query_workspace(
@@ -1815,6 +1822,16 @@ impl<I: Services> WorkspaceService for I {
             .await
     }
 
+    async fn sem_search_availability(
+        &self,
+        path: PathBuf,
+        embedding_model_id: Option<String>,
+    ) -> anyhow::Result<SemSearchAvailability> {
+        self.workspace_service()
+            .sem_search_availability(path, embedding_model_id)
+            .await
+    }
+
     async fn query_workspace(
         &self,
         path: PathBuf,
@@ -2551,6 +2568,14 @@ mod tests {
             _path: PathBuf,
             _embedding_model_id: Option<String>,
         ) -> anyhow::Result<WorkspaceSemanticInjectionReadiness> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn sem_search_availability(
+            &self,
+            _path: PathBuf,
+            _embedding_model_id: Option<String>,
+        ) -> anyhow::Result<SemSearchAvailability> {
             anyhow::bail!("unused workspace service")
         }
 

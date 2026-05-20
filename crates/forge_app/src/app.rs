@@ -1794,10 +1794,11 @@ mod tests {
         LearningProvenance, LearningRecordId, LearningRecordProjection, LearningRedactionStatus,
         LearningReviewState, McpConfig, McpServers, Model, ModelId, Node, NodeData, NodeId,
         PermissionOperation, ProjectSemanticEmbeddingVector, Provider, ProviderId, ProviderType,
-        ResultStream, Scope, SearchParams, SteerMessage, SyncProgress, ToolCallContext,
-        ToolCallFull, ToolOutput, ToolResult, WorkspaceAuth, WorkspaceContextFreshness,
-        WorkspaceContextManifestDiagnostic, WorkspaceEvidenceReadinessDiagnostic, WorkspaceId,
-        WorkspaceInfo, WorkspaceSemanticInjectionReadiness,
+        ResultStream, Scope, SearchParams, SemSearchAvailability, SteerMessage, SyncProgress,
+        ToolCallContext, ToolCallFull, ToolOutput, ToolResult, WorkspaceAuth,
+        WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
+        WorkspaceEvidenceReadinessDiagnostic, WorkspaceId, WorkspaceInfo,
+        WorkspaceSemanticInjectionReadiness,
     };
     use futures::StreamExt;
     use pretty_assertions::assert_eq;
@@ -2477,6 +2478,16 @@ mod tests {
             _embedding_model_id: Option<String>,
         ) -> Result<WorkspaceSemanticInjectionReadiness> {
             Ok(WorkspaceSemanticInjectionReadiness::VectorIndexAbsentOrNoMatch)
+        }
+
+        async fn sem_search_availability(
+            &self,
+            _path: PathBuf,
+            _embedding_model_id: Option<String>,
+        ) -> Result<SemSearchAvailability> {
+            Ok(SemSearchAvailability::Unsupported {
+                reason: "vector_index_absent_or_no_match".to_string(),
+            })
         }
 
         async fn query_workspace(
@@ -3358,6 +3369,64 @@ mod tests {
                 return Ok(readiness.clone());
             }
             Ok(WorkspaceSemanticInjectionReadiness::VectorIndexAbsentOrNoMatch)
+        }
+
+        async fn sem_search_availability(
+            &self,
+            path: PathBuf,
+            embedding_model_id: Option<String>,
+        ) -> Result<SemSearchAvailability> {
+            match self
+                .semantic_injection_readiness(path.clone(), embedding_model_id)
+                .await?
+            {
+                WorkspaceSemanticInjectionReadiness::SemanticDisabledNoModelConfig => {
+                    Ok(SemSearchAvailability::Unsupported {
+                        reason: "semantic_embedding_model_id_not_configured".to_string(),
+                    })
+                }
+                WorkspaceSemanticInjectionReadiness::VectorIndexAbsentOrNoMatch => {
+                    Ok(SemSearchAvailability::Unsupported {
+                        reason: "vector_index_absent_or_no_match".to_string(),
+                    })
+                }
+                WorkspaceSemanticInjectionReadiness::VectorIndexReady { dimension } => {
+                    Ok(SemSearchAvailability::Ready {
+                        workspace_root: path,
+                        manifest_hash: "fixture-manifest-hash".to_string(),
+                        vector_artifact_id: "fixture-vector-artifact".to_string(),
+                        dimension,
+                    })
+                }
+                WorkspaceSemanticInjectionReadiness::VectorIndexAmbiguous => {
+                    Ok(SemSearchAvailability::Unknown {
+                        reason: "vector_index_ambiguous".to_string(),
+                    })
+                }
+                WorkspaceSemanticInjectionReadiness::VectorIndexCorruptOrNotReady => {
+                    Ok(SemSearchAvailability::Unknown {
+                        reason: "vector_index_corrupt_or_not_ready".to_string(),
+                    })
+                }
+                WorkspaceSemanticInjectionReadiness::VectorDimensionMismatch {
+                    expected,
+                    actual,
+                } => Ok(SemSearchAvailability::Unknown {
+                    reason: format!(
+                        "vector_dimension_mismatch: expected={expected}, actual={actual}"
+                    ),
+                }),
+                WorkspaceSemanticInjectionReadiness::EmbeddingProviderUnavailable => {
+                    Ok(SemSearchAvailability::Unknown {
+                        reason: "embedding_provider_unavailable".to_string(),
+                    })
+                }
+                WorkspaceSemanticInjectionReadiness::EmbeddingProviderTimeout => {
+                    Ok(SemSearchAvailability::Unknown {
+                        reason: "embedding_provider_timeout".to_string(),
+                    })
+                }
+            }
         }
 
         async fn query_workspace(

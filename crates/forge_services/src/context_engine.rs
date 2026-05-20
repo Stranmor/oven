@@ -10,14 +10,14 @@ use forge_app::{CommandInfra, EnvironmentInfra, FileReaderInfra, WalkerInfra, Wo
 use forge_domain::{
     AuthCredential, AuthDetails, FileChunk, Node, NodeData, NodeId, ProjectSemanticEmbeddingInput,
     ProjectSemanticEmbeddingOutput, ProjectSemanticEmbeddingRequest,
-    ProjectSemanticEmbeddingVector, ProviderId, ProviderRepository, SearchParams, SyncProgress,
-    UserId, WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
-    WorkspaceEvidenceLedgerActivationDiagnostic, WorkspaceEvidenceLedgerActivationSummary,
-    WorkspaceEvidenceLedgerGraphMetadata, WorkspaceEvidenceReadinessDiagnostic,
-    WorkspaceEvidenceReplayBudgetSummary, WorkspaceEvidenceReplayDiagnostic,
-    WorkspaceEvidenceReplayIssueSummary, WorkspaceEvidenceReplayPreviewDiagnostic,
-    WorkspaceEvidenceReplayPreviewStatus, WorkspaceEvidenceReplayReference,
-    WorkspaceEvidenceReplayStatus, WorkspaceExactFactBoundedLoss,
+    ProjectSemanticEmbeddingVector, ProviderId, ProviderRepository, SearchParams,
+    SemSearchAvailability, SyncProgress, UserId, WorkspaceContextFreshness,
+    WorkspaceContextManifestDiagnostic, WorkspaceEvidenceLedgerActivationDiagnostic,
+    WorkspaceEvidenceLedgerActivationSummary, WorkspaceEvidenceLedgerGraphMetadata,
+    WorkspaceEvidenceReadinessDiagnostic, WorkspaceEvidenceReplayBudgetSummary,
+    WorkspaceEvidenceReplayDiagnostic, WorkspaceEvidenceReplayIssueSummary,
+    WorkspaceEvidenceReplayPreviewDiagnostic, WorkspaceEvidenceReplayPreviewStatus,
+    WorkspaceEvidenceReplayReference, WorkspaceEvidenceReplayStatus, WorkspaceExactFactBoundedLoss,
     WorkspaceExactFactIngestionSummary, WorkspaceExactFactIssue,
     WorkspaceExactFactReadinessDiagnostic, WorkspaceExactFactReferenceReport,
     WorkspaceExactFactReferenceStatus, WorkspaceExactFactStatusReport, WorkspaceId,
@@ -1073,6 +1073,67 @@ impl<
         }
     }
 
+    fn sem_search_availability_for_model(
+        &self,
+        path: PathBuf,
+        embedding_model_id: Option<&str>,
+    ) -> Result<SemSearchAvailability> {
+        let Some(embedding_model_id) =
+            embedding_model_id.filter(|model_id| !model_id.trim().is_empty())
+        else {
+            return Ok(SemSearchAvailability::Unsupported {
+                reason: "semantic_embedding_model_id_not_configured".to_string(),
+            });
+        };
+        let root = canonicalize_path(path)?;
+        let manifest_path = local_project_model_manifest(&root);
+        if !root.is_dir() || !manifest_path.is_file() {
+            return Ok(SemSearchAvailability::Unsupported {
+                reason: "project_model_manifest_missing".to_string(),
+            });
+        }
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+        let manifest = match indexer.read_manifest() {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                return Ok(SemSearchAvailability::Unknown {
+                    reason: format!("project_model_manifest_unreadable: {error}"),
+                });
+            }
+        };
+        let freshness = match indexer.evaluate_manifest_freshness(&manifest) {
+            Ok(evaluation) if evaluation.can_inject() => WorkspaceContextFreshness::Fresh,
+            Ok(evaluation) if evaluation.state.fresh => WorkspaceContextFreshness::Unknown {
+                reason: "project-model freshness checked only indexed files; added-file discovery not proven".to_string(),
+            },
+            Ok(evaluation) => WorkspaceContextFreshness::Stale {
+                changed: evaluation.state.changed,
+                deleted: evaluation.state.deleted,
+                added: evaluation.state.added,
+            },
+            Err(error) => WorkspaceContextFreshness::Unknown { reason: error.to_string() },
+        };
+        match freshness {
+            WorkspaceContextFreshness::Fresh => {}
+            WorkspaceContextFreshness::Stale { changed, deleted, added } => {
+                return Ok(SemSearchAvailability::Unknown {
+                    reason: format!(
+                        "project_model_manifest_stale: changed={}, deleted={}, added={}",
+                        changed.len(),
+                        deleted.len(),
+                        added.len()
+                    ),
+                });
+            }
+            WorkspaceContextFreshness::Unknown { reason } => {
+                return Ok(SemSearchAvailability::Unknown {
+                    reason: format!("project_model_manifest_freshness_unknown: {reason}"),
+                });
+            }
+        }
+        sem_search_availability_from_indexer(&indexer, &manifest, embedding_model_id)
+    }
+
     async fn query_local_workspace(
         &self,
         path: PathBuf,
@@ -1411,6 +1472,64 @@ impl DurableVectorSelection {
             ProjectContextVectorReadiness::Ready { .. } => None,
             ProjectContextVectorReadiness::Unavailable(reason) => Some(reason),
         }
+    }
+}
+
+fn sem_search_availability_from_indexer(
+    indexer: &ProjectIndexer,
+    manifest: &forge_project_model::ProjectManifest,
+    embedding_model_id: &str,
+) -> Result<SemSearchAvailability> {
+    let ids = match indexer.list_vector_indexes() {
+        Ok(ids) => ids,
+        Err(error) => {
+            return Ok(SemSearchAvailability::Unknown {
+                reason: format!("vector_index_listing_failed: {error}"),
+            });
+        }
+    };
+    let mut matching = Vec::new();
+    let mut has_unreadable_artifact = false;
+    for id in ids {
+        let artifact =
+            match read_vector_artifact_scan_outcome(indexer, manifest, embedding_model_id, &id) {
+                Ok(VectorArtifactScanOutcome::Current(artifact)) => artifact,
+                Ok(VectorArtifactScanOutcome::Stale) => continue,
+                Ok(VectorArtifactScanOutcome::Unreadable) => {
+                    has_unreadable_artifact = true;
+                    continue;
+                }
+                Err(error) => {
+                    return Ok(SemSearchAvailability::Unknown {
+                        reason: format!("vector_index_artifact_corrupt: {error}"),
+                    });
+                }
+            };
+        matching.push((id, artifact));
+    }
+    match matching.as_slice() {
+        [] if has_unreadable_artifact => Ok(SemSearchAvailability::Unknown {
+            reason: "vector_index_corrupt_or_not_ready".to_string(),
+        }),
+        [] => Ok(SemSearchAvailability::Unsupported {
+            reason: "vector_index_absent_or_no_match".to_string(),
+        }),
+        [(id, artifact)] => {
+            if let Err(error) =
+                forge_project_model::DurableVectorIndex::new(manifest, artifact.clone())
+            {
+                return Ok(SemSearchAvailability::Unknown {
+                    reason: format!("vector_index_corrupt_or_not_ready: {error}"),
+                });
+            }
+            Ok(SemSearchAvailability::Ready {
+                workspace_root: indexer.root().to_path_buf(),
+                manifest_hash: manifest.manifest_hash.clone(),
+                vector_artifact_id: id.to_string(),
+                dimension: artifact.dimension,
+            })
+        }
+        _ => Ok(SemSearchAvailability::Unknown { reason: "vector_index_ambiguous".to_string() }),
     }
 }
 
@@ -1987,6 +2106,14 @@ impl<
         embedding_model_id: Option<String>,
     ) -> Result<WorkspaceSemanticInjectionReadiness> {
         self.semantic_injection_readiness_for_model(path, embedding_model_id.as_deref())
+    }
+
+    async fn sem_search_availability(
+        &self,
+        path: PathBuf,
+        embedding_model_id: Option<String>,
+    ) -> Result<SemSearchAvailability> {
+        self.sem_search_availability_for_model(path, embedding_model_id.as_deref())
     }
 
     /// Performs semantic code search on a workspace.
@@ -2668,7 +2795,11 @@ mod tests {
         setup.write_manifest(&manifest)
     }
 
-    fn write_fixture_vector_index(root: &Path, model_id: &str, target_symbol: &str) -> Result<()> {
+    fn write_fixture_vector_index(
+        root: &Path,
+        model_id: &str,
+        target_symbol: &str,
+    ) -> Result<VectorIndexArtifactId> {
         let indexer = ProjectIndexer::new(root, local_project_model_dir(root));
         let manifest = indexer.read_manifest()?;
         let symbol = manifest
@@ -2681,7 +2812,61 @@ mod tests {
             BTreeMap::from([(symbol.id.clone(), vec![1.0, 0.0])]),
         )?;
         let artifact = VectorIndexArtifact::new(&manifest, model_id, 2, entries)?;
+        let id = indexer.vector_index_artifact_id(&artifact)?;
         indexer.write_vector_index(&manifest, &artifact)?;
+        Ok(id)
+    }
+
+    #[test]
+    fn sem_search_availability_ready_returns_manifest_and_vector_identity() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let expected_id = write_fixture_vector_index(&root, "fixture-model", "RuntimeNeedle")?;
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+        let manifest = indexer.read_manifest()?;
+
+        let actual = sem_search_availability_from_indexer(&indexer, &manifest, "fixture-model")?;
+        let expected = SemSearchAvailability::Ready {
+            workspace_root: root,
+            manifest_hash: manifest.manifest_hash,
+            vector_artifact_id: expected_id.to_string(),
+            dimension: 2,
+        };
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn sem_search_availability_absent_vector_is_unsupported() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+        let manifest = indexer.read_manifest()?;
+
+        let actual = sem_search_availability_from_indexer(&indexer, &manifest, "fixture-model")?;
+        let expected = SemSearchAvailability::Unsupported {
+            reason: "vector_index_absent_or_no_match".to_string(),
+        };
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn sem_search_availability_ambiguous_vector_is_unknown() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        write_fixture_vector_index(&root, "fixture-model", "RuntimeNeedle")?;
+        write_fixture_vector_index(&root, "fixture-model", "build_runtime_needle")?;
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+        let manifest = indexer.read_manifest()?;
+
+        let actual = sem_search_availability_from_indexer(&indexer, &manifest, "fixture-model")?;
+        let expected =
+            SemSearchAvailability::Unknown { reason: "vector_index_ambiguous".to_string() };
+
+        assert_eq!(actual, expected);
         Ok(())
     }
 
