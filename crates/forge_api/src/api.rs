@@ -157,14 +157,14 @@ pub trait API: Sync + Send {
         conversation_id: &ConversationId,
     ) -> Result<CompactionResult>;
 
-    /// Executes a shell command using the shell tool infrastructure
+    /// Executes a shell command using the shell tool infrastructure.
     async fn execute_shell_command(
         &self,
         command: &str,
         working_dir: PathBuf,
-    ) -> Result<CommandOutput>;
+    ) -> Result<CommandExecutionOutput>;
 
-    /// Executes the shell command on present stdio.
+    /// Executes the shell command on present stdio without managed-process handoff.
     async fn execute_shell_command_raw(&self, command: &str) -> Result<std::process::ExitStatus>;
 
     /// Reads and merges MCP configurations from all available configuration

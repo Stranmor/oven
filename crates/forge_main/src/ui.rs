@@ -2584,7 +2584,13 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                 self.on_model_selection(None).await?;
             }
             AppCommand::Shell(ref command) => {
-                self.api.execute_shell_command_raw(command).await?;
+                let execution = self
+                    .api
+                    .execute_shell_command(command, self.state.cwd.clone())
+                    .await?;
+                if execution.process.is_some() && !execution.output.stderr.is_empty() {
+                    self.writeln_to_stderr(execution.output.stderr.trim_end().to_string())?;
+                }
             }
             AppCommand::Commit { max_diff_size, .. } => {
                 let args = CommitCommandGroup {

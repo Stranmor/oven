@@ -61,6 +61,28 @@ impl ForgeAPI<ForgeServices<ForgeRepo<ForgeInfra>>, ForgeRepo<ForgeInfra>> {
     }
 }
 
+impl<A, F> ForgeAPI<A, F>
+where
+    F: CommandInfra,
+{
+    async fn execute_shell_command_with_handoff_timeout(
+        &self,
+        command: &str,
+        working_dir: PathBuf,
+        handoff_timeout: ShellHandoffTimeoutSeconds,
+    ) -> anyhow::Result<CommandExecutionOutput> {
+        self.infra
+            .execute_command(
+                command.to_string(),
+                working_dir,
+                false,
+                None,
+                handoff_timeout,
+            )
+            .await
+    }
+}
+
 #[async_trait::async_trait]
 impl<
     A: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>,
@@ -263,17 +285,9 @@ impl<
         &self,
         command: &str,
         working_dir: PathBuf,
-    ) -> anyhow::Result<CommandOutput> {
-        self.infra
-            .execute_command(
-                command.to_string(),
-                working_dir,
-                false,
-                None,
-                Default::default(),
-            )
+    ) -> anyhow::Result<CommandExecutionOutput> {
+        self.execute_shell_command_with_handoff_timeout(command, working_dir, Default::default())
             .await
-            .map(|execution| execution.output)
     }
     async fn read_mcp_config(&self, scope: Option<&Scope>) -> Result<McpConfig> {
         self.services
@@ -535,6 +549,114 @@ impl<
     fn hydrate_channel(&self) -> Result<()> {
         self.infra.hydrate();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use forge_domain::{
+        CommandExecutionOutput, Environment, ProcessObservationWaitSeconds,
+        ShellHandoffTimeoutSeconds,
+    };
+    use forge_infra::{ForgeCommandExecutorService, StdConsoleWriter};
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    fn fixture_environment(cwd: PathBuf) -> Environment {
+        Environment {
+            os: std::env::consts::OS.to_string(),
+            cwd: cwd.clone(),
+            home: Some(cwd.clone()),
+            shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
+            base_path: cwd,
+        }
+    }
+
+    fn fixture_api(
+        cwd: PathBuf,
+    ) -> ForgeAPI<(), ForgeCommandExecutorService<std::io::Stdout, std::io::Stderr>> {
+        let infra = ForgeCommandExecutorService::new(
+            fixture_environment(cwd),
+            Arc::new(StdConsoleWriter::default()),
+        );
+        ForgeAPI::new(Arc::new(()), Arc::new(infra))
+    }
+
+    #[tokio::test]
+    async fn test_api_shell_command_returns_short_output_synchronously() {
+        let setup = tempfile::tempdir().unwrap();
+        let fixture = fixture_api(setup.path().to_path_buf());
+
+        let actual = fixture
+            .execute_shell_command_with_handoff_timeout(
+                "printf api-short-output",
+                setup.path().to_path_buf(),
+                ShellHandoffTimeoutSeconds::new(1).unwrap(),
+            )
+            .await
+            .unwrap();
+        let expected = CommandExecutionOutput {
+            output: CommandOutput {
+                command: "printf api-short-output".to_string(),
+                stdout: "api-short-output".to_string(),
+                stderr: String::new(),
+                exit_code: Some(0),
+            },
+            process: None,
+        };
+
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_api_shell_command_hands_off_long_output_as_managed_process() {
+        let setup = tempfile::tempdir().unwrap();
+        let fixture = fixture_api(setup.path().to_path_buf());
+
+        let actual = fixture
+            .execute_shell_command_with_handoff_timeout(
+                "printf api-before; sleep 1.05; printf api-after; sleep 2",
+                setup.path().to_path_buf(),
+                ShellHandoffTimeoutSeconds::new(1).unwrap(),
+            )
+            .await
+            .unwrap();
+        let process = actual
+            .process
+            .clone()
+            .expect("long-running API command should be handed off");
+        let initial_output = fixture
+            .infra
+            .read_process(
+                process.process_id.clone(),
+                forge_domain::ProcessReadCursor::new(0),
+                None,
+            )
+            .await
+            .unwrap();
+        let process_output = fixture
+            .infra
+            .read_process(
+                process.process_id.clone(),
+                initial_output.next_cursor,
+                Some(ProcessObservationWaitSeconds::new(3).unwrap()),
+            )
+            .await
+            .unwrap();
+        let _ = fixture.infra.kill_process(process.process_id).await;
+
+        assert_eq!(actual.output.stdout, "api-before");
+        assert_eq!(actual.output.exit_code, None);
+        assert!(actual.output.stderr.contains("managed background process"));
+        assert!(
+            process_output
+                .entries
+                .iter()
+                .any(|entry| entry.content.contains("api-after"))
+        );
     }
 }
 
