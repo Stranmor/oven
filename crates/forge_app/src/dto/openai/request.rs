@@ -399,6 +399,7 @@ impl Request {
         let mut pipeline = ProviderPipeline::new(provider, merge_system_messages);
         let mut request = pipeline.transform(request);
         request.validate_and_canonicalize_images()?;
+        request.validate_tool_parameter_schemas()?;
         Ok(request)
     }
 
@@ -469,6 +470,27 @@ impl Request {
                         }
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_tool_parameter_schemas(&self) -> anyhow::Result<()> {
+        for tool in self.tools.iter().flatten() {
+            let Tool::Function { function } = tool else {
+                continue;
+            };
+            let schema_value = serde_json::to_value(&function.parameters)?;
+            let root_type = schema_value
+                .as_object()
+                .and_then(|schema| schema.get("type"))
+                .and_then(|schema_type| schema_type.as_str());
+            if root_type != Some("object") {
+                anyhow::bail!(
+                    "OpenAI-compatible provider request blocked before dispatch: tool function '{}' has parameters root schema type '{}', but function parameters must be a JSON Schema object. Fix the ToolDefinition.input_schema at its source.",
+                    function.name.as_str(),
+                    root_type.unwrap_or("<missing-or-non-string>")
+                );
             }
         }
         Ok(())
@@ -1239,10 +1261,68 @@ mod tests {
     }
 
     use forge_domain::{
-        ContextMessage, Role, TextMessage, ToolCallFull, ToolCallId, ToolCatalog, ToolName,
-        ToolResult,
+        Agent, AgentId, ContextMessage, ProviderId, Role, TextMessage, ToolCallFull, ToolCallId,
+        ToolCatalog, ToolDefinition, ToolName, ToolResult,
     };
     use insta::assert_json_snapshot;
+
+    #[test]
+    fn test_dynamic_agent_tool_serializes_object_schema_with_tasks() {
+        let fixture = Agent::new(
+            AgentId::new("arch-sentinel"),
+            ProviderId::OPENAI,
+            ModelId::new("gpt-test"),
+        )
+        .description("Architecture critic");
+        let tool_definition: ToolDefinition = fixture.into();
+
+        let actual = Tool::from(tool_definition);
+        let Tool::Function { function } = actual else {
+            panic!("Expected function tool")
+        };
+        let actual_schema = serde_json::to_value(function.parameters).unwrap();
+        let expected_type = serde_json::json!("object");
+        let expected_tasks_type = serde_json::json!("array");
+
+        assert_eq!(function.name, ToolName::new("arch-sentinel"));
+        assert_eq!(actual_schema["type"], expected_type);
+        assert_eq!(
+            actual_schema["properties"]["tasks"]["type"],
+            expected_tasks_type
+        );
+    }
+
+    #[test]
+    fn test_provider_request_rejects_root_string_tool_schema_before_dispatch() {
+        let fixture = Request::default().tools(vec![Tool::Function {
+            function: FunctionDescription {
+                name: ToolName::new("arch-sentinel"),
+                description: Some("Architecture critic".to_string()),
+                parameters: serde_json::from_value(serde_json::json!({
+                    "type": "string"
+                }))
+                .unwrap(),
+            },
+        }]);
+
+        let actual = fixture
+            .validate_tool_parameter_schemas()
+            .unwrap_err()
+            .to_string();
+        let expected = true;
+
+        assert_eq!(actual.contains("arch-sentinel"), expected);
+        assert_eq!(actual.contains("root schema type 'string'"), expected);
+    }
+
+    #[test]
+    fn test_provider_request_accepts_empty_object_tool_schema() {
+        let fixture = Request::default().tools(vec![Tool::from(ToolDefinition::new("empty_tool"))]);
+
+        let actual = fixture.validate_tool_parameter_schemas();
+
+        assert!(actual.is_ok());
+    }
 
     #[test]
     fn test_user_message_conversion() {

@@ -229,8 +229,7 @@ impl Agent {
         if self.description.is_none() || self.description.as_ref().is_none_or(|d| d.is_empty()) {
             return Err(Error::MissingAgentDescription(self.id.clone()));
         }
-        Ok(ToolDefinition::new(self.id.as_str().to_string())
-            .description(self.description.clone().unwrap()))
+        Ok(self.clone().into())
     }
 
     /// Sets the model in compaction config if not already set
@@ -315,7 +314,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
-    use crate::{InputModality, Model, ProviderId};
+    use crate::{InputModality, Model, ProviderId, ToolName};
 
     fn model_fixture(id: &str, context_length: Option<u64>) -> Model {
         Model {
@@ -329,6 +328,28 @@ mod tests {
             supports_reasoning: Some(true),
             input_modalities: vec![InputModality::Text],
         }
+    }
+
+    #[test]
+    fn test_agent_tool_definition_uses_agent_input_object_schema() {
+        let fixture = Agent::new(
+            AgentId::new("arch-sentinel"),
+            ProviderId::OPENAI,
+            ModelId::new("gpt-test"),
+        )
+        .description("Architecture critic");
+
+        let actual = fixture.tool_definition().unwrap();
+        let actual_schema = serde_json::to_value(actual.input_schema).unwrap();
+        let expected_type = serde_json::json!("object");
+        let expected_tasks_type = serde_json::json!("array");
+
+        assert_eq!(actual.name, ToolName::new("arch-sentinel"));
+        assert_eq!(actual_schema["type"], expected_type);
+        assert_eq!(
+            actual_schema["properties"]["tasks"]["type"],
+            expected_tasks_type
+        );
     }
 
     #[test]
