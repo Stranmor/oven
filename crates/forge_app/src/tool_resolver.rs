@@ -90,7 +90,8 @@ impl ToolResolver {
             .map(|name| aliases.get(name.as_str()).unwrap_or(name).clone())
             .collect::<HashSet<_>>();
 
-        if tool_names.contains(&ToolName::new(Self::SHELL_TOOL_NAME)) {
+        let base_specs = Self::build_allowed_specs(tool_names.iter().cloned());
+        if Self::is_allowed_tool(&base_specs, &ToolName::new(Self::SHELL_TOOL_NAME)) {
             tool_names.extend(
                 Self::PROCESS_OBSERVATION_TOOL_NAMES
                     .iter()
@@ -99,6 +100,10 @@ impl ToolResolver {
             );
         }
 
+        Self::build_allowed_specs(tool_names)
+    }
+
+    fn build_allowed_specs(tool_names: impl IntoIterator<Item = ToolName>) -> Vec<AllowedToolSpec> {
         tool_names
             .into_iter()
             .map(|tool_name| AllowedToolSpec {
@@ -385,6 +390,52 @@ mod tests {
             ModelId::new("claude-3-5-sonnet-20241022"),
         )
         .tools(vec![ToolName::new("shell")]);
+
+        let actual = tool_resolver.resolve(&fixture);
+        let expected = vec![
+            &tool_resolver.all_tool_definitions[0],
+            &tool_resolver.all_tool_definitions[4],
+            &tool_resolver.all_tool_definitions[3],
+            &tool_resolver.all_tool_definitions[2],
+            &tool_resolver.all_tool_definitions[1],
+        ];
+
+        assert_eq!(actual, expected);
+        assert!(ToolResolver::is_allowed(
+            &fixture,
+            &ToolName::new("process_status")
+        ));
+        assert!(ToolResolver::is_allowed(
+            &fixture,
+            &ToolName::new("process_read")
+        ));
+        assert!(ToolResolver::is_allowed(
+            &fixture,
+            &ToolName::new("process_list")
+        ));
+        assert!(ToolResolver::is_allowed(
+            &fixture,
+            &ToolName::new("process_kill")
+        ));
+    }
+
+    #[test]
+    fn test_shell_matching_pattern_resolves_managed_process_observation_tools() {
+        let all_tool_definitions = vec![
+            ToolDefinition::new("shell").description("Shell Tool"),
+            ToolDefinition::new("process_status").description("Process Status Tool"),
+            ToolDefinition::new("process_read").description("Process Read Tool"),
+            ToolDefinition::new("process_list").description("Process List Tool"),
+            ToolDefinition::new("process_kill").description("Process Kill Tool"),
+            ToolDefinition::new("read").description("Read Tool"),
+        ];
+        let tool_resolver = ToolResolver::new(all_tool_definitions);
+        let fixture = Agent::new(
+            AgentId::new("test-agent"),
+            ProviderId::ANTHROPIC,
+            ModelId::new("claude-3-5-sonnet-20241022"),
+        )
+        .tools(vec![ToolName::new("sh*")]);
 
         let actual = tool_resolver.resolve(&fixture);
         let expected = vec![
