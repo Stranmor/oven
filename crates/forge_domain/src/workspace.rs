@@ -265,6 +265,81 @@ impl WorkspaceEvidenceReplayStatus {
     }
 }
 
+/// Redaction-safe read-only replay-preview status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceEvidenceReplayPreviewStatus {
+    /// Project-model manifest was not found, so preview did not inspect replay artifacts.
+    NotPreviewedManifestMissing,
+    /// Project-model manifest is stale, so preview did not inspect replay artifacts.
+    NotPreviewedManifestStale,
+    /// Project-model manifest freshness could not be proven, so preview did not inspect replay artifacts.
+    NotPreviewedManifestUnknown,
+    /// Replay ran but selected no previewable references and emitted no visible issues.
+    NotPreviewedEmptyReplay,
+    /// Replay preview rendered selected metadata-only references.
+    PreviewedWithSelection,
+    /// Replay preview rendered metadata-only issue evidence.
+    PreviewedWithIssues,
+    /// Replay preview adapter refused the selected report as invalid for the current manifest.
+    PreviewRefused,
+    /// Replay preview was produced, but replay selection reported budget truncation.
+    PreviewTruncated,
+    /// Replay preview rendering exceeded the render budget and fell back to omission metadata.
+    PreviewBudgetExceeded,
+}
+
+impl WorkspaceEvidenceReplayPreviewStatus {
+    /// Returns the stable status label used by read-only preview diagnostics.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::NotPreviewedManifestMissing => "not_previewed_manifest_missing",
+            Self::NotPreviewedManifestStale => "not_previewed_manifest_stale",
+            Self::NotPreviewedManifestUnknown => "not_previewed_manifest_unknown",
+            Self::NotPreviewedEmptyReplay => "not_previewed_empty_replay",
+            Self::PreviewedWithSelection => "previewed_with_selection",
+            Self::PreviewedWithIssues => "previewed_with_issues",
+            Self::PreviewRefused => "preview_refused",
+            Self::PreviewTruncated => "preview_truncated",
+            Self::PreviewBudgetExceeded => "preview_budget_exceeded",
+        }
+    }
+}
+
+/// Redaction-safe rendered evidence replay preview for diagnostics only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceEvidenceReplayPreviewDiagnostic {
+    /// Stable preview status.
+    pub status: WorkspaceEvidenceReplayPreviewStatus,
+    /// Stable redaction-safe label for the canonical workspace root.
+    pub workspace_root_label: String,
+    /// Stable redaction-safe label for the project-model manifest.
+    pub manifest_label: String,
+    /// Whether the manifest file exists at the expected path.
+    pub manifest_found: bool,
+    /// Manifest freshness classification label.
+    pub manifest_freshness: String,
+    /// Redaction-safe skip or refusal reason.
+    pub not_previewed_reason: Option<String>,
+    /// Manifest hash used by replay after freshness was proven.
+    pub manifest_hash: Option<String>,
+    /// Content policy label; always reference-only when replay runs.
+    pub content_policy: Option<String>,
+    /// Stale policy label when replay runs.
+    pub stale_policy: Option<String>,
+    /// Changed evidence references excluded by policy.
+    pub changed_excluded: usize,
+    /// Deleted evidence references excluded by policy.
+    pub deleted_excluded: usize,
+    /// Deterministic budget and selection audit when replay runs.
+    pub budget: Option<WorkspaceEvidenceReplayBudgetSummary>,
+    /// Reference-only selected evidence items.
+    pub selected: Vec<WorkspaceEvidenceReplayReference>,
+    /// Typed redaction-safe issue summaries.
+    pub issues: Vec<WorkspaceEvidenceReplayIssueSummary>,
+    /// Rendered metadata-only preview using the canonical project-model context renderer.
+    pub rendered_preview: Option<String>,
+}
+
 /// Reference-only selected evidence item for workspace replay diagnostics.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceEvidenceReplayReference {

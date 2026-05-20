@@ -1652,6 +1652,13 @@ mod tests {
             anyhow::bail!("unused workspace evidence replay diagnostic")
         }
 
+        async fn workspace_evidence_replay_preview_diagnostic(
+            &self,
+            _path: PathBuf,
+        ) -> Result<WorkspaceEvidenceReplayPreviewDiagnostic> {
+            anyhow::bail!("unused workspace evidence replay preview diagnostic")
+        }
+
         async fn query_workspace(
             &self,
             _path: PathBuf,
@@ -2248,6 +2255,13 @@ mod tests {
             _path: PathBuf,
         ) -> Result<WorkspaceEvidenceReplayDiagnostic> {
             anyhow::bail!("unused workspace evidence replay diagnostic")
+        }
+
+        async fn workspace_evidence_replay_preview_diagnostic(
+            &self,
+            _path: PathBuf,
+        ) -> Result<WorkspaceEvidenceReplayPreviewDiagnostic> {
+            anyhow::bail!("unused workspace evidence replay preview diagnostic")
         }
 
         async fn query_workspace(

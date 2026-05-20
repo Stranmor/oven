@@ -12,7 +12,8 @@ use forge_domain::{
     Scope, SearchParams, SteerMessage, SubagentTaskId, SubagentTaskSession,
     SubagentTaskSessionFilter, SyncProgress, SyntaxError, Template, ToolCallFull, ToolOutput,
     WorkspaceAuth, WorkspaceContextManifestDiagnostic, WorkspaceEvidenceReplayDiagnostic,
-    WorkspaceExactFactReferenceReport, WorkspaceExactFactStatusReport, WorkspaceId, WorkspaceInfo,
+    WorkspaceEvidenceReplayPreviewDiagnostic, WorkspaceExactFactReferenceReport,
+    WorkspaceExactFactStatusReport, WorkspaceId, WorkspaceInfo,
 };
 use forge_eventsource::EventSource;
 use reqwest::Response;
@@ -558,6 +559,12 @@ pub trait WorkspaceService: Send + Sync {
         &self,
         path: PathBuf,
     ) -> anyhow::Result<WorkspaceEvidenceReplayDiagnostic>;
+
+    /// Renders a metadata-only evidence replay preview without mutating workspace state.
+    async fn workspace_evidence_replay_preview_diagnostic(
+        &self,
+        path: PathBuf,
+    ) -> anyhow::Result<WorkspaceEvidenceReplayPreviewDiagnostic>;
 
     /// Query the indexed workspace with semantic search
     async fn query_workspace(
@@ -1562,6 +1569,15 @@ impl<I: Services> WorkspaceService for I {
             .await
     }
 
+    async fn workspace_evidence_replay_preview_diagnostic(
+        &self,
+        path: PathBuf,
+    ) -> anyhow::Result<WorkspaceEvidenceReplayPreviewDiagnostic> {
+        self.workspace_service()
+            .workspace_evidence_replay_preview_diagnostic(path)
+            .await
+    }
+
     async fn query_workspace(
         &self,
         path: PathBuf,
@@ -2215,6 +2231,13 @@ mod tests {
             &self,
             _path: PathBuf,
         ) -> anyhow::Result<WorkspaceEvidenceReplayDiagnostic> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn workspace_evidence_replay_preview_diagnostic(
+            &self,
+            _path: PathBuf,
+        ) -> anyhow::Result<WorkspaceEvidenceReplayPreviewDiagnostic> {
             anyhow::bail!("unused workspace service")
         }
 
