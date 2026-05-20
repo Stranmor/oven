@@ -39,6 +39,16 @@ pub enum CachePartitionError {
     /// Stable render budget was exceeded before the overflow could be classified.
     #[error("project-model stable cache partition blocked: render budget overflow is unclassified")]
     BudgetOverflowUnclassified,
+    /// The provider-visible payload does not match the sealed payload digest.
+    #[error(
+        "project-model stable cache partition blocked: provider-visible payload digest mismatch: expected {expected}, actual {actual}"
+    )]
+    ProviderVisiblePayloadDigestMismatch {
+        /// Expected provider-visible payload digest sealed in stable identity.
+        expected: String,
+        /// Actual provider-visible payload digest at render time.
+        actual: String,
+    },
 }
 
 /// Typestate marker proving the manifest identity is known and fresh.
@@ -263,9 +273,34 @@ impl ProjectModelCachePartition<ReadbackVerified> {
     pub fn seal_stable_payload(
         self,
     ) -> Result<CachePartitionStablePayloadSealed, CachePartitionError> {
+        self.seal_stable_payload_with_provider_visible_digest("metadata_only_payload_not_rendered")
+    }
+
+    /// Seals cache-eligible stable payload identity with a digest of the exact
+    /// stable provider-visible payload bytes.
+    ///
+    /// # Arguments
+    /// * `provider_visible_payload` - Exact stable bytes that will be rendered
+    ///   inside the provider-visible stable project-model context message.
+    ///
+    /// # Errors
+    /// Returns an error when the sealed stable bytes exceed the render budget.
+    pub fn seal_stable_payload_bytes(
+        self,
+        provider_visible_payload: impl AsRef<[u8]>,
+    ) -> Result<CachePartitionStablePayloadSealed, CachePartitionError> {
+        let payload = String::from_utf8_lossy(provider_visible_payload.as_ref());
+        self.seal_stable_payload_with_provider_visible_digest(fingerprint(&payload))
+    }
+
+    fn seal_stable_payload_with_provider_visible_digest(
+        self,
+        stable_provider_visible_payload_digest: impl Into<String>,
+    ) -> Result<CachePartitionStablePayloadSealed, CachePartitionError> {
         let fields = ProjectModelStablePayloadWhitelistedFields::new(
             self.identity.clone(),
             self.sources.clone(),
+            stable_provider_visible_payload_digest.into(),
         );
         let bytes =
             serde_json::to_vec(&fields).expect("stable project-model payload is serializable");
@@ -333,11 +368,51 @@ impl ProjectModelCachePartition<VolatileSidecarAttached> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectModelStablePayload {
     /// Stable cache identity derived from stable payload bytes.
-    pub identity: String,
+    identity: String,
     /// Exact stable payload bytes.
-    pub bytes: Vec<u8>,
+    bytes: Vec<u8>,
     /// Whitelisted stable fields used to produce the bytes.
-    pub fields: ProjectModelStablePayloadWhitelistedFields,
+    fields: ProjectModelStablePayloadWhitelistedFields,
+}
+
+impl ProjectModelStablePayload {
+    /// Returns the stable cache identity derived from sealed stable bytes.
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    /// Returns the exact sealed stable payload bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Renders the stable provider-visible project-model context message using
+    /// the sealed cache identity owned by the project-model partition layer.
+    ///
+    /// # Arguments
+    /// * `provider_visible_payload` - Exact stable payload body whose digest was
+    ///   sealed into this payload's identity.
+    ///
+    /// # Errors
+    /// Returns an error when `provider_visible_payload` differs from the bytes
+    /// whose digest was sealed into the stable identity.
+    pub fn provider_visible_message(
+        &self,
+        provider_visible_payload: &str,
+    ) -> Result<String, CachePartitionError> {
+        let actual = fingerprint(provider_visible_payload);
+        let expected = &self.fields.stable_provider_visible_payload_digest;
+        if &actual != expected {
+            return Err(CachePartitionError::ProviderVisiblePayloadDigestMismatch {
+                expected: expected.clone(),
+                actual,
+            });
+        }
+        Ok(format!(
+            "<project_model_context cache=\"stable\" stable_identity=\"{}\">\n{}\n</project_model_context>",
+            self.identity, provider_visible_payload
+        ))
+    }
 }
 
 /// Stable payload fields allowed inside the cache-eligible partition.
@@ -359,6 +434,8 @@ pub struct ProjectModelStablePayloadWhitelistedFields {
     pub agents_project_rules_digest: Option<String>,
     /// Ordered selected source list with readback digest per range.
     pub ordered_sources: Vec<ProjectModelStableSourceIdentity>,
+    /// Digest of the exact stable provider-visible payload bytes.
+    pub stable_provider_visible_payload_digest: String,
     /// Render budget encoded into stable identity.
     pub render_budget: u32,
     /// Stable truncation policy label.
@@ -369,6 +446,7 @@ impl ProjectModelStablePayloadWhitelistedFields {
     fn new(
         identity: ProjectModelCachePartitionIdentity,
         sources: Vec<ProjectModelCachePartitionSource>,
+        stable_provider_visible_payload_digest: String,
     ) -> Self {
         Self {
             cache_partition_schema_version: identity.cache_partition_schema_version,
@@ -382,6 +460,7 @@ impl ProjectModelStablePayloadWhitelistedFields {
                 .into_iter()
                 .map(ProjectModelStableSourceIdentity::from)
                 .collect(),
+            stable_provider_visible_payload_digest,
             render_budget: identity.render_budget,
             truncation_policy: identity.truncation_policy,
         }
@@ -530,7 +609,7 @@ mod tests {
 
         let expected = true;
         assert_eq!(
-            actual.0.bytes == actual.1.bytes && actual.0.identity == actual.1.identity,
+            actual.0.bytes() == actual.1.bytes() && actual.0.identity() == actual.1.identity(),
             expected
         );
     }
@@ -567,8 +646,12 @@ mod tests {
         changed.manifest_hash = "manifest-b".to_string();
 
         let actual = (
-            seal(identity(), vec![source("src/lib.rs", "fn main() {}")]).identity,
-            seal(changed, vec![source("src/lib.rs", "fn main() {}")]).identity,
+            seal(identity(), vec![source("src/lib.rs", "fn main() {}")])
+                .identity()
+                .to_string(),
+            seal(changed, vec![source("src/lib.rs", "fn main() {}")])
+                .identity()
+                .to_string(),
         );
 
         let expected = false;
@@ -578,12 +661,71 @@ mod tests {
     #[test]
     fn source_order_change_alters_stable_identity() {
         let actual = (
-            seal(identity(), vec![source("a.rs", "a"), source("b.rs", "b")]).identity,
-            seal(identity(), vec![source("b.rs", "b"), source("a.rs", "a")]).identity,
+            seal(identity(), vec![source("a.rs", "a"), source("b.rs", "b")])
+                .identity()
+                .to_string(),
+            seal(identity(), vec![source("b.rs", "b"), source("a.rs", "a")])
+                .identity()
+                .to_string(),
         );
 
         let expected = false;
         assert_eq!(actual.0 == actual.1, expected);
+    }
+
+    #[test]
+    fn provider_visible_stable_payload_change_alters_stable_identity() {
+        let actual = (
+            ProjectModelCachePartitionInput { identity: identity() }
+                .manifest_known()
+                .unwrap()
+                .select_sources(vec![source("src/lib.rs", "fn main() {}")])
+                .unwrap()
+                .verify_readback()
+                .unwrap()
+                .seal_stable_payload_bytes(b"<project_model_context score=\"0.875000\" />")
+                .unwrap()
+                .stable_payload()
+                .identity()
+                .to_string(),
+            ProjectModelCachePartitionInput { identity: identity() }
+                .manifest_known()
+                .unwrap()
+                .select_sources(vec![source("src/lib.rs", "fn main() {}")])
+                .unwrap()
+                .verify_readback()
+                .unwrap()
+                .seal_stable_payload_bytes(b"<project_model_context score=\"0.500000\" />")
+                .unwrap()
+                .stable_payload()
+                .identity()
+                .to_string(),
+        );
+
+        let expected = false;
+        assert_eq!(actual.0 == actual.1, expected);
+    }
+
+    #[test]
+    fn provider_visible_message_rejects_payload_that_was_not_sealed() {
+        let setup = ProjectModelCachePartitionInput { identity: identity() }
+            .manifest_known()
+            .unwrap()
+            .select_sources(vec![source("src/lib.rs", "fn main() {}")])
+            .unwrap()
+            .verify_readback()
+            .unwrap()
+            .seal_stable_payload_bytes(b"<project_model_context score=\"0.875000\" />")
+            .unwrap()
+            .stable_payload()
+            .clone();
+
+        let actual = setup
+            .provider_visible_message("<project_model_context score=\"0.500000\" />")
+            .is_err();
+        let expected = true;
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -592,8 +734,12 @@ mod tests {
         changed.render_budget = 8192;
 
         let actual = (
-            seal(identity(), vec![source("src/lib.rs", "fn main() {}")]).identity,
-            seal(changed, vec![source("src/lib.rs", "fn main() {}")]).identity,
+            seal(identity(), vec![source("src/lib.rs", "fn main() {}")])
+                .identity()
+                .to_string(),
+            seal(changed, vec![source("src/lib.rs", "fn main() {}")])
+                .identity()
+                .to_string(),
         );
 
         let expected = false;
@@ -606,8 +752,12 @@ mod tests {
         changed.renderer_template_version = "renderer-v2".to_string();
 
         let actual = (
-            seal(identity(), vec![source("src/lib.rs", "fn main() {}")]).identity,
-            seal(changed, vec![source("src/lib.rs", "fn main() {}")]).identity,
+            seal(identity(), vec![source("src/lib.rs", "fn main() {}")])
+                .identity()
+                .to_string(),
+            seal(changed, vec![source("src/lib.rs", "fn main() {}")])
+                .identity()
+                .to_string(),
         );
 
         let expected = false;

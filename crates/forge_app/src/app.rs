@@ -1254,7 +1254,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
             .manifest_known()
             .and_then(|partition| partition.select_sources(stable_sources))
             .and_then(|partition| partition.verify_readback())
-            .and_then(|partition| partition.seal_stable_payload())
+            .and_then(|partition| partition.seal_stable_payload_bytes(rendered.as_bytes()))
         {
             Ok(partition) => partition,
             Err(error) => {
@@ -1262,11 +1262,13 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
                 return None;
             }
         };
-        let stable_identity = stable.stable_payload().identity.clone();
-        let stable_payload = format!(
-            "<project_model_context cache=\"stable\" stable_identity=\"{}\">\n{}\n</project_model_context>",
-            stable_identity, rendered
-        );
+        let stable_payload = match stable.stable_payload().provider_visible_message(&rendered) {
+            Ok(stable_payload) => stable_payload,
+            Err(error) => {
+                tracing::debug!(error = ?error, path = %workspace_root.display(), "Skipping stable project-model context injection because provider-visible payload no longer matches sealed cache identity");
+                return None;
+            }
+        };
         let mut diagnostics = Vec::new();
         diagnostics.push(format!("freshness={}", diagnostic.freshness.label()));
         if let Some(semantic_diagnostic) = semantic_diagnostic {
@@ -6335,6 +6337,67 @@ mod tests {
             1usize,
         );
         Ok(())
+    }
+
+    #[test]
+    fn project_model_context_stable_identity_changes_when_rendered_stable_bytes_change() {
+        let fixture = WorkspaceContextManifestDiagnostic {
+            workspace_root: PathBuf::from("/workspace"),
+            manifest_path: PathBuf::from("/workspace/.forge_project_model/project_manifest.json"),
+            manifest_found: true,
+            freshness: WorkspaceContextFreshness::Fresh,
+            manifest_hash: Some("fixture-manifest-hash".to_string()),
+            exact_fact_readiness: None,
+            evidence_readiness: None,
+            evidence_ledger_activation: None,
+        };
+        let setup_nodes = |score| {
+            vec![Node {
+                node_id: NodeId::new("symbol:src/lib.rs:automatic_injection_needle"),
+                node: NodeData::FileChunk(FileChunk {
+                    file_path: "src/lib.rs".to_string(),
+                    content: "pub fn automatic_injection_needle() -> usize { 42 }".to_string(),
+                    start_line: 3,
+                    end_line: 3,
+                }),
+                relevance: Some(score),
+                distance: None,
+            }]
+        };
+
+        let actual_a = ProjectContextInjection::<ProjectContextHarness>::render_context(
+            Path::new("/workspace"),
+            &fixture,
+            None,
+            setup_nodes(0.875),
+        )
+        .unwrap();
+        let actual_b = ProjectContextInjection::<ProjectContextHarness>::render_context(
+            Path::new("/workspace"),
+            &fixture,
+            None,
+            setup_nodes(0.500),
+        )
+        .unwrap();
+        let identity_a = actual_a
+            .stable_payload
+            .split("stable_identity=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        let identity_b = actual_b
+            .stable_payload
+            .split("stable_identity=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+
+        assert_ne!(actual_a.stable_payload, actual_b.stable_payload);
+        assert_ne!(identity_a, identity_b);
     }
 
     #[tokio::test]
