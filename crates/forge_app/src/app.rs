@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use chrono::Local;
@@ -64,6 +65,15 @@ pub(crate) fn build_template_config(config: &ForgeConfig) -> forge_domain::Templ
     }
 }
 
+const AUTOMATIC_CONTEXT_QUERY_EMBEDDING_TEXT_LIMIT: usize = 4096;
+
+fn bounded_semantic_embedding_query(query: &str) -> String {
+    query
+        .chars()
+        .take(AUTOMATIC_CONTEXT_QUERY_EMBEDDING_TEXT_LIMIT)
+        .collect()
+}
+
 struct ProjectContextTargetDiagnostic {
     target: ProjectContextTarget,
     diagnostic: WorkspaceContextManifestDiagnostic,
@@ -82,6 +92,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
     const MAX_INDEX_PROBES: usize = 32;
     const MAX_LEARNING_RECORDS: usize = 8;
     const MAX_LEARNING_CONTEXT_CHARS: usize = 8_192;
+    const SEMANTIC_EMBEDDING_TIMEOUT: Duration = Duration::from_secs(5);
 
     fn new(services: Arc<S>, agent: Agent) -> Self {
         Self { services, agent }
@@ -217,6 +228,15 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
         }
 
         let max_sources = ProjectModelContextRenderBudget::default().max_sources;
+        let config = self.services.get_config().ok();
+        let embedding_model_id = config
+            .as_ref()
+            .and_then(|config| config.semantic_embedding_model_id.clone())
+            .filter(|model_id| !model_id.trim().is_empty());
+        let semantic_top_k = config
+            .as_ref()
+            .map(|config| config.sem_search_top_k)
+            .filter(|top_k| *top_k > 0);
         let mut rendered_contexts = Vec::new();
         for target_diagnostic in targets {
             let target = target_diagnostic.target;
@@ -225,6 +245,17 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
             if let Some(path_filter) = target.path_filter.clone() {
                 params = params.starts_with(path_filter);
             }
+            if let Some(top_k) = semantic_top_k {
+                params = params.top_k(top_k as u32);
+            }
+            let (params, semantic_diagnostic) = self
+                .semantic_params_for_target(
+                    &target.workspace_root,
+                    &query,
+                    params,
+                    embedding_model_id.clone(),
+                )
+                .await;
             let nodes = match self
                 .services
                 .query_workspace(target.workspace_root.clone(), params)
@@ -247,6 +278,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
                     .diagnostic
                     .evidence_ledger_activation
                     .as_ref(),
+                semantic_diagnostic.as_deref(),
                 nodes,
             ));
         }
@@ -263,6 +295,150 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
             context = context.add_message(ContextMessage::Text(message));
         }
         conversation.context(context)
+    }
+
+    async fn semantic_params_for_target<'a>(
+        &self,
+        workspace_root: &Path,
+        query: &'a str,
+        params: SearchParams<'a>,
+        embedding_model_id: Option<String>,
+    ) -> (SearchParams<'a>, Option<String>) {
+        let readiness = match self
+            .services
+            .semantic_injection_readiness(workspace_root.to_path_buf(), embedding_model_id.clone())
+            .await
+        {
+            Ok(readiness) => readiness,
+            Err(error) => {
+                tracing::debug!(error = ?error, path = %workspace_root.display(), "Automatic semantic project-context readiness check failed; using lexical fallback");
+                return (
+                    params,
+                    Some("semantic_vector_state=VectorIndexCorruptOrNotReady".to_string()),
+                );
+            }
+        };
+        match readiness {
+            WorkspaceSemanticInjectionReadiness::SemanticDisabledNoModelConfig
+            | WorkspaceSemanticInjectionReadiness::VectorIndexAbsentOrNoMatch => (params, None),
+            WorkspaceSemanticInjectionReadiness::VectorIndexReady { dimension } => {
+                let Some(embedding_model_id) = embedding_model_id else {
+                    return (params, None);
+                };
+                let output = match tokio::time::timeout(
+                    Self::SEMANTIC_EMBEDDING_TIMEOUT,
+                    self.services.embed_workspace_query(
+                        bounded_semantic_embedding_query(query),
+                        embedding_model_id.clone(),
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(output)) => output,
+                    Ok(Err(error)) => {
+                        tracing::debug!(error = ?error, path = %workspace_root.display(), "Automatic semantic project-context embedding failed; using lexical fallback");
+                        return (
+                            params,
+                            Some(
+                                "semantic_vector_state=EmbeddingProviderUnavailable lexical_fallback=true"
+                                    .to_string(),
+                            ),
+                        );
+                    }
+                    Err(_elapsed) => {
+                        tracing::debug!(path = %workspace_root.display(), timeout_ms = Self::SEMANTIC_EMBEDDING_TIMEOUT.as_millis(), "Automatic semantic project-context embedding timed out; using lexical fallback");
+                        return (
+                            params,
+                            Some(
+                                "semantic_vector_state=EmbeddingProviderTimeout lexical_fallback=true"
+                                    .to_string(),
+                            ),
+                        );
+                    }
+                };
+                let Some(vector) = output.vectors.into_iter().next() else {
+                    return (
+                        params,
+                        Some(
+                            "semantic_vector_state=EmbeddingProviderUnavailable lexical_fallback=true"
+                                .to_string(),
+                        ),
+                    );
+                };
+                if output.embedding_model_id != embedding_model_id {
+                    return (
+                        params,
+                        Some(
+                            "semantic_vector_state=EmbeddingProviderUnavailable lexical_fallback=true"
+                                .to_string(),
+                        ),
+                    );
+                }
+                if vector.embedding.len() != dimension {
+                    tracing::debug!(expected = dimension, actual = vector.embedding.len(), path = %workspace_root.display(), "Automatic semantic project-context embedding dimension mismatched durable vector index; using lexical fallback");
+                    return (
+                        params,
+                        Some(format!(
+                            "semantic_vector_state=VectorDimensionMismatch expected={} actual={} lexical_fallback=true",
+                            dimension,
+                            vector.embedding.len()
+                        )),
+                    );
+                }
+                (
+                    params
+                        .query_embedding(vector.embedding)
+                        .embedding_model_id(embedding_model_id),
+                    None,
+                )
+            }
+            WorkspaceSemanticInjectionReadiness::VectorIndexAmbiguous
+            | WorkspaceSemanticInjectionReadiness::VectorIndexCorruptOrNotReady
+            | WorkspaceSemanticInjectionReadiness::VectorDimensionMismatch { .. } => {
+                let diagnostic = Self::semantic_invalid_diagnostic(readiness);
+                tracing::debug!(diagnostic = %diagnostic, path = %workspace_root.display(), "Automatic semantic project-context disabled because vector state is invalid; using lexical fallback");
+                (params, Some(diagnostic))
+            }
+            WorkspaceSemanticInjectionReadiness::EmbeddingProviderUnavailable
+            | WorkspaceSemanticInjectionReadiness::EmbeddingProviderTimeout => {
+                let diagnostic = Self::semantic_invalid_diagnostic(readiness);
+                tracing::debug!(diagnostic = %diagnostic, path = %workspace_root.display(), "Automatic semantic project-context provider unavailable; using lexical fallback");
+                (params, Some(diagnostic))
+            }
+        }
+    }
+
+    fn semantic_invalid_diagnostic(readiness: WorkspaceSemanticInjectionReadiness) -> String {
+        match readiness {
+            WorkspaceSemanticInjectionReadiness::SemanticDisabledNoModelConfig => {
+                "semantic_vector_state=SemanticDisabledNoModelConfig".to_string()
+            }
+            WorkspaceSemanticInjectionReadiness::VectorIndexAbsentOrNoMatch => {
+                "semantic_vector_state=VectorIndexAbsentOrNoMatch".to_string()
+            }
+            WorkspaceSemanticInjectionReadiness::VectorIndexReady { dimension } => {
+                format!("semantic_vector_state=VectorIndexReady dimension={dimension}")
+            }
+            WorkspaceSemanticInjectionReadiness::VectorIndexAmbiguous => {
+                "semantic_vector_state=VectorIndexAmbiguous lexical_fallback=true".to_string()
+            }
+            WorkspaceSemanticInjectionReadiness::VectorIndexCorruptOrNotReady => {
+                "semantic_vector_state=VectorIndexCorruptOrNotReady lexical_fallback=true"
+                    .to_string()
+            }
+            WorkspaceSemanticInjectionReadiness::VectorDimensionMismatch { expected, actual } => {
+                format!(
+                    "semantic_vector_state=VectorDimensionMismatch expected={expected} actual={actual} lexical_fallback=true"
+                )
+            }
+            WorkspaceSemanticInjectionReadiness::EmbeddingProviderUnavailable => {
+                "semantic_vector_state=EmbeddingProviderUnavailable lexical_fallback=true"
+                    .to_string()
+            }
+            WorkspaceSemanticInjectionReadiness::EmbeddingProviderTimeout => {
+                "semantic_vector_state=EmbeddingProviderTimeout lexical_fallback=true".to_string()
+            }
+        }
     }
 
     async fn explain(&self, query: Option<String>) -> WorkspaceContextExplanation {
@@ -758,6 +934,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
         exact_fact_readiness: Option<&WorkspaceExactFactReadinessDiagnostic>,
         evidence_readiness: Option<&WorkspaceEvidenceReadinessDiagnostic>,
         evidence_ledger_activation: Option<&WorkspaceEvidenceLedgerActivationDiagnostic>,
+        semantic_diagnostic: Option<&str>,
         nodes: Vec<Node>,
     ) -> String {
         let manifest_path = local_project_model_manifest(workspace_root);
@@ -775,7 +952,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
             evidence_readiness,
             evidence_ledger_activation,
         };
-        render_project_model_context(
+        let rendered = render_project_model_context(
             &workspace_root.display().to_string(),
             &manifest_path.display().to_string(),
             "local_manifest_available",
@@ -783,7 +960,11 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
             Some(&readiness),
             &sources,
             &ProjectModelContextRenderBudget::default(),
-        )
+        );
+        match semantic_diagnostic {
+            Some(diagnostic) => format!("{rendered}\n<!-- {diagnostic} -->"),
+            None => rendered,
+        }
     }
 
     fn exact_fact_readiness_metadata(
@@ -1379,7 +1560,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use anyhow::Result;
     use forge_domain::{
@@ -1390,10 +1571,11 @@ mod tests {
         LearningLedgerAppendOutcome, LearningLedgerEvent, LearningLedgerFreshness,
         LearningProvenance, LearningRecordId, LearningRecordProjection, LearningRedactionStatus,
         LearningReviewState, McpConfig, McpServers, Model, ModelId, Node, NodeData, NodeId,
-        PermissionOperation, Provider, ProviderId, ProviderType, ResultStream, Scope, SearchParams,
-        SteerMessage, SyncProgress, ToolCallContext, ToolCallFull, ToolOutput, ToolResult,
-        WorkspaceAuth, WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
-        WorkspaceEvidenceReadinessDiagnostic, WorkspaceId, WorkspaceInfo,
+        PermissionOperation, ProjectSemanticEmbeddingVector, Provider, ProviderId, ProviderType,
+        ResultStream, Scope, SearchParams, SteerMessage, SyncProgress, ToolCallContext,
+        ToolCallFull, ToolOutput, ToolResult, WorkspaceAuth, WorkspaceContextFreshness,
+        WorkspaceContextManifestDiagnostic, WorkspaceEvidenceReadinessDiagnostic, WorkspaceId,
+        WorkspaceInfo, WorkspaceSemanticInjectionReadiness,
     };
     use futures::StreamExt;
     use pretty_assertions::assert_eq;
@@ -2067,6 +2249,14 @@ mod tests {
             anyhow::bail!("unused workspace query embedding")
         }
 
+        async fn semantic_injection_readiness(
+            &self,
+            _path: PathBuf,
+            _embedding_model_id: Option<String>,
+        ) -> Result<WorkspaceSemanticInjectionReadiness> {
+            Ok(WorkspaceSemanticInjectionReadiness::VectorIndexAbsentOrNoMatch)
+        }
+
         async fn query_workspace(
             &self,
             _path: PathBuf,
@@ -2498,9 +2688,17 @@ mod tests {
         workspace_queries: AtomicUsize,
         queried_workspaces: Mutex<Vec<PathBuf>>,
         query_filters: Mutex<Vec<Option<String>>>,
+        query_embeddings: Mutex<Vec<Option<Vec<f32>>>>,
         index_checks: AtomicUsize,
         learning_records: Mutex<Vec<LearningRecordProjection>>,
         learning_freshness: LearningLedgerFreshness,
+        config: ForgeConfig,
+        semantic_readiness: Mutex<HashMap<PathBuf, WorkspaceSemanticInjectionReadiness>>,
+        embedding_calls: AtomicUsize,
+        embedding_inputs: Mutex<Vec<String>>,
+        embedding_failure: AtomicBool,
+        embedding_pending: AtomicBool,
+        embedding_dimension: AtomicUsize,
     }
 
     impl ProjectContextHarness {
@@ -2604,6 +2802,8 @@ mod tests {
             inactive_exact_fact_paths: Vec<PathBuf>,
             replay_preview_empty_paths: Vec<PathBuf>,
         ) -> Arc<Self> {
+            let mut config = ForgeConfig::default();
+            config.semantic_embedding_model_id = Some("fixture-embedding-model".to_string());
             Arc::new(Self {
                 cwd,
                 empty_paths,
@@ -2616,6 +2816,7 @@ mod tests {
                 workspace_queries: AtomicUsize::new(0),
                 queried_workspaces: Mutex::new(Vec::new()),
                 query_filters: Mutex::new(Vec::new()),
+                query_embeddings: Mutex::new(Vec::new()),
                 index_checks: AtomicUsize::new(0),
                 learning_records: Mutex::new(Vec::new()),
                 learning_freshness: LearningLedgerFreshness {
@@ -2623,11 +2824,39 @@ mod tests {
                     projection_version: 1,
                     review_state_fingerprint: "fixture-learning".to_string(),
                 },
+                config,
+                semantic_readiness: Mutex::new(HashMap::new()),
+                embedding_calls: AtomicUsize::new(0),
+                embedding_inputs: Mutex::new(Vec::new()),
+                embedding_failure: AtomicBool::new(false),
+                embedding_pending: AtomicBool::new(false),
+                embedding_dimension: AtomicUsize::new(2),
             })
         }
 
         async fn set_learning_records(&self, records: Vec<LearningRecordProjection>) {
             *self.learning_records.lock().await = records;
+        }
+
+        async fn set_semantic_readiness(
+            &self,
+            path: PathBuf,
+            readiness: WorkspaceSemanticInjectionReadiness,
+        ) {
+            let path = fs::canonicalize(&path).unwrap_or(path);
+            self.semantic_readiness.lock().await.insert(path, readiness);
+        }
+
+        fn fail_embedding(&self) {
+            self.embedding_failure.store(true, Ordering::SeqCst);
+        }
+
+        fn pending_embedding(&self) {
+            self.embedding_pending.store(true, Ordering::SeqCst);
+        }
+
+        fn set_embedding_dimension(&self, dimension: usize) {
+            self.embedding_dimension.store(dimension, Ordering::SeqCst);
         }
     }
 
@@ -2653,7 +2882,7 @@ mod tests {
         }
 
         fn get_config(&self) -> Result<Self::Config> {
-            Ok(ForgeConfig::default())
+            Ok(self.config.clone())
         }
 
         async fn update_environment(&self, _ops: Vec<forge_domain::ConfigOperation>) -> Result<()> {
@@ -2856,10 +3085,47 @@ mod tests {
 
         async fn embed_workspace_query(
             &self,
-            _query: String,
-            _embedding_model_id: String,
+            query: String,
+            embedding_model_id: String,
         ) -> Result<ProjectSemanticEmbeddingOutput> {
-            anyhow::bail!("unused workspace query embedding")
+            self.embedding_calls.fetch_add(1, Ordering::SeqCst);
+            self.embedding_inputs.lock().await.push(query);
+            if self.embedding_pending.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            if self.embedding_failure.load(Ordering::SeqCst) {
+                anyhow::bail!("fixture embedding provider unavailable")
+            }
+            let dimension = self.embedding_dimension.load(Ordering::SeqCst);
+            Ok(ProjectSemanticEmbeddingOutput {
+                embedding_model_id,
+                dimension,
+                vectors: vec![ProjectSemanticEmbeddingVector {
+                    source_id: "query".to_string(),
+                    source_fingerprint: "query".to_string(),
+                    embedding: vec![1.0; dimension],
+                }],
+            })
+        }
+
+        async fn semantic_injection_readiness(
+            &self,
+            path: PathBuf,
+            embedding_model_id: Option<String>,
+        ) -> Result<WorkspaceSemanticInjectionReadiness> {
+            if embedding_model_id.is_none() {
+                return Ok(WorkspaceSemanticInjectionReadiness::SemanticDisabledNoModelConfig);
+            }
+            let readiness = self.semantic_readiness.lock().await;
+            if let Some(readiness) = readiness.get(&path) {
+                return Ok(readiness.clone());
+            }
+            if let Ok(canonical_path) = fs::canonicalize(&path)
+                && let Some(readiness) = readiness.get(&canonical_path)
+            {
+                return Ok(readiness.clone());
+            }
+            Ok(WorkspaceSemanticInjectionReadiness::VectorIndexAbsentOrNoMatch)
         }
 
         async fn query_workspace(
@@ -2875,6 +3141,10 @@ mod tests {
                 .lock()
                 .await
                 .push(params.starts_with.clone());
+            self.query_embeddings
+                .lock()
+                .await
+                .push(params.query_embedding.clone());
             if self
                 .error_paths
                 .iter()
@@ -2888,6 +3158,19 @@ mod tests {
                 .any(|empty_path| empty_path == &path)
             {
                 return Ok(Vec::new());
+            }
+            if params.query_embedding.is_some() {
+                return Ok(vec![Node {
+                    node_id: NodeId::new("symbol:src/vector_only.rs:SemanticVectorOnlyHit"),
+                    node: NodeData::FileChunk(FileChunk {
+                        file_path: "src/vector_only.rs".to_string(),
+                        content: "pub struct SemanticVectorOnlyHit;".to_string(),
+                        start_line: 7,
+                        end_line: 7,
+                    }),
+                    relevance: Some(0.99),
+                    distance: None,
+                }]);
             }
             let file_path = params.starts_with.as_deref().unwrap_or("src/lib.rs");
             let long_content = (0..40)
@@ -3987,6 +4270,346 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn project_model_context_vector_ready_injects_vector_only_source() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root.clone());
+        setup
+            .set_semantic_readiness(
+                root.clone(),
+                WorkspaceSemanticInjectionReadiness::VectorIndexReady { dimension: 2 },
+            )
+            .await;
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let conversation =
+            Conversation::generate().context(Context::default().add_message(ContextMessage::user(
+                "find automatic injection needle lexicalmiss",
+                Some(model_id),
+            )));
+
+        let actual = ProjectContextInjection::new(setup.clone(), agent)
+            .inject(conversation)
+            .await;
+        let content = actual
+            .context
+            .unwrap()
+            .messages
+            .iter()
+            .filter_map(|message| message.content())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let expected = (1usize, vec![Some(vec![1.0, 1.0])], true, false);
+
+        assert_eq!(
+            (
+                setup.embedding_calls.load(Ordering::SeqCst),
+                setup.query_embeddings.lock().await.clone(),
+                content.contains("SemanticVectorOnlyHit"),
+                content.contains("automatic_injection_needle"),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_model_context_vector_ready_bounds_query_embedding_input() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root.clone());
+        setup
+            .set_semantic_readiness(
+                root.clone(),
+                WorkspaceSemanticInjectionReadiness::VectorIndexReady { dimension: 2 },
+            )
+            .await;
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let long_query = format!("find automatic injection needle {}", "x".repeat(10_000));
+        let conversation = Conversation::generate().context(
+            Context::default().add_message(ContextMessage::user(long_query, Some(model_id))),
+        );
+
+        let actual = ProjectContextInjection::new(setup.clone(), agent)
+            .inject(conversation)
+            .await;
+        let content = actual
+            .context
+            .unwrap()
+            .messages
+            .iter()
+            .filter_map(|message| message.content())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let embedding_inputs = setup.embedding_inputs.lock().await.clone();
+        let expected = (1usize, true, true);
+
+        assert_eq!(
+            (
+                embedding_inputs.len(),
+                embedding_inputs[0].chars().count() <= AUTOMATIC_CONTEXT_QUERY_EMBEDDING_TEXT_LIMIT,
+                content.contains("SemanticVectorOnlyHit"),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_model_context_no_vector_keeps_lexical_and_skips_embedding() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root);
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let conversation = Conversation::generate().context(Context::default().add_message(
+            ContextMessage::user("find automatic injection needle", Some(model_id)),
+        ));
+
+        let actual = ProjectContextInjection::new(setup.clone(), agent)
+            .inject(conversation)
+            .await;
+        let content = actual
+            .context
+            .unwrap()
+            .messages
+            .iter()
+            .filter_map(|message| message.content())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let expected = (0usize, vec![None], true);
+
+        assert_eq!(
+            (
+                setup.embedding_calls.load(Ordering::SeqCst),
+                setup.query_embeddings.lock().await.clone(),
+                content.contains("automatic_injection_needle"),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_model_context_invalid_vector_state_marks_diagnostic_and_uses_lexical()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root.clone());
+        setup
+            .set_semantic_readiness(
+                root.clone(),
+                WorkspaceSemanticInjectionReadiness::VectorIndexAmbiguous,
+            )
+            .await;
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let conversation = Conversation::generate().context(Context::default().add_message(
+            ContextMessage::user("find automatic injection needle", Some(model_id)),
+        ));
+
+        let actual = ProjectContextInjection::new(setup.clone(), agent)
+            .inject(conversation)
+            .await;
+        let content = actual
+            .context
+            .unwrap()
+            .messages
+            .iter()
+            .filter_map(|message| message.content())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let expected = (0usize, vec![None], true, true, false);
+
+        assert_eq!(
+            (
+                setup.embedding_calls.load(Ordering::SeqCst),
+                setup.query_embeddings.lock().await.clone(),
+                content.contains("automatic_injection_needle"),
+                content.contains("semantic_vector_state=VectorIndexAmbiguous"),
+                content.contains("SemanticVectorOnlyHit"),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_model_context_corrupt_vector_state_marks_diagnostic_and_uses_lexical()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root.clone());
+        setup
+            .set_semantic_readiness(
+                root.clone(),
+                WorkspaceSemanticInjectionReadiness::VectorIndexCorruptOrNotReady,
+            )
+            .await;
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let conversation = Conversation::generate().context(Context::default().add_message(
+            ContextMessage::user("find automatic injection needle", Some(model_id)),
+        ));
+
+        let actual = ProjectContextInjection::new(setup.clone(), agent)
+            .inject(conversation)
+            .await;
+        let content = actual
+            .context
+            .unwrap()
+            .messages
+            .iter()
+            .filter_map(|message| message.content())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let expected = (0usize, vec![None], true, true, false);
+
+        assert_eq!(
+            (
+                setup.embedding_calls.load(Ordering::SeqCst),
+                setup.query_embeddings.lock().await.clone(),
+                content.contains("automatic_injection_needle"),
+                content.contains("semantic_vector_state=VectorIndexCorruptOrNotReady"),
+                content.contains("SemanticVectorOnlyHit"),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn project_model_context_embedding_timeout_keeps_main_request_lexical() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root.clone());
+        setup.pending_embedding();
+        setup
+            .set_semantic_readiness(
+                root.clone(),
+                WorkspaceSemanticInjectionReadiness::VectorIndexReady { dimension: 2 },
+            )
+            .await;
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let conversation = Conversation::generate().context(Context::default().add_message(
+            ContextMessage::user("find automatic injection needle", Some(model_id)),
+        ));
+
+        let actual = ProjectContextInjection::new(setup.clone(), agent)
+            .inject(conversation)
+            .await;
+        let content = actual
+            .context
+            .unwrap()
+            .messages
+            .iter()
+            .filter_map(|message| message.content())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let expected = (1usize, vec![None], true, true);
+
+        assert_eq!(
+            (
+                setup.embedding_calls.load(Ordering::SeqCst),
+                setup.query_embeddings.lock().await.clone(),
+                content.contains("automatic_injection_needle"),
+                content.contains("semantic_vector_state=EmbeddingProviderTimeout"),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn project_model_context_embedding_failure_keeps_main_request_lexical() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root.clone());
+        setup.fail_embedding();
+        setup
+            .set_semantic_readiness(
+                root.clone(),
+                WorkspaceSemanticInjectionReadiness::VectorIndexReady { dimension: 2 },
+            )
+            .await;
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let conversation = Conversation::generate().context(Context::default().add_message(
+            ContextMessage::user("find automatic injection needle", Some(model_id)),
+        ));
+
+        let actual = ProjectContextInjection::new(setup.clone(), agent)
+            .inject(conversation)
+            .await;
+        let content = actual
+            .context
+            .unwrap()
+            .messages
+            .iter()
+            .filter_map(|message| message.content())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let expected = (1usize, vec![None], true, true);
+
+        assert_eq!(
+            (
+                setup.embedding_calls.load(Ordering::SeqCst),
+                setup.query_embeddings.lock().await.clone(),
+                content.contains("automatic_injection_needle"),
+                content.contains("semantic_vector_state=EmbeddingProviderUnavailable"),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_model_context_dimension_mismatch_disables_semantic_without_query_vector()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root.clone());
+        setup.set_embedding_dimension(3);
+        setup
+            .set_semantic_readiness(
+                root.clone(),
+                WorkspaceSemanticInjectionReadiness::VectorIndexReady { dimension: 2 },
+            )
+            .await;
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let conversation = Conversation::generate().context(Context::default().add_message(
+            ContextMessage::user("find automatic injection needle", Some(model_id)),
+        ));
+
+        let actual = ProjectContextInjection::new(setup.clone(), agent)
+            .inject(conversation)
+            .await;
+        let content = actual
+            .context
+            .unwrap()
+            .messages
+            .iter()
+            .filter_map(|message| message.content())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let expected = (1usize, vec![None], true, true);
+
+        assert_eq!(
+            (
+                setup.embedding_calls.load(Ordering::SeqCst),
+                setup.query_embeddings.lock().await.clone(),
+                content.contains("automatic_injection_needle"),
+                content.contains("semantic_vector_state=VectorDimensionMismatch"),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn project_model_context_semantic_diagnostic_does_not_activate_reranker_config() {
+        let actual = ProjectContextInjection::<ProjectContextHarness>::semantic_invalid_diagnostic(
+            WorkspaceSemanticInjectionReadiness::VectorIndexAmbiguous,
+        );
+        let expected = false;
+
+        assert_eq!(actual.contains("reranker"), expected);
+    }
     #[tokio::test]
     async fn project_model_context_does_not_inject_stale_manifest() -> Result<()> {
         let (_fixture, root) = fixture_workspace()?;

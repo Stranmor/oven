@@ -16,7 +16,8 @@ use forge_domain::{
     SyntaxError, Template, ToolCallFull, ToolOutput, WorkspaceAuth,
     WorkspaceContextManifestDiagnostic, WorkspaceEvidenceReplayDiagnostic,
     WorkspaceEvidenceReplayPreviewDiagnostic, WorkspaceExactFactReferenceReport,
-    WorkspaceExactFactStatusReport, WorkspaceId, WorkspaceInfo, WorkspaceVectorIndexBuildReport,
+    WorkspaceExactFactStatusReport, WorkspaceId, WorkspaceInfo,
+    WorkspaceSemanticInjectionReadiness, WorkspaceVectorIndexBuildReport,
 };
 use forge_eventsource::EventSource;
 use reqwest::Response;
@@ -715,6 +716,13 @@ pub trait WorkspaceService: Send + Sync {
         query: String,
         embedding_model_id: String,
     ) -> anyhow::Result<ProjectSemanticEmbeddingOutput>;
+
+    /// Checks durable-vector readiness for automatic semantic context injection.
+    async fn semantic_injection_readiness(
+        &self,
+        path: PathBuf,
+        embedding_model_id: Option<String>,
+    ) -> anyhow::Result<WorkspaceSemanticInjectionReadiness>;
 
     /// Query the indexed workspace with semantic search
     async fn query_workspace(
@@ -1797,6 +1805,16 @@ impl<I: Services> WorkspaceService for I {
             .await
     }
 
+    async fn semantic_injection_readiness(
+        &self,
+        path: PathBuf,
+        embedding_model_id: Option<String>,
+    ) -> anyhow::Result<WorkspaceSemanticInjectionReadiness> {
+        self.workspace_service()
+            .semantic_injection_readiness(path, embedding_model_id)
+            .await
+    }
+
     async fn query_workspace(
         &self,
         path: PathBuf,
@@ -2525,6 +2543,14 @@ mod tests {
             _query: String,
             _embedding_model_id: String,
         ) -> anyhow::Result<ProjectSemanticEmbeddingOutput> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn semantic_injection_readiness(
+            &self,
+            _path: PathBuf,
+            _embedding_model_id: Option<String>,
+        ) -> anyhow::Result<WorkspaceSemanticInjectionReadiness> {
             anyhow::bail!("unused workspace service")
         }
 

@@ -20,7 +20,8 @@ use forge_domain::{
     WorkspaceExactFactIngestionSummary, WorkspaceExactFactIssue,
     WorkspaceExactFactReadinessDiagnostic, WorkspaceExactFactReferenceReport,
     WorkspaceExactFactReferenceStatus, WorkspaceExactFactStatusReport, WorkspaceId,
-    WorkspaceIndexRepository, WorkspaceVectorIndexBuildReport, WorkspaceVectorIndexBuildStatus,
+    WorkspaceIndexRepository, WorkspaceSemanticInjectionReadiness, WorkspaceVectorIndexBuildReport,
+    WorkspaceVectorIndexBuildStatus,
 };
 use forge_project_model::{
     ContextPackArtifactId, EvidenceFreshness, EvidenceLedgerReplayReport,
@@ -1007,6 +1008,63 @@ impl<
         validate_embedding_output(&request, output).map_err(anyhow::Error::from)
     }
 
+    fn semantic_injection_readiness_for_model(
+        &self,
+        path: PathBuf,
+        embedding_model_id: Option<&str>,
+    ) -> Result<WorkspaceSemanticInjectionReadiness> {
+        let Some(embedding_model_id) =
+            embedding_model_id.filter(|model_id| !model_id.trim().is_empty())
+        else {
+            return Ok(WorkspaceSemanticInjectionReadiness::SemanticDisabledNoModelConfig);
+        };
+        let root = canonicalize_path(path)?;
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+        let manifest = indexer.read_manifest()?;
+        Ok(Self::semantic_injection_readiness_from_indexer(
+            &indexer,
+            &manifest,
+            embedding_model_id,
+        ))
+    }
+
+    fn semantic_injection_readiness_from_indexer(
+        indexer: &ProjectIndexer,
+        manifest: &forge_project_model::ProjectManifest,
+        embedding_model_id: &str,
+    ) -> WorkspaceSemanticInjectionReadiness {
+        let Ok(ids) = indexer.list_vector_indexes() else {
+            return WorkspaceSemanticInjectionReadiness::VectorIndexCorruptOrNotReady;
+        };
+        let mut matching_dimensions = Vec::new();
+        for id in ids {
+            let artifact = match indexer.read_vector_index(manifest, &id) {
+                Ok(artifact) => artifact,
+                Err(_error) => {
+                    return WorkspaceSemanticInjectionReadiness::VectorIndexCorruptOrNotReady;
+                }
+            };
+            if artifact.manifest_hash == manifest.manifest_hash
+                && artifact.embedding_model_id == embedding_model_id
+            {
+                let dimension = artifact.dimension;
+                match forge_project_model::DurableVectorIndex::new(manifest, artifact) {
+                    Ok(_index) => matching_dimensions.push(dimension),
+                    Err(_error) => {
+                        return WorkspaceSemanticInjectionReadiness::VectorIndexCorruptOrNotReady;
+                    }
+                }
+            }
+        }
+        match matching_dimensions.as_slice() {
+            [] => WorkspaceSemanticInjectionReadiness::VectorIndexAbsentOrNoMatch,
+            [dimension] => {
+                WorkspaceSemanticInjectionReadiness::VectorIndexReady { dimension: *dimension }
+            }
+            _ => WorkspaceSemanticInjectionReadiness::VectorIndexAmbiguous,
+        }
+    }
+
     async fn query_local_workspace(
         &self,
         path: PathBuf,
@@ -1867,6 +1925,14 @@ impl<
         let provider = OpenAiCompatibleProjectSemanticEmbeddingProvider::default();
         self.embed_workspace_query_with_provider(&query, embedding_model_id, &provider)
             .await
+    }
+
+    async fn semantic_injection_readiness(
+        &self,
+        path: PathBuf,
+        embedding_model_id: Option<String>,
+    ) -> Result<WorkspaceSemanticInjectionReadiness> {
+        self.semantic_injection_readiness_for_model(path, embedding_model_id.as_deref())
     }
 
     /// Performs semantic code search on a workspace.
@@ -3505,6 +3571,81 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn semantic_injection_readiness_classifies_ready_absent_ambiguous_and_corrupt_vectors()
+    -> Result<()> {
+        let (_ready_fixture, ready_root) = fixture_workspace()?;
+        write_fixture_project_model(&ready_root)?;
+        write_fixture_vector_index(&ready_root, "fixture-model", "RuntimeNeedle")?;
+        let ready_setup = fixture_sync_service(&ready_root);
+
+        let (_absent_fixture, absent_root) = fixture_workspace()?;
+        write_fixture_project_model(&absent_root)?;
+        let absent_setup = fixture_sync_service(&absent_root);
+
+        let (_ambiguous_fixture, ambiguous_root) = fixture_workspace()?;
+        write_fixture_project_model(&ambiguous_root)?;
+        write_fixture_vector_index(&ambiguous_root, "fixture-model", "RuntimeNeedle")?;
+        write_fixture_vector_index(&ambiguous_root, "fixture-model", "build_runtime_needle")?;
+        let ambiguous_setup = fixture_sync_service(&ambiguous_root);
+
+        let (_corrupt_fixture, corrupt_root) = fixture_workspace()?;
+        write_fixture_project_model(&corrupt_root)?;
+        let vector_dir = local_project_model_dir(&corrupt_root).join("vector_indexes");
+        fs::create_dir_all(&vector_dir)?;
+        fs::write(vector_dir.join(format!("{}.json", "f".repeat(64))), "{")?;
+        let corrupt_setup = fixture_sync_service(&corrupt_root);
+
+        let actual = (
+            WorkspaceService::semantic_injection_readiness(
+                &ready_setup,
+                ready_root,
+                Some("fixture-model".to_string()),
+            )
+            .await?,
+            WorkspaceService::semantic_injection_readiness(
+                &absent_setup,
+                absent_root,
+                Some("fixture-model".to_string()),
+            )
+            .await?,
+            WorkspaceService::semantic_injection_readiness(
+                &ambiguous_setup,
+                ambiguous_root,
+                Some("fixture-model".to_string()),
+            )
+            .await?,
+            WorkspaceService::semantic_injection_readiness(
+                &corrupt_setup,
+                corrupt_root,
+                Some("fixture-model".to_string()),
+            )
+            .await?,
+        );
+        let expected = (
+            WorkspaceSemanticInjectionReadiness::VectorIndexReady { dimension: 2 },
+            WorkspaceSemanticInjectionReadiness::VectorIndexAbsentOrNoMatch,
+            WorkspaceSemanticInjectionReadiness::VectorIndexAmbiguous,
+            WorkspaceSemanticInjectionReadiness::VectorIndexCorruptOrNotReady,
+        );
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn semantic_injection_readiness_without_model_config_is_disabled_without_vector_scan()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let setup = fixture_sync_service(&root);
+
+        let actual = WorkspaceService::semantic_injection_readiness(&setup, root, None).await?;
+        let expected = WorkspaceSemanticInjectionReadiness::SemanticDisabledNoModelConfig;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
     #[tokio::test]
     async fn query_workspace_uses_injected_query_vector_and_durable_index_for_lexical_miss()
     -> Result<()> {

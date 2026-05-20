@@ -503,7 +503,7 @@ mod tests {
         SyncProgress, ToolCallContext, ToolCallFull, WorkspaceAuth, WorkspaceContextFreshness,
         WorkspaceContextManifestDiagnostic, WorkspaceEvidenceReplayDiagnostic,
         WorkspaceEvidenceReplayPreviewDiagnostic, WorkspaceExactFactStatusReport, WorkspaceId,
-        WorkspaceInfo, WorkspaceVectorIndexBuildReport,
+        WorkspaceInfo, WorkspaceSemanticInjectionReadiness, WorkspaceVectorIndexBuildReport,
     };
     use pretty_assertions::assert_eq;
     use tokio::sync::Mutex;
@@ -659,6 +659,14 @@ mod tests {
                     embedding: vec![1.0, 0.0],
                 }],
             })
+        }
+
+        async fn semantic_injection_readiness(
+            &self,
+            _path: PathBuf,
+            _embedding_model_id: Option<String>,
+        ) -> anyhow::Result<WorkspaceSemanticInjectionReadiness> {
+            Ok(WorkspaceSemanticInjectionReadiness::VectorIndexReady { dimension: 2 })
         }
 
         async fn query_workspace(

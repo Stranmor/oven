@@ -47,6 +47,35 @@ pub struct ProjectSemanticEmbeddingOutput {
     pub vectors: Vec<ProjectSemanticEmbeddingVector>,
 }
 
+/// Typed readiness classification for automatic semantic project-context injection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceSemanticInjectionReadiness {
+    /// Semantic injection is disabled because no embedding model is configured.
+    SemanticDisabledNoModelConfig,
+    /// No durable vector index matches the current manifest and embedding model.
+    VectorIndexAbsentOrNoMatch,
+    /// Exactly one durable vector index matches the current manifest and embedding model.
+    VectorIndexReady {
+        /// Fixed vector dimension expected by the durable index.
+        dimension: usize,
+    },
+    /// More than one durable vector index matches, so no random artifact may be selected.
+    VectorIndexAmbiguous,
+    /// Vector artifact state is corrupt or structurally not ready.
+    VectorIndexCorruptOrNotReady,
+    /// Query embedding dimension is incompatible with the selected durable vector index.
+    VectorDimensionMismatch {
+        /// Durable index dimension.
+        expected: usize,
+        /// Query vector dimension.
+        actual: usize,
+    },
+    /// Embedding provider was unavailable during the bounded semantic attempt.
+    EmbeddingProviderUnavailable,
+    /// Embedding provider timed out during the bounded semantic attempt.
+    EmbeddingProviderTimeout,
+}
+
 /// Stable status for explicit workspace vector-index production.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkspaceVectorIndexBuildStatus {
