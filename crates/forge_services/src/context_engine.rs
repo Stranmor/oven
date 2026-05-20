@@ -27,24 +27,24 @@ use forge_domain::{
     WorkspaceVectorIndexBuildStatus,
 };
 use forge_project_model::{
-    ContextPackArtifactId, EvidenceFreshness, EvidenceLedgerReplayReport,
-    EvidenceReadinessDiagnostic, EvidenceReplayContentPolicy, EvidenceReplayFreshnessPolicy,
-    EvidenceReplayIssueCode, EvidenceReplayScoreKind, ExternalFactArtifactIngestionReport,
-    ExternalFactIngestionIssue, ExternalFactProductionReport, ExternalFactProductionRequest,
-    ExternalFactProductionStatus, NativeLspReferenceProducer, NativeLspReferenceRequest,
-    NativeLspReferenceRequestDerivation, ProjectContextIntegrationIdentity,
-    ProjectContextPathScope, ProjectContextRerankerBoundary, ProjectContextRerankerReadiness,
+    EvidenceFreshness, EvidenceLedgerReplayReport, EvidenceReadinessDiagnostic,
+    EvidenceReplayContentPolicy, EvidenceReplayFreshnessPolicy, EvidenceReplayIssueCode,
+    EvidenceReplayScoreKind, ExternalFactArtifactIngestionReport, ExternalFactIngestionIssue,
+    ExternalFactProductionReport, ExternalFactProductionRequest, ExternalFactProductionStatus,
+    NativeLspReferenceProducer, NativeLspReferenceRequest, NativeLspReferenceRequestDerivation,
+    ProjectContextIntegrationIdentity, ProjectContextPackCommit, ProjectContextPackPersistedProof,
+    ProjectContextPackReadbackDecision, ProjectContextPathScope, ProjectContextReadbackOutcome,
+    ProjectContextRerankerBoundary, ProjectContextRerankerReadiness,
     ProjectContextRerankerUnavailableReason, ProjectContextRetrievalOptions,
     ProjectContextRetrievalPhaseStatus, ProjectContextRetrievalPlanningOutcome,
     ProjectContextRetrievalRequest, ProjectContextVectorIndexBoundary,
-    ProjectContextVectorReadiness, ProjectContextVectorUnavailableReason,
-    ProjectContextWriteDecision, ProjectIndexer, ProjectModelContextRenderBudget, Provenance,
+    ProjectContextVectorReadiness, ProjectContextVectorUnavailableReason, ProjectIndexer,
+    ProjectModelContextRenderBudget, ProjectModelSearchEpisodeInput, ReadRequestsSelected,
     ReplayActivationCaps, ReplayActivationRequest, RustAnalyzerBounds, RustAnalyzerCapability,
     RustAnalyzerCapabilityProbe, RustAnalyzerCapabilityStatus, RustAnalyzerProbe,
-    StdRustAnalyzerProcess, ToolEpisode, VectorIndexArtifact, VectorIndexArtifactId,
-    VectorIndexEntry, VectorQuery, activate_evidence_ledger_replay, apply_replay_readback_results,
-    derive_native_lsp_reference_request, fingerprint, load_evidence_ledger_activation,
-    local_project_model_dir, local_project_model_manifest,
+    StdRustAnalyzerProcess, VectorIndexArtifact, VectorIndexArtifactId, VectorIndexEntry,
+    VectorQuery, activate_evidence_ledger_replay, derive_native_lsp_reference_request, fingerprint,
+    load_evidence_ledger_activation, local_project_model_dir, local_project_model_manifest,
     plan_project_context_retrieval_with_options, read_exact_fact_status,
     redaction_safe_issue_path_label, redaction_safe_provenance_source_label,
     redaction_safe_replay_path_label, render_project_model_context,
@@ -58,9 +58,6 @@ use tracing::info;
 use crate::fd::FileDiscovery;
 use crate::sync::{WorkspaceSyncEngine, canonicalize_path};
 
-const PROJECT_MODEL_SEARCH_TOOL: &str = "project_model_search";
-const PROJECT_MODEL_SEARCH_SUCCESS: &str = "success";
-const PROJECT_MODEL_SEARCH_PROVENANCE_SOURCE: &str = "WorkspaceService::query_workspace";
 const EXACT_FACT_READINESS_MAX_ISSUES: usize = 8;
 const PREVIEW_MANIFEST_MISSING_REASON: &str = "manifest_missing";
 const PREVIEW_MANIFEST_READ_ERROR_REASON: &str = "manifest_read_error";
@@ -1334,7 +1331,7 @@ impl<
         let plan = match plan_project_context_retrieval_with_options(
             &manifest,
             &freshness,
-            request.clone(),
+            request,
             ProjectContextRetrievalOptions {
                 vector_query: semantic_query.as_ref(),
                 vector_index: durable_vector_selection.boundary(),
@@ -1365,18 +1362,14 @@ impl<
                 reason
             );
         }
-        let replay_evidence_ids = pending_replay_activation
-            .active_refs
-            .iter()
-            .map(|reference| reference.canonical_target_id.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        let plan_has_replay_evidence = plan
-            .selected_results
-            .iter()
-            .any(|result| replay_evidence_ids.contains(&result.id));
-        let mut replay_readback_results = BTreeMap::new();
+        let commit = ProjectContextPackCommit::<ReadRequestsSelected>::from_retrieval_plan(
+            &plan,
+            pending_replay_activation,
+        )?;
+        let mut readback_outcomes = Vec::new();
+        let mut first_readback_error = None;
         let mut nodes = Vec::new();
-        for read_request in &plan.read_requests {
+        for read_request in commit.read_requests() {
             let absolute_path = root.join(read_request.relative_manifest_path());
             match self
                 .infra
@@ -1388,9 +1381,7 @@ impl<
                 .await
             {
                 Ok((content, _)) => {
-                    if replay_evidence_ids.contains(&read_request.evidence_id) {
-                        replay_readback_results.insert(read_request.evidence_id.clone(), true);
-                    }
+                    readback_outcomes.push(ProjectContextReadbackOutcome::succeeded(read_request));
                     nodes.push(Node {
                         node_id: NodeId::new(read_request.evidence_id.clone()),
                         node: NodeData::FileChunk(FileChunk {
@@ -1407,65 +1398,62 @@ impl<
                         distance: None,
                     });
                 }
-                Err(error) if replay_evidence_ids.contains(&read_request.evidence_id) => {
-                    replay_readback_results.insert(read_request.evidence_id.clone(), false);
+                Err(error) => {
+                    readback_outcomes.push(ProjectContextReadbackOutcome::failed(read_request));
                     info!(
                         path = %absolute_path.display(),
                         evidence_id = %read_request.evidence_id,
                         error = %error,
-                        "excluded replay evidence after failed readback"
+                        "project-model evidence readback failed"
                     );
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| format!("read {}", absolute_path.display()));
+                    if first_readback_error.is_none() {
+                        first_readback_error =
+                            Some(error.context(format!("read {}", absolute_path.display())));
+                    }
                 }
             }
         }
-        let verified_replay_activation =
-            apply_replay_readback_results(&pending_replay_activation, &replay_readback_results);
-        let write_plan = if plan_has_replay_evidence {
-            match plan_project_context_retrieval_with_options(
-                &manifest,
-                &freshness,
-                request,
-                ProjectContextRetrievalOptions {
-                    vector_query: semantic_query.as_ref(),
-                    vector_index: durable_vector_selection.boundary(),
-                    reranker: self.select_project_context_reranker_boundary(),
-                    vector_unavailable_reason: durable_vector_selection.unavailable_reason(),
-                    exact_fact_status: exact_fact_status.as_ref(),
-                    replay_activation: Some(&verified_replay_activation),
-                },
-            ) {
-                ProjectContextRetrievalPlanningOutcome::Plan(write_plan) => write_plan,
-                ProjectContextRetrievalPlanningOutcome::Refusal(refusal) => {
-                    anyhow::bail!(
-                        "Workspace project model retrieval refused after replay readback at {} for {}: {}",
-                        manifest_path.display(),
-                        root.display(),
-                        refusal.detail
-                    );
+        match commit.verify_readbacks(readback_outcomes)? {
+            ProjectContextPackReadbackDecision::NoWrite(no_write) => {
+                if matches!(
+                    no_write.reason(),
+                    forge_project_model::ProjectContextPackNoWriteReason::RequiredReadbackFailed
+                ) {
+                    return Err(first_readback_error.unwrap_or_else(|| {
+                        anyhow::anyhow!("project-model required evidence readback failed")
+                    }));
                 }
             }
-        } else {
-            plan.clone()
-        };
-        if write_plan.write_decision == ProjectContextWriteDecision::WriteContextPackAfterReadback {
-            let pack = write_plan
-                .context_pack
-                .as_ref()
-                .context("project-model retrieval plan requested write without context pack")?;
-            let _artifact_path = indexer.write_context_pack(pack)?;
-            let artifact_id = indexer.context_pack_artifact_id(pack)?;
-            let episode = project_model_search_episode(
-                &params,
-                &manifest.manifest_hash,
-                &artifact_id,
-                &nodes,
-            );
-            indexer
-                .append_episode(&episode)
-                .context("append project-model search episode")?;
+            ProjectContextPackReadbackDecision::Write(verified_commit) => {
+                let write_instruction = verified_commit.write_instruction();
+                let artifact_path = indexer.write_context_pack(write_instruction.context_pack())?;
+                let artifact_id =
+                    indexer.context_pack_artifact_id(write_instruction.context_pack())?;
+                let proof = ProjectContextPackPersistedProof::new(
+                    artifact_id,
+                    artifact_path.display().to_string(),
+                    write_instruction.context_pack(),
+                );
+                let node_ids = nodes
+                    .iter()
+                    .map(|node| node.node_id.as_str().to_string())
+                    .collect::<Vec<_>>();
+                let episode_instruction = proof.project_model_search_episode_instruction(
+                    ProjectModelSearchEpisodeInput {
+                        query: params.query.to_string(),
+                        use_case: params.use_case.to_string(),
+                        limit: params.limit,
+                        top_k: params.top_k,
+                        starts_with: params.starts_with.clone(),
+                        ends_with: params.ends_with.clone().unwrap_or_default(),
+                        node_ids,
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                    },
+                );
+                indexer
+                    .append_episode(episode_instruction.episode())
+                    .context("append project-model search episode")?;
+            }
         }
         nodes.sort_by(|left, right| {
             right
@@ -1813,49 +1801,6 @@ fn select_durable_vector_index(
         _ => DurableVectorSelection::unavailable(
             ProjectContextVectorUnavailableReason::AmbiguousVectorIndex,
         ),
-    }
-}
-
-fn project_model_search_episode(
-    params: &SearchParams<'_>,
-    manifest_hash: &str,
-    artifact_id: &ContextPackArtifactId,
-    nodes: &[Node],
-) -> ToolEpisode {
-    let mut node_ids = nodes
-        .iter()
-        .map(|node| node.node_id.as_str().to_string())
-        .collect::<Vec<_>>();
-    node_ids.sort();
-    let input_fingerprint = fingerprint(&format!(
-        "query={};use_case={};limit={:?};top_k={:?};starts_with={:?};ends_with={:?}",
-        params.query,
-        params.use_case,
-        params.limit,
-        params.top_k,
-        params.starts_with,
-        params.ends_with
-    ));
-    let output_seed = format!(
-        "artifact={};manifest={};nodes={}",
-        artifact_id.as_str(),
-        manifest_hash,
-        node_ids.join("\0")
-    );
-    let output_fingerprint = fingerprint(&output_seed);
-    ToolEpisode {
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        tool: PROJECT_MODEL_SEARCH_TOOL.to_string(),
-        input_fingerprint,
-        output_fingerprint,
-        status: PROJECT_MODEL_SEARCH_SUCCESS.to_string(),
-        provenance: Provenance {
-            path: format!("context_packs/{}.json", artifact_id.as_str()),
-            start_line: None,
-            end_line: None,
-            source: PROJECT_MODEL_SEARCH_PROVENANCE_SOURCE.to_string(),
-            fingerprint: fingerprint(&output_seed),
-        },
     }
 }
 
@@ -2532,9 +2477,9 @@ mod tests {
         ExactFactArtifactStoreState, ExactFactStatus, ExactFactStatusReport, ExternalFactBatch,
         ExternalFactBatchMetadata, ExternalFactIngestionIssueCode, ExternalFactProductionReport,
         ExternalFactProductionStatus, ExternalFactSource, FreshnessState, GraphEdgeKind,
-        NativeLspReferenceRequest, RetrievalQuery, RustAnalyzerCapability,
+        NativeLspReferenceRequest, Provenance, RetrievalQuery, RustAnalyzerCapability,
         RustAnalyzerCapabilityStatus, RustAnalyzerProbe, StaleEvidencePolicy, SymbolKind,
-        TypedExternalFacts, TypedExternalReferenceFact, TypedExternalSymbolFact,
+        ToolEpisode, TypedExternalFacts, TypedExternalReferenceFact, TypedExternalSymbolFact,
         VectorIndexArtifact, external_fact_artifact_fingerprint, external_fact_batch_fingerprint,
         retrieve, vector_entries_from_manifest_embeddings, write_external_fact_artifact,
     };
@@ -5111,15 +5056,15 @@ mod tests {
         );
         assert_eq!(first_episodes.len(), 1usize);
         assert_eq!(second_episodes.len(), 2usize);
-        assert_eq!(episode.tool, PROJECT_MODEL_SEARCH_TOOL.to_string());
-        assert_eq!(episode.status, PROJECT_MODEL_SEARCH_SUCCESS.to_string());
+        assert_eq!(episode.tool, "project_model_search".to_string());
+        assert_eq!(episode.status, "success".to_string());
         assert_eq!(
             episode.provenance.path,
             format!("context_packs/{}.json", id.as_str())
         );
         assert_eq!(
             episode.provenance.source,
-            PROJECT_MODEL_SEARCH_PROVENANCE_SOURCE.to_string()
+            "WorkspaceService::query_workspace".to_string()
         );
         assert!(!episode.input_fingerprint.is_empty());
         assert!(!episode.output_fingerprint.is_empty());

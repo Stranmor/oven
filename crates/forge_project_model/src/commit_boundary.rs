@@ -1,0 +1,883 @@
+//! Typestate boundary for readback-verified context-pack commits.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::marker::PhantomData;
+
+use thiserror::Error;
+
+use crate::evidence_replay::{
+    ReplayActivationBoundary, ReplayEvidenceReadbackStatus, apply_replay_readback_results,
+};
+use crate::retrieval_plan::{
+    ProjectContextReadRequest, ProjectContextRetrievalPlan, ProjectContextWriteDecision,
+};
+use crate::types::{ContextPack, ContextPackArtifactId, Provenance, ToolEpisode};
+use crate::util::fingerprint;
+
+const PROJECT_MODEL_SEARCH_TOOL: &str = "project_model_search";
+const PROJECT_MODEL_SEARCH_SUCCESS: &str = "success";
+const PROJECT_MODEL_SEARCH_PROVENANCE_SOURCE: &str = "WorkspaceService::query_workspace";
+
+/// Typestate marker for a selected plan whose read requests have not yet been verified.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadRequestsSelected;
+
+/// Typestate marker for a context-pack commit whose readback evidence has been verified.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadbackVerified;
+
+/// Typestate boundary for the project-model context-pack commit lifecycle.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectContextPackCommit<State> {
+    state: ProjectContextPackCommitState,
+    _state: PhantomData<State>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ProjectContextPackCommitState {
+    Selected(ProjectContextPackCommitSelected),
+    Verified(ProjectContextPackCommitVerified),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ProjectContextPackCommitSelected {
+    context_pack: Option<ContextPack>,
+    read_requests: Vec<ProjectContextReadRequest>,
+    write_decision: ProjectContextWriteDecision,
+    replay_activation: ReplayActivationBoundary,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ProjectContextPackCommitVerified {
+    context_pack: ContextPack,
+}
+
+/// Typed readback status produced by the service IO boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProjectContextReadbackStatus {
+    /// The service successfully read the planned path/range.
+    Succeeded,
+    /// The service failed to read the planned path/range.
+    Failed,
+}
+
+/// Typed readback outcome for exactly one planned read request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectContextReadbackOutcome {
+    evidence_id: String,
+    relative_manifest_path: String,
+    start_line: u32,
+    end_line: u32,
+    status: ProjectContextReadbackStatus,
+}
+
+impl ProjectContextReadbackOutcome {
+    /// Builds a successful readback outcome from the executed request.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - Planned read request that was executed successfully.
+    pub fn succeeded(request: &ProjectContextReadRequest) -> Self {
+        Self::from_request(request, ProjectContextReadbackStatus::Succeeded)
+    }
+
+    /// Builds a failed readback outcome from the executed request.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - Planned read request that failed at the service IO boundary.
+    pub fn failed(request: &ProjectContextReadRequest) -> Self {
+        Self::from_request(request, ProjectContextReadbackStatus::Failed)
+    }
+
+    /// Builds a readback outcome from explicit typed metadata.
+    ///
+    /// # Arguments
+    ///
+    /// * `evidence_id` - Evidence identifier reported by readback.
+    /// * `relative_manifest_path` - Manifest-relative path reported by readback.
+    /// * `start_line` - One-based inclusive start line reported by readback.
+    /// * `end_line` - One-based inclusive end line reported by readback.
+    /// * `status` - Readback status reported by the IO boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the readback path or line range is invalid.
+    pub fn new(
+        evidence_id: impl Into<String>,
+        relative_manifest_path: impl Into<String>,
+        start_line: u32,
+        end_line: u32,
+        status: ProjectContextReadbackStatus,
+    ) -> anyhow::Result<Self> {
+        let request = ProjectContextReadRequest::new(
+            relative_manifest_path,
+            evidence_id,
+            start_line,
+            end_line,
+        )?;
+        Ok(Self::from_request(&request, status))
+    }
+
+    fn from_request(
+        request: &ProjectContextReadRequest,
+        status: ProjectContextReadbackStatus,
+    ) -> Self {
+        Self {
+            evidence_id: request.evidence_id.clone(),
+            relative_manifest_path: request.relative_manifest_path().to_string(),
+            start_line: request.start_line,
+            end_line: request.end_line,
+            status,
+        }
+    }
+
+    /// Returns the evidence identifier carried by this outcome.
+    pub fn evidence_id(&self) -> &str {
+        &self.evidence_id
+    }
+
+    /// Returns the readback status.
+    pub fn status(&self) -> &ProjectContextReadbackStatus {
+        &self.status
+    }
+}
+
+/// Deterministic no-write reason produced by the commit lifecycle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProjectContextPackNoWriteReason {
+    /// Retrieval selected no evidence.
+    EmptyEvidence,
+    /// A non-replay readback failed and therefore blocks persistence.
+    RequiredReadbackFailed,
+    /// Replay filtering left no verified evidence to persist.
+    NoVerifiedEvidenceAfterReplayFiltering,
+}
+
+/// Typed no-write state that cannot produce a write instruction or episode payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectContextPackNoWrite {
+    reason: ProjectContextPackNoWriteReason,
+}
+
+impl ProjectContextPackNoWrite {
+    /// Returns the typed no-write reason.
+    pub fn reason(&self) -> &ProjectContextPackNoWriteReason {
+        &self.reason
+    }
+}
+
+/// Commit decision after typed readback verification.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProjectContextPackReadbackDecision {
+    /// No context pack may be written.
+    NoWrite(ProjectContextPackNoWrite),
+    /// A readback-verified context pack may be persisted.
+    Write(ProjectContextPackCommit<ReadbackVerified>),
+}
+
+/// Typed context-pack write instruction produced only by verified readback state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectContextPackWriteInstruction {
+    context_pack: ContextPack,
+}
+
+impl ProjectContextPackWriteInstruction {
+    /// Returns the verified context pack that must be persisted.
+    pub fn context_pack(&self) -> &ContextPack {
+        &self.context_pack
+    }
+}
+
+/// Readback-verified proof produced after durable context-pack persistence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectContextPackPersistedProof {
+    artifact_id: ContextPackArtifactId,
+    artifact_path: String,
+    manifest_hash: String,
+}
+
+impl ProjectContextPackPersistedProof {
+    /// Builds a persisted proof after the storage layer has written and read back the pack.
+    ///
+    /// # Arguments
+    ///
+    /// * `artifact_id` - Deterministic persisted context-pack artifact id.
+    /// * `artifact_path` - Redaction-safe persisted artifact path label.
+    /// * `context_pack` - Context pack that was written and read back successfully.
+    pub fn new(
+        artifact_id: ContextPackArtifactId,
+        artifact_path: impl Into<String>,
+        context_pack: &ContextPack,
+    ) -> Self {
+        Self {
+            artifact_id,
+            artifact_path: artifact_path.into(),
+            manifest_hash: context_pack.manifest_hash.clone(),
+        }
+    }
+
+    /// Returns the persisted context-pack artifact id.
+    pub fn artifact_id(&self) -> &ContextPackArtifactId {
+        &self.artifact_id
+    }
+
+    /// Returns the redaction-safe artifact path label.
+    pub fn artifact_path(&self) -> &str {
+        &self.artifact_path
+    }
+
+    /// Returns the manifest hash proven by the persisted pack.
+    pub fn manifest_hash(&self) -> &str {
+        &self.manifest_hash
+    }
+}
+
+/// Redaction-safe input used to build a project-model search episode.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProjectModelSearchEpisodeInput {
+    /// Search query text used only as fingerprint input.
+    pub query: String,
+    /// Search use-case text used only as fingerprint input.
+    pub use_case: String,
+    /// Optional result limit used only as fingerprint input.
+    pub limit: Option<usize>,
+    /// Optional top-k candidate budget used only as fingerprint input.
+    pub top_k: Option<u32>,
+    /// Optional path prefix scope used only as fingerprint input.
+    pub starts_with: Option<String>,
+    /// Path suffix scope used only as fingerprint input.
+    pub ends_with: Vec<String>,
+    /// Returned node identifiers used only as output fingerprint input.
+    pub node_ids: Vec<String>,
+    /// Event timestamp supplied by the service boundary.
+    pub timestamp: String,
+}
+
+/// Typed episode append instruction produced only from a persisted context-pack proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectContextEpisodeAppendInstruction {
+    episode: ToolEpisode,
+}
+
+impl ProjectContextEpisodeAppendInstruction {
+    /// Returns the redaction-safe episode payload to append.
+    pub fn episode(&self) -> &ToolEpisode {
+        &self.episode
+    }
+}
+
+/// Typed errors emitted by the context-pack commit boundary.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum ProjectContextPackCommitError {
+    /// The retrieval plan requested a write but did not contain a context pack.
+    #[error("project-model retrieval plan requested write without context pack")]
+    MissingContextPackForWrite,
+    /// A readback outcome referenced evidence that was not planned.
+    #[error("unknown project-model readback outcome: {evidence_id}")]
+    UnknownReadbackOutcome { evidence_id: String },
+    /// A planned read request did not receive any readback outcome.
+    #[error("missing required project-model readback outcome: {evidence_id}")]
+    MissingRequiredReadback { evidence_id: String },
+    /// A readback outcome did not match the planned path/range for its evidence id.
+    #[error("project-model readback path/range mismatch: {evidence_id}")]
+    ReadbackPathRangeMismatch { evidence_id: String },
+    /// Two planned read requests share an evidence id and cannot be verified independently.
+    #[error("duplicate planned project-model read request: {evidence_id}")]
+    DuplicatePlannedReadRequest { evidence_id: String },
+    /// Two readback outcomes reported the same evidence id.
+    #[error("duplicate project-model readback outcome: {evidence_id}")]
+    DuplicateReadbackOutcome { evidence_id: String },
+}
+
+impl ProjectContextPackCommit<ReadRequestsSelected> {
+    /// Builds the selected-read-requests typestate from a retrieval plan.
+    ///
+    /// # Arguments
+    ///
+    /// * `plan` - Pure retrieval plan produced by the project-model planner.
+    /// * `replay_activation` - Pending replay activation used to classify replay readback failures.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the plan requests a write without a context pack.
+    pub fn from_retrieval_plan(
+        plan: &ProjectContextRetrievalPlan,
+        replay_activation: ReplayActivationBoundary,
+    ) -> Result<Self, ProjectContextPackCommitError> {
+        if plan.write_decision == ProjectContextWriteDecision::WriteContextPackAfterReadback
+            && plan.context_pack.is_none()
+        {
+            return Err(ProjectContextPackCommitError::MissingContextPackForWrite);
+        }
+        Ok(Self {
+            state: ProjectContextPackCommitState::Selected(ProjectContextPackCommitSelected {
+                context_pack: plan.context_pack.clone(),
+                read_requests: plan.read_requests.clone(),
+                write_decision: plan.write_decision.clone(),
+                replay_activation,
+            }),
+            _state: PhantomData,
+        })
+    }
+
+    /// Returns the validated read requests that the service must execute.
+    pub fn read_requests(&self) -> &[ProjectContextReadRequest] {
+        match &self.state {
+            ProjectContextPackCommitState::Selected(selected) => &selected.read_requests,
+            ProjectContextPackCommitState::Verified(_) => {
+                unreachable!("selected typestate cannot hold verified state")
+            }
+        }
+    }
+
+    /// Verifies typed readback outcomes and returns the write/no-write decision.
+    ///
+    /// # Arguments
+    ///
+    /// * `outcomes` - Typed readback outcomes produced by the service IO boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing, duplicate, unknown, or path/range-mismatched outcomes.
+    pub fn verify_readbacks(
+        self,
+        outcomes: Vec<ProjectContextReadbackOutcome>,
+    ) -> Result<ProjectContextPackReadbackDecision, ProjectContextPackCommitError> {
+        let selected = match self.state {
+            ProjectContextPackCommitState::Selected(selected) => selected,
+            ProjectContextPackCommitState::Verified(_) => {
+                unreachable!("selected typestate cannot hold verified state")
+            }
+        };
+        if selected.write_decision == ProjectContextWriteDecision::NoWriteEmptyRetrieval {
+            return Ok(ProjectContextPackReadbackDecision::NoWrite(
+                ProjectContextPackNoWrite {
+                    reason: ProjectContextPackNoWriteReason::EmptyEvidence,
+                },
+            ));
+        }
+        let Some(context_pack) = selected.context_pack else {
+            return Err(ProjectContextPackCommitError::MissingContextPackForWrite);
+        };
+        if context_pack.evidence.is_empty() {
+            return Ok(ProjectContextPackReadbackDecision::NoWrite(
+                ProjectContextPackNoWrite {
+                    reason: ProjectContextPackNoWriteReason::EmptyEvidence,
+                },
+            ));
+        }
+
+        let mut planned_by_id = BTreeMap::new();
+        for request in &selected.read_requests {
+            if planned_by_id
+                .insert(request.evidence_id.clone(), request)
+                .is_some()
+            {
+                return Err(ProjectContextPackCommitError::DuplicatePlannedReadRequest {
+                    evidence_id: request.evidence_id.clone(),
+                });
+            }
+        }
+        let mut outcome_by_id = BTreeMap::new();
+        for outcome in outcomes {
+            let evidence_id = outcome.evidence_id.clone();
+            let Some(planned) = planned_by_id.get(&evidence_id) else {
+                return Err(ProjectContextPackCommitError::UnknownReadbackOutcome { evidence_id });
+            };
+            if outcome_by_id
+                .insert(evidence_id.clone(), outcome.clone())
+                .is_some()
+            {
+                return Err(ProjectContextPackCommitError::DuplicateReadbackOutcome {
+                    evidence_id,
+                });
+            }
+            if planned.relative_manifest_path() != outcome.relative_manifest_path
+                || planned.start_line != outcome.start_line
+                || planned.end_line != outcome.end_line
+            {
+                return Err(ProjectContextPackCommitError::ReadbackPathRangeMismatch {
+                    evidence_id,
+                });
+            }
+        }
+        for request in &selected.read_requests {
+            if !outcome_by_id.contains_key(&request.evidence_id) {
+                return Err(ProjectContextPackCommitError::MissingRequiredReadback {
+                    evidence_id: request.evidence_id.clone(),
+                });
+            }
+        }
+
+        let replay_ids = selected
+            .replay_activation
+            .active_refs
+            .iter()
+            .map(|reference| reference.canonical_target_id.clone())
+            .filter(|evidence_id| planned_by_id.contains_key(evidence_id))
+            .collect::<BTreeSet<_>>();
+        let readback_results = outcome_by_id
+            .iter()
+            .filter(|(evidence_id, _)| replay_ids.contains(*evidence_id))
+            .map(|(evidence_id, outcome)| {
+                (
+                    evidence_id.clone(),
+                    outcome.status == ProjectContextReadbackStatus::Succeeded,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let verified_replay_activation =
+            apply_replay_readback_results(&selected.replay_activation, &readback_results);
+        let verified_replay_ids = verified_replay_activation
+            .active_refs
+            .iter()
+            .filter(|reference| reference.readback_status == ReplayEvidenceReadbackStatus::Verified)
+            .map(|reference| reference.canonical_target_id.clone())
+            .collect::<BTreeSet<_>>();
+        let failed_non_replay = outcome_by_id.iter().any(|(evidence_id, outcome)| {
+            outcome.status == ProjectContextReadbackStatus::Failed
+                && !replay_ids.contains(evidence_id)
+        });
+        if failed_non_replay {
+            return Ok(ProjectContextPackReadbackDecision::NoWrite(
+                ProjectContextPackNoWrite {
+                    reason: ProjectContextPackNoWriteReason::RequiredReadbackFailed,
+                },
+            ));
+        }
+
+        let failed_replay_ids = replay_ids
+            .difference(&verified_replay_ids)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let filtered_context_pack = if failed_replay_ids.is_empty() {
+            context_pack
+        } else {
+            filter_failed_replay_evidence(context_pack, &failed_replay_ids)
+        };
+        if filtered_context_pack.evidence.is_empty() {
+            return Ok(ProjectContextPackReadbackDecision::NoWrite(
+                ProjectContextPackNoWrite {
+                    reason: ProjectContextPackNoWriteReason::NoVerifiedEvidenceAfterReplayFiltering,
+                },
+            ));
+        }
+        Ok(ProjectContextPackReadbackDecision::Write(
+            ProjectContextPackCommit {
+                state: ProjectContextPackCommitState::Verified(ProjectContextPackCommitVerified {
+                    context_pack: filtered_context_pack,
+                }),
+                _state: PhantomData,
+            },
+        ))
+    }
+}
+
+impl ProjectContextPackCommit<ReadbackVerified> {
+    /// Builds a context-pack write instruction from readback-verified state.
+    pub fn write_instruction(&self) -> ProjectContextPackWriteInstruction {
+        let verified = match &self.state {
+            ProjectContextPackCommitState::Verified(verified) => verified,
+            ProjectContextPackCommitState::Selected(_) => {
+                unreachable!("verified typestate cannot hold selected state")
+            }
+        };
+        ProjectContextPackWriteInstruction { context_pack: verified.context_pack.clone() }
+    }
+}
+
+impl ProjectContextPackPersistedProof {
+    /// Builds a redaction-safe episode append instruction from persisted context-pack proof.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Redaction-safe episode fingerprint inputs.
+    pub fn project_model_search_episode_instruction(
+        &self,
+        mut input: ProjectModelSearchEpisodeInput,
+    ) -> ProjectContextEpisodeAppendInstruction {
+        input.node_ids.sort();
+        let input_fingerprint = fingerprint(&format!(
+            "query={};use_case={};limit={:?};top_k={:?};starts_with={:?};ends_with={:?}",
+            input.query,
+            input.use_case,
+            input.limit,
+            input.top_k,
+            input.starts_with,
+            input.ends_with
+        ));
+        let output_seed = format!(
+            "artifact={};manifest={};nodes={}",
+            self.artifact_id.as_str(),
+            self.manifest_hash,
+            input.node_ids.join("\0")
+        );
+        let output_fingerprint = fingerprint(&output_seed);
+        ProjectContextEpisodeAppendInstruction {
+            episode: ToolEpisode {
+                timestamp: input.timestamp,
+                tool: PROJECT_MODEL_SEARCH_TOOL.to_string(),
+                input_fingerprint,
+                output_fingerprint,
+                status: PROJECT_MODEL_SEARCH_SUCCESS.to_string(),
+                provenance: Provenance {
+                    path: format!("context_packs/{}.json", self.artifact_id.as_str()),
+                    start_line: None,
+                    end_line: None,
+                    source: PROJECT_MODEL_SEARCH_PROVENANCE_SOURCE.to_string(),
+                    fingerprint: fingerprint(&output_seed),
+                },
+            },
+        }
+    }
+}
+
+fn filter_failed_replay_evidence(
+    mut context_pack: ContextPack,
+    failed_replay_ids: &BTreeSet<String>,
+) -> ContextPack {
+    context_pack
+        .evidence
+        .retain(|evidence| !failed_replay_ids.contains(&evidence.id));
+    context_pack.provenance = context_pack
+        .evidence
+        .iter()
+        .map(|evidence| evidence.provenance.clone())
+        .collect::<Vec<_>>();
+    context_pack
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+    use crate::types::{ContextPackEvidence, ContextPackEvidenceSource, EvidenceFreshness};
+    use crate::{
+        EvidenceReplayScoreKind, ProjectContextRetrievalPhaseDiagnostics,
+        ProjectContextRetrievalQueryDiagnostics, ProjectContextTopKStatus,
+        ReplayActivatedEvidenceRef, ReplayActivationCaps, ReplayActivationDiagnostics,
+        ReplayActivationFingerprintInputs, ReplayEvidenceTargetKind,
+    };
+
+    #[test]
+    fn empty_evidence_returns_no_write_state() {
+        let setup = plan(
+            None,
+            Vec::new(),
+            ProjectContextWriteDecision::NoWriteEmptyRetrieval,
+        );
+        let actual =
+            ProjectContextPackCommit::from_retrieval_plan(&setup, replay_boundary(Vec::new()))
+                .unwrap()
+                .verify_readbacks(Vec::new())
+                .unwrap();
+        let expected = ProjectContextPackNoWriteReason::EmptyEvidence;
+
+        assert_eq!(no_write_reason(actual), expected);
+    }
+
+    #[test]
+    fn missing_required_readback_is_rejected_distinctly() {
+        let setup = plan(
+            Some(pack(vec![evidence("main", "src/main.rs")])),
+            vec![request("main", "src/main.rs")],
+            ProjectContextWriteDecision::WriteContextPackAfterReadback,
+        );
+        let actual =
+            ProjectContextPackCommit::from_retrieval_plan(&setup, replay_boundary(Vec::new()))
+                .unwrap()
+                .verify_readbacks(Vec::new())
+                .unwrap_err();
+        let expected = ProjectContextPackCommitError::MissingRequiredReadback {
+            evidence_id: "main".to_string(),
+        };
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn unknown_readback_outcome_is_rejected() {
+        let setup = plan(
+            Some(pack(vec![evidence("main", "src/main.rs")])),
+            vec![request("main", "src/main.rs")],
+            ProjectContextWriteDecision::WriteContextPackAfterReadback,
+        );
+        let actual =
+            ProjectContextPackCommit::from_retrieval_plan(&setup, replay_boundary(Vec::new()))
+                .unwrap()
+                .verify_readbacks(vec![
+                    ProjectContextReadbackOutcome::new(
+                        "other",
+                        "src/lib.rs",
+                        1,
+                        3,
+                        ProjectContextReadbackStatus::Succeeded,
+                    )
+                    .unwrap(),
+                ])
+                .unwrap_err();
+        let expected = ProjectContextPackCommitError::UnknownReadbackOutcome {
+            evidence_id: "other".to_string(),
+        };
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn readback_path_range_must_match_planned_request() {
+        let setup = plan(
+            Some(pack(vec![evidence("main", "src/main.rs")])),
+            vec![request("main", "src/main.rs")],
+            ProjectContextWriteDecision::WriteContextPackAfterReadback,
+        );
+        let actual =
+            ProjectContextPackCommit::from_retrieval_plan(&setup, replay_boundary(Vec::new()))
+                .unwrap()
+                .verify_readbacks(vec![
+                    ProjectContextReadbackOutcome::new(
+                        "main",
+                        "src/main.rs",
+                        2,
+                        3,
+                        ProjectContextReadbackStatus::Succeeded,
+                    )
+                    .unwrap(),
+                ])
+                .unwrap_err();
+        let expected = ProjectContextPackCommitError::ReadbackPathRangeMismatch {
+            evidence_id: "main".to_string(),
+        };
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn non_replay_readback_failure_yields_no_write_or_episode_instruction() {
+        let setup = plan(
+            Some(pack(vec![evidence("main", "src/main.rs")])),
+            vec![request("main", "src/main.rs")],
+            ProjectContextWriteDecision::WriteContextPackAfterReadback,
+        );
+        let actual =
+            ProjectContextPackCommit::from_retrieval_plan(&setup, replay_boundary(Vec::new()))
+                .unwrap()
+                .verify_readbacks(vec![ProjectContextReadbackOutcome::failed(
+                    &setup.read_requests[0],
+                )])
+                .unwrap();
+        let expected = ProjectContextPackNoWriteReason::RequiredReadbackFailed;
+
+        assert_eq!(no_write_reason(actual), expected);
+    }
+
+    #[test]
+    fn replay_readback_failure_filters_only_failed_replay_evidence() {
+        let setup = plan(
+            Some(pack(vec![
+                evidence("stable", "src/stable.rs"),
+                evidence("replay_failed", "src/replay_failed.rs"),
+                evidence("replay_ok", "src/replay_ok.rs"),
+            ])),
+            vec![
+                request("stable", "src/stable.rs"),
+                request("replay_failed", "src/replay_failed.rs"),
+                request("replay_ok", "src/replay_ok.rs"),
+            ],
+            ProjectContextWriteDecision::WriteContextPackAfterReadback,
+        );
+        let actual = ProjectContextPackCommit::from_retrieval_plan(
+            &setup,
+            replay_boundary(vec!["replay_failed", "replay_ok"]),
+        )
+        .unwrap()
+        .verify_readbacks(vec![
+            ProjectContextReadbackOutcome::succeeded(&setup.read_requests[0]),
+            ProjectContextReadbackOutcome::failed(&setup.read_requests[1]),
+            ProjectContextReadbackOutcome::succeeded(&setup.read_requests[2]),
+        ])
+        .unwrap();
+        let expected = vec!["replay_ok".to_string(), "stable".to_string()];
+
+        let ProjectContextPackReadbackDecision::Write(verified) = actual else {
+            panic!("expected write decision")
+        };
+        let write = verified.write_instruction();
+        let mut actual = write
+            .context_pack()
+            .evidence
+            .iter()
+            .map(|evidence| evidence.id.clone())
+            .collect::<Vec<_>>();
+        actual.sort();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn duplicate_planned_evidence_id_cannot_hide_unverified_read_request() {
+        let setup = plan(
+            Some(pack(vec![evidence("main", "src/second.rs")])),
+            vec![
+                request("main", "src/first.rs"),
+                request("main", "src/second.rs"),
+            ],
+            ProjectContextWriteDecision::WriteContextPackAfterReadback,
+        );
+        let actual =
+            ProjectContextPackCommit::from_retrieval_plan(&setup, replay_boundary(Vec::new()))
+                .unwrap()
+                .verify_readbacks(vec![ProjectContextReadbackOutcome::succeeded(
+                    &setup.read_requests[1],
+                )])
+                .unwrap_err();
+        let expected = ProjectContextPackCommitError::DuplicatePlannedReadRequest {
+            evidence_id: "main".to_string(),
+        };
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn successful_persisted_context_pack_proof_required_before_episode_payload_construction() {
+        let setup_pack = pack(vec![evidence("main", "src/main.rs")]);
+        let proof = ProjectContextPackPersistedProof::new(
+            crate::ContextPackArtifactId::new("a".repeat(64)).unwrap(),
+            "context_packs/proof.json",
+            &setup_pack,
+        );
+        let actual =
+            proof.project_model_search_episode_instruction(ProjectModelSearchEpisodeInput {
+                query: "needle".to_string(),
+                use_case: "proof".to_string(),
+                limit: Some(1),
+                top_k: Some(1),
+                starts_with: Some("src".to_string()),
+                ends_with: vec![".rs".to_string()],
+                node_ids: vec!["main".to_string()],
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+            });
+        let expected = "project_model_search";
+
+        assert_eq!(actual.episode().tool, expected);
+        assert_eq!(
+            actual.episode().provenance.path,
+            format!("context_packs/{}.json", proof.artifact_id().as_str())
+        );
+    }
+
+    fn no_write_reason(
+        decision: ProjectContextPackReadbackDecision,
+    ) -> ProjectContextPackNoWriteReason {
+        match decision {
+            ProjectContextPackReadbackDecision::NoWrite(no_write) => no_write.reason().clone(),
+            ProjectContextPackReadbackDecision::Write(_) => panic!("expected no-write decision"),
+        }
+    }
+
+    fn plan(
+        context_pack: Option<ContextPack>,
+        read_requests: Vec<ProjectContextReadRequest>,
+        write_decision: ProjectContextWriteDecision,
+    ) -> ProjectContextRetrievalPlan {
+        ProjectContextRetrievalPlan {
+            query_diagnostics: query_diagnostics(),
+            selected_results: Vec::new(),
+            context_pack,
+            read_requests,
+            write_decision,
+            return_order: Vec::new(),
+        }
+    }
+
+    fn query_diagnostics() -> ProjectContextRetrievalQueryDiagnostics {
+        ProjectContextRetrievalQueryDiagnostics {
+            query_text: Some("test".to_string()),
+            path_prefix: None,
+            path_suffixes: Vec::new(),
+            limit: 10,
+            top_k: None,
+            top_k_status: ProjectContextTopKStatus::NotRequested,
+            use_case: None,
+            include_graph_expansion: false,
+            stale_policy: crate::StaleEvidencePolicy::Reject,
+            freshness_proof_level: crate::FreshnessProofLevel::FullFilesystem,
+            phase_diagnostics: ProjectContextRetrievalPhaseDiagnostics::default(),
+        }
+    }
+
+    fn request(evidence_id: &str, path: &str) -> ProjectContextReadRequest {
+        ProjectContextReadRequest::new(path, evidence_id, 1, 3).unwrap()
+    }
+
+    fn pack(evidence: Vec<ContextPackEvidence>) -> ContextPack {
+        ContextPack {
+            version: 1,
+            manifest_hash: "manifest".to_string(),
+            provenance: evidence
+                .iter()
+                .map(|evidence| evidence.provenance.clone())
+                .collect(),
+            evidence,
+        }
+    }
+
+    fn evidence(id: &str, path: &str) -> ContextPackEvidence {
+        ContextPackEvidence {
+            id: id.to_string(),
+            path: path.to_string(),
+            symbol: None,
+            source: ContextPackEvidenceSource::RetrievalResult,
+            freshness: EvidenceFreshness::Fresh,
+            provenance: Provenance {
+                path: path.to_string(),
+                start_line: Some(1),
+                end_line: Some(3),
+                source: "test".to_string(),
+                fingerprint: fingerprint(&format!("{path}:1-3")),
+            },
+            score: 1.0,
+        }
+    }
+
+    fn replay_boundary(ids: Vec<&str>) -> ReplayActivationBoundary {
+        ReplayActivationBoundary {
+            manifest_hash: "manifest".to_string(),
+            active_refs: ids
+                .into_iter()
+                .map(|id| ReplayActivatedEvidenceRef {
+                    artifact_id: "artifact".to_string(),
+                    evidence_id: id.to_string(),
+                    evidence_path: format!("src/{id}.rs"),
+                    start_line: 1,
+                    end_line: 3,
+                    score_kind: EvidenceReplayScoreKind::RetrievalResult,
+                    score: 1.0,
+                    provenance_source: "test".to_string(),
+                    target_kind: ReplayEvidenceTargetKind::ManifestSource,
+                    canonical_target_id: id.to_string(),
+                    fingerprint_inputs: ReplayActivationFingerprintInputs {
+                        manifest_hash: "manifest".to_string(),
+                        source_content_hash: fingerprint(id),
+                        line_range_fingerprint: fingerprint(&format!("{id}:1-3")),
+                        target_kind: ReplayEvidenceTargetKind::ManifestSource,
+                        target_id: id.to_string(),
+                    },
+                    readback_status: ReplayEvidenceReadbackStatus::Pending,
+                })
+                .collect(),
+            issues: Vec::new(),
+            diagnostics: ReplayActivationDiagnostics {
+                candidate_count: 0,
+                active_count: 0,
+                excluded_count: 0,
+                excluded_by_reason: BTreeMap::new(),
+                caps: ReplayActivationCaps::default(),
+                stable_ordering: "test".to_string(),
+                activation_fingerprint: fingerprint("activation"),
+            },
+        }
+    }
+}

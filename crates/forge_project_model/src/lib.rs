@@ -1,6 +1,7 @@
 //! Project model primitives, indexing, retrieval, graph, and episodic storage.
 
 mod cache_partition;
+mod commit_boundary;
 mod context_adapter;
 mod durable_vector_index;
 mod eval;
@@ -33,6 +34,14 @@ pub use cache_partition::{
     ProjectModelStablePayloadWhitelistedFields, ProjectModelVolatileSidecar,
     ProjectModelVolatileSidecarInput, StableProjectModelContextMessage,
     build_project_model_context_envelope, stable_cache_partition_sources_from_nodes,
+};
+pub use commit_boundary::{
+    ProjectContextEpisodeAppendInstruction, ProjectContextPackCommit,
+    ProjectContextPackCommitError, ProjectContextPackNoWrite, ProjectContextPackNoWriteReason,
+    ProjectContextPackPersistedProof, ProjectContextPackReadbackDecision,
+    ProjectContextPackWriteInstruction, ProjectContextReadbackOutcome,
+    ProjectContextReadbackStatus, ProjectModelSearchEpisodeInput, ReadRequestsSelected,
+    ReadbackVerified,
 };
 pub use context_adapter::{
     EvidenceReplayPreviewError, ManifestEvidenceTarget, ProjectModelContextRenderRoot,
