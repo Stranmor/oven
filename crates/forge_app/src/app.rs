@@ -14,10 +14,10 @@ use forge_project_model::{
     LearningReviewState as ProjectLearningReviewState,
     LearningSourceKind as ProjectLearningSourceKind, ProjectContextTarget,
     ProjectModelContextReadinessMetadata, ProjectModelContextRenderBudget,
-    ProjectModelEvidenceReadinessMetadata, ProjectModelExactFactReadinessMetadata,
-    ProjectModelSourceNode, TargetResolutionBudget, directory_path_filter,
-    local_project_model_manifest, mentioned_paths, render_project_model_context,
-    render_sources_from_nodes,
+    ProjectModelEvidenceLedgerActivationMetadata, ProjectModelEvidenceReadinessMetadata,
+    ProjectModelExactFactReadinessMetadata, ProjectModelSourceNode, TargetResolutionBudget,
+    directory_path_filter, local_project_model_manifest, mentioned_paths,
+    render_project_model_context, render_sources_from_nodes,
 };
 use forge_stream::MpscStream;
 use url::Url;
@@ -240,6 +240,10 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
                 &target.workspace_root,
                 target_diagnostic.diagnostic.exact_fact_readiness.as_ref(),
                 target_diagnostic.diagnostic.evidence_readiness.as_ref(),
+                target_diagnostic
+                    .diagnostic
+                    .evidence_ledger_activation
+                    .as_ref(),
                 nodes,
             ));
         }
@@ -575,6 +579,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
         workspace_root: &std::path::Path,
         exact_fact_readiness: Option<&WorkspaceExactFactReadinessDiagnostic>,
         evidence_readiness: Option<&WorkspaceEvidenceReadinessDiagnostic>,
+        evidence_ledger_activation: Option<&WorkspaceEvidenceLedgerActivationDiagnostic>,
         nodes: Vec<Node>,
     ) -> String {
         let manifest_path = local_project_model_manifest(workspace_root);
@@ -585,8 +590,13 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
         let sources = render_sources_from_nodes(source_nodes);
         let exact_fact_readiness = exact_fact_readiness.map(Self::exact_fact_readiness_metadata);
         let evidence_readiness = evidence_readiness.map(Self::evidence_readiness_metadata);
-        let readiness =
-            ProjectModelContextReadinessMetadata { exact_fact_readiness, evidence_readiness };
+        let evidence_ledger_activation =
+            evidence_ledger_activation.map(Self::evidence_ledger_activation_metadata);
+        let readiness = ProjectModelContextReadinessMetadata {
+            exact_fact_readiness,
+            evidence_readiness,
+            evidence_ledger_activation,
+        };
         render_project_model_context(
             &workspace_root.display().to_string(),
             &manifest_path.display().to_string(),
@@ -631,6 +641,24 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
             worst_case_freshness: readiness.worst_case_freshness.clone(),
             issue_summaries: readiness.issue_summaries.clone(),
             truncated: readiness.truncated,
+        }
+    }
+
+    fn evidence_ledger_activation_metadata(
+        activation: &WorkspaceEvidenceLedgerActivationDiagnostic,
+    ) -> ProjectModelEvidenceLedgerActivationMetadata {
+        ProjectModelEvidenceLedgerActivationMetadata {
+            context_pack_artifact_count: activation.summary.context_pack_artifact_count,
+            readable_context_pack_count: activation.summary.readable_context_pack_count,
+            tool_episode_count: activation.summary.tool_episode_count,
+            linked_episode_count: activation.summary.linked_episode_count,
+            missing_link_count: activation.summary.missing_link_count,
+            graph_node_count: activation.summary.graph_node_count,
+            graph_edge_count: activation.summary.graph_edge_count,
+            worst_case_freshness: activation.summary.worst_case_freshness.clone(),
+            issue_count: activation.summary.issue_count,
+            issue_summaries: activation.summary.issue_summaries.clone(),
+            truncated: activation.summary.truncated,
         }
     }
 
@@ -1658,6 +1686,7 @@ mod tests {
                 },
                 exact_fact_readiness: None,
                 evidence_readiness: None,
+                evidence_ledger_activation: None,
             })
         }
 
@@ -2392,7 +2421,39 @@ mod tests {
                 manifest_path,
                 freshness,
                 exact_fact_readiness,
-                evidence_readiness,
+                evidence_readiness: evidence_readiness.clone(),
+                evidence_ledger_activation: evidence_readiness.as_ref().map(|readiness| {
+                    WorkspaceEvidenceLedgerActivationDiagnostic {
+                        summary: WorkspaceEvidenceLedgerActivationSummary {
+                            context_pack_artifact_count: readiness.context_pack_artifact_count,
+                            readable_context_pack_count: readiness.context_pack_artifact_count,
+                            tool_episode_count: readiness.tool_episode_count,
+                            linked_episode_count: readiness.linked_episode_count,
+                            missing_link_count: readiness.missing_link_count,
+                            graph_node_count: 2,
+                            graph_edge_count: readiness.linked_episode_count,
+                            worst_case_freshness: readiness.worst_case_freshness.clone(),
+                            issue_count: readiness
+                                .context_pack_issue_count
+                                .saturating_add(readiness.tool_episode_issue_count)
+                                .saturating_add(readiness.missing_link_count),
+                            issue_summaries: readiness.issue_summaries.clone(),
+                            truncated: readiness.truncated,
+                        },
+                        graph: Some(WorkspaceEvidenceLedgerGraphMetadata {
+                            node_count: 2,
+                            edge_count: readiness.linked_episode_count,
+                            node_kind_counts: BTreeMap::from([
+                                ("retrieved_evidence".to_string(), 1),
+                                ("tool_episode".to_string(), 1),
+                            ]),
+                            edge_kind_counts: BTreeMap::from([(
+                                "tool_episode_relates".to_string(),
+                                readiness.linked_episode_count,
+                            )]),
+                        }),
+                    }
+                }),
             })
         }
 
@@ -3296,6 +3357,30 @@ mod tests {
                 worst_case_freshness: Some("changed".to_string()),
                 issue_summaries: vec!["context_pack:StaleArtifactEvidence".to_string()],
                 truncated: false,
+            }),
+            evidence_ledger_activation: Some(WorkspaceEvidenceLedgerActivationDiagnostic {
+                summary: WorkspaceEvidenceLedgerActivationSummary {
+                    context_pack_artifact_count: 1,
+                    readable_context_pack_count: 1,
+                    tool_episode_count: 1,
+                    linked_episode_count: 1,
+                    missing_link_count: 0,
+                    graph_node_count: 2,
+                    graph_edge_count: 1,
+                    worst_case_freshness: Some("changed".to_string()),
+                    issue_count: 1,
+                    issue_summaries: vec!["context_pack:StaleArtifactEvidence".to_string()],
+                    truncated: false,
+                },
+                graph: Some(WorkspaceEvidenceLedgerGraphMetadata {
+                    node_count: 2,
+                    edge_count: 1,
+                    node_kind_counts: BTreeMap::from([
+                        ("retrieved_evidence".to_string(), 1),
+                        ("tool_episode".to_string(), 1),
+                    ]),
+                    edge_kind_counts: BTreeMap::from([("tool_episode_relates".to_string(), 1)]),
+                }),
             }),
         };
         let actual = setup.can_inject();

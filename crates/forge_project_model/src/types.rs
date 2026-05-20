@@ -1762,6 +1762,118 @@ pub struct EvidenceReadinessDiagnostic {
     pub truncated: bool,
 }
 
+/// Bounded read-only activation summary for existing evidence-ledger artifacts.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceLedgerActivationSummary {
+    /// Number of context-pack artifact candidates inspected under budget.
+    pub context_pack_artifact_count: usize,
+    /// Number of inspected context-pack artifacts that were readable.
+    pub readable_context_pack_count: usize,
+    /// Number of valid tool episodes inspected under budget.
+    pub tool_episode_count: usize,
+    /// Number of inspected tool episodes linked to a readable context-pack artifact.
+    pub linked_episode_count: usize,
+    /// Number of linkage issues or missing context-pack artifact references.
+    pub missing_link_count: usize,
+    /// Graph node count computed from metadata-only activation graph construction.
+    pub graph_node_count: usize,
+    /// Graph edge count computed from metadata-only activation graph construction.
+    pub graph_edge_count: usize,
+    /// Worst-case freshness across readable context-pack artifacts.
+    pub worst_case_freshness: Option<String>,
+    /// Total redaction-safe issue count before summary capping.
+    pub issue_count: usize,
+    /// Deterministically capped stable issue labels.
+    pub issue_summaries: Vec<String>,
+    /// Whether any activation budget omitted data or graph metadata.
+    pub truncated: bool,
+}
+
+/// Metadata-only graph proof for evidence-ledger activation.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceLedgerGraphMetadata {
+    /// Total typed graph node count.
+    pub node_count: usize,
+    /// Total typed graph edge count.
+    pub edge_count: usize,
+    /// Node counts keyed by stable node-kind label.
+    pub node_kind_counts: BTreeMap<String, usize>,
+    /// Edge counts keyed by stable edge-kind label.
+    pub edge_kind_counts: BTreeMap<String, usize>,
+}
+
+impl EvidenceLedgerGraphMetadata {
+    /// Builds metadata-only graph counters without exposing graph payloads.
+    ///
+    /// # Arguments
+    ///
+    /// * `graph` - Typed activation graph built from redaction-safe artifacts and episodes.
+    pub fn from_graph(graph: &KnowledgeGraph) -> Self {
+        let mut node_kind_counts = BTreeMap::new();
+        let mut edge_kind_counts = BTreeMap::new();
+        for node in &graph.nodes {
+            increment_count(&mut node_kind_counts, graph_node_kind_label(&node.kind()));
+        }
+        for edge in &graph.edges {
+            increment_count(&mut edge_kind_counts, graph_edge_kind_label(&edge.kind));
+        }
+        Self {
+            node_count: graph.nodes.len(),
+            edge_count: graph.edges.len(),
+            node_kind_counts,
+            edge_kind_counts,
+        }
+    }
+}
+
+/// Read-only activation object for evidence-ledger counters and proof metadata.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceLedgerActivation {
+    /// Compact counters and redaction-safe proof labels.
+    pub summary: EvidenceLedgerActivationSummary,
+    /// Existing readiness diagnostic preserved for app/domain compatibility.
+    pub readiness: EvidenceReadinessDiagnostic,
+    /// Optional metadata-only graph proof omitted when graph budgets are exceeded.
+    pub graph: Option<EvidenceLedgerGraphMetadata>,
+}
+
+fn increment_count(counts: &mut BTreeMap<String, usize>, key: &'static str) {
+    let count = counts.entry(key.to_string()).or_default();
+    *count = count.saturating_add(1);
+}
+
+fn graph_node_kind_label(kind: &KnowledgeGraphNodeKind) -> &'static str {
+    match kind {
+        KnowledgeGraphNodeKind::File => "file",
+        KnowledgeGraphNodeKind::Symbol => "symbol",
+        KnowledgeGraphNodeKind::Shard => "shard",
+        KnowledgeGraphNodeKind::Task => "task",
+        KnowledgeGraphNodeKind::Decision => "decision",
+        KnowledgeGraphNodeKind::RetrievedEvidence => "retrieved_evidence",
+        KnowledgeGraphNodeKind::ToolEpisode => "tool_episode",
+        KnowledgeGraphNodeKind::EvalCase => "eval_case",
+    }
+}
+
+fn graph_edge_kind_label(kind: &GraphEdgeKind) -> &'static str {
+    match kind {
+        GraphEdgeKind::Contains => "contains",
+        GraphEdgeKind::ChildOf => "child_of",
+        GraphEdgeKind::Imports => "imports",
+        GraphEdgeKind::ModuleDeclares => "module_declares",
+        GraphEdgeKind::ExternCrate => "extern_crate",
+        GraphEdgeKind::CargoDependency => "cargo_dependency",
+        GraphEdgeKind::Calls => "calls",
+        GraphEdgeKind::References => "references",
+        GraphEdgeKind::TaskDependsOn => "task_depends_on",
+        GraphEdgeKind::DecisionSupportedBy => "decision_supported_by",
+        GraphEdgeKind::EvidenceCites => "evidence_cites",
+        GraphEdgeKind::ToolEpisodeRelates => "tool_episode_relates",
+        GraphEdgeKind::EvalCovers => "eval_covers",
+        GraphEdgeKind::Related => "related",
+    }
+}
+
 /// Evaluation report for persisted context-pack artifacts.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextPackArtifactEvalReport {

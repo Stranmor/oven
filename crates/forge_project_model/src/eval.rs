@@ -11,7 +11,8 @@ use crate::freshness::compare_freshness;
 use crate::retrieval::retrieve;
 use crate::types::{
     ContextPack, ContextPackArtifactEvalReport, ContextPackArtifactId, EdgeConfidence,
-    EvidenceFreshness, EvidenceLedgerEvalIssue, EvidenceLedgerEvalIssueCode,
+    EvidenceFreshness, EvidenceLedgerActivation, EvidenceLedgerActivationSummary,
+    EvidenceLedgerEvalIssue, EvidenceLedgerEvalIssueCode, EvidenceLedgerGraphMetadata,
     EvidenceLedgerLinkageReport, EvidenceReadinessDiagnostic, FreshnessEvalReport,
     GraphCoverageReport, GraphEdge, GraphEdgeKind, KnowledgeGraph, KnowledgeGraphEdge,
     KnowledgeGraphNode, KnowledgeGraphNodeId, ProjectManifest, Provenance,
@@ -39,6 +40,94 @@ impl Default for EvidenceReadinessDiagnosticBudget {
             max_issue_summaries: 16,
         }
     }
+}
+
+/// Bounded budgets for read-only evidence-ledger activation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvidenceLedgerActivationBudget {
+    /// Maximum context-pack artifact files to inspect.
+    pub max_artifacts: usize,
+    /// Maximum non-empty tool episode JSONL lines to inspect.
+    pub max_episode_lines: usize,
+    /// Maximum graph nodes allowed before graph metadata is omitted.
+    pub max_nodes: usize,
+    /// Maximum graph edges allowed before graph metadata is omitted.
+    pub max_edges: usize,
+    /// Maximum redaction-safe issue summaries to retain.
+    pub max_issue_summaries: usize,
+}
+
+impl Default for EvidenceLedgerActivationBudget {
+    fn default() -> Self {
+        Self {
+            max_artifacts: 128,
+            max_episode_lines: 512,
+            max_nodes: 512,
+            max_edges: 512,
+            max_issue_summaries: 16,
+        }
+    }
+}
+
+/// Builds a read-only bounded evidence-ledger activation from persisted artifacts only.
+///
+/// This API reads existing context-pack artifacts and tool episodes, then returns
+/// redaction-safe counters and graph metadata. It does not index, sync, write,
+/// append, repair, invoke producers, or expose source/tool payload content.
+///
+/// # Arguments
+///
+/// * `indexer` - Project indexer whose model storage is inspected.
+/// * `budget` - Hard caps for artifact, episode, graph, and issue-summary inspection.
+///
+/// # Errors
+///
+/// Returns an error only when typed graph metadata construction fails for the
+/// already-readable artifacts and episodes.
+pub fn load_evidence_ledger_activation(
+    indexer: &ProjectIndexer,
+    budget: &EvidenceLedgerActivationBudget,
+) -> anyhow::Result<EvidenceLedgerActivation> {
+    let readiness_budget = EvidenceReadinessDiagnosticBudget {
+        max_artifacts: budget.max_artifacts,
+        max_episode_lines: budget.max_episode_lines,
+        max_issue_summaries: budget.max_issue_summaries,
+    };
+    let readiness = diagnose_evidence_readiness(indexer, &readiness_budget);
+    let mut builder = EvidenceReadinessDiagnosticBuilder::new(budget.max_issue_summaries);
+    let artifact_paths =
+        context_pack_artifact_paths(indexer.model_dir(), &readiness_budget, &mut builder);
+    let mut readable_artifacts = Vec::new();
+    for (artifact_id, _path) in &artifact_paths {
+        if let Ok(pack) = indexer.read_context_pack(artifact_id) {
+            readable_artifacts.push((artifact_id.clone(), pack));
+        }
+    }
+    let episode_read =
+        read_tool_episode_lines(indexer.model_dir(), &readiness_budget, &mut builder);
+    let graph = tool_episodes_to_graph(&episode_read.episodes, &readable_artifacts)?;
+    let graph_metadata = EvidenceLedgerGraphMetadata::from_graph(&graph);
+    let graph_over_budget = graph_metadata.node_count > budget.max_nodes
+        || graph_metadata.edge_count > budget.max_edges;
+    let graph = (!graph_over_budget).then_some(graph_metadata.clone());
+    let issue_count = readiness
+        .context_pack_issue_count
+        .saturating_add(readiness.tool_episode_issue_count)
+        .saturating_add(readiness.missing_link_count);
+    let summary = EvidenceLedgerActivationSummary {
+        context_pack_artifact_count: readiness.context_pack_artifact_count,
+        readable_context_pack_count: readable_artifacts.len(),
+        tool_episode_count: readiness.tool_episode_count,
+        linked_episode_count: readiness.linked_episode_count,
+        missing_link_count: readiness.missing_link_count,
+        graph_node_count: graph_metadata.node_count,
+        graph_edge_count: graph_metadata.edge_count,
+        worst_case_freshness: readiness.worst_case_freshness.clone(),
+        issue_count,
+        issue_summaries: readiness.issue_summaries.clone(),
+        truncated: readiness.truncated || graph_over_budget,
+    };
+    Ok(EvidenceLedgerActivation { summary, readiness, graph })
 }
 
 /// Builds a read-only bounded evidence readiness diagnostic for context packs and tool episodes.
@@ -1033,6 +1122,125 @@ mod tests {
         assert_eq!(first_id.as_str().len(), 64usize);
         Ok(())
     }
+    #[test]
+    fn evidence_ledger_activation_builds_summary_from_valid_context_pack_and_linked_episode()
+    -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let (artifact_id, _pack) = write_fixture_context_pack(&setup, &manifest)?;
+        setup.append_episode(&fixture_episode(&artifact_id))?;
+
+        let actual =
+            load_evidence_ledger_activation(&setup, &EvidenceLedgerActivationBudget::default())?;
+        let expected = (
+            1usize, 1usize, 1usize, 1usize, 0usize, 2usize, 1usize, false,
+        );
+
+        assert_eq!(
+            (
+                actual.summary.context_pack_artifact_count,
+                actual.summary.readable_context_pack_count,
+                actual.summary.tool_episode_count,
+                actual.summary.linked_episode_count,
+                actual.summary.missing_link_count,
+                actual.summary.graph_node_count,
+                actual.summary.graph_edge_count,
+                actual.summary.truncated,
+            ),
+            expected,
+        );
+        assert_eq!(
+            actual.summary.worst_case_freshness,
+            Some("fresh".to_string())
+        );
+        let actual_graph = actual
+            .graph
+            .as_ref()
+            .expect("fixture activation should include graph metadata");
+        assert_eq!(
+            actual_graph.node_kind_counts.get("retrieved_evidence"),
+            Some(&1)
+        );
+        assert_eq!(actual_graph.node_kind_counts.get("tool_episode"), Some(&1));
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_ledger_activation_counts_malformed_inputs_without_raw_payload_echo() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let artifact_id = ContextPackArtifactId::new("b".repeat(64))?;
+        fs::create_dir_all(fixture.path().join("model").join("context_packs"))?;
+        fs::write(
+            artifact_path(fixture.path(), &artifact_id),
+            "not json secret payload",
+        )?;
+        fs::write(
+            fixture.path().join("model").join("tool_episodes.jsonl"),
+            "not json raw tool payload\n",
+        )?;
+
+        let actual =
+            load_evidence_ledger_activation(&setup, &EvidenceLedgerActivationBudget::default())?;
+        let actual_json = serde_json::to_string(&actual)?;
+        let expected = (1usize, 0usize, 0usize, 2usize, true, true);
+
+        assert_eq!(
+            (
+                actual.summary.context_pack_artifact_count,
+                actual.summary.readable_context_pack_count,
+                actual.summary.tool_episode_count,
+                actual.summary.issue_count,
+                actual
+                    .summary
+                    .issue_summaries
+                    .contains(&"context_pack:CorruptArtifact".to_string()),
+                actual
+                    .summary
+                    .issue_summaries
+                    .contains(&"tool_episode_line_malformed".to_string()),
+            ),
+            expected,
+        );
+        assert!(!actual_json.contains("not json"));
+        assert!(!actual_json.contains("secret payload"));
+        assert!(!actual_json.contains("raw tool payload"));
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_ledger_activation_graph_budget_omits_graph_and_preserves_summary() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let (artifact_id, _pack) = write_fixture_context_pack(&setup, &manifest)?;
+        setup.append_episode(&fixture_episode(&artifact_id))?;
+
+        let actual = load_evidence_ledger_activation(
+            &setup,
+            &EvidenceLedgerActivationBudget {
+                max_artifacts: 8,
+                max_episode_lines: 8,
+                max_nodes: 1,
+                max_edges: 8,
+                max_issue_summaries: 8,
+            },
+        )?;
+        let expected = (2usize, 1usize, true);
+
+        assert_eq!(
+            (
+                actual.summary.graph_node_count,
+                actual.summary.graph_edge_count,
+                actual.summary.truncated,
+            ),
+            expected,
+        );
+        assert_eq!(actual.graph, None);
+        Ok(())
+    }
+
     #[test]
     fn evaluates_context_pack_episode_linkage_and_graph_happy_path() -> Result<()> {
         let (fixture, root) = fixture_project()?;

@@ -87,6 +87,33 @@ pub struct ProjectModelEvidenceReadinessMetadata {
     pub truncated: bool,
 }
 
+/// Compact read-only evidence-ledger activation metadata for context rendering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectModelEvidenceLedgerActivationMetadata {
+    /// Number of context-pack artifact candidates inspected under budget.
+    pub context_pack_artifact_count: usize,
+    /// Number of inspected context-pack artifacts that were readable.
+    pub readable_context_pack_count: usize,
+    /// Number of valid tool episodes inspected under budget.
+    pub tool_episode_count: usize,
+    /// Number of inspected tool episodes linked to a readable context-pack artifact.
+    pub linked_episode_count: usize,
+    /// Number of linkage issues or missing context-pack artifact references.
+    pub missing_link_count: usize,
+    /// Graph node count computed from metadata-only activation graph construction.
+    pub graph_node_count: usize,
+    /// Graph edge count computed from metadata-only activation graph construction.
+    pub graph_edge_count: usize,
+    /// Worst-case freshness across readable context-pack artifacts.
+    pub worst_case_freshness: Option<String>,
+    /// Total redaction-safe issue count before summary capping.
+    pub issue_count: usize,
+    /// Deterministically capped stable issue labels.
+    pub issue_summaries: Vec<String>,
+    /// Whether any activation budget omitted data or graph metadata.
+    pub truncated: bool,
+}
+
 /// Compact read-only readiness metadata for context rendering.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProjectModelContextReadinessMetadata {
@@ -94,6 +121,8 @@ pub struct ProjectModelContextReadinessMetadata {
     pub exact_fact_readiness: Option<ProjectModelExactFactReadinessMetadata>,
     /// Optional context-pack and tool-episode evidence readiness metadata.
     pub evidence_readiness: Option<ProjectModelEvidenceReadinessMetadata>,
+    /// Optional evidence-ledger activation metadata.
+    pub evidence_ledger_activation: Option<ProjectModelEvidenceLedgerActivationMetadata>,
 }
 
 /// A typed project-model context source prepared by an adapter layer.
@@ -211,6 +240,7 @@ struct ProjectModelContextRenderRoot<'a> {
     provenance: &'a str,
     exact_fact_readiness: Option<&'a ProjectModelExactFactReadinessMetadata>,
     evidence_readiness: Option<&'a ProjectModelEvidenceReadinessMetadata>,
+    evidence_ledger_activation: Option<&'a ProjectModelEvidenceLedgerActivationMetadata>,
 }
 
 /// Renders dynamic project-model context under a typed budget.
@@ -240,6 +270,8 @@ pub fn render_project_model_context(
         provenance,
         exact_fact_readiness: readiness.and_then(|metadata| metadata.exact_fact_readiness.as_ref()),
         evidence_readiness: readiness.and_then(|metadata| metadata.evidence_readiness.as_ref()),
+        evidence_ledger_activation: readiness
+            .and_then(|metadata| metadata.evidence_ledger_activation.as_ref()),
     };
     let rendered = render_project_model_context_inner(&root, sources, budget, false);
     if rendered.chars().count() <= budget.max_rendered_chars {
@@ -278,6 +310,7 @@ fn render_project_model_context_inner(
     ));
     render_exact_fact_readiness_attrs(&mut rendered, root.exact_fact_readiness, budget);
     render_evidence_readiness_attrs(&mut rendered, root.evidence_readiness, budget);
+    render_evidence_ledger_activation_attrs(&mut rendered, root.evidence_ledger_activation, budget);
     rendered.push('>');
 
     let mut remaining_content_chars = budget.max_total_content_chars;
@@ -380,6 +413,44 @@ fn render_evidence_readiness_attrs(
             " evidence_readiness_issue_summaries=\"{}\"",
             xml_attr(truncate_attr(
                 &readiness.issue_summaries.join(";"),
+                budget.max_metadata_attr_chars,
+            ))
+        ));
+    }
+}
+
+fn render_evidence_ledger_activation_attrs(
+    rendered: &mut String,
+    activation: Option<&ProjectModelEvidenceLedgerActivationMetadata>,
+    budget: &ProjectModelContextRenderBudget,
+) {
+    let Some(activation) = activation else {
+        rendered.push_str(" evidence_ledger_activation=\"not_evaluated\"");
+        return;
+    };
+    rendered.push_str(&format!(
+        " evidence_ledger_activation=\"evaluated\" evidence_ledger_context_pack_artifact_count=\"{}\" evidence_ledger_readable_context_pack_count=\"{}\" evidence_ledger_tool_episode_count=\"{}\" evidence_ledger_linked_episode_count=\"{}\" evidence_ledger_missing_link_count=\"{}\" evidence_ledger_graph_node_count=\"{}\" evidence_ledger_graph_edge_count=\"{}\" evidence_ledger_issue_count=\"{}\" evidence_ledger_truncated=\"{}\"",
+        activation.context_pack_artifact_count,
+        activation.readable_context_pack_count,
+        activation.tool_episode_count,
+        activation.linked_episode_count,
+        activation.missing_link_count,
+        activation.graph_node_count,
+        activation.graph_edge_count,
+        activation.issue_count,
+        activation.truncated,
+    ));
+    if let Some(freshness) = &activation.worst_case_freshness {
+        rendered.push_str(&format!(
+            " evidence_ledger_worst_case_freshness=\"{}\"",
+            xml_attr(truncate_attr(freshness, budget.max_metadata_attr_chars))
+        ));
+    }
+    if !activation.issue_summaries.is_empty() {
+        rendered.push_str(&format!(
+            " evidence_ledger_issue_summaries=\"{}\"",
+            xml_attr(truncate_attr(
+                &activation.issue_summaries.join(";"),
                 budget.max_metadata_attr_chars,
             ))
         ));
@@ -673,6 +744,7 @@ mod tests {
         let readiness = ProjectModelContextReadinessMetadata {
             exact_fact_readiness: Some(readiness),
             evidence_readiness: None,
+            evidence_ledger_activation: None,
         };
 
         let actual = render_project_model_context(
@@ -720,6 +792,7 @@ mod tests {
         let readiness = ProjectModelContextReadinessMetadata {
             exact_fact_readiness: None,
             evidence_readiness: Some(readiness),
+            evidence_ledger_activation: None,
         };
 
         let actual = render_project_model_context(

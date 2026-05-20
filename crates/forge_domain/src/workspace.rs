@@ -93,6 +93,55 @@ pub struct WorkspaceExactFactReadinessDiagnostic {
     pub exact_compiler_reference_edge_count: usize,
 }
 
+/// Local project-model evidence-ledger graph metadata for context-pack artifacts and tool episodes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceEvidenceLedgerGraphMetadata {
+    /// Total typed graph node count.
+    pub node_count: usize,
+    /// Total typed graph edge count.
+    pub edge_count: usize,
+    /// Node counts keyed by stable node-kind label.
+    pub node_kind_counts: std::collections::BTreeMap<String, usize>,
+    /// Edge counts keyed by stable edge-kind label.
+    pub edge_kind_counts: std::collections::BTreeMap<String, usize>,
+}
+
+/// Local project-model evidence-ledger activation summary for context-pack artifacts and tool episodes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceEvidenceLedgerActivationSummary {
+    /// Number of context-pack artifact candidates inspected under budget.
+    pub context_pack_artifact_count: usize,
+    /// Number of inspected context-pack artifacts that were readable.
+    pub readable_context_pack_count: usize,
+    /// Number of valid tool episodes inspected under budget.
+    pub tool_episode_count: usize,
+    /// Number of inspected tool episodes linked to a readable context-pack artifact.
+    pub linked_episode_count: usize,
+    /// Number of linkage issues or missing context-pack artifact references.
+    pub missing_link_count: usize,
+    /// Graph node count computed from metadata-only activation graph construction.
+    pub graph_node_count: usize,
+    /// Graph edge count computed from metadata-only activation graph construction.
+    pub graph_edge_count: usize,
+    /// Worst-case freshness across readable context-pack artifacts.
+    pub worst_case_freshness: Option<String>,
+    /// Total redaction-safe issue count before summary capping.
+    pub issue_count: usize,
+    /// Deterministically capped stable issue labels.
+    pub issue_summaries: Vec<String>,
+    /// Whether any activation budget omitted data or graph metadata.
+    pub truncated: bool,
+}
+
+/// Local project-model evidence-ledger activation diagnostic for context-pack artifacts and tool episodes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceEvidenceLedgerActivationDiagnostic {
+    /// Compact counters and redaction-safe proof labels.
+    pub summary: WorkspaceEvidenceLedgerActivationSummary,
+    /// Optional metadata-only graph proof omitted when graph budgets are exceeded.
+    pub graph: Option<WorkspaceEvidenceLedgerGraphMetadata>,
+}
+
 /// Local project-model evidence readiness diagnostic for context-pack artifacts and tool episodes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceEvidenceReadinessDiagnostic {
@@ -137,6 +186,8 @@ pub struct WorkspaceContextManifestDiagnostic {
     pub exact_fact_readiness: Option<WorkspaceExactFactReadinessDiagnostic>,
     /// Read-only evidence readiness for context-pack artifacts and tool episodes, when evaluated.
     pub evidence_readiness: Option<WorkspaceEvidenceReadinessDiagnostic>,
+    /// Read-only evidence-ledger activation proof for context-pack artifacts and tool episodes, when evaluated.
+    pub evidence_ledger_activation: Option<WorkspaceEvidenceLedgerActivationDiagnostic>,
 }
 
 impl WorkspaceContextManifestDiagnostic {

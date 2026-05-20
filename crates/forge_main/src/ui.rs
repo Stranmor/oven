@@ -19,7 +19,8 @@ use forge_config::ForgeConfig;
 use forge_display::MarkdownFormat;
 use forge_domain::{
     AuthMethod, ChatResponseContent, ConsoleWriter, ContextMessage, Role, TitleFormat, UserCommand,
-    WorkspaceEvidenceReadinessDiagnostic, WorkspaceExactFactReadinessDiagnostic,
+    WorkspaceEvidenceLedgerActivationDiagnostic, WorkspaceEvidenceReadinessDiagnostic,
+    WorkspaceExactFactReadinessDiagnostic,
 };
 use forge_fs::ForgeFS;
 use forge_select::{ForgeWidget, SelectRow};
@@ -114,6 +115,29 @@ fn format_mcp_headers(server: &forge_domain::McpServerConfig) -> Option<String> 
             }
         }
     }
+}
+
+fn format_evidence_ledger_activation(
+    activation: Option<&WorkspaceEvidenceLedgerActivationDiagnostic>,
+) -> String {
+    activation.map_or_else(
+        || "not_evaluated".to_string(),
+        |activation| {
+            format!(
+                "context_packs={} readable_context_packs={} tool_episodes={} linked_episodes={} missing_links={} graph_nodes={} graph_edges={} issues={} worst_case_freshness={} truncated={}",
+                activation.summary.context_pack_artifact_count,
+                activation.summary.readable_context_pack_count,
+                activation.summary.tool_episode_count,
+                activation.summary.linked_episode_count,
+                activation.summary.missing_link_count,
+                activation.summary.graph_node_count,
+                activation.summary.graph_edge_count,
+                activation.summary.issue_count,
+                activation.summary.worst_case_freshness.as_deref().unwrap_or("unknown"),
+                activation.summary.truncated,
+            )
+        },
+    )
 }
 
 fn format_compaction_provider_request_estimate(result: &forge_domain::CompactionResult) -> String {
@@ -5574,13 +5598,14 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             info = info.add_key_value(
                 "Target",
                 format!(
-                    "workspace={} manifest_found={} manifest_path={} freshness={} exact_fact_readiness={} evidence_readiness={}",
+                    "workspace={} manifest_found={} manifest_path={} freshness={} exact_fact_readiness={} evidence_readiness={} evidence_ledger_activation={}",
                     target.workspace_root.display(),
                     target.manifest_found,
                     target.manifest_path.display(),
                     target.freshness.label(),
                     Self::format_exact_fact_readiness(target.exact_fact_readiness.as_ref()),
-                    Self::format_evidence_readiness(target.evidence_readiness.as_ref())
+                    Self::format_evidence_readiness(target.evidence_readiness.as_ref()),
+                    Self::format_evidence_ledger_activation(target.evidence_ledger_activation.as_ref())
                 ),
             );
         }
@@ -5594,13 +5619,14 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                 info = info.add_key_value(
                     "Skipped Manifest",
                     format!(
-                        "workspace={} manifest_found={} manifest_path={} freshness={} exact_fact_readiness={} evidence_readiness={}",
+                        "workspace={} manifest_found={} manifest_path={} freshness={} exact_fact_readiness={} evidence_readiness={} evidence_ledger_activation={}",
                         target.workspace_root.display(),
                         target.manifest_found,
                         target.manifest_path.display(),
                         target.freshness.label(),
                         Self::format_exact_fact_readiness(target.exact_fact_readiness.as_ref()),
-                        Self::format_evidence_readiness(target.evidence_readiness.as_ref())
+                        Self::format_evidence_readiness(target.evidence_readiness.as_ref()),
+                        Self::format_evidence_ledger_activation(target.evidence_ledger_activation.as_ref())
                     ),
                 );
             }
@@ -5663,6 +5689,11 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         )
     }
 
+    fn format_evidence_ledger_activation(
+        activation: Option<&WorkspaceEvidenceLedgerActivationDiagnostic>,
+    ) -> String {
+        format_evidence_ledger_activation(activation)
+    }
     /// Displays sync status for all files in the workspace.
     async fn on_workspace_status(
         &mut self,
@@ -5924,6 +5955,7 @@ async fn run_tui_suspended_stdout_boundary(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::io;
     use std::sync::Arc;
 
@@ -6334,6 +6366,49 @@ mod tests {
         );
         let expected = (true, 1, 1, 0, false, false);
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn evidence_ledger_activation_explain_format_contains_counters_only() {
+        let fixture = WorkspaceEvidenceLedgerActivationDiagnostic {
+            summary: forge_domain::WorkspaceEvidenceLedgerActivationSummary {
+                context_pack_artifact_count: 1,
+                readable_context_pack_count: 1,
+                tool_episode_count: 1,
+                linked_episode_count: 1,
+                missing_link_count: 0,
+                graph_node_count: 2,
+                graph_edge_count: 1,
+                worst_case_freshness: Some("fresh".to_string()),
+                issue_count: 0,
+                issue_summaries: Vec::new(),
+                truncated: false,
+            },
+            graph: Some(forge_domain::WorkspaceEvidenceLedgerGraphMetadata {
+                node_count: 2,
+                edge_count: 1,
+                node_kind_counts: BTreeMap::from([
+                    ("retrieved_evidence".to_string(), 1),
+                    ("tool_episode".to_string(), 1),
+                ]),
+                edge_kind_counts: BTreeMap::from([("tool_episode_relates".to_string(), 1)]),
+            }),
+        };
+        let actual = format_evidence_ledger_activation(Some(&fixture));
+        let expected = (true, true, false, false, false, false, false);
+
+        assert_eq!(
+            (
+                actual.contains("context_packs=1"),
+                actual.contains("graph_nodes=2"),
+                actual.contains("retrieved_evidence"),
+                actual.contains("tool_episode_relates"),
+                actual.contains("context_pack_artifact:"),
+                actual.contains("KnowledgeGraphNode"),
+                actual.contains("pub fn"),
+            ),
+            expected,
+        );
     }
 
     #[test]

@@ -27,11 +27,12 @@ pub use durable_vector_index::{
     VectorIndexEntry, VectorSourceKind, vector_entries_from_manifest_embeddings,
 };
 pub use eval::{
-    EvidenceReadinessDiagnosticBudget, context_pack_worst_case_freshness,
-    diagnose_evidence_readiness, evaluate_context_pack_artifacts,
-    evaluate_context_pack_artifacts_by_id, evaluate_episode_artifact_links, evaluate_freshness,
-    evaluate_graph_coverage, evaluate_provenance_completeness, evaluate_retrieval,
-    evaluate_tool_episodes, tool_episode_graph_id, tool_episodes_to_graph,
+    EvidenceLedgerActivationBudget, EvidenceReadinessDiagnosticBudget,
+    context_pack_worst_case_freshness, diagnose_evidence_readiness,
+    evaluate_context_pack_artifacts, evaluate_context_pack_artifacts_by_id,
+    evaluate_episode_artifact_links, evaluate_freshness, evaluate_graph_coverage,
+    evaluate_provenance_completeness, evaluate_retrieval, evaluate_tool_episodes,
+    load_evidence_ledger_activation, tool_episode_graph_id, tool_episodes_to_graph,
 };
 pub use extraction::{
     RustExtraction, extract_cargo_dependency_edges, extract_rust_call_edges,
@@ -72,8 +73,8 @@ pub use producer::{
 pub use render::{
     DEFAULT_RENDERED_SOURCE_LIMIT, ProjectModelContextReadinessMetadata,
     ProjectModelContextRenderBudget, ProjectModelContextSource,
-    ProjectModelEvidenceReadinessMetadata, ProjectModelExactFactReadinessMetadata,
-    render_project_model_context,
+    ProjectModelEvidenceLedgerActivationMetadata, ProjectModelEvidenceReadinessMetadata,
+    ProjectModelExactFactReadinessMetadata, render_project_model_context,
 };
 pub use retrieval::{plan_retrieval, retrieve, retrieve_with_boundaries};
 pub use status::{
@@ -85,8 +86,9 @@ pub use types::{
     CargoPackageMetadata, CargoTargetDeclaration, CargoTargetKind, CargoTargetMetadata,
     CargoWorkspaceMetadata, ContextPack, ContextPackArtifactEvalReport, ContextPackArtifactId,
     ContextPackEvidence, ContextPackEvidenceSource, ContextPackSelection, DecisionGraphNode,
-    EdgeConfidence, EvalCaseGraphNode, EvidenceFreshness, EvidenceLedgerEvalIssue,
-    EvidenceLedgerEvalIssueCode, EvidenceLedgerLinkageReport, EvidenceReadinessDiagnostic,
+    EdgeConfidence, EvalCaseGraphNode, EvidenceFreshness, EvidenceLedgerActivation,
+    EvidenceLedgerActivationSummary, EvidenceLedgerEvalIssue, EvidenceLedgerEvalIssueCode,
+    EvidenceLedgerGraphMetadata, EvidenceLedgerLinkageReport, EvidenceReadinessDiagnostic,
     ExternalFactArtifactIngestionReport, ExternalFactArtifactReport, ExternalFactBatch,
     ExternalFactBatchMetadata, ExternalFactIngestionIssue, ExternalFactIngestionIssueCode,
     ExternalFactIngestionReport, ExternalFactProductionBaseline, ExternalFactSource, ExternalFacts,

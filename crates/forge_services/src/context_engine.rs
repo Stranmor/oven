@@ -8,22 +8,23 @@ use forge_app::{CommandInfra, EnvironmentInfra, FileReaderInfra, WalkerInfra, Wo
 use forge_domain::{
     AuthCredential, AuthDetails, FileChunk, Node, NodeData, NodeId, ProviderId, ProviderRepository,
     SearchParams, SyncProgress, UserId, WorkspaceContextFreshness,
-    WorkspaceContextManifestDiagnostic, WorkspaceEvidenceReadinessDiagnostic,
-    WorkspaceExactFactBoundedLoss, WorkspaceExactFactIngestionSummary, WorkspaceExactFactIssue,
+    WorkspaceContextManifestDiagnostic, WorkspaceEvidenceLedgerActivationDiagnostic,
+    WorkspaceEvidenceLedgerActivationSummary, WorkspaceEvidenceLedgerGraphMetadata,
+    WorkspaceEvidenceReadinessDiagnostic, WorkspaceExactFactBoundedLoss,
+    WorkspaceExactFactIngestionSummary, WorkspaceExactFactIssue,
     WorkspaceExactFactReadinessDiagnostic, WorkspaceExactFactReferenceReport,
     WorkspaceExactFactReferenceStatus, WorkspaceExactFactStatusReport, WorkspaceId,
     WorkspaceIndexRepository,
 };
 use forge_project_model::{
     ContextPack, ContextPackArtifactId, ContextPackSelection, EvidenceReadinessDiagnostic,
-    EvidenceReadinessDiagnosticBudget, ExternalFactArtifactIngestionReport,
-    ExternalFactIngestionIssue, ExternalFactProductionReport, ExternalFactProductionRequest,
-    ExternalFactProductionStatus, NativeLspReferenceProducer, NativeLspReferenceRequest,
-    NativeLspReferenceRequestDerivation, ProjectIndexer, Provenance, RetrievalQuery,
-    RustAnalyzerBounds, RustAnalyzerCapability, RustAnalyzerCapabilityProbe,
+    ExternalFactArtifactIngestionReport, ExternalFactIngestionIssue, ExternalFactProductionReport,
+    ExternalFactProductionRequest, ExternalFactProductionStatus, NativeLspReferenceProducer,
+    NativeLspReferenceRequest, NativeLspReferenceRequestDerivation, ProjectIndexer, Provenance,
+    RetrievalQuery, RustAnalyzerBounds, RustAnalyzerCapability, RustAnalyzerCapabilityProbe,
     RustAnalyzerCapabilityStatus, RustAnalyzerProbe, StaleEvidencePolicy, StdRustAnalyzerProcess,
-    ToolEpisode, derive_native_lsp_reference_request, diagnose_evidence_readiness,
-    evidence_line_range, fingerprint, local_project_model_dir, local_project_model_manifest,
+    ToolEpisode, derive_native_lsp_reference_request, evidence_line_range, fingerprint,
+    load_evidence_ledger_activation, local_project_model_dir, local_project_model_manifest,
     read_exact_fact_status, retrieve,
 };
 use forge_stream::MpscStream;
@@ -685,12 +686,55 @@ fn evaluate_exact_fact_readiness(path: &Path) -> Option<WorkspaceExactFactReadin
     }
 }
 
-fn evaluate_evidence_readiness(path: &Path) -> WorkspaceEvidenceReadinessDiagnostic {
+fn evaluate_evidence_activation(path: &Path) -> forge_project_model::EvidenceLedgerActivation {
     let indexer = ProjectIndexer::new(path, local_project_model_dir(path));
-    workspace_evidence_readiness_diagnostic(diagnose_evidence_readiness(
+    load_evidence_ledger_activation(
         &indexer,
-        &EvidenceReadinessDiagnosticBudget::default(),
-    ))
+        &forge_project_model::EvidenceLedgerActivationBudget::default(),
+    )
+    .unwrap_or_else(|_error| forge_project_model::EvidenceLedgerActivation {
+        summary: forge_project_model::EvidenceLedgerActivationSummary {
+            issue_count: 1,
+            issue_summaries: vec!["evidence_ledger_activation_unreadable".to_string()],
+            truncated: false,
+            ..Default::default()
+        },
+        readiness: EvidenceReadinessDiagnostic {
+            context_pack_valid: false,
+            context_pack_issue_count: 1,
+            issue_summaries: vec!["evidence_ledger_activation_unreadable".to_string()],
+            ..Default::default()
+        },
+        graph: None,
+    })
+}
+
+fn workspace_evidence_ledger_activation_diagnostic(
+    activation: forge_project_model::EvidenceLedgerActivation,
+) -> WorkspaceEvidenceLedgerActivationDiagnostic {
+    WorkspaceEvidenceLedgerActivationDiagnostic {
+        summary: WorkspaceEvidenceLedgerActivationSummary {
+            context_pack_artifact_count: activation.summary.context_pack_artifact_count,
+            readable_context_pack_count: activation.summary.readable_context_pack_count,
+            tool_episode_count: activation.summary.tool_episode_count,
+            linked_episode_count: activation.summary.linked_episode_count,
+            missing_link_count: activation.summary.missing_link_count,
+            graph_node_count: activation.summary.graph_node_count,
+            graph_edge_count: activation.summary.graph_edge_count,
+            worst_case_freshness: activation.summary.worst_case_freshness,
+            issue_count: activation.summary.issue_count,
+            issue_summaries: activation.summary.issue_summaries,
+            truncated: activation.summary.truncated,
+        },
+        graph: activation
+            .graph
+            .map(|metadata| WorkspaceEvidenceLedgerGraphMetadata {
+                node_count: metadata.node_count,
+                edge_count: metadata.edge_count,
+                node_kind_counts: metadata.node_kind_counts,
+                edge_kind_counts: metadata.edge_kind_counts,
+            }),
+    }
 }
 
 fn workspace_evidence_readiness_diagnostic(
@@ -724,10 +768,17 @@ fn evaluate_project_model_context(path: &Path) -> WorkspaceContextManifestDiagno
             },
             exact_fact_readiness: None,
             evidence_readiness: None,
+            evidence_ledger_activation: None,
         };
     }
     let exact_fact_readiness = evaluate_exact_fact_readiness(path);
-    let evidence_readiness = Some(evaluate_evidence_readiness(path));
+    let evidence_activation = evaluate_evidence_activation(path);
+    let evidence_readiness = Some(workspace_evidence_readiness_diagnostic(
+        evidence_activation.readiness.clone(),
+    ));
+    let evidence_ledger_activation = Some(workspace_evidence_ledger_activation_diagnostic(
+        evidence_activation,
+    ));
 
     let indexer = ProjectIndexer::new(path, local_project_model_dir(path));
     let freshness = match indexer
@@ -753,6 +804,7 @@ fn evaluate_project_model_context(path: &Path) -> WorkspaceContextManifestDiagno
         freshness,
         exact_fact_readiness,
         evidence_readiness,
+        evidence_ledger_activation,
     }
 }
 
