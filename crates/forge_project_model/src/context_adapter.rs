@@ -813,6 +813,8 @@ mod tests {
                 ..fixture_provenance("indexer")
             },
             freshness,
+            source_content_hash: "source-hash".to_string(),
+            line_range_fingerprint: "range-fingerprint".to_string(),
             linked_episode_count: 1,
             link_issue_count: 0,
         }

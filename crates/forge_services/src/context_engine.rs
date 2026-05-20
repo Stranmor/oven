@@ -39,9 +39,10 @@ use forge_project_model::{
     ProjectContextRetrievalRequest, ProjectContextVectorIndexBoundary,
     ProjectContextVectorReadiness, ProjectContextVectorUnavailableReason,
     ProjectContextWriteDecision, ProjectIndexer, ProjectModelContextRenderBudget, Provenance,
-    RustAnalyzerBounds, RustAnalyzerCapability, RustAnalyzerCapabilityProbe,
-    RustAnalyzerCapabilityStatus, RustAnalyzerProbe, StdRustAnalyzerProcess, ToolEpisode,
-    VectorIndexArtifact, VectorIndexArtifactId, VectorIndexEntry, VectorQuery,
+    ReplayActivationCaps, ReplayActivationRequest, RustAnalyzerBounds, RustAnalyzerCapability,
+    RustAnalyzerCapabilityProbe, RustAnalyzerCapabilityStatus, RustAnalyzerProbe,
+    StdRustAnalyzerProcess, ToolEpisode, VectorIndexArtifact, VectorIndexArtifactId,
+    VectorIndexEntry, VectorQuery, activate_evidence_ledger_replay, apply_replay_readback_results,
     derive_native_lsp_reference_request, fingerprint, load_evidence_ledger_activation,
     local_project_model_dir, local_project_model_manifest,
     plan_project_context_retrieval_with_options, read_exact_fact_status,
@@ -1305,18 +1306,40 @@ impl<
                 reason
             );
         }
-        let reranker_selection = self.select_project_context_reranker_boundary();
         let exact_fact_status = read_exact_fact_status(&root).ok();
+        let replay_report_request =
+            forge_project_model::EvidenceLedgerReplayRequest::reference_only(&manifest);
+        let replay_report =
+            select_evidence_ledger_replay(&indexer, &manifest, &replay_report_request);
+        let replay_activation_request = ReplayActivationRequest::new(
+            &manifest,
+            fingerprint(&format!(
+                "{}:{}:{:?}:{:?}:{:?}",
+                params.query,
+                params.limit.unwrap_or(10),
+                params.starts_with,
+                params.ends_with,
+                params.top_k
+            )),
+            ReplayActivationCaps::default(),
+        );
+        let pending_replay_activation = activate_evidence_ledger_replay(
+            &manifest,
+            &freshness,
+            &replay_report,
+            &replay_activation_request,
+        );
         let plan = match plan_project_context_retrieval_with_options(
             &manifest,
             &freshness,
-            request,
+            request.clone(),
             ProjectContextRetrievalOptions {
                 vector_query: semantic_query.as_ref(),
                 vector_index: durable_vector_selection.boundary(),
-                reranker: reranker_selection,
+                reranker: self.select_project_context_reranker_boundary(),
                 vector_unavailable_reason: durable_vector_selection.unavailable_reason(),
                 exact_fact_status: exact_fact_status.as_ref(),
+                replay_activation: Some(&pending_replay_activation),
             },
         ) {
             ProjectContextRetrievalPlanningOutcome::Plan(plan) => plan,
@@ -1340,10 +1363,20 @@ impl<
                 reason
             );
         }
+        let replay_evidence_ids = pending_replay_activation
+            .active_refs
+            .iter()
+            .map(|reference| reference.canonical_target_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let plan_has_replay_evidence = plan
+            .selected_results
+            .iter()
+            .any(|result| replay_evidence_ids.contains(&result.id));
+        let mut replay_readback_results = BTreeMap::new();
         let mut nodes = Vec::new();
         for read_request in &plan.read_requests {
             let absolute_path = root.join(read_request.relative_manifest_path());
-            let (content, _) = self
+            match self
                 .infra
                 .range_read_utf8(
                     &absolute_path,
@@ -1351,25 +1384,72 @@ impl<
                     u64::from(read_request.end_line),
                 )
                 .await
-                .with_context(|| format!("read {}", absolute_path.display()))?;
-            nodes.push(Node {
-                node_id: NodeId::new(read_request.evidence_id.clone()),
-                node: NodeData::FileChunk(FileChunk {
-                    file_path: read_request.relative_manifest_path().to_string(),
-                    content,
-                    start_line: read_request.start_line,
-                    end_line: read_request.end_line,
-                }),
-                relevance: plan
-                    .return_order
-                    .iter()
-                    .find(|item| item.evidence_id == read_request.evidence_id)
-                    .map(|item| item.relevance),
-                distance: None,
-            });
+            {
+                Ok((content, _)) => {
+                    if replay_evidence_ids.contains(&read_request.evidence_id) {
+                        replay_readback_results.insert(read_request.evidence_id.clone(), true);
+                    }
+                    nodes.push(Node {
+                        node_id: NodeId::new(read_request.evidence_id.clone()),
+                        node: NodeData::FileChunk(FileChunk {
+                            file_path: read_request.relative_manifest_path().to_string(),
+                            content,
+                            start_line: read_request.start_line,
+                            end_line: read_request.end_line,
+                        }),
+                        relevance: plan
+                            .return_order
+                            .iter()
+                            .find(|item| item.evidence_id == read_request.evidence_id)
+                            .map(|item| item.relevance),
+                        distance: None,
+                    });
+                }
+                Err(error) if replay_evidence_ids.contains(&read_request.evidence_id) => {
+                    replay_readback_results.insert(read_request.evidence_id.clone(), false);
+                    info!(
+                        path = %absolute_path.display(),
+                        evidence_id = %read_request.evidence_id,
+                        error = %error,
+                        "excluded replay evidence after failed readback"
+                    );
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("read {}", absolute_path.display()));
+                }
+            }
         }
-        if plan.write_decision == ProjectContextWriteDecision::WriteContextPackAfterReadback {
-            let pack = plan
+        let verified_replay_activation =
+            apply_replay_readback_results(&pending_replay_activation, &replay_readback_results);
+        let write_plan = if plan_has_replay_evidence {
+            match plan_project_context_retrieval_with_options(
+                &manifest,
+                &freshness,
+                request,
+                ProjectContextRetrievalOptions {
+                    vector_query: semantic_query.as_ref(),
+                    vector_index: durable_vector_selection.boundary(),
+                    reranker: self.select_project_context_reranker_boundary(),
+                    vector_unavailable_reason: durable_vector_selection.unavailable_reason(),
+                    exact_fact_status: exact_fact_status.as_ref(),
+                    replay_activation: Some(&verified_replay_activation),
+                },
+            ) {
+                ProjectContextRetrievalPlanningOutcome::Plan(write_plan) => write_plan,
+                ProjectContextRetrievalPlanningOutcome::Refusal(refusal) => {
+                    anyhow::bail!(
+                        "Workspace project model retrieval refused after replay readback at {} for {}: {}",
+                        manifest_path.display(),
+                        root.display(),
+                        refusal.detail
+                    );
+                }
+            }
+        } else {
+            plan.clone()
+        };
+        if write_plan.write_decision == ProjectContextWriteDecision::WriteContextPackAfterReadback {
+            let pack = write_plan
                 .context_pack
                 .as_ref()
                 .context("project-model retrieval plan requested write without context pack")?;
@@ -3934,6 +4014,8 @@ mod tests {
                     fingerprint: "fingerprint".to_string(),
                 },
                 freshness: EvidenceFreshness::Fresh,
+                source_content_hash: "source-hash".to_string(),
+                line_range_fingerprint: "range-fingerprint".to_string(),
                 linked_episode_count: 0,
                 link_issue_count: 0,
             }],

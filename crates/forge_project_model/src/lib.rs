@@ -48,7 +48,11 @@ pub use evidence_replay::{
     EvidenceReplayBudgetReport, EvidenceReplayContentPolicy, EvidenceReplayFreshnessPolicy,
     EvidenceReplayIssue, EvidenceReplayIssueCode, EvidenceReplayManifestReference,
     EvidenceReplayReference, EvidenceReplayScoreKind, EvidenceReplaySelectionPolicy,
-    EvidenceReplayStalePolicyReport, select_evidence_ledger_replay,
+    EvidenceReplayStalePolicyReport, ReplayActivatedEvidenceRef, ReplayActivationBoundary,
+    ReplayActivationCaps, ReplayActivationDiagnostics, ReplayActivationFingerprintInputs,
+    ReplayActivationIssue, ReplayActivationRequest, ReplayEvidenceReadbackStatus,
+    ReplayEvidenceTargetKind, activate_evidence_ledger_replay, apply_replay_readback_results,
+    select_evidence_ledger_replay,
 };
 
 pub use extraction::{

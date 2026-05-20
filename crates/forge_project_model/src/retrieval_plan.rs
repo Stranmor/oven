@@ -5,7 +5,7 @@ use std::path::{Component, Path};
 
 use anyhow::{Result, bail};
 
-use crate::context_adapter::resolve_manifest_evidence_target;
+use crate::context_adapter::{ManifestEvidenceTarget, resolve_manifest_evidence_target};
 use crate::retrieval::retrieve_with_boundaries;
 use crate::types::{
     ContextPack, ContextPackEvidence, ContextPackSelection, EdgeConfidence, FreshnessProofLevel,
@@ -13,7 +13,7 @@ use crate::types::{
     RetrievalResult, RetrievalScoringWeights, StaleEvidencePolicy, VectorQuery,
 };
 use crate::vector::{Reranker, VectorIndex};
-use crate::{ExactFactStatus, ExactFactStatusReport};
+use crate::{ExactFactStatus, ExactFactStatusReport, ReplayActivationBoundary};
 
 const MAX_DIAGNOSTIC_SUMMARIES: usize = 8;
 const EXACT_FACT_REFERENCE_FANOUT_CAP: usize = 8;
@@ -130,6 +130,8 @@ pub struct ProjectContextRetrievalOptions<'a> {
     pub vector_unavailable_reason: Option<ProjectContextVectorUnavailableReason>,
     /// Optional exact-fact activation status supplied by a read-only status boundary.
     pub exact_fact_status: Option<&'a ExactFactStatusReport>,
+    /// Optional read-only replay activation boundary supplied by project-model activation.
+    pub replay_activation: Option<&'a ReplayActivationBoundary>,
 }
 
 /// Validated vector index boundary plus redaction-safe metadata.
@@ -832,6 +834,16 @@ pub fn plan_project_context_retrieval_with_options(
     let exact_fact_activation =
         exact_fact_activation(manifest, freshness, options.exact_fact_status);
     selected_results.extend(exact_fact_activation.results.iter().cloned());
+    if selected_results.is_empty()
+        && let Some(replay_activation) = options.replay_activation
+    {
+        selected_results.extend(
+            replay_activation
+                .active_refs
+                .iter()
+                .map(|reference| reference.to_retrieval_result()),
+        );
+    }
     selected_results = selected_results
         .into_iter()
         .filter(|result| request.path_scope.matches(&result.path))
@@ -885,7 +897,7 @@ pub fn plan_project_context_retrieval_with_options(
 
     let mut read_requests = Vec::new();
     for evidence in &context_pack.evidence {
-        let target = match resolve_manifest_evidence_target(manifest, &evidence.id) {
+        let target = match resolve_readback_evidence_target(manifest, evidence) {
             Some(target) => target,
             None => {
                 return ProjectContextRetrievalPlanningOutcome::Refusal(
@@ -1302,6 +1314,32 @@ impl ProjectContextRerankerActivation<'_> {
     }
 }
 
+fn resolve_readback_evidence_target(
+    manifest: &ProjectManifest,
+    evidence: &ContextPackEvidence,
+) -> Option<ManifestEvidenceTarget> {
+    if let Some(target) = resolve_manifest_evidence_target(manifest, &evidence.id) {
+        return Some(target);
+    }
+    let start_line = evidence.provenance.start_line?;
+    let end_line = evidence.provenance.end_line?;
+    if start_line == 0 || start_line > end_line {
+        return None;
+    }
+    let file = manifest
+        .files
+        .iter()
+        .find(|file| file.path == evidence.provenance.path)?;
+    if end_line > file.lines {
+        return None;
+    }
+    Some(ManifestEvidenceTarget {
+        path: file.path.clone(),
+        line_range: Some((start_line, end_line)),
+        content_hash: file.content_hash.clone(),
+    })
+}
+
 fn stable_return_order(evidence: &[ContextPackEvidence]) -> Vec<ProjectContextReturnOrderItem> {
     let mut items = evidence
         .iter()
@@ -1386,7 +1424,12 @@ mod tests {
         FreshnessState, Language, Provenance, SourceFile,
     };
     use crate::vector::DeterministicVectorIndex;
-    use crate::{ProjectIndexer, ShardManifest, SymbolKind, SymbolNode, fingerprint};
+    use crate::{
+        ProjectIndexer, ReplayActivatedEvidenceRef, ReplayActivationBoundary, ReplayActivationCaps,
+        ReplayActivationDiagnostics, ReplayActivationFingerprintInputs,
+        ReplayEvidenceReadbackStatus, ReplayEvidenceTargetKind, ShardManifest, SymbolKind,
+        SymbolNode, fingerprint,
+    };
 
     #[test]
     fn planner_builds_whole_file_read_request_for_cargo_metadata_evidence() {
@@ -1416,6 +1459,144 @@ mod tests {
             },
             expected,
         );
+    }
+
+    #[test]
+    fn planner_consumes_only_activation_boundary_for_replay_evidence() {
+        let setup = cargo_plan_manifest();
+        let source = setup.files.first().expect("fixture file should exist");
+        let boundary = ReplayActivationBoundary {
+            manifest_hash: setup.manifest_hash.clone(),
+            active_refs: vec![ReplayActivatedEvidenceRef {
+                artifact_id: "artifact".to_string(),
+                evidence_id: "Cargo.toml".to_string(),
+                evidence_path: "Cargo.toml".to_string(),
+                start_line: 1,
+                end_line: 16,
+                score_kind: crate::EvidenceReplayScoreKind::DirectEvidence,
+                score: 42.0,
+                provenance_source: "indexer".to_string(),
+                target_kind: ReplayEvidenceTargetKind::ManifestSource,
+                canonical_target_id: fingerprint("target"),
+                fingerprint_inputs: ReplayActivationFingerprintInputs {
+                    manifest_hash: setup.manifest_hash.clone(),
+                    source_content_hash: source.content_hash.clone(),
+                    line_range_fingerprint: fingerprint("Cargo.toml:1-16"),
+                    target_kind: ReplayEvidenceTargetKind::ManifestSource,
+                    target_id: fingerprint("target"),
+                },
+                readback_status: ReplayEvidenceReadbackStatus::Verified,
+            }],
+            issues: Vec::new(),
+            diagnostics: ReplayActivationDiagnostics {
+                candidate_count: 1,
+                active_count: 1,
+                excluded_count: 0,
+                excluded_by_reason: BTreeMap::new(),
+                caps: ReplayActivationCaps::default(),
+                stable_ordering: "test".to_string(),
+                activation_fingerprint: fingerprint("activation"),
+            },
+        };
+        let request = ProjectContextRetrievalRequest::new(
+            "no lexical match for replay-only boundary",
+            1,
+            ProjectContextPathScope::default(),
+            false,
+        );
+
+        let actual = plan_project_context_retrieval_with_options(
+            &setup,
+            &freshness(&setup),
+            request,
+            ProjectContextRetrievalOptions {
+                replay_activation: Some(&boundary),
+                ..ProjectContextRetrievalOptions::default()
+            },
+        );
+        let expected = vec!["Cargo.toml".to_string()];
+
+        assert_eq!(planned_paths(actual), expected);
+    }
+
+    #[test]
+    fn planner_preserves_replay_route_identity_for_same_evidence_id() {
+        let setup = cargo_plan_manifest();
+        let source = setup.files.first().expect("fixture file should exist");
+        let boundary = ReplayActivationBoundary {
+            manifest_hash: setup.manifest_hash.clone(),
+            active_refs: vec![
+                ReplayActivatedEvidenceRef {
+                    artifact_id: "unlinked-artifact".to_string(),
+                    evidence_id: "Cargo.toml".to_string(),
+                    evidence_path: "Cargo.toml".to_string(),
+                    start_line: 1,
+                    end_line: 16,
+                    score_kind: crate::EvidenceReplayScoreKind::DirectEvidence,
+                    score: 2.0,
+                    provenance_source: "indexer".to_string(),
+                    target_kind: ReplayEvidenceTargetKind::ManifestSource,
+                    canonical_target_id: fingerprint("manifest-source-target"),
+                    fingerprint_inputs: ReplayActivationFingerprintInputs {
+                        manifest_hash: setup.manifest_hash.clone(),
+                        source_content_hash: source.content_hash.clone(),
+                        line_range_fingerprint: fingerprint("Cargo.toml:1-16"),
+                        target_kind: ReplayEvidenceTargetKind::ManifestSource,
+                        target_id: fingerprint("manifest-source-target"),
+                    },
+                    readback_status: ReplayEvidenceReadbackStatus::Verified,
+                },
+                ReplayActivatedEvidenceRef {
+                    artifact_id: "linked-artifact".to_string(),
+                    evidence_id: "Cargo.toml".to_string(),
+                    evidence_path: "Cargo.toml".to_string(),
+                    start_line: 1,
+                    end_line: 16,
+                    score_kind: crate::EvidenceReplayScoreKind::DirectEvidence,
+                    score: 1.0,
+                    provenance_source: "indexer".to_string(),
+                    target_kind: ReplayEvidenceTargetKind::ToolObservation,
+                    canonical_target_id: fingerprint("tool-observation-target"),
+                    fingerprint_inputs: ReplayActivationFingerprintInputs {
+                        manifest_hash: setup.manifest_hash.clone(),
+                        source_content_hash: source.content_hash.clone(),
+                        line_range_fingerprint: fingerprint("Cargo.toml:1-16"),
+                        target_kind: ReplayEvidenceTargetKind::ToolObservation,
+                        target_id: fingerprint("tool-observation-target"),
+                    },
+                    readback_status: ReplayEvidenceReadbackStatus::Verified,
+                },
+            ],
+            issues: Vec::new(),
+            diagnostics: ReplayActivationDiagnostics {
+                candidate_count: 2,
+                active_count: 2,
+                excluded_count: 0,
+                excluded_by_reason: BTreeMap::new(),
+                caps: ReplayActivationCaps::default(),
+                stable_ordering: "test".to_string(),
+                activation_fingerprint: fingerprint("activation"),
+            },
+        };
+        let request = ProjectContextRetrievalRequest::new(
+            "no lexical match for replay-only route identity boundary",
+            2,
+            ProjectContextPathScope::default(),
+            false,
+        );
+
+        let actual = expect_plan(plan_project_context_retrieval_with_options(
+            &setup,
+            &freshness(&setup),
+            request,
+            ProjectContextRetrievalOptions {
+                replay_activation: Some(&boundary),
+                ..ProjectContextRetrievalOptions::default()
+            },
+        ));
+        let expected = 2usize;
+
+        assert_eq!(actual.selected_results.len(), expected);
     }
 
     #[test]
@@ -1834,6 +2015,7 @@ mod tests {
                 reranker: None,
                 vector_unavailable_reason: None,
                 exact_fact_status: None,
+                replay_activation: None,
             },
         );
         let plan = expect_plan(actual);
@@ -1881,6 +2063,7 @@ mod tests {
                 reranker: None,
                 vector_unavailable_reason: None,
                 exact_fact_status: None,
+                replay_activation: None,
             },
         );
         let actual_plan = expect_plan(actual);
@@ -1925,6 +2108,7 @@ mod tests {
                 reranker: None,
                 vector_unavailable_reason: None,
                 exact_fact_status: None,
+                replay_activation: None,
             },
         );
         let actual_plan = expect_plan(actual);
@@ -1970,6 +2154,7 @@ mod tests {
                 reranker: None,
                 vector_unavailable_reason: None,
                 exact_fact_status: None,
+                replay_activation: None,
             },
         );
         let actual_plan = expect_plan(actual);
@@ -2020,6 +2205,7 @@ mod tests {
                 reranker: None,
                 vector_unavailable_reason: None,
                 exact_fact_status: None,
+                replay_activation: None,
             },
         );
         let actual_plan = expect_plan(actual);
@@ -2063,6 +2249,7 @@ mod tests {
                 reranker: None,
                 vector_unavailable_reason: None,
                 exact_fact_status: None,
+                replay_activation: None,
             },
         );
         let actual_plan = expect_plan(actual);
@@ -2107,6 +2294,7 @@ mod tests {
                 reranker: None,
                 vector_unavailable_reason: None,
                 exact_fact_status: None,
+                replay_activation: None,
             },
         );
         let actual_plan = expect_plan(actual);
@@ -2151,6 +2339,7 @@ mod tests {
                 reranker: None,
                 vector_unavailable_reason: None,
                 exact_fact_status: None,
+                replay_activation: None,
             },
         );
         let actual_plan = expect_plan(actual);
@@ -2188,6 +2377,7 @@ mod tests {
                     ProjectContextVectorUnavailableReason::AmbiguousVectorIndex,
                 ),
                 exact_fact_status: None,
+                replay_activation: None,
             },
         );
         let actual_plan = expect_plan(actual);
@@ -2276,6 +2466,7 @@ mod tests {
                 reranker: None,
                 vector_unavailable_reason: None,
                 exact_fact_status: None,
+                replay_activation: None,
             },
         );
         let actual_plan = expect_plan(actual);
@@ -2483,6 +2674,7 @@ mod tests {
             request,
             ProjectContextRetrievalOptions {
                 exact_fact_status: Some(&exact_status(&setup, ExactFactStatus::Active)),
+                replay_activation: None,
                 ..ProjectContextRetrievalOptions::default()
             },
         );
@@ -2586,6 +2778,7 @@ mod tests {
                     request,
                     ProjectContextRetrievalOptions {
                         exact_fact_status: status.as_ref(),
+                        replay_activation: None,
                         ..ProjectContextRetrievalOptions::default()
                     },
                 );
@@ -2637,6 +2830,7 @@ mod tests {
             ),
             ProjectContextRetrievalOptions {
                 exact_fact_status: Some(&stale_status),
+                replay_activation: None,
                 ..ProjectContextRetrievalOptions::default()
             },
         ));
@@ -2727,6 +2921,7 @@ mod tests {
                     request,
                     ProjectContextRetrievalOptions {
                         exact_fact_status: Some(&status),
+                        replay_activation: None,
                         ..ProjectContextRetrievalOptions::default()
                     },
                 ));
@@ -2790,6 +2985,7 @@ mod tests {
             request,
             ProjectContextRetrievalOptions {
                 exact_fact_status: Some(&exact_status(&setup, ExactFactStatus::Active)),
+                replay_activation: None,
                 ..ProjectContextRetrievalOptions::default()
             },
         );
@@ -2831,6 +3027,7 @@ mod tests {
             request,
             ProjectContextRetrievalOptions {
                 exact_fact_status: Some(&exact_status(&setup, ExactFactStatus::Active)),
+                replay_activation: None,
                 ..ProjectContextRetrievalOptions::default()
             },
         ));
@@ -2876,6 +3073,7 @@ mod tests {
             request,
             ProjectContextRetrievalOptions {
                 exact_fact_status: Some(&exact_status(&setup, ExactFactStatus::Active)),
+                replay_activation: None,
                 ..ProjectContextRetrievalOptions::default()
             },
         );

@@ -16,8 +16,9 @@ use crate::ProjectIndexer;
 use crate::eval::tool_episode_graph_id;
 use crate::types::{
     ContextPack, ContextPackArtifactId, ContextPackEvidenceSource, EvidenceFreshness,
-    ProjectManifest, Provenance, ToolEpisode,
+    ManifestFreshnessEvaluation, ProjectManifest, Provenance, RetrievalResult, ToolEpisode,
 };
+use crate::util::fingerprint;
 
 /// Manifest identity expected by a read-only evidence-ledger replay request.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,9 +180,225 @@ pub enum EvidenceReplayIssueCode {
     DanglingEpisodeLink,
     /// Duplicate artifact or evidence identity was observed.
     Duplicate,
+    /// Raw replay evidence was derived from an assistant/summary output without a primary source anchor.
+    DerivedEvidenceWithoutPrimaryAnchor,
+    /// Replay evidence no longer matches current manifest/content/range fingerprint inputs.
+    StaleActivationFingerprint,
+    /// Replay evidence exceeded deterministic fairness quotas.
+    FairnessQuotaExceeded,
+    /// Replay evidence was a duplicate canonical target identity.
+    DuplicateCanonicalTarget,
+    /// Replay evidence failed required service readback and must not be included.
+    ReadbackFailed,
 }
 
-/// Redaction-safe typed issue emitted during replay selection.
+/// Typed target kind used by the activation boundary.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ReplayEvidenceTargetKind {
+    /// A manifest source file line range.
+    ManifestSource,
+    /// A tool observation that is re-anchored to a manifest source file line range.
+    ToolObservation,
+}
+
+/// Readback verification state for activated evidence references.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplayEvidenceReadbackStatus {
+    /// Readback is still pending at the service boundary.
+    Pending,
+    /// Readback succeeded and the reference may be included in user-visible nodes.
+    Verified,
+}
+
+/// Deterministic fairness caps for replay activation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayActivationCaps {
+    /// Maximum activated references per provenance source label.
+    pub per_source: usize,
+    /// Maximum activated references per linked episode bucket.
+    pub per_episode: usize,
+    /// Maximum activated references per manifest file.
+    pub per_file: usize,
+    /// Maximum activated references globally.
+    pub global: usize,
+}
+
+impl Default for ReplayActivationCaps {
+    fn default() -> Self {
+        Self { per_source: 8, per_episode: 8, per_file: 8, global: 16 }
+    }
+}
+
+impl ReplayActivationCaps {
+    fn sanitized(self) -> Self {
+        Self {
+            per_source: self.per_source.max(1),
+            per_episode: self.per_episode.max(1),
+            per_file: self.per_file.max(1),
+            global: self.global.max(1),
+        }
+    }
+}
+
+/// Explicit fingerprint inputs used by late-bound replay activation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayActivationFingerprintInputs {
+    /// Current manifest hash.
+    pub manifest_hash: String,
+    /// Current manifest source content hash.
+    pub source_content_hash: String,
+    /// Fingerprint over target path and one-based inclusive line range.
+    pub line_range_fingerprint: String,
+    /// Activated target kind.
+    pub target_kind: ReplayEvidenceTargetKind,
+    /// Canonical target identity.
+    pub target_id: String,
+}
+
+/// Readback-eligible activated evidence reference.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReplayActivatedEvidenceRef {
+    /// Context-pack artifact identifier that supplied this reference.
+    pub artifact_id: String,
+    /// Evidence identifier inside the artifact.
+    pub evidence_id: String,
+    /// Manifest-relative path using safe components.
+    pub evidence_path: String,
+    /// One-based inclusive start line.
+    pub start_line: u32,
+    /// One-based inclusive end line.
+    pub end_line: u32,
+    /// Score class; raw snippets are intentionally absent.
+    pub score_kind: EvidenceReplayScoreKind,
+    /// Deterministic replay priority.
+    pub score: f32,
+    /// Redaction-safe provenance source label.
+    pub provenance_source: String,
+    /// Activated target kind.
+    pub target_kind: ReplayEvidenceTargetKind,
+    /// Canonical target identity used for duplicate collapse.
+    pub canonical_target_id: String,
+    /// Explicit activation fingerprint inputs for cache/freshness boundaries.
+    pub fingerprint_inputs: ReplayActivationFingerprintInputs,
+    /// Service readback state.
+    pub readback_status: ReplayEvidenceReadbackStatus,
+}
+
+impl ReplayActivatedEvidenceRef {
+    /// Converts an activated replay reference into a retrieval result for planner mixing.
+    pub fn to_retrieval_result(&self) -> RetrievalResult {
+        let mut score_parts = BTreeMap::new();
+        score_parts.insert("evidence_ledger_replay".to_string(), self.score);
+        RetrievalResult {
+            id: self.canonical_target_id.clone(),
+            path: self.evidence_path.clone(),
+            symbol: None,
+            score: self.score,
+            score_parts,
+            provenance: Provenance {
+                path: self.evidence_path.clone(),
+                start_line: Some(self.start_line),
+                end_line: Some(self.end_line),
+                source: self.provenance_source.clone(),
+                fingerprint: self.fingerprint_inputs.line_range_fingerprint.clone(),
+            },
+        }
+    }
+}
+
+/// Redaction-safe typed issue emitted by replay activation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayActivationIssue {
+    /// Machine-readable issue code.
+    pub code: EvidenceReplayIssueCode,
+    /// Optional artifact id.
+    pub artifact_id: Option<String>,
+    /// Optional evidence id.
+    pub evidence_id: Option<String>,
+    /// Optional redaction-safe path label.
+    pub path: Option<String>,
+    /// Optional canonical target id.
+    pub target_id: Option<String>,
+}
+
+/// Deterministic activation diagnostic summary.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayActivationDiagnostics {
+    /// Number of replay references considered before activation filters.
+    pub candidate_count: usize,
+    /// Number of active references produced before service readback.
+    pub active_count: usize,
+    /// Number of references excluded by activation/readback policy.
+    pub excluded_count: usize,
+    /// Excluded counts keyed by typed issue code.
+    pub excluded_by_reason: BTreeMap<EvidenceReplayIssueCode, usize>,
+    /// Fairness caps used by this activation.
+    pub caps: ReplayActivationCaps,
+    /// Stable ordering contract.
+    pub stable_ordering: String,
+    /// Explicit fingerprint over manifest/query/caps/report identity inputs.
+    pub activation_fingerprint: String,
+}
+
+/// Small read-only activation request consumed by the project-model airlock.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayActivationRequest {
+    /// Current manifest hash expected by the caller.
+    pub manifest_hash: String,
+    /// Optional query fingerprint so different query/caps calls cannot share stale selections.
+    pub query_fingerprint: String,
+    /// Deterministic fairness caps.
+    pub caps: ReplayActivationCaps,
+}
+
+impl ReplayActivationRequest {
+    /// Builds an activation request for a current manifest and query fingerprint.
+    pub fn new(
+        manifest: &ProjectManifest,
+        query_fingerprint: impl Into<String>,
+        caps: ReplayActivationCaps,
+    ) -> Self {
+        Self {
+            manifest_hash: manifest.manifest_hash.clone(),
+            query_fingerprint: query_fingerprint.into(),
+            caps,
+        }
+    }
+}
+
+/// Read-only activation airlock output for planner consumption.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReplayActivationBoundary {
+    /// Current manifest hash used by activation.
+    pub manifest_hash: String,
+    /// Active references safe for planner mixing and service readback.
+    pub active_refs: Vec<ReplayActivatedEvidenceRef>,
+    /// Redaction-safe activation issues.
+    pub issues: Vec<ReplayActivationIssue>,
+    /// Bounded typed diagnostics.
+    pub diagnostics: ReplayActivationDiagnostics,
+}
+
+impl ReplayActivationBoundary {
+    /// Returns a copy of this boundary with only readback-verified references retained.
+    pub fn verified_only(&self) -> Self {
+        let active_refs = self
+            .active_refs
+            .iter()
+            .filter(|reference| reference.readback_status == ReplayEvidenceReadbackStatus::Verified)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut diagnostics = self.diagnostics.clone();
+        diagnostics.active_count = active_refs.len();
+        Self {
+            manifest_hash: self.manifest_hash.clone(),
+            active_refs,
+            issues: self.issues.clone(),
+            diagnostics,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceReplayIssue {
     /// Machine-readable issue code.
@@ -219,6 +436,10 @@ pub struct EvidenceReplayReference {
     pub provenance: Provenance,
     /// Evidence freshness state.
     pub freshness: EvidenceFreshness,
+    /// Manifest source content hash observed when replay reference was produced.
+    pub source_content_hash: String,
+    /// Fingerprint over source path and line range observed when replay reference was produced.
+    pub line_range_fingerprint: String,
     /// Number of valid tool episodes linking this artifact.
     pub linked_episode_count: usize,
     /// Number of dangling or invalid linkage proofs seen for this artifact.
@@ -305,12 +526,10 @@ pub fn select_evidence_ledger_replay(
     let original_candidate_count = artifact_candidates.original_count;
     let episode_links = read_episode_links(indexer.model_dir(), request, &mut builder);
     let mut readable_artifact_ids = BTreeSet::new();
-    let mut duplicate_artifact_ids = BTreeSet::new();
     let mut candidate_refs = Vec::new();
 
     for candidate in artifact_candidates.paths {
         if !readable_artifact_ids.insert(candidate.id.as_str().to_string()) {
-            duplicate_artifact_ids.insert(candidate.id.as_str().to_string());
             builder.push_issue(
                 EvidenceReplayIssueCode::Duplicate,
                 Some(candidate.id.as_str()),
@@ -376,6 +595,418 @@ pub fn select_evidence_ledger_replay(
     let truncated =
         artifact_candidates.truncated || episode_links.truncated || truncated_by_selection;
     builder.finish(selected, original_candidate_count, truncated)
+}
+
+/// Activates replay references into a read-only planner airlock.
+///
+/// The activation boundary centralizes freshness, path, range, provenance,
+/// quota, duplicate, and redaction checks. It never reads stores, writes,
+/// repairs, refreshes indexes, or exposes raw replay/tool payloads.
+///
+/// # Arguments
+///
+/// * `manifest` - Current manifest used as the primary source anchor.
+/// * `freshness` - Current freshness proof required for activation.
+/// * `report` - Reference-only replay report produced by read-only replay.
+/// * `request` - Late-bound activation request with query/cap fingerprint inputs.
+pub fn activate_evidence_ledger_replay(
+    manifest: &ProjectManifest,
+    freshness: &ManifestFreshnessEvaluation,
+    report: &EvidenceLedgerReplayReport,
+    request: &ReplayActivationRequest,
+) -> ReplayActivationBoundary {
+    let mut builder = ActivationBuilder::new(manifest, report, request);
+    if request.manifest_hash != manifest.manifest_hash
+        || report.manifest_hash != manifest.manifest_hash
+    {
+        builder.push_issue(
+            EvidenceReplayIssueCode::ManifestMismatch,
+            None,
+            None,
+            None,
+            None,
+        );
+        return builder.finish(Vec::new());
+    }
+    if !freshness.can_inject() {
+        builder.push_issue(
+            EvidenceReplayIssueCode::StaleActivationFingerprint,
+            None,
+            None,
+            None,
+            None,
+        );
+        return builder.finish(Vec::new());
+    }
+
+    let caps = request.caps.sanitized();
+    let mut candidates = report
+        .selected
+        .iter()
+        .filter_map(|reference| builder.candidate_from_reference(reference))
+        .collect::<Vec<_>>();
+    candidates.sort_by(compare_activation_candidates);
+
+    let mut active = Vec::new();
+    let mut seen_targets = BTreeSet::new();
+    let mut per_source = BTreeMap::<String, usize>::new();
+    let mut per_episode = BTreeMap::<String, usize>::new();
+    let mut per_file = BTreeMap::<String, usize>::new();
+    for candidate in candidates {
+        if active.len() >= caps.global {
+            builder.push_issue(
+                EvidenceReplayIssueCode::FairnessQuotaExceeded,
+                Some(candidate.reference.artifact_id.as_str()),
+                Some(candidate.reference.evidence_id.as_str()),
+                Some(candidate.reference.evidence_path.as_str()),
+                Some(candidate.reference.canonical_target_id.as_str()),
+            );
+            continue;
+        }
+        if !seen_targets.insert(candidate.reference.canonical_target_id.clone()) {
+            builder.push_issue(
+                EvidenceReplayIssueCode::DuplicateCanonicalTarget,
+                Some(candidate.reference.artifact_id.as_str()),
+                Some(candidate.reference.evidence_id.as_str()),
+                Some(candidate.reference.evidence_path.as_str()),
+                Some(candidate.reference.canonical_target_id.as_str()),
+            );
+            continue;
+        }
+        let source_count = per_source.entry(candidate.source_key.clone()).or_default();
+        let episode_count = per_episode
+            .entry(candidate.episode_key.clone())
+            .or_default();
+        let file_count = per_file.entry(candidate.file_key.clone()).or_default();
+        if *source_count >= caps.per_source
+            || *episode_count >= caps.per_episode
+            || *file_count >= caps.per_file
+        {
+            builder.push_issue(
+                EvidenceReplayIssueCode::FairnessQuotaExceeded,
+                Some(candidate.reference.artifact_id.as_str()),
+                Some(candidate.reference.evidence_id.as_str()),
+                Some(candidate.reference.evidence_path.as_str()),
+                Some(candidate.reference.canonical_target_id.as_str()),
+            );
+            continue;
+        }
+        *source_count = source_count.saturating_add(1);
+        *episode_count = episode_count.saturating_add(1);
+        *file_count = file_count.saturating_add(1);
+        active.push(candidate.reference);
+    }
+    builder.finish(active)
+}
+
+/// Applies service readback results to an activation boundary.
+///
+/// # Arguments
+///
+/// * `boundary` - Pending activation boundary.
+/// * `readback_results` - Deterministic readback outcome by canonical target id.
+pub fn apply_replay_readback_results(
+    boundary: &ReplayActivationBoundary,
+    readback_results: &BTreeMap<String, bool>,
+) -> ReplayActivationBoundary {
+    let mut issues = boundary.issues.clone();
+    let mut excluded_by_reason = boundary.diagnostics.excluded_by_reason.clone();
+    let mut active_refs = Vec::new();
+    for reference in &boundary.active_refs {
+        if readback_results
+            .get(&reference.canonical_target_id)
+            .copied()
+            .unwrap_or(false)
+        {
+            let mut verified = reference.clone();
+            verified.readback_status = ReplayEvidenceReadbackStatus::Verified;
+            active_refs.push(verified);
+        } else {
+            *excluded_by_reason
+                .entry(EvidenceReplayIssueCode::ReadbackFailed)
+                .or_default() += 1;
+            issues.push(ReplayActivationIssue {
+                code: EvidenceReplayIssueCode::ReadbackFailed,
+                artifact_id: Some(reference.artifact_id.clone()),
+                evidence_id: Some(reference.evidence_id.clone()),
+                path: Some(reference.evidence_path.clone()),
+                target_id: Some(reference.canonical_target_id.clone()),
+            });
+        }
+    }
+    let mut diagnostics = boundary.diagnostics.clone();
+    diagnostics.active_count = active_refs.len();
+    diagnostics.excluded_by_reason = excluded_by_reason;
+    diagnostics.excluded_count = issues.len();
+    ReplayActivationBoundary {
+        manifest_hash: boundary.manifest_hash.clone(),
+        active_refs,
+        issues,
+        diagnostics,
+    }
+}
+
+struct ActivationBuilder<'a> {
+    manifest: &'a ProjectManifest,
+    report: &'a EvidenceLedgerReplayReport,
+    request: &'a ReplayActivationRequest,
+    issues: Vec<ReplayActivationIssue>,
+    excluded_by_reason: BTreeMap<EvidenceReplayIssueCode, usize>,
+}
+
+impl<'a> ActivationBuilder<'a> {
+    fn new(
+        manifest: &'a ProjectManifest,
+        report: &'a EvidenceLedgerReplayReport,
+        request: &'a ReplayActivationRequest,
+    ) -> Self {
+        Self {
+            manifest,
+            report,
+            request,
+            issues: Vec::new(),
+            excluded_by_reason: BTreeMap::new(),
+        }
+    }
+
+    fn candidate_from_reference(
+        &mut self,
+        reference: &EvidenceReplayReference,
+    ) -> Option<ActivationCandidate> {
+        if validate_source_path(Path::new("."), &reference.evidence_path).is_err()
+            || validate_source_path(Path::new("."), &reference.provenance.path).is_err()
+        {
+            self.push_issue(
+                EvidenceReplayIssueCode::PathEscape,
+                Some(reference.artifact_id.as_str()),
+                Some(reference.evidence_id.as_str()),
+                Some(reference.evidence_path.as_str()),
+                None,
+            );
+            return None;
+        }
+        if reference.freshness != EvidenceFreshness::Fresh
+            && reference.freshness != EvidenceFreshness::Added
+        {
+            self.push_issue(
+                EvidenceReplayIssueCode::StaleActivationFingerprint,
+                Some(reference.artifact_id.as_str()),
+                Some(reference.evidence_id.as_str()),
+                Some(reference.evidence_path.as_str()),
+                None,
+            );
+            return None;
+        }
+        if is_derived_source_without_primary_anchor(&reference.provenance.source) {
+            self.push_issue(
+                EvidenceReplayIssueCode::DerivedEvidenceWithoutPrimaryAnchor,
+                Some(reference.artifact_id.as_str()),
+                Some(reference.evidence_id.as_str()),
+                Some(reference.evidence_path.as_str()),
+                None,
+            );
+            return None;
+        }
+        let Some(start_line) = reference.start_line.or(reference.provenance.start_line) else {
+            self.push_issue(
+                EvidenceReplayIssueCode::InvalidRange,
+                Some(reference.artifact_id.as_str()),
+                Some(reference.evidence_id.as_str()),
+                Some(reference.evidence_path.as_str()),
+                None,
+            );
+            return None;
+        };
+        let Some(end_line) = reference.end_line.or(reference.provenance.end_line) else {
+            self.push_issue(
+                EvidenceReplayIssueCode::InvalidRange,
+                Some(reference.artifact_id.as_str()),
+                Some(reference.evidence_id.as_str()),
+                Some(reference.evidence_path.as_str()),
+                None,
+            );
+            return None;
+        };
+        let Some(source_file) = self
+            .manifest
+            .files
+            .iter()
+            .find(|file| file.path == reference.evidence_path)
+        else {
+            self.push_issue(
+                EvidenceReplayIssueCode::DeletedEvidence,
+                Some(reference.artifact_id.as_str()),
+                Some(reference.evidence_id.as_str()),
+                Some(reference.evidence_path.as_str()),
+                None,
+            );
+            return None;
+        };
+        if invalid_range(Some(start_line), Some(end_line), source_file.lines) {
+            self.push_issue(
+                EvidenceReplayIssueCode::InvalidRange,
+                Some(reference.artifact_id.as_str()),
+                Some(reference.evidence_id.as_str()),
+                Some(reference.evidence_path.as_str()),
+                None,
+            );
+            return None;
+        }
+        let range_fingerprint =
+            line_range_fingerprint(&reference.evidence_path, start_line, end_line);
+        if reference.source_content_hash != source_file.content_hash
+            || reference.line_range_fingerprint != range_fingerprint
+        {
+            self.push_issue(
+                EvidenceReplayIssueCode::StaleActivationFingerprint,
+                Some(reference.artifact_id.as_str()),
+                Some(reference.evidence_id.as_str()),
+                Some(reference.evidence_path.as_str()),
+                None,
+            );
+            return None;
+        }
+        let target_kind = if reference.linked_episode_count == 0 {
+            ReplayEvidenceTargetKind::ManifestSource
+        } else {
+            ReplayEvidenceTargetKind::ToolObservation
+        };
+        let target_identity = format!("{}:{}-{}", reference.evidence_path, start_line, end_line);
+        let canonical_target_id = canonical_target_id(
+            &self.manifest.manifest_hash,
+            &source_file.content_hash,
+            &range_fingerprint,
+            &target_kind,
+            &target_identity,
+        );
+        let target = ReplayActivatedEvidenceRef {
+            artifact_id: reference.artifact_id.clone(),
+            evidence_id: reference.evidence_id.clone(),
+            evidence_path: reference.evidence_path.clone(),
+            start_line,
+            end_line,
+            score_kind: reference.score_kind.clone(),
+            score: reference.score,
+            provenance_source: reference.provenance.source.clone(),
+            target_kind: target_kind.clone(),
+            canonical_target_id: canonical_target_id.clone(),
+            fingerprint_inputs: ReplayActivationFingerprintInputs {
+                manifest_hash: self.manifest.manifest_hash.clone(),
+                source_content_hash: source_file.content_hash.clone(),
+                line_range_fingerprint: range_fingerprint,
+                target_kind,
+                target_id: canonical_target_id.clone(),
+            },
+            readback_status: ReplayEvidenceReadbackStatus::Pending,
+        };
+        Some(ActivationCandidate {
+            source_key: target.provenance_source.clone(),
+            episode_key: reference.linked_episode_count.to_string(),
+            file_key: target.evidence_path.clone(),
+            reference: target,
+        })
+    }
+
+    fn push_issue(
+        &mut self,
+        code: EvidenceReplayIssueCode,
+        artifact_id: Option<&str>,
+        evidence_id: Option<&str>,
+        path: Option<&str>,
+        target_id: Option<&str>,
+    ) {
+        *self.excluded_by_reason.entry(code.clone()).or_default() += 1;
+        self.issues.push(ReplayActivationIssue {
+            code,
+            artifact_id: artifact_id.map(ToString::to_string),
+            evidence_id: evidence_id.map(ToString::to_string),
+            path: path.map(redaction_safe_activation_path_label),
+            target_id: target_id.map(ToString::to_string),
+        });
+    }
+
+    fn finish(self, active_refs: Vec<ReplayActivatedEvidenceRef>) -> ReplayActivationBoundary {
+        let activation_fingerprint = fingerprint(&format!(
+            "{}:{}:{:?}:{}:{}",
+            self.manifest.manifest_hash,
+            self.request.query_fingerprint,
+            self.request.caps,
+            self.report.budget.selected_count,
+            self.report.budget.excluded_count
+        ));
+        ReplayActivationBoundary {
+            manifest_hash: self.manifest.manifest_hash.clone(),
+            diagnostics: ReplayActivationDiagnostics {
+                candidate_count: self.report.selected.len(),
+                active_count: active_refs.len(),
+                excluded_count: self.issues.len(),
+                excluded_by_reason: self.excluded_by_reason,
+                caps: self.request.caps.sanitized(),
+                stable_ordering: "linked_episode_count_desc:score_kind:score_desc:freshness:path:evidence_id:artifact_id:quota_caps:canonical_target".to_string(),
+                activation_fingerprint,
+            },
+            active_refs,
+            issues: self.issues,
+        }
+    }
+}
+
+struct ActivationCandidate {
+    source_key: String,
+    episode_key: String,
+    file_key: String,
+    reference: ReplayActivatedEvidenceRef,
+}
+
+fn compare_activation_candidates(
+    left: &ActivationCandidate,
+    right: &ActivationCandidate,
+) -> std::cmp::Ordering {
+    compare_activated_refs(&left.reference, &right.reference)
+}
+
+fn compare_activated_refs(
+    left: &ReplayActivatedEvidenceRef,
+    right: &ReplayActivatedEvidenceRef,
+) -> std::cmp::Ordering {
+    right
+        .score
+        .total_cmp(&left.score)
+        .then_with(|| left.score_kind.cmp(&right.score_kind))
+        .then_with(|| left.evidence_path.cmp(&right.evidence_path))
+        .then_with(|| left.start_line.cmp(&right.start_line))
+        .then_with(|| left.end_line.cmp(&right.end_line))
+        .then_with(|| left.evidence_id.cmp(&right.evidence_id))
+        .then_with(|| left.artifact_id.cmp(&right.artifact_id))
+}
+
+fn is_derived_source_without_primary_anchor(source: &str) -> bool {
+    let lower = source.to_ascii_lowercase();
+    lower.contains("assistant") || lower.contains("summary") || lower.contains("derived")
+}
+
+fn redaction_safe_activation_path_label(path: &str) -> String {
+    if validate_source_path(Path::new("."), path).is_ok() {
+        path.to_string()
+    } else {
+        "unsafe_path".to_string()
+    }
+}
+
+fn line_range_fingerprint(path: &str, start_line: u32, end_line: u32) -> String {
+    fingerprint(&format!("{path}:{start_line}-{end_line}"))
+}
+
+fn canonical_target_id(
+    manifest_hash: &str,
+    source_content_hash: &str,
+    line_range_fingerprint: &str,
+    target_kind: &ReplayEvidenceTargetKind,
+    target_id: &str,
+) -> String {
+    fingerprint(&format!(
+        "{manifest_hash}:{source_content_hash}:{line_range_fingerprint}:{target_kind:?}:{target_id}"
+    ))
 }
 
 struct ReplayBuilder<'a> {
@@ -758,6 +1389,13 @@ impl PackReferenceCollector<'_, '_> {
                     score: evidence.score,
                     provenance: evidence.provenance.clone(),
                     freshness: evidence.freshness.clone(),
+                    source_content_hash: source_file.content_hash.clone(),
+                    line_range_fingerprint: evidence
+                        .provenance
+                        .start_line
+                        .zip(evidence.provenance.end_line)
+                        .map(|(start, end)| line_range_fingerprint(&evidence.path, start, end))
+                        .unwrap_or_default(),
                     linked_episode_count,
                     link_issue_count,
                 },
@@ -1449,6 +2087,309 @@ mod tests {
                         | EvidenceReplayIssueCode::InvalidArtifactPath
                 )),
             ),
+            expected,
+        );
+        Ok(())
+    }
+
+    fn fresh_activation_state() -> ManifestFreshnessEvaluation {
+        ManifestFreshnessEvaluation {
+            state: FreshnessState { fresh: true, ..Default::default() },
+            proof_level: crate::FreshnessProofLevel::FullFilesystem,
+        }
+    }
+
+    fn activation_request(manifest: &ProjectManifest) -> ReplayActivationRequest {
+        ReplayActivationRequest::new(manifest, "query", ReplayActivationCaps::default())
+    }
+
+    #[test]
+    fn activation_selects_fresh_primary_replay_evidence() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let indexer = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = indexer.index()?;
+        write_fixture_context_pack(&indexer, &manifest, EvidenceFreshness::Fresh, 1.0)?;
+        let report =
+            select_evidence_ledger_replay(&indexer, &manifest, &fixture_request(&manifest));
+        let setup = activation_request(&manifest);
+
+        let actual =
+            activate_evidence_ledger_replay(&manifest, &fresh_activation_state(), &report, &setup);
+        let expected = 1usize;
+
+        assert_eq!(actual.active_refs.len(), expected);
+        Ok(())
+    }
+
+    #[test]
+    fn activation_rejects_derived_summary_without_primary_anchor() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let indexer = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = indexer.index()?;
+        let (artifact_id, mut pack) =
+            write_fixture_context_pack(&indexer, &manifest, EvidenceFreshness::Fresh, 1.0)?;
+        fs::remove_file(artifact_path(fixture.path(), &artifact_id))?;
+        pack.evidence
+            .first_mut()
+            .expect("fixture evidence should exist")
+            .provenance
+            .source = "assistant_summary".to_string();
+        let derived_id = indexer.context_pack_artifact_id(&pack)?;
+        fs::write(
+            artifact_path(fixture.path(), &derived_id),
+            pack.to_stable_json()?,
+        )?;
+        let report =
+            select_evidence_ledger_replay(&indexer, &manifest, &fixture_request(&manifest));
+
+        let actual = activate_evidence_ledger_replay(
+            &manifest,
+            &fresh_activation_state(),
+            &report,
+            &activation_request(&manifest),
+        );
+        let expected = true;
+
+        assert_eq!(
+            actual.issues.iter().any(|issue| {
+                issue.code == EvidenceReplayIssueCode::DerivedEvidenceWithoutPrimaryAnchor
+            }),
+            expected,
+        );
+        assert_eq!(actual.active_refs.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn activation_marks_same_manifest_changed_source_hash_as_stale() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let indexer = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let mut manifest = indexer.index()?;
+        write_fixture_context_pack(&indexer, &manifest, EvidenceFreshness::Fresh, 1.0)?;
+        let report =
+            select_evidence_ledger_replay(&indexer, &manifest, &fixture_request(&manifest));
+        manifest
+            .files
+            .iter_mut()
+            .find(|file| file.path == report.selected[0].evidence_path)
+            .expect("fixture source file should exist")
+            .content_hash = fingerprint("changed-content");
+
+        let actual = activate_evidence_ledger_replay(
+            &manifest,
+            &fresh_activation_state(),
+            &report,
+            &activation_request(&manifest),
+        );
+        let expected = true;
+
+        assert_eq!(
+            actual
+                .issues
+                .iter()
+                .any(|issue| { issue.code == EvidenceReplayIssueCode::StaleActivationFingerprint }),
+            expected,
+        );
+        assert_eq!(actual.active_refs.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn activation_fairness_caps_are_deterministic_and_bound_noisy_episode() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        fs::write(root.join("src").join("second.rs"), "pub struct Second;\n")?;
+        let indexer = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = indexer.index()?;
+        write_fixture_context_pack(&indexer, &manifest, EvidenceFreshness::Fresh, 3.0)?;
+        write_fixture_context_pack(&indexer, &manifest, EvidenceFreshness::Fresh, 2.0)?;
+        write_fixture_context_pack(&indexer, &manifest, EvidenceFreshness::Fresh, 1.0)?;
+        let report =
+            select_evidence_ledger_replay(&indexer, &manifest, &fixture_request(&manifest));
+        let setup = ReplayActivationRequest::new(
+            &manifest,
+            "query",
+            ReplayActivationCaps { per_source: 1, per_episode: 1, per_file: 1, global: 1 },
+        );
+
+        let actual =
+            activate_evidence_ledger_replay(&manifest, &fresh_activation_state(), &report, &setup);
+        let expected =
+            activate_evidence_ledger_replay(&manifest, &fresh_activation_state(), &report, &setup);
+
+        assert_eq!(actual.active_refs, expected.active_refs);
+        assert_eq!(actual.active_refs.len(), 1);
+        assert!(
+            actual
+                .issues
+                .iter()
+                .any(|issue| { issue.code == EvidenceReplayIssueCode::FairnessQuotaExceeded })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn activation_deduplicates_same_manifest_target_across_distinct_evidence_ids() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let indexer = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = indexer.index()?;
+        let (_original_id, pack) =
+            write_fixture_context_pack(&indexer, &manifest, EvidenceFreshness::Fresh, 2.0)?;
+        let mut duplicate_pack = pack.clone();
+        duplicate_pack
+            .evidence
+            .first_mut()
+            .expect("fixture evidence should exist")
+            .id = "alternate-evidence-id-for-same-target".to_string();
+        duplicate_pack
+            .evidence
+            .first_mut()
+            .expect("fixture evidence should exist")
+            .score = 1.0;
+        indexer.write_context_pack(&duplicate_pack)?;
+        let report =
+            select_evidence_ledger_replay(&indexer, &manifest, &fixture_request(&manifest));
+
+        let actual = activate_evidence_ledger_replay(
+            &manifest,
+            &fresh_activation_state(),
+            &report,
+            &activation_request(&manifest),
+        );
+        let expected = (1usize, true);
+
+        assert_eq!(
+            (
+                actual.active_refs.len(),
+                actual
+                    .issues
+                    .iter()
+                    .any(|issue| issue.code == EvidenceReplayIssueCode::DuplicateCanonicalTarget),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn activation_keeps_same_manifest_target_when_route_identity_differs() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let indexer = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = indexer.index()?;
+        let (_unlinked_id, _unlinked_pack) =
+            write_fixture_context_pack(&indexer, &manifest, EvidenceFreshness::Fresh, 2.0)?;
+        let (linked_id, _linked_pack) =
+            write_fixture_context_pack(&indexer, &manifest, EvidenceFreshness::Fresh, 1.0)?;
+        indexer.append_episode(&fixture_episode(&linked_id))?;
+        let report =
+            select_evidence_ledger_replay(&indexer, &manifest, &fixture_request(&manifest));
+
+        let actual = activate_evidence_ledger_replay(
+            &manifest,
+            &fresh_activation_state(),
+            &report,
+            &activation_request(&manifest),
+        );
+        let expected = (2usize, false);
+
+        assert_eq!(
+            (
+                actual.active_refs.len(),
+                actual
+                    .issues
+                    .iter()
+                    .any(|issue| issue.code == EvidenceReplayIssueCode::DuplicateCanonicalTarget),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn activation_redacts_rejected_path_escape_diagnostic_payload() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let indexer = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = indexer.index()?;
+        let malicious_path = "../PROMPT_INJECTION_PATH\nraw activation payload";
+        let setup = EvidenceLedgerReplayReport {
+            manifest_hash: manifest.manifest_hash.clone(),
+            content_policy: EvidenceReplayContentPolicy::ReferenceOnly,
+            stale_policy: EvidenceReplayStalePolicyReport {
+                policy: EvidenceReplayFreshnessPolicy::ExcludeChangedAndDeleted,
+                changed_excluded: 0,
+                deleted_excluded: 0,
+            },
+            selected: vec![EvidenceReplayReference {
+                artifact_id: "a".repeat(64),
+                artifact_path: "context_packs/fixture.json".to_string(),
+                evidence_id: "fixture".to_string(),
+                evidence_path: malicious_path.to_string(),
+                start_line: Some(1),
+                end_line: Some(1),
+                score_kind: EvidenceReplayScoreKind::RetrievalResult,
+                score: 1.0,
+                provenance: Provenance {
+                    path: malicious_path.to_string(),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                    source: "test".to_string(),
+                    fingerprint: fingerprint("fixture"),
+                },
+                freshness: EvidenceFreshness::Fresh,
+                source_content_hash: fingerprint("source"),
+                line_range_fingerprint: fingerprint("range"),
+                linked_episode_count: 0,
+                link_issue_count: 0,
+            }],
+            issues: Vec::new(),
+            budget: EvidenceReplayBudgetReport {
+                original_candidate_count: 1,
+                selected_count: 1,
+                excluded_count: 0,
+                excluded_by_reason: BTreeMap::new(),
+                truncated: false,
+                budget: EvidenceReplayBudget::default(),
+                stable_ordering: "fixture".to_string(),
+            },
+        };
+
+        let actual = activate_evidence_ledger_replay(
+            &manifest,
+            &fresh_activation_state(),
+            &setup,
+            &activation_request(&manifest),
+        );
+        let actual_json = serde_json::to_string(&actual)?;
+
+        assert!(!actual_json.contains("PROMPT_INJECTION_PATH"));
+        assert!(!actual_json.contains("raw activation payload"));
+        Ok(())
+    }
+
+    #[test]
+    fn readback_failure_excludes_reference_without_placeholder() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let indexer = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = indexer.index()?;
+        write_fixture_context_pack(&indexer, &manifest, EvidenceFreshness::Fresh, 1.0)?;
+        let report =
+            select_evidence_ledger_replay(&indexer, &manifest, &fixture_request(&manifest));
+        let boundary = activate_evidence_ledger_replay(
+            &manifest,
+            &fresh_activation_state(),
+            &report,
+            &activation_request(&manifest),
+        );
+        let setup = BTreeMap::from([(boundary.active_refs[0].canonical_target_id.clone(), false)]);
+
+        let actual = apply_replay_readback_results(&boundary, &setup);
+        let expected = true;
+
+        assert_eq!(actual.active_refs.len(), 0);
+        assert_eq!(
+            actual
+                .issues
+                .iter()
+                .any(|issue| issue.code == EvidenceReplayIssueCode::ReadbackFailed),
             expected,
         );
         Ok(())
