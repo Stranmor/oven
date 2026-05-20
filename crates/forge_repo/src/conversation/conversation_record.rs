@@ -1100,8 +1100,13 @@ impl TryFrom<ConversationRecord> for forge_domain::Conversation {
         };
 
         let visibility = match record.visibility.as_deref() {
+            None => forge_domain::ConversationVisibility::Normal,
             Some("background") => forge_domain::ConversationVisibility::Background,
-            _ => forge_domain::ConversationVisibility::Normal,
+            Some(value) => anyhow::bail!(
+                "Conversation {} has unsupported visibility value {:?}",
+                conversation_id,
+                value
+            ),
         };
 
         let mut conv = forge_domain::Conversation::new(id)
@@ -1129,6 +1134,60 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    fn conversation_record_with_visibility(visibility: Option<&str>) -> ConversationRecord {
+        let conversation_id = ConversationId::generate();
+        let created_at = chrono::DateTime::UNIX_EPOCH.naive_utc();
+
+        ConversationRecord {
+            conversation_id: conversation_id.into_string(),
+            title: None,
+            workspace_id: 0,
+            context: None,
+            created_at,
+            updated_at: None,
+            metrics: None,
+            parent_id: None,
+            initiator: None,
+            visibility: visibility.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn test_conversation_record_null_visibility_converts_to_normal() {
+        let fixture = conversation_record_with_visibility(None);
+
+        let actual = forge_domain::Conversation::try_from(fixture)
+            .unwrap()
+            .visibility;
+        let expected = forge_domain::ConversationVisibility::Normal;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_conversation_record_background_visibility_converts_to_background() {
+        let fixture = conversation_record_with_visibility(Some("background"));
+
+        let actual = forge_domain::Conversation::try_from(fixture)
+            .unwrap()
+            .visibility;
+        let expected = forge_domain::ConversationVisibility::Background;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_conversation_record_unknown_visibility_returns_error() {
+        let fixture = conversation_record_with_visibility(Some("archived"));
+
+        let actual = forge_domain::Conversation::try_from(fixture)
+            .unwrap_err()
+            .to_string();
+        let expected = "has unsupported visibility value";
+
+        assert!(actual.contains(expected));
+    }
 
     #[test]
     fn test_context_record_preserves_context_window_recovery_marker() {

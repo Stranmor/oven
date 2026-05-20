@@ -737,6 +737,71 @@ mod tests {
         Ok(id)
     }
 
+    async fn insert_record_with_visibility(
+        repo: &ConversationRepositoryImpl,
+        visibility: Option<&str>,
+    ) -> anyhow::Result<ConversationId> {
+        let id = ConversationId::generate();
+        let now = Utc::now().naive_utc();
+        let record = ConversationRecord {
+            conversation_id: id.into_string(),
+            title: Some("Raw Visibility Conversation".to_string()),
+            workspace_id: 0,
+            context: Some(serde_json::to_string(&ContextRecord::from(
+                &Context::default()
+                    .messages(vec![ContextMessage::user("Raw visibility", None).into()]),
+            ))?),
+            created_at: now,
+            updated_at: Some(now),
+            metrics: None,
+            parent_id: None,
+            initiator: None,
+            visibility: visibility.map(str::to_string),
+        };
+
+        repo.run_with_connection(move |connection, _wid| {
+            diesel::insert_into(conversations::table)
+                .values(&record)
+                .execute(connection)?;
+            Ok(())
+        })
+        .await?;
+
+        Ok(id)
+    }
+
+    async fn raw_visibility_for_conversation(
+        repo: &ConversationRepositoryImpl,
+        conversation_id: ConversationId,
+    ) -> anyhow::Result<Option<String>> {
+        repo.run_with_connection(move |connection, _wid| {
+            let actual = conversations::table
+                .filter(conversations::conversation_id.eq(conversation_id.into_string()))
+                .select(conversations::visibility)
+                .first::<Option<String>>(connection)?;
+            Ok(actual)
+        })
+        .await
+    }
+
+    async fn insert_record_with_unknown_visibility(
+        repo: &ConversationRepositoryImpl,
+    ) -> anyhow::Result<ConversationId> {
+        insert_record_with_visibility(repo, Some("archived")).await
+    }
+
+    async fn insert_record_with_null_visibility(
+        repo: &ConversationRepositoryImpl,
+    ) -> anyhow::Result<ConversationId> {
+        insert_record_with_visibility(repo, None).await
+    }
+
+    async fn insert_record_with_background_visibility(
+        repo: &ConversationRepositoryImpl,
+    ) -> anyhow::Result<ConversationId> {
+        insert_record_with_visibility(repo, Some("background")).await
+    }
+
     async fn insert_legacy_subagent_task_session(
         repo: &ConversationRepositoryImpl,
         session: SubagentTaskSession,
@@ -1056,6 +1121,65 @@ mod tests {
             actual_all.iter().map(|conv| conv.id).collect::<Vec<_>>(),
             expected_all
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_raw_null_visibility_reads_back_as_normal() -> anyhow::Result<()> {
+        let repo = repository()?;
+        let fixture = insert_record_with_null_visibility(&repo).await?;
+
+        let actual = repo
+            .get_conversation(&fixture)
+            .await?
+            .expect("null visibility fixture should be directly addressable")
+            .visibility;
+        let expected = forge_domain::ConversationVisibility::Normal;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_raw_background_visibility_reads_back_as_background() -> anyhow::Result<()> {
+        let repo = repository()?;
+        let fixture = insert_record_with_background_visibility(&repo).await?;
+
+        let actual = repo
+            .get_conversation(&fixture)
+            .await?
+            .expect("background visibility fixture should be directly addressable")
+            .visibility;
+        let expected = forge_domain::ConversationVisibility::Background;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unknown_visibility_is_not_treated_as_normal() -> anyhow::Result<()> {
+        let repo = repository()?;
+        let unknown_visibility_id = insert_record_with_unknown_visibility(&repo).await?;
+
+        let actual_normal = repo.get_all_conversations().await?;
+        let actual_all_error = repo
+            .get_all_conversations_by_visibility(ConversationVisibilityFilter::All)
+            .await
+            .unwrap_err()
+            .to_string();
+        let actual_readback_error = repo
+            .get_conversation(&unknown_visibility_id)
+            .await
+            .unwrap_err()
+            .to_string();
+        let actual_persisted_visibility =
+            raw_visibility_for_conversation(&repo, unknown_visibility_id).await?;
+        let expected = "unsupported visibility value";
+
+        assert!(actual_normal.is_empty());
+        assert!(actual_all_error.contains(expected));
+        assert!(actual_readback_error.contains(expected));
+        assert_eq!(actual_persisted_visibility, Some("archived".to_string()));
         Ok(())
     }
 
