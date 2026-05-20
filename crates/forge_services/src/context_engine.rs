@@ -25,13 +25,16 @@ use forge_project_model::{
     EvidenceReplayIssueCode, EvidenceReplayScoreKind, ExternalFactArtifactIngestionReport,
     ExternalFactIngestionIssue, ExternalFactProductionReport, ExternalFactProductionRequest,
     ExternalFactProductionStatus, NativeLspReferenceProducer, NativeLspReferenceRequest,
-    NativeLspReferenceRequestDerivation, ProjectContextPathScope,
+    NativeLspReferenceRequestDerivation, ProjectContextIntegrationIdentity,
+    ProjectContextPathScope, ProjectContextRetrievalOptions,
     ProjectContextRetrievalPlanningOutcome, ProjectContextRetrievalRequest,
-    ProjectContextWriteDecision, ProjectIndexer, ProjectModelContextRenderBudget, Provenance,
-    RustAnalyzerBounds, RustAnalyzerCapability, RustAnalyzerCapabilityProbe,
-    RustAnalyzerCapabilityStatus, RustAnalyzerProbe, StdRustAnalyzerProcess, ToolEpisode,
-    derive_native_lsp_reference_request, fingerprint, load_evidence_ledger_activation,
-    local_project_model_dir, local_project_model_manifest, plan_project_context_retrieval,
+    ProjectContextVectorIndexBoundary, ProjectContextVectorReadiness,
+    ProjectContextVectorUnavailableReason, ProjectContextWriteDecision, ProjectIndexer,
+    ProjectModelContextRenderBudget, Provenance, RustAnalyzerBounds, RustAnalyzerCapability,
+    RustAnalyzerCapabilityProbe, RustAnalyzerCapabilityStatus, RustAnalyzerProbe,
+    StdRustAnalyzerProcess, ToolEpisode, VectorQuery, derive_native_lsp_reference_request,
+    fingerprint, load_evidence_ledger_activation, local_project_model_dir,
+    local_project_model_manifest, plan_project_context_retrieval_with_options,
     read_exact_fact_status, redaction_safe_issue_path_label,
     redaction_safe_provenance_source_label, redaction_safe_replay_path_label,
     render_project_model_context, render_sources_from_evidence_replay,
@@ -767,7 +770,7 @@ impl<
             )
         })?;
         let freshness = indexer.evaluate_manifest_freshness(&manifest)?;
-        let request = ProjectContextRetrievalRequest::new(
+        let mut request = ProjectContextRetrievalRequest::new(
             params.query.to_string(),
             params.limit.unwrap_or(10),
             ProjectContextPathScope::new(
@@ -775,8 +778,32 @@ impl<
                 params.ends_with.clone().unwrap_or_default(),
             ),
             true,
+        )
+        .with_use_case(params.use_case.clone());
+        if let Some(top_k) = params.top_k {
+            request = request.with_top_k(top_k as usize);
+        }
+        let semantic_query = params
+            .query_embedding
+            .clone()
+            .map(|embedding| VectorQuery { embedding });
+        let durable_vector_selection = select_durable_vector_index(
+            &indexer,
+            &manifest,
+            semantic_query.as_ref(),
+            params.embedding_model_id.as_deref(),
         );
-        let plan = match plan_project_context_retrieval(&manifest, &freshness, request) {
+        let plan = match plan_project_context_retrieval_with_options(
+            &manifest,
+            &freshness,
+            request,
+            ProjectContextRetrievalOptions {
+                vector_query: semantic_query.as_ref(),
+                vector_index: durable_vector_selection.boundary(),
+                reranker: None,
+                vector_unavailable_reason: durable_vector_selection.unavailable_reason(),
+            },
+        ) {
             ProjectContextRetrievalPlanningOutcome::Plan(plan) => plan,
             ProjectContextRetrievalPlanningOutcome::Refusal(refusal) => {
                 anyhow::bail!(
@@ -840,6 +867,103 @@ impl<
                 .then_with(|| left.node_id.as_str().cmp(right.node_id.as_str()))
         });
         Ok(nodes)
+    }
+}
+
+struct DurableVectorSelection {
+    index: Option<forge_project_model::DurableVectorIndex>,
+    readiness: ProjectContextVectorReadiness,
+}
+
+impl DurableVectorSelection {
+    fn unavailable(reason: ProjectContextVectorUnavailableReason) -> Self {
+        Self {
+            index: None,
+            readiness: ProjectContextVectorReadiness::Unavailable(reason),
+        }
+    }
+
+    fn boundary(&self) -> Option<ProjectContextVectorIndexBoundary<'_>> {
+        self.index
+            .as_ref()
+            .map(|index| ProjectContextVectorIndexBoundary {
+                index,
+                identity: ProjectContextIntegrationIdentity {
+                    provider: "durable-project-model",
+                    artifact: "durable-vector-index",
+                },
+                readiness: self.readiness,
+            })
+    }
+
+    fn unavailable_reason(&self) -> Option<ProjectContextVectorUnavailableReason> {
+        match self.readiness {
+            ProjectContextVectorReadiness::Ready { .. } => None,
+            ProjectContextVectorReadiness::Unavailable(reason) => Some(reason),
+        }
+    }
+}
+
+fn select_durable_vector_index(
+    indexer: &ProjectIndexer,
+    manifest: &forge_project_model::ProjectManifest,
+    query: Option<&VectorQuery>,
+    embedding_model_id: Option<&str>,
+) -> DurableVectorSelection {
+    let Some(query) = query else {
+        return DurableVectorSelection::unavailable(
+            ProjectContextVectorUnavailableReason::MissingQueryEmbedding,
+        );
+    };
+    if query.embedding.is_empty() {
+        return DurableVectorSelection::unavailable(
+            ProjectContextVectorUnavailableReason::MissingVectorIndex,
+        );
+    }
+    let Some(embedding_model_id) = embedding_model_id else {
+        return DurableVectorSelection::unavailable(
+            ProjectContextVectorUnavailableReason::MissingVectorIndex,
+        );
+    };
+    let Ok(ids) = indexer.list_vector_indexes() else {
+        return DurableVectorSelection::unavailable(
+            ProjectContextVectorUnavailableReason::IndexNotReady,
+        );
+    };
+    let mut matching = Vec::new();
+    for id in ids {
+        let Ok(artifact) = indexer.read_vector_index(manifest, &id) else {
+            continue;
+        };
+        if artifact.manifest_hash == manifest.manifest_hash
+            && artifact.embedding_model_id == embedding_model_id
+            && artifact.dimension == query.embedding.len()
+        {
+            matching.push(artifact);
+        }
+    }
+    match matching.len() {
+        0 => DurableVectorSelection::unavailable(
+            ProjectContextVectorUnavailableReason::NoMatchingVectorIndex,
+        ),
+        1 => {
+            let artifact = matching
+                .pop()
+                .expect("matching vector artifact should be present");
+            let dimension = artifact.dimension;
+            match forge_project_model::DurableVectorIndex::new(manifest, artifact) {
+                Ok(index) => DurableVectorSelection {
+                    index: Some(index),
+                    readiness: ProjectContextVectorReadiness::Ready { dimension },
+                },
+                Err(_error) => DurableVectorSelection::unavailable(
+                    ProjectContextVectorUnavailableReason::IndexNotReady,
+                ),
+            }
+        }
+        _ => DurableVectorSelection::unavailable(
+            ProjectContextVectorUnavailableReason::AmbiguousVectorIndex,
+        ),
     }
 }
 
@@ -1507,8 +1631,8 @@ mod tests {
         NativeLspReferenceRequest, RetrievalQuery, RustAnalyzerCapability,
         RustAnalyzerCapabilityStatus, RustAnalyzerProbe, StaleEvidencePolicy, SymbolKind,
         TypedExternalFacts, TypedExternalReferenceFact, TypedExternalSymbolFact,
-        external_fact_artifact_fingerprint, external_fact_batch_fingerprint, retrieve,
-        write_external_fact_artifact,
+        VectorIndexArtifact, external_fact_artifact_fingerprint, external_fact_batch_fingerprint,
+        retrieve, vector_entries_from_manifest_embeddings, write_external_fact_artifact,
     };
     use futures::{Stream, StreamExt};
     use tempfile::TempDir;
@@ -1951,6 +2075,23 @@ mod tests {
         let setup = ProjectIndexer::new(root, local_project_model_dir(root));
         let manifest = setup.index()?;
         setup.write_manifest(&manifest)
+    }
+
+    fn write_fixture_vector_index(root: &Path, model_id: &str, target_symbol: &str) -> Result<()> {
+        let indexer = ProjectIndexer::new(root, local_project_model_dir(root));
+        let manifest = indexer.read_manifest()?;
+        let symbol = manifest
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == target_symbol)
+            .expect("fixture should include requested symbol");
+        let entries = vector_entries_from_manifest_embeddings(
+            &manifest,
+            BTreeMap::from([(symbol.id.clone(), vec![1.0, 0.0])]),
+        )?;
+        let artifact = VectorIndexArtifact::new(&manifest, model_id, 2, entries)?;
+        indexer.write_vector_index(&manifest, &artifact)?;
+        Ok(())
     }
 
     fn write_fixture_context_pack(root: &Path) -> Result<()> {
@@ -2699,6 +2840,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_workspace_corrupt_vector_artifact_falls_back_to_lexical() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let vector_dir = local_project_model_dir(&root).join("vector_indexes");
+        fs::create_dir_all(&vector_dir)?;
+        fs::write(vector_dir.join(format!("{}.json", "0".repeat(64))), "{")?;
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::new(AtomicBool::new(false)),
+                range_read_fails: false,
+            }),
+            Arc::new(NoopDiscovery),
+        );
+        let params = SearchParams::new("build runtime needle", "corrupt vector fallback proof")
+            .limit(5usize)
+            .query_embedding(vec![1.0, 0.0])
+            .embedding_model_id("fixture-model".to_string());
+
+        let actual = WorkspaceService::query_workspace(&setup, root, params).await?;
+        let expected = true;
+        assert_eq!(
+            actual.iter().any(|node| match &node.node {
+                NodeData::FileChunk(chunk) => chunk.content.contains("build_runtime_needle"),
+                _ => false,
+            }),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_workspace_ambiguous_vector_artifacts_do_not_select_random_latest() -> Result<()>
+    {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        write_fixture_vector_index(&root, "fixture-model", "RuntimeNeedle")?;
+        write_fixture_vector_index(&root, "fixture-model", "build_runtime_needle")?;
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::new(AtomicBool::new(false)),
+                range_read_fails: false,
+            }),
+            Arc::new(NoopDiscovery),
+        );
+        let params = SearchParams::new("lexicalmissneedle", "ambiguous vector proof")
+            .limit(1usize)
+            .query_embedding(vec![1.0, 0.0])
+            .embedding_model_id("fixture-model".to_string());
+
+        let actual = WorkspaceService::query_workspace(&setup, root.clone(), params).await?;
+        let expected = Vec::<Node>::new();
+        assert_eq!(actual, expected);
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+        assert!(indexer.list_context_pack_artifacts()?.is_empty());
+        assert!(indexer.read_episodes()?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_workspace_uses_injected_query_vector_and_durable_index_for_lexical_miss()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        write_fixture_vector_index(&root, "fixture-model", "RuntimeNeedle")?;
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::new(AtomicBool::new(false)),
+                range_read_fails: false,
+            }),
+            Arc::new(NoopDiscovery),
+        );
+        let params = SearchParams::new("lexicalmissneedle", "semantic runtime proof")
+            .limit(1usize)
+            .query_embedding(vec![1.0, 0.0])
+            .embedding_model_id("fixture-model".to_string());
+
+        let actual = WorkspaceService::query_workspace(&setup, root, params).await?;
+        let expected = Some("src/lib.rs".to_string());
+        assert_eq!(
+            actual.iter().find_map(|node| match &node.node {
+                NodeData::FileChunk(chunk) if chunk.content.contains("RuntimeNeedle") => {
+                    Some(chunk.file_path.clone())
+                }
+                _ => None,
+            }),
+            expected,
+        );
+        Ok(())
+    }
+    #[tokio::test]
     async fn query_workspace_delegates_prefix_suffix_scope_before_truncation_to_planner()
     -> Result<()> {
         let (_fixture, root) = fixture_scoped_workspace()?;
@@ -2875,7 +3118,10 @@ mod tests {
             }),
             Arc::new(NoopDiscovery),
         );
-        let params = SearchParams::new("absent-token-for-no-evidence", "unused").limit(5usize);
+        let params = SearchParams::new("absent-token-for-no-evidence", "unused")
+            .limit(5usize)
+            .top_k(1u32)
+            .starts_with("src/".to_string());
 
         let actual = WorkspaceService::query_workspace(&setup, root.clone(), params).await?;
         let expected = Vec::<Node>::new();

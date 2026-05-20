@@ -27,6 +27,10 @@ pub struct ProjectContextRetrievalRequest {
     pub path_scope: ProjectContextPathScope,
     /// Whether graph expansion should participate in deterministic retrieval.
     pub include_graph_expansion: bool,
+    /// Optional caller use-case preserved as metadata/provenance diagnostics.
+    pub use_case: Option<String>,
+    /// Optional typed retrieval candidate budget requested by the caller.
+    pub top_k: Option<usize>,
 }
 
 impl ProjectContextRetrievalRequest {
@@ -49,7 +53,29 @@ impl ProjectContextRetrievalRequest {
             limit,
             path_scope,
             include_graph_expansion,
+            use_case: None,
+            top_k: None,
         }
+    }
+
+    /// Adds use-case metadata to the retrieval request.
+    ///
+    /// # Arguments
+    ///
+    /// * `use_case` - Caller-supplied use-case text preserved as typed metadata.
+    pub fn with_use_case(mut self, use_case: impl Into<String>) -> Self {
+        self.use_case = Some(use_case.into());
+        self
+    }
+
+    /// Adds an explicit retrieval candidate budget to the request.
+    ///
+    /// # Arguments
+    ///
+    /// * `top_k` - Candidate budget requested by the caller.
+    pub fn with_top_k(mut self, top_k: usize) -> Self {
+        self.top_k = Some(top_k);
+        self
     }
 }
 
@@ -96,6 +122,8 @@ pub struct ProjectContextRetrievalOptions<'a> {
     pub vector_index: Option<ProjectContextVectorIndexBoundary<'a>>,
     /// Optional reranker boundary and readiness metadata.
     pub reranker: Option<ProjectContextRerankerBoundary<'a>>,
+    /// Optional semantic unavailable reason from a runtime artifact selector.
+    pub vector_unavailable_reason: Option<ProjectContextVectorUnavailableReason>,
 }
 
 /// Validated vector index boundary plus redaction-safe metadata.
@@ -156,6 +184,10 @@ pub enum ProjectContextVectorUnavailableReason {
     MissingVectorIndex,
     /// Vector index metadata says the index is not ready.
     IndexNotReady,
+    /// No valid durable vector index matched the query boundary.
+    NoMatchingVectorIndex,
+    /// Multiple vector index artifacts matched the same query boundary.
+    AmbiguousVectorIndex,
 }
 
 /// Redaction-safe reranker unavailability reason.
@@ -237,6 +269,10 @@ pub enum ProjectContextRetrievalPhaseUnavailableReason {
     MissingReranker,
     /// Reranker boundary reported not-ready status.
     RerankerNotReady,
+    /// No valid durable vector index matched the query boundary.
+    NoMatchingVectorIndex,
+    /// Multiple vector index artifacts matched the same query boundary.
+    AmbiguousVectorIndex,
 }
 
 /// Redaction-safe reason for an invalid phase.
@@ -441,6 +477,12 @@ pub struct ProjectContextRetrievalQueryDiagnostics {
     pub path_suffixes: Vec<String>,
     /// Effective retrieval limit.
     pub limit: usize,
+    /// Candidate budget metadata supplied by the caller.
+    pub top_k: Option<usize>,
+    /// Status of top-k support for this query.
+    pub top_k_status: ProjectContextTopKStatus,
+    /// Redaction-safe use-case metadata supplied by the caller.
+    pub use_case: Option<String>,
     /// Whether graph expansion was requested.
     pub include_graph_expansion: bool,
     /// Fixed stale policy used for query path injection.
@@ -449,6 +491,37 @@ pub struct ProjectContextRetrievalQueryDiagnostics {
     pub freshness_proof_level: FreshnessProofLevel,
     /// Typed redaction-safe retrieval phase diagnostics.
     pub phase_diagnostics: ProjectContextRetrievalPhaseDiagnostics,
+}
+
+/// Typed top-k handling status for project-context retrieval.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ProjectContextTopKStatus {
+    /// No top-k candidate budget was supplied.
+    #[default]
+    NotRequested,
+    /// Candidate retrieval used the supplied top-k budget before final limit truncation.
+    Applied { candidate_count: usize },
+}
+
+/// Runtime semantic options passed from service/integration boundaries.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ProjectContextSemanticQueryOptions {
+    /// Optional provider-neutral query embedding generated outside this crate.
+    pub query_embedding: Option<Vec<f32>>,
+    /// Optional external embedding model identity used for durable index selection.
+    pub embedding_model_id: Option<String>,
+}
+
+impl ProjectContextSemanticQueryOptions {
+    /// Builds semantic query options from optional embedding data.
+    ///
+    /// # Arguments
+    ///
+    /// * `query_embedding` - Optional provider-neutral query vector.
+    /// * `embedding_model_id` - Optional external embedding model identity.
+    pub fn new(query_embedding: Option<Vec<f32>>, embedding_model_id: Option<String>) -> Self {
+        Self { query_embedding, embedding_model_id }
+    }
 }
 
 /// Deterministic write decision for project-context retrieval.
@@ -563,6 +636,16 @@ pub fn plan_project_context_retrieval_with_options(
     } else {
         request.limit
     };
+    let candidate_limit = request
+        .top_k
+        .unwrap_or(effective_limit)
+        .max(effective_limit);
+    let top_k_status = match request.top_k {
+        Some(top_k) => {
+            ProjectContextTopKStatus::Applied { candidate_count: top_k.max(effective_limit) }
+        }
+        None => ProjectContextTopKStatus::NotRequested,
+    };
     let phase_diagnostics = ProjectContextRetrievalPhaseDiagnostics {
         lexical: lexical_phase_status(&request.query_text),
         graph: graph_phase_status(request.include_graph_expansion),
@@ -574,6 +657,9 @@ pub fn plan_project_context_retrieval_with_options(
         path_prefix: request.path_scope.starts_with.clone(),
         path_suffixes: request.path_scope.ends_with.clone(),
         limit: effective_limit,
+        top_k: request.top_k,
+        top_k_status,
+        use_case: request.use_case.clone(),
         include_graph_expansion: request.include_graph_expansion,
         stale_policy: StaleEvidencePolicy::Reject,
         freshness_proof_level: freshness.proof_level.clone(),
@@ -591,10 +677,14 @@ pub fn plan_project_context_retrieval_with_options(
         path: None,
         path_prefix: diagnostics.path_prefix.clone(),
         symbol: None,
-        limit: usize::MAX,
+        limit: candidate_limit,
         include_graph_expansion: diagnostics.include_graph_expansion,
     };
-    let vector_activation = vector_activation(options.vector_query, options.vector_index);
+    let vector_activation = vector_activation(
+        options.vector_query,
+        options.vector_index,
+        options.vector_unavailable_reason,
+    );
     let reranker_activation = reranker_activation(options.reranker, &request.query_text);
     let mut selected_results = retrieve_with_boundaries(
         manifest,
@@ -766,6 +856,7 @@ fn graph_phase_status_with_results(
 fn vector_activation<'a>(
     vector_query: Option<&'a VectorQuery>,
     vector_index: Option<ProjectContextVectorIndexBoundary<'a>>,
+    unavailable_reason: Option<ProjectContextVectorUnavailableReason>,
 ) -> ProjectContextVectorActivation<'a> {
     match (vector_query, vector_index) {
         (Some(query), Some(boundary)) => match boundary.readiness {
@@ -793,18 +884,45 @@ fn vector_activation<'a>(
                     }
                 }
             }
-            ProjectContextVectorReadiness::Unavailable(_) => {
-                ProjectContextVectorActivation::unavailable(
-                    ProjectContextRetrievalPhaseUnavailableReason::VectorIndexNotReady,
-                )
+            ProjectContextVectorReadiness::Unavailable(reason) => {
+                ProjectContextVectorActivation::unavailable(vector_unavailable_phase_reason(reason))
             }
         },
         (None, _) => ProjectContextVectorActivation::unavailable(
             ProjectContextRetrievalPhaseUnavailableReason::MissingQueryEmbedding,
         ),
+        (Some(query), None) if query.embedding.is_empty() => {
+            ProjectContextVectorActivation::invalid(
+                ProjectContextRetrievalPhaseInvalidReason::EmptyQueryEmbedding,
+            )
+        }
         (Some(_), None) => ProjectContextVectorActivation::unavailable(
-            ProjectContextRetrievalPhaseUnavailableReason::MissingVectorIndex,
+            unavailable_reason
+                .map(vector_unavailable_phase_reason)
+                .unwrap_or(ProjectContextRetrievalPhaseUnavailableReason::MissingVectorIndex),
         ),
+    }
+}
+
+fn vector_unavailable_phase_reason(
+    reason: ProjectContextVectorUnavailableReason,
+) -> ProjectContextRetrievalPhaseUnavailableReason {
+    match reason {
+        ProjectContextVectorUnavailableReason::MissingQueryEmbedding => {
+            ProjectContextRetrievalPhaseUnavailableReason::MissingQueryEmbedding
+        }
+        ProjectContextVectorUnavailableReason::MissingVectorIndex => {
+            ProjectContextRetrievalPhaseUnavailableReason::MissingVectorIndex
+        }
+        ProjectContextVectorUnavailableReason::IndexNotReady => {
+            ProjectContextRetrievalPhaseUnavailableReason::VectorIndexNotReady
+        }
+        ProjectContextVectorUnavailableReason::NoMatchingVectorIndex => {
+            ProjectContextRetrievalPhaseUnavailableReason::NoMatchingVectorIndex
+        }
+        ProjectContextVectorUnavailableReason::AmbiguousVectorIndex => {
+            ProjectContextRetrievalPhaseUnavailableReason::AmbiguousVectorIndex
+        }
     }
 }
 
@@ -1432,6 +1550,7 @@ mod tests {
                 vector_query: Some(&vector_query),
                 vector_index: Some(ready_vector_boundary(&vector_index, 2)),
                 reranker: None,
+                vector_unavailable_reason: None,
             },
         );
         let plan = expect_plan(actual);
@@ -1477,6 +1596,7 @@ mod tests {
                 vector_query: None,
                 vector_index: Some(ready_vector_boundary(&vector_index, 2)),
                 reranker: None,
+                vector_unavailable_reason: None,
             },
         );
         let actual_plan = expect_plan(actual);
@@ -1519,6 +1639,7 @@ mod tests {
                 vector_query: Some(&vector_query),
                 vector_index: None,
                 reranker: None,
+                vector_unavailable_reason: None,
             },
         );
         let actual_plan = expect_plan(actual);
@@ -1562,6 +1683,7 @@ mod tests {
                 vector_query: Some(&vector_query),
                 vector_index: Some(ready_vector_boundary(&vector_index, 3)),
                 reranker: None,
+                vector_unavailable_reason: None,
             },
         );
         let actual_plan = expect_plan(actual);
@@ -1591,6 +1713,158 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn empty_query_embedding_reports_invalid_even_without_vector_index() -> Result<()> {
+        let (_fixture, _root, manifest) = indexed_fixture()?;
+        let vector_query = VectorQuery { embedding: Vec::new() };
+        let request = ProjectContextRetrievalRequest::new(
+            "Root model",
+            3,
+            ProjectContextPathScope::default(),
+            true,
+        );
+
+        let actual = plan_project_context_retrieval_with_options(
+            &manifest,
+            &freshness(&manifest),
+            request,
+            ProjectContextRetrievalOptions {
+                vector_query: Some(&vector_query),
+                vector_index: None,
+                reranker: None,
+                vector_unavailable_reason: None,
+            },
+        );
+        let actual_plan = expect_plan(actual);
+        let expected = ProjectContextRetrievalPhaseStatus::Invalid(
+            ProjectContextRetrievalPhaseInvalidReason::EmptyQueryEmbedding,
+        );
+        assert_eq!(
+            actual_plan.query_diagnostics.phase_diagnostics.vector,
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vector_selector_unavailable_reason_is_preserved_as_typed_phase() -> Result<()> {
+        let (_fixture, _root, manifest) = indexed_fixture()?;
+        let vector_query = VectorQuery { embedding: vec![1.0, 0.0] };
+        let request = ProjectContextRetrievalRequest::new(
+            "Root model",
+            3,
+            ProjectContextPathScope::default(),
+            true,
+        );
+
+        let actual = plan_project_context_retrieval_with_options(
+            &manifest,
+            &freshness(&manifest),
+            request,
+            ProjectContextRetrievalOptions {
+                vector_query: Some(&vector_query),
+                vector_index: None,
+                reranker: None,
+                vector_unavailable_reason: Some(
+                    ProjectContextVectorUnavailableReason::AmbiguousVectorIndex,
+                ),
+            },
+        );
+        let actual_plan = expect_plan(actual);
+        let expected = ProjectContextRetrievalPhaseStatus::Unavailable(
+            ProjectContextRetrievalPhaseUnavailableReason::AmbiguousVectorIndex,
+        );
+        assert_eq!(
+            actual_plan.query_diagnostics.phase_diagnostics.vector,
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn planner_preserves_use_case_and_applies_top_k_candidate_budget() -> Result<()> {
+        let (_fixture, _root, manifest) = indexed_fixture()?;
+        let request = ProjectContextRetrievalRequest::new(
+            "Root model",
+            1,
+            ProjectContextPathScope::default(),
+            true,
+        )
+        .with_use_case("ranked caller proof")
+        .with_top_k(4);
+
+        let actual = plan_project_context_retrieval_with_options(
+            &manifest,
+            &freshness(&manifest),
+            request,
+            ProjectContextRetrievalOptions::default(),
+        );
+        let actual_plan = expect_plan(actual);
+        let expected = (
+            Some("ranked caller proof".to_string()),
+            Some(4usize),
+            ProjectContextTopKStatus::Applied { candidate_count: 4 },
+            1usize,
+        );
+        assert_eq!(
+            (
+                actual_plan.query_diagnostics.use_case,
+                actual_plan.query_diagnostics.top_k,
+                actual_plan.query_diagnostics.top_k_status,
+                actual_plan.selected_results.len(),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn freshness_refusal_still_blocks_semantic_boundaries_before_reads_or_writes() -> Result<()> {
+        let (_fixture, _root, manifest) = indexed_fixture()?;
+        let vector_query = VectorQuery { embedding: vec![1.0, 0.0] };
+        let root_symbol = manifest
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "Root")
+            .expect("fixture should include Root symbol");
+        let vector_index = DeterministicVectorIndex::new(BTreeMap::from([(
+            root_symbol.id.clone(),
+            vec![1.0, 0.0],
+        )]));
+        let evaluation = ManifestFreshnessEvaluation {
+            state: FreshnessState {
+                changed: vec!["src/lib.rs".to_string()],
+                fresh: true,
+                ..fresh_state(&manifest)
+            },
+            proof_level: FreshnessProofLevel::FullFilesystem,
+        };
+        let request = ProjectContextRetrievalRequest::new(
+            "Root model",
+            3,
+            ProjectContextPathScope::default(),
+            true,
+        );
+
+        let actual = plan_project_context_retrieval_with_options(
+            &manifest,
+            &evaluation,
+            request,
+            ProjectContextRetrievalOptions {
+                vector_query: Some(&vector_query),
+                vector_index: Some(ready_vector_boundary(&vector_index, 2)),
+                reranker: None,
+                vector_unavailable_reason: None,
+            },
+        );
+        let actual_plan = expect_plan(actual);
+        let expected = ProjectContextRetrievalPhaseStatus::Active { result_count: 0 };
+        assert_eq!(
+            actual_plan.query_diagnostics.phase_diagnostics.vector,
+            expected
+        );
+        Ok(())
+    }
     #[test]
     fn reranker_absence_reports_diagnostic_without_changing_fallback() -> Result<()> {
         let (_fixture, _root, manifest) = indexed_fixture()?;

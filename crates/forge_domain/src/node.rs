@@ -137,7 +137,7 @@ impl<T> CodeBase<T> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Setters)]
+#[derive(Debug, Clone, PartialEq, Setters)]
 #[setters(strip_option, into)]
 pub struct SearchParams<'a> {
     pub query: &'a str,
@@ -146,6 +146,10 @@ pub struct SearchParams<'a> {
     pub use_case: String,
     pub starts_with: Option<String>,
     pub ends_with: Option<Vec<String>>,
+    /// Optional provider-neutral query embedding computed by an external boundary.
+    pub query_embedding: Option<Vec<f32>>,
+    /// Optional external embedding model identity for selecting durable indexes.
+    pub embedding_model_id: Option<String>,
 }
 
 impl<'a> SearchParams<'a> {
@@ -157,6 +161,8 @@ impl<'a> SearchParams<'a> {
             use_case: use_case.to_string(),
             starts_with: None,
             ends_with: None,
+            query_embedding: None,
+            embedding_model_id: None,
         }
     }
 }
@@ -456,6 +462,8 @@ mod tests {
             use_case: "find retry logic".to_string(),
             starts_with: None,
             ends_with: Some(vec![".rs".to_string()]),
+            query_embedding: None,
+            embedding_model_id: None,
         };
 
         assert_eq!(actual, expected);
@@ -483,6 +491,8 @@ mod tests {
                 ".ts".to_string(),
                 ".py".to_string(),
             ]),
+            query_embedding: None,
+            embedding_model_id: None,
         };
 
         assert_eq!(actual, expected);
@@ -499,6 +509,8 @@ mod tests {
             use_case: "authentication implementation".to_string(),
             starts_with: None,
             ends_with: None,
+            query_embedding: None,
+            embedding_model_id: None,
         };
 
         assert_eq!(actual, expected);

@@ -104,10 +104,11 @@ pub use retrieval_plan::{
     ProjectContextRetrievalQueryDiagnostics, ProjectContextRetrievalReadRequestSummary,
     ProjectContextRetrievalRefusal, ProjectContextRetrievalRefusalCode,
     ProjectContextRetrievalRequest, ProjectContextRetrievalSelectedSummary,
-    ProjectContextReturnOrderItem, ProjectContextVectorIndexBoundary,
-    ProjectContextVectorInvalidReason, ProjectContextVectorReadiness,
-    ProjectContextVectorUnavailableReason, ProjectContextWriteDecision,
-    plan_project_context_retrieval, plan_project_context_retrieval_with_options,
+    ProjectContextReturnOrderItem, ProjectContextSemanticQueryOptions, ProjectContextTopKStatus,
+    ProjectContextVectorIndexBoundary, ProjectContextVectorInvalidReason,
+    ProjectContextVectorReadiness, ProjectContextVectorUnavailableReason,
+    ProjectContextWriteDecision, plan_project_context_retrieval,
+    plan_project_context_retrieval_with_options,
 };
 pub use status::{
     ExactFactArtifactStoreMetadata, ExactFactArtifactStoreState, ExactFactStatus,
