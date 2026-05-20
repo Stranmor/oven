@@ -5,6 +5,83 @@ use derive_more::Display;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Typed manifest-derived input for an external project semantic embedding boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSemanticEmbeddingInput {
+    /// Manifest-owned source identifier that must be echoed by the boundary.
+    pub source_id: String,
+    /// Manifest-owned source fingerprint that must be echoed by the boundary.
+    pub source_fingerprint: String,
+    /// Bounded text derived from project-model evidence for embedding.
+    pub text: String,
+}
+
+/// Provider-neutral semantic embedding request for project-model vector indexing or query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSemanticEmbeddingRequest {
+    /// External embedding model identity chosen by the caller.
+    pub embedding_model_id: String,
+    /// Ordered bounded embedding inputs.
+    pub inputs: Vec<ProjectSemanticEmbeddingInput>,
+}
+
+/// Provider-neutral semantic vector returned by an embedding boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectSemanticEmbeddingVector {
+    /// Manifest-owned source identifier echoed from the request.
+    pub source_id: String,
+    /// Manifest-owned source fingerprint echoed from the request.
+    pub source_fingerprint: String,
+    /// Provider-neutral embedding values.
+    pub embedding: Vec<f32>,
+}
+
+/// Provider-neutral ordered semantic embedding output.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectSemanticEmbeddingOutput {
+    /// External embedding model identity echoed by the boundary.
+    pub embedding_model_id: String,
+    /// Fixed embedding dimension for every vector.
+    pub dimension: usize,
+    /// Ordered provider-neutral vectors matching the request inputs.
+    pub vectors: Vec<ProjectSemanticEmbeddingVector>,
+}
+
+/// Stable status for explicit workspace vector-index production.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceVectorIndexBuildStatus {
+    /// Exactly one durable vector artifact was written and validated by readback.
+    ArtifactWritten,
+}
+
+impl WorkspaceVectorIndexBuildStatus {
+    /// Returns the stable lowercase status label used by human output.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::ArtifactWritten => "artifact_written",
+        }
+    }
+}
+
+/// Redaction-safe command report for explicit workspace vector-index production.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceVectorIndexBuildReport {
+    /// Explicit command status.
+    pub status: WorkspaceVectorIndexBuildStatus,
+    /// Persisted artifact path.
+    pub artifact_path: PathBuf,
+    /// Deterministic vector artifact identifier.
+    pub artifact_id: String,
+    /// Embedding model identity used for the artifact.
+    pub embedding_model_id: String,
+    /// Fixed embedding dimension.
+    pub dimension: usize,
+    /// Number of persisted vector entries.
+    pub entry_count: usize,
+    /// Manifest hash used as the source baseline.
+    pub manifest_hash: String,
+}
+
 /// Workspace identifier (UUID) from workspace server.
 ///
 /// Generated locally and sent to server during CreateWorkspace.

@@ -276,6 +276,20 @@ pub trait API: Sync + Send {
         path: PathBuf,
     ) -> Result<forge_domain::WorkspaceExactFactStatusReport>;
 
+    /// Builds a durable semantic vector index for a workspace.
+    async fn build_workspace_vector_index(
+        &self,
+        path: PathBuf,
+        embedding_model_id: String,
+    ) -> Result<forge_domain::WorkspaceVectorIndexBuildReport>;
+
+    /// Embeds a workspace query through the semantic embedding boundary.
+    async fn embed_workspace_query(
+        &self,
+        query: String,
+        embedding_model_id: String,
+    ) -> Result<forge_domain::ProjectSemanticEmbeddingOutput>;
+
     /// Query the indexed workspace
     async fn query_workspace(
         &self,

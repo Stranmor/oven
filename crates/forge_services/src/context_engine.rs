@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -6,18 +6,20 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use forge_app::{CommandInfra, EnvironmentInfra, FileReaderInfra, WalkerInfra, WorkspaceService};
 use forge_domain::{
-    AuthCredential, AuthDetails, FileChunk, Node, NodeData, NodeId, ProviderId, ProviderRepository,
-    SearchParams, SyncProgress, UserId, WorkspaceContextFreshness,
-    WorkspaceContextManifestDiagnostic, WorkspaceEvidenceLedgerActivationDiagnostic,
-    WorkspaceEvidenceLedgerActivationSummary, WorkspaceEvidenceLedgerGraphMetadata,
-    WorkspaceEvidenceReadinessDiagnostic, WorkspaceEvidenceReplayBudgetSummary,
-    WorkspaceEvidenceReplayDiagnostic, WorkspaceEvidenceReplayIssueSummary,
-    WorkspaceEvidenceReplayPreviewDiagnostic, WorkspaceEvidenceReplayPreviewStatus,
-    WorkspaceEvidenceReplayReference, WorkspaceEvidenceReplayStatus, WorkspaceExactFactBoundedLoss,
+    AuthCredential, AuthDetails, FileChunk, Node, NodeData, NodeId, ProjectSemanticEmbeddingInput,
+    ProjectSemanticEmbeddingOutput, ProjectSemanticEmbeddingRequest,
+    ProjectSemanticEmbeddingVector, ProviderId, ProviderRepository, SearchParams, SyncProgress,
+    UserId, WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
+    WorkspaceEvidenceLedgerActivationDiagnostic, WorkspaceEvidenceLedgerActivationSummary,
+    WorkspaceEvidenceLedgerGraphMetadata, WorkspaceEvidenceReadinessDiagnostic,
+    WorkspaceEvidenceReplayBudgetSummary, WorkspaceEvidenceReplayDiagnostic,
+    WorkspaceEvidenceReplayIssueSummary, WorkspaceEvidenceReplayPreviewDiagnostic,
+    WorkspaceEvidenceReplayPreviewStatus, WorkspaceEvidenceReplayReference,
+    WorkspaceEvidenceReplayStatus, WorkspaceExactFactBoundedLoss,
     WorkspaceExactFactIngestionSummary, WorkspaceExactFactIssue,
     WorkspaceExactFactReadinessDiagnostic, WorkspaceExactFactReferenceReport,
     WorkspaceExactFactReferenceStatus, WorkspaceExactFactStatusReport, WorkspaceId,
-    WorkspaceIndexRepository,
+    WorkspaceIndexRepository, WorkspaceVectorIndexBuildReport, WorkspaceVectorIndexBuildStatus,
 };
 use forge_project_model::{
     ContextPackArtifactId, EvidenceFreshness, EvidenceLedgerReplayReport,
@@ -32,13 +34,13 @@ use forge_project_model::{
     ProjectContextVectorUnavailableReason, ProjectContextWriteDecision, ProjectIndexer,
     ProjectModelContextRenderBudget, Provenance, RustAnalyzerBounds, RustAnalyzerCapability,
     RustAnalyzerCapabilityProbe, RustAnalyzerCapabilityStatus, RustAnalyzerProbe,
-    StdRustAnalyzerProcess, ToolEpisode, VectorQuery, derive_native_lsp_reference_request,
-    fingerprint, load_evidence_ledger_activation, local_project_model_dir,
-    local_project_model_manifest, plan_project_context_retrieval_with_options,
-    read_exact_fact_status, redaction_safe_issue_path_label,
-    redaction_safe_provenance_source_label, redaction_safe_replay_path_label,
-    render_project_model_context, render_sources_from_evidence_replay,
-    select_evidence_ledger_replay,
+    StdRustAnalyzerProcess, ToolEpisode, VectorIndexArtifact, VectorIndexEntry, VectorQuery,
+    derive_native_lsp_reference_request, fingerprint, load_evidence_ledger_activation,
+    local_project_model_dir, local_project_model_manifest,
+    plan_project_context_retrieval_with_options, read_exact_fact_status,
+    redaction_safe_issue_path_label, redaction_safe_provenance_source_label,
+    redaction_safe_replay_path_label, render_project_model_context,
+    render_sources_from_evidence_replay, select_evidence_ledger_replay,
 };
 use forge_stream::MpscStream;
 use futures::future::join_all;
@@ -55,6 +57,117 @@ const PREVIEW_MANIFEST_MISSING_REASON: &str = "manifest_missing";
 const PREVIEW_MANIFEST_READ_ERROR_REASON: &str = "manifest_read_error";
 const PREVIEW_MANIFEST_FRESHNESS_ERROR_REASON: &str = "manifest_freshness_error";
 const PREVIEW_MANIFEST_BOUNDED_FRESHNESS_REASON: &str = "manifest_bounded_freshness_not_injectable";
+const SEMANTIC_EMBEDDING_TEXT_LIMIT: usize = 4096;
+const QUERY_EMBEDDING_SOURCE_ID: &str = "query";
+const QUERY_EMBEDDING_SOURCE_FINGERPRINT: &str = "query";
+
+/// Typed provider-neutral embedding boundary for workspace semantic vectors.
+#[async_trait]
+pub trait ProjectSemanticEmbeddingProvider: Send + Sync {
+    /// Embeds ordered bounded project-model inputs.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - Typed provider-neutral embedding request derived from manifest evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed embedding errors when the provider is unavailable or returns invalid vectors.
+    async fn embed_project_semantic(
+        &self,
+        request: ProjectSemanticEmbeddingRequest,
+    ) -> std::result::Result<ProjectSemanticEmbeddingOutput, ProjectSemanticEmbeddingError>;
+}
+
+/// Precise semantic embedding boundary failure taxonomy.
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum ProjectSemanticEmbeddingError {
+    /// Embedding provider is not available for this runtime.
+    #[error("semantic embedding provider unavailable: {0}")]
+    ProviderUnavailable(String),
+    /// Boundary returned an empty vector.
+    #[error("semantic embedding vector is empty for source {source_id}")]
+    EmptyVector {
+        /// Source identifier whose vector was empty.
+        source_id: String,
+    },
+    /// Boundary returned a non-finite vector value.
+    #[error("semantic embedding vector has non-finite value for source {source_id}")]
+    NonFiniteVector {
+        /// Source identifier whose vector contained a non-finite value.
+        source_id: String,
+    },
+    /// Boundary output dimension did not match a returned vector.
+    #[error(
+        "semantic embedding dimension mismatch for source {source_id}: expected {expected}, got {actual}"
+    )]
+    DimensionMismatch {
+        /// Source identifier whose vector dimension mismatched.
+        source_id: String,
+        /// Output dimension declared by the boundary.
+        expected: usize,
+        /// Actual vector length.
+        actual: usize,
+    },
+    /// Boundary echoed a different model id than requested.
+    #[error("semantic embedding model id mismatch: expected {expected}, got {actual}")]
+    ModelIdMismatch {
+        /// Requested model identity.
+        expected: String,
+        /// Returned model identity.
+        actual: String,
+    },
+    /// Boundary output order or source identity did not match request input.
+    #[error(
+        "semantic embedding source mismatch at position {position}: expected {expected}, got {actual}"
+    )]
+    SourceMismatch {
+        /// Zero-based vector position.
+        position: usize,
+        /// Expected request source identity.
+        expected: String,
+        /// Actual response source identity.
+        actual: String,
+    },
+}
+
+/// Deterministic local embedding boundary used when no external provider is wired.
+#[derive(Clone, Debug, Default)]
+pub struct DeterministicProjectSemanticEmbeddingProvider;
+
+#[async_trait]
+impl ProjectSemanticEmbeddingProvider for DeterministicProjectSemanticEmbeddingProvider {
+    async fn embed_project_semantic(
+        &self,
+        request: ProjectSemanticEmbeddingRequest,
+    ) -> std::result::Result<ProjectSemanticEmbeddingOutput, ProjectSemanticEmbeddingError> {
+        let vectors = request
+            .inputs
+            .iter()
+            .map(|input| ProjectSemanticEmbeddingVector {
+                source_id: input.source_id.clone(),
+                source_fingerprint: input.source_fingerprint.clone(),
+                embedding: deterministic_embedding(&input.text),
+            })
+            .collect::<Vec<_>>();
+        Ok(ProjectSemanticEmbeddingOutput {
+            embedding_model_id: request.embedding_model_id,
+            dimension: 2,
+            vectors,
+        })
+    }
+}
+
+fn deterministic_embedding(text: &str) -> Vec<f32> {
+    let lower = text.to_ascii_lowercase();
+    let semantic_score = if lower.contains("runtime") || lower.contains("needle") {
+        1.0
+    } else {
+        0.25
+    };
+    let lexical_score = if lower.contains("query") { 0.75 } else { 0.1 };
+    vec![semantic_score, lexical_score]
+}
 
 fn workspace_evidence_replay_diagnostic(
     path: PathBuf,
@@ -755,6 +868,71 @@ impl<
 
         Ok((is_new_workspace, workspace_id))
     }
+    async fn build_workspace_vector_index_with_provider<P>(
+        &self,
+        path: PathBuf,
+        embedding_model_id: String,
+        provider: &P,
+    ) -> Result<WorkspaceVectorIndexBuildReport>
+    where
+        P: ProjectSemanticEmbeddingProvider,
+    {
+        let root = canonicalize_path(path)?;
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+        let (manifest, ingestion_report) = indexer.index_with_external_fact_report()?;
+        let manifest_path = indexer.write_manifest(&manifest)?;
+        indexer.write_external_fact_artifact_ingestion_report(&ingestion_report)?;
+        let request = semantic_embedding_request_from_manifest(&manifest, embedding_model_id)?;
+        let output = provider.embed_project_semantic(request.clone()).await?;
+        let entries = vector_entries_from_embedding_output(&manifest, &request, output)?;
+        let artifact = VectorIndexArtifact::new(
+            &manifest,
+            request.embedding_model_id.clone(),
+            entries.dimension,
+            entries.entries,
+        )?;
+        let artifact_path = indexer.write_vector_index(&manifest, &artifact)?;
+        let artifact_id = indexer.vector_index_artifact_id(&artifact)?;
+        let actual = indexer.read_vector_index(&manifest, &artifact_id)?;
+        if actual != artifact {
+            anyhow::bail!(
+                "workspace vector index readback mismatch after writing {} via manifest {}",
+                artifact_id,
+                manifest_path.display()
+            );
+        }
+        Ok(WorkspaceVectorIndexBuildReport {
+            status: WorkspaceVectorIndexBuildStatus::ArtifactWritten,
+            artifact_path,
+            artifact_id: artifact_id.to_string(),
+            embedding_model_id: artifact.embedding_model_id,
+            dimension: artifact.dimension,
+            entry_count: artifact.entries.len(),
+            manifest_hash: manifest.manifest_hash,
+        })
+    }
+
+    async fn embed_workspace_query_with_provider<P>(
+        &self,
+        query: &str,
+        embedding_model_id: String,
+        provider: &P,
+    ) -> Result<ProjectSemanticEmbeddingOutput>
+    where
+        P: ProjectSemanticEmbeddingProvider,
+    {
+        let request = ProjectSemanticEmbeddingRequest {
+            embedding_model_id,
+            inputs: vec![ProjectSemanticEmbeddingInput {
+                source_id: QUERY_EMBEDDING_SOURCE_ID.to_string(),
+                source_fingerprint: QUERY_EMBEDDING_SOURCE_FINGERPRINT.to_string(),
+                text: query.to_string(),
+            }],
+        };
+        let output = provider.embed_project_semantic(request.clone()).await?;
+        validate_embedding_output(&request, output).map_err(anyhow::Error::from)
+    }
+
     async fn query_local_workspace(
         &self,
         path: PathBuf,
@@ -793,6 +971,16 @@ impl<
             semantic_query.as_ref(),
             params.embedding_model_id.as_deref(),
         );
+        if semantic_query.is_some()
+            && let Some(reason) = durable_vector_selection.unavailable_reason()
+        {
+            anyhow::bail!(
+                "Workspace project model vector retrieval unavailable at {} for {}: {:?}",
+                manifest_path.display(),
+                root.display(),
+                reason
+            );
+        }
         let plan = match plan_project_context_retrieval_with_options(
             &manifest,
             &freshness,
@@ -870,6 +1058,137 @@ impl<
     }
 }
 
+struct ValidatedVectorEntries {
+    dimension: usize,
+    entries: Vec<VectorIndexEntry>,
+}
+
+fn semantic_embedding_request_from_manifest(
+    manifest: &forge_project_model::ProjectManifest,
+    embedding_model_id: String,
+) -> Result<ProjectSemanticEmbeddingRequest> {
+    if embedding_model_id.trim().is_empty() {
+        anyhow::bail!("semantic embedding model id must be non-empty");
+    }
+    let mut inputs = manifest
+        .symbols
+        .iter()
+        .map(|symbol| ProjectSemanticEmbeddingInput {
+            source_id: symbol.id.clone(),
+            source_fingerprint: symbol.provenance.fingerprint.clone(),
+            text: bounded_embedding_text(format!(
+                "symbol name: {}\nkind: {:?}\npath: {}\nlines: {}-{}",
+                symbol.name, symbol.kind, symbol.path, symbol.start_line, symbol.end_line
+            )),
+        })
+        .collect::<Vec<_>>();
+    if inputs.is_empty() {
+        inputs = manifest
+            .shards
+            .iter()
+            .map(|shard| ProjectSemanticEmbeddingInput {
+                source_id: shard.id.clone(),
+                source_fingerprint: shard.content_hash.clone(),
+                text: bounded_embedding_text(format!(
+                    "shard path: {}\nlines: {}-{}\ncontent_hash: {}",
+                    shard.path, shard.start_line, shard.end_line, shard.content_hash
+                )),
+            })
+            .collect::<Vec<_>>();
+    }
+    if inputs.is_empty() {
+        inputs = manifest
+            .files
+            .iter()
+            .map(|file| ProjectSemanticEmbeddingInput {
+                source_id: file.path.clone(),
+                source_fingerprint: file.content_hash.clone(),
+                text: bounded_embedding_text(format!(
+                    "file path: {}\nlanguage: {:?}\nlines: {}",
+                    file.path, file.language, file.lines
+                )),
+            })
+            .collect::<Vec<_>>();
+    }
+    if inputs.is_empty() {
+        anyhow::bail!("project manifest has no vector-embeddable evidence");
+    }
+    Ok(ProjectSemanticEmbeddingRequest { embedding_model_id, inputs })
+}
+
+fn bounded_embedding_text(text: String) -> String {
+    text.chars().take(SEMANTIC_EMBEDDING_TEXT_LIMIT).collect()
+}
+
+fn vector_entries_from_embedding_output(
+    manifest: &forge_project_model::ProjectManifest,
+    request: &ProjectSemanticEmbeddingRequest,
+    output: ProjectSemanticEmbeddingOutput,
+) -> std::result::Result<ValidatedVectorEntries, ProjectSemanticEmbeddingError> {
+    let output = validate_embedding_output(request, output)?;
+    let embeddings = output
+        .vectors
+        .into_iter()
+        .map(|vector| (vector.source_id, vector.embedding))
+        .collect::<BTreeMap<_, _>>();
+    let entries =
+        forge_project_model::vector_entries_from_manifest_embeddings(manifest, embeddings)
+            .map_err(|error| ProjectSemanticEmbeddingError::SourceMismatch {
+                position: 0,
+                expected: "manifest-owned vector evidence".to_string(),
+                actual: error.to_string(),
+            })?;
+    Ok(ValidatedVectorEntries { dimension: output.dimension, entries })
+}
+
+fn validate_embedding_output(
+    request: &ProjectSemanticEmbeddingRequest,
+    output: ProjectSemanticEmbeddingOutput,
+) -> std::result::Result<ProjectSemanticEmbeddingOutput, ProjectSemanticEmbeddingError> {
+    if output.embedding_model_id != request.embedding_model_id {
+        return Err(ProjectSemanticEmbeddingError::ModelIdMismatch {
+            expected: request.embedding_model_id.clone(),
+            actual: output.embedding_model_id,
+        });
+    }
+    if output.vectors.len() != request.inputs.len() {
+        return Err(ProjectSemanticEmbeddingError::SourceMismatch {
+            position: request.inputs.len(),
+            expected: format!("{} vectors", request.inputs.len()),
+            actual: format!("{} vectors", output.vectors.len()),
+        });
+    }
+    for (position, (input, vector)) in request.inputs.iter().zip(&output.vectors).enumerate() {
+        if vector.source_id != input.source_id
+            || vector.source_fingerprint != input.source_fingerprint
+        {
+            return Err(ProjectSemanticEmbeddingError::SourceMismatch {
+                position,
+                expected: format!("{}:{}", input.source_id, input.source_fingerprint),
+                actual: format!("{}:{}", vector.source_id, vector.source_fingerprint),
+            });
+        }
+        if vector.embedding.is_empty() {
+            return Err(ProjectSemanticEmbeddingError::EmptyVector {
+                source_id: vector.source_id.clone(),
+            });
+        }
+        if vector.embedding.len() != output.dimension {
+            return Err(ProjectSemanticEmbeddingError::DimensionMismatch {
+                source_id: vector.source_id.clone(),
+                expected: output.dimension,
+                actual: vector.embedding.len(),
+            });
+        }
+        if vector.embedding.iter().any(|value| !value.is_finite()) {
+            return Err(ProjectSemanticEmbeddingError::NonFiniteVector {
+                source_id: vector.source_id.clone(),
+            });
+        }
+    }
+    Ok(output)
+}
+
 struct DurableVectorSelection {
     index: Option<forge_project_model::DurableVectorIndex>,
     readiness: ProjectContextVectorReadiness,
@@ -932,12 +1251,16 @@ fn select_durable_vector_index(
     };
     let mut matching = Vec::new();
     for id in ids {
-        let Ok(artifact) = indexer.read_vector_index(manifest, &id) else {
-            continue;
+        let artifact = match indexer.read_vector_index(manifest, &id) {
+            Ok(artifact) => artifact,
+            Err(_error) => {
+                return DurableVectorSelection::unavailable(
+                    ProjectContextVectorUnavailableReason::IndexNotReady,
+                );
+            }
         };
         if artifact.manifest_hash == manifest.manifest_hash
             && artifact.embedding_model_id == embedding_model_id
-            && artifact.dimension == query.embedding.len()
         {
             matching.push(artifact);
         }
@@ -1441,6 +1764,26 @@ impl<
         workspace_evidence_replay_preview_diagnostic(path)
     }
 
+    async fn build_workspace_vector_index(
+        &self,
+        path: PathBuf,
+        embedding_model_id: String,
+    ) -> Result<WorkspaceVectorIndexBuildReport> {
+        let provider = DeterministicProjectSemanticEmbeddingProvider;
+        self.build_workspace_vector_index_with_provider(path, embedding_model_id, &provider)
+            .await
+    }
+
+    async fn embed_workspace_query(
+        &self,
+        query: String,
+        embedding_model_id: String,
+    ) -> Result<ProjectSemanticEmbeddingOutput> {
+        let provider = DeterministicProjectSemanticEmbeddingProvider;
+        self.embed_workspace_query_with_provider(&query, embedding_model_id, &provider)
+            .await
+    }
+
     /// Performs semantic code search on a workspace.
     async fn query_workspace(
         &self,
@@ -1654,6 +1997,49 @@ mod tests {
         probe: RustAnalyzerProbe,
         produce_calls: Arc<std::sync::atomic::AtomicUsize>,
         create_file_during_produce: bool,
+    }
+
+    #[derive(Clone, Debug)]
+    struct FakeSemanticEmbeddingProvider {
+        model_id: String,
+        vectors: BTreeMap<String, Vec<f32>>,
+    }
+
+    impl FakeSemanticEmbeddingProvider {
+        fn new(model_id: &str, vectors: BTreeMap<String, Vec<f32>>) -> Self {
+            Self { model_id: model_id.to_string(), vectors }
+        }
+    }
+
+    #[async_trait]
+    impl ProjectSemanticEmbeddingProvider for FakeSemanticEmbeddingProvider {
+        async fn embed_project_semantic(
+            &self,
+            request: ProjectSemanticEmbeddingRequest,
+        ) -> std::result::Result<ProjectSemanticEmbeddingOutput, ProjectSemanticEmbeddingError>
+        {
+            let vectors = request
+                .inputs
+                .iter()
+                .map(|input| ProjectSemanticEmbeddingVector {
+                    source_id: input.source_id.clone(),
+                    source_fingerprint: input.source_fingerprint.clone(),
+                    embedding: self
+                        .vectors
+                        .get(&input.source_id)
+                        .cloned()
+                        .unwrap_or_else(|| vec![0.0, 1.0]),
+                })
+                .collect::<Vec<_>>();
+            Ok(ProjectSemanticEmbeddingOutput {
+                embedding_model_id: self.model_id.clone(),
+                dimension: vectors
+                    .first()
+                    .map(|vector| vector.embedding.len())
+                    .unwrap_or(2),
+                vectors,
+            })
+        }
     }
 
     impl FakeExactFactDriver {
@@ -2091,6 +2477,113 @@ mod tests {
         )?;
         let artifact = VectorIndexArtifact::new(&manifest, model_id, 2, entries)?;
         indexer.write_vector_index(&manifest, &artifact)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn build_workspace_vector_index_writes_one_readable_artifact_from_embedding_boundary()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = fixture_sync_service(&root);
+        let manifest_path = setup.write_local_project_model_manifest(&root)?;
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+        let manifest = indexer.read_manifest()?;
+        let target_symbol = manifest
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "RuntimeNeedle")
+            .expect("fixture should include RuntimeNeedle symbol");
+        let provider = FakeSemanticEmbeddingProvider::new(
+            "fixture-model",
+            BTreeMap::from([(target_symbol.id.clone(), vec![1.0, 0.0])]),
+        );
+
+        let actual = setup
+            .build_workspace_vector_index_with_provider(
+                root.clone(),
+                "fixture-model".to_string(),
+                &provider,
+            )
+            .await?;
+        let ids = indexer.list_vector_indexes()?;
+        let expected = (
+            1usize,
+            "fixture-model".to_string(),
+            2usize,
+            manifest_path.is_file(),
+        );
+
+        assert_eq!(
+            (
+                ids.len(),
+                actual.embedding_model_id.clone(),
+                actual.dimension,
+                expected.3,
+            ),
+            expected,
+        );
+        let artifact_id = ids.first().expect("one vector artifact should exist");
+        let artifact = indexer.read_vector_index(&indexer.read_manifest()?, artifact_id)?;
+        assert_eq!(artifact.entries.len(), actual.entry_count);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_workspace_embedded_query_uses_built_durable_vector_artifact_for_lexical_miss()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = fixture_sync_service(&root);
+        setup.write_local_project_model_manifest(&root)?;
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+        let manifest = indexer.read_manifest()?;
+        let target_symbol = manifest
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "RuntimeNeedle")
+            .expect("fixture should include RuntimeNeedle symbol");
+        let build_provider = FakeSemanticEmbeddingProvider::new(
+            "fixture-model",
+            BTreeMap::from([(target_symbol.id.clone(), vec![1.0, 0.0])]),
+        );
+        setup
+            .build_workspace_vector_index_with_provider(
+                root.clone(),
+                "fixture-model".to_string(),
+                &build_provider,
+            )
+            .await?;
+        let query_provider = FakeSemanticEmbeddingProvider::new(
+            "fixture-model",
+            BTreeMap::from([(QUERY_EMBEDDING_SOURCE_ID.to_string(), vec![1.0, 0.0])]),
+        );
+        let output = setup
+            .embed_workspace_query_with_provider(
+                "semantic-only request without lexical token",
+                "fixture-model".to_string(),
+                &query_provider,
+            )
+            .await?;
+        let vector = output
+            .vectors
+            .into_iter()
+            .next()
+            .expect("query embedding should be present");
+        let params = SearchParams::new("lexicalmiss", "semantic query bridge proof")
+            .limit(1usize)
+            .query_embedding(vector.embedding)
+            .embedding_model_id(output.embedding_model_id);
+
+        let actual = WorkspaceService::query_workspace(&setup, root, params).await?;
+        let expected = Some("src/lib.rs".to_string());
+        assert_eq!(
+            actual.iter().find_map(|node| match &node.node {
+                NodeData::FileChunk(chunk) if chunk.content.contains("RuntimeNeedle") => {
+                    Some(chunk.file_path.clone())
+                }
+                _ => None,
+            }),
+            expected,
+        );
         Ok(())
     }
 
@@ -2840,7 +3333,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_workspace_corrupt_vector_artifact_falls_back_to_lexical() -> Result<()> {
+    async fn query_workspace_corrupt_vector_artifact_returns_typed_failure() -> Result<()> {
         let (_fixture, root) = fixture_workspace()?;
         write_fixture_project_model(&root)?;
         let vector_dir = local_project_model_dir(&root).join("vector_indexes");
@@ -2862,15 +3355,9 @@ mod tests {
             .query_embedding(vec![1.0, 0.0])
             .embedding_model_id("fixture-model".to_string());
 
-        let actual = WorkspaceService::query_workspace(&setup, root, params).await?;
-        let expected = true;
-        assert_eq!(
-            actual.iter().any(|node| match &node.node {
-                NodeData::FileChunk(chunk) => chunk.content.contains("build_runtime_needle"),
-                _ => false,
-            }),
-            expected,
-        );
+        let actual = WorkspaceService::query_workspace(&setup, root, params).await;
+        let expected = "IndexNotReady";
+        assert!(actual.unwrap_err().to_string().contains(expected));
         Ok(())
     }
 
@@ -2897,9 +3384,9 @@ mod tests {
             .query_embedding(vec![1.0, 0.0])
             .embedding_model_id("fixture-model".to_string());
 
-        let actual = WorkspaceService::query_workspace(&setup, root.clone(), params).await?;
-        let expected = Vec::<Node>::new();
-        assert_eq!(actual, expected);
+        let actual = WorkspaceService::query_workspace(&setup, root.clone(), params).await;
+        let expected = "AmbiguousVectorIndex";
+        assert!(actual.unwrap_err().to_string().contains(expected));
         let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
         assert!(indexer.list_context_pack_artifacts()?.is_empty());
         assert!(indexer.read_episodes()?.is_empty());

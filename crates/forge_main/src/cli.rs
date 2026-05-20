@@ -352,6 +352,20 @@ pub struct WorkspaceCommandGroup {
 }
 
 #[derive(Subcommand, Debug, Clone)]
+pub enum WorkspaceVectorIndexCommand {
+    /// Build one durable vector index artifact from the fresh project manifest.
+    Build {
+        /// Path to the workspace directory.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Embedding model identity for artifact/query compatibility.
+        #[arg(long, default_value = "forge-local-deterministic-v1")]
+        embedding_model_id: String,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
 pub enum WorkspaceCommand {
     /// Produce opt-in exact-fact workspace artifacts.
     ExactFact(WorkspaceExactFactCommandGroup),
@@ -366,6 +380,12 @@ pub enum WorkspaceCommand {
         /// been initialized yet.
         #[arg(long)]
         init: bool,
+    },
+
+    /// Build a durable semantic vector index for a workspace.
+    VectorIndex {
+        #[command(subcommand)]
+        command: WorkspaceVectorIndexCommand,
     },
 
     /// List all workspaces.
@@ -404,6 +424,14 @@ pub enum WorkspaceCommand {
         /// Filter results to files ending with this suffix.
         #[arg(long)]
         ends_with: Option<String>,
+
+        /// Compute a semantic query embedding for durable vector-index selection.
+        #[arg(long)]
+        semantic: bool,
+
+        /// Embedding model identity used when --semantic is set.
+        #[arg(long, default_value = "forge-local-deterministic-v1")]
+        embedding_model_id: String,
     },
 
     /// Show workspace information for an indexed directory.
@@ -1164,6 +1192,57 @@ mod tests {
 
     fn conversation_id(fixture: &str) -> ConversationId {
         ConversationId::parse(fixture).expect("fixture conversation id should be valid")
+    }
+
+    #[test]
+    fn workspace_query_semantic_flags_parse_embedding_model() {
+        let fixture = Cli::parse_from([
+            "forge",
+            "workspace",
+            "query",
+            "lexicalmiss",
+            ".",
+            "--use-case",
+            "semantic proof",
+            "--semantic",
+            "--embedding-model-id",
+            "fixture-model",
+        ]);
+        let actual = match fixture.subcommands {
+            Some(TopLevelCommand::Workspace(group)) => match group.command {
+                WorkspaceCommand::Query { semantic, embedding_model_id, .. } => {
+                    (semantic, embedding_model_id)
+                }
+                _ => panic!("expected workspace query command"),
+            },
+            _ => panic!("expected workspace command"),
+        };
+        let expected = (true, "fixture-model".to_string());
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn workspace_vector_index_build_parses_embedding_model() {
+        let fixture = Cli::parse_from([
+            "forge",
+            "workspace",
+            "vector-index",
+            "build",
+            ".",
+            "--embedding-model-id",
+            "fixture-model",
+        ]);
+        let actual = match fixture.subcommands {
+            Some(TopLevelCommand::Workspace(group)) => match group.command {
+                WorkspaceCommand::VectorIndex {
+                    command: WorkspaceVectorIndexCommand::Build { path, embedding_model_id },
+                } => (path, embedding_model_id),
+                _ => panic!("expected workspace vector-index build command"),
+            },
+            _ => panic!("expected workspace command"),
+        };
+        let expected = (PathBuf::from("."), "fixture-model".to_string());
+        assert_eq!(actual, expected);
     }
 
     #[test]

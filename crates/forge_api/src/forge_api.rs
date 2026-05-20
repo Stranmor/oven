@@ -456,6 +456,26 @@ impl<
         self.services.workspace_exact_fact_status(path).await
     }
 
+    async fn build_workspace_vector_index(
+        &self,
+        path: PathBuf,
+        embedding_model_id: String,
+    ) -> Result<forge_domain::WorkspaceVectorIndexBuildReport> {
+        self.services
+            .build_workspace_vector_index(path, embedding_model_id)
+            .await
+    }
+
+    async fn embed_workspace_query(
+        &self,
+        query: String,
+        embedding_model_id: String,
+    ) -> Result<forge_domain::ProjectSemanticEmbeddingOutput> {
+        self.services
+            .embed_workspace_query(query, embedding_model_id)
+            .await
+    }
+
     async fn query_workspace(
         &self,
         path: PathBuf,

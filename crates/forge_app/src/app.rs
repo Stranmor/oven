@@ -2051,6 +2051,22 @@ mod tests {
             anyhow::bail!("unused workspace evidence replay preview diagnostic")
         }
 
+        async fn build_workspace_vector_index(
+            &self,
+            _path: PathBuf,
+            _embedding_model_id: String,
+        ) -> Result<WorkspaceVectorIndexBuildReport> {
+            anyhow::bail!("unused workspace vector index build")
+        }
+
+        async fn embed_workspace_query(
+            &self,
+            _query: String,
+            _embedding_model_id: String,
+        ) -> Result<ProjectSemanticEmbeddingOutput> {
+            anyhow::bail!("unused workspace query embedding")
+        }
+
         async fn query_workspace(
             &self,
             _path: PathBuf,
@@ -2828,6 +2844,22 @@ mod tests {
                     "<project_model_context source=\"evidence_replay_preview\"><source path=\"src/lib.rs\" start_line=\"3\" end_line=\"3\" content_digest=\"fixture-digest\" /></project_model_context>".to_string(),
                 ),
             })
+        }
+
+        async fn build_workspace_vector_index(
+            &self,
+            _path: PathBuf,
+            _embedding_model_id: String,
+        ) -> Result<WorkspaceVectorIndexBuildReport> {
+            anyhow::bail!("unused workspace vector index build")
+        }
+
+        async fn embed_workspace_query(
+            &self,
+            _query: String,
+            _embedding_model_id: String,
+        ) -> Result<ProjectSemanticEmbeddingOutput> {
+            anyhow::bail!("unused workspace query embedding")
         }
 
         async fn query_workspace(

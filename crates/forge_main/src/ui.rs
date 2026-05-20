@@ -883,6 +883,15 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                     crate::cli::WorkspaceCommand::Sync { path, init } => {
                         self.on_index(path, init).await?;
                     }
+                    crate::cli::WorkspaceCommand::VectorIndex { command } => match command {
+                        crate::cli::WorkspaceVectorIndexCommand::Build {
+                            path,
+                            embedding_model_id,
+                        } => {
+                            self.on_workspace_vector_index_build(path, embedding_model_id)
+                                .await?;
+                        }
+                    },
                     crate::cli::WorkspaceCommand::List { porcelain } => {
                         self.on_list_workspaces(porcelain).await?;
                     }
@@ -894,6 +903,8 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                         use_case,
                         starts_with,
                         ends_with,
+                        semantic,
+                        embedding_model_id,
                     } => {
                         let mut params =
                             forge_domain::SearchParams::new(&query, &use_case).limit(limit);
@@ -905,6 +916,20 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                         }
                         if let Some(suffix) = ends_with {
                             params = params.ends_with(vec![suffix]);
+                        }
+                        if semantic {
+                            let output = self
+                                .api
+                                .embed_workspace_query(query.clone(), embedding_model_id.clone())
+                                .await?;
+                            let query_vector = output
+                                .vectors
+                                .into_iter()
+                                .next()
+                                .context("semantic query embedding output was empty")?;
+                            params = params
+                                .query_embedding(query_vector.embedding)
+                                .embedding_model_id(output.embedding_model_id);
                         }
                         self.on_query(path, params).await?;
                     }
@@ -5515,6 +5540,37 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         }
 
         Ok(())
+    }
+
+    async fn on_workspace_vector_index_build(
+        &mut self,
+        path: PathBuf,
+        embedding_model_id: String,
+    ) -> anyhow::Result<()> {
+        self.spinner
+            .start(Some("Building workspace vector index..."))?;
+        let report = match self
+            .api
+            .build_workspace_vector_index(path, embedding_model_id)
+            .await
+        {
+            Ok(report) => report,
+            Err(error) => {
+                self.spinner.stop(None)?;
+                return Err(error);
+            }
+        };
+        self.spinner.stop(None)?;
+        let info = Info::new()
+            .add_title("WORKSPACE VECTOR INDEX")
+            .add_key_value("Status", report.status.label())
+            .add_key_value("Artifact", report.artifact_path.display().to_string())
+            .add_key_value("Artifact ID", report.artifact_id)
+            .add_key_value("Model", report.embedding_model_id)
+            .add_key_value("Dimension", report.dimension.to_string())
+            .add_key_value("Entries", report.entry_count.to_string())
+            .add_key_value("Manifest", report.manifest_hash);
+        self.writeln(info)
     }
 
     async fn on_query(

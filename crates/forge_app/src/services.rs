@@ -10,12 +10,13 @@ use forge_domain::{
     LearningLedgerFreshness, LearningRecordId, LearningRecordProjection, LearningReviewOutcome,
     LearningReviewRequest, LearningReviewState, LearningSensorReviewInput,
     LearningSensorReviewOutput, McpConfig, McpServers, Model, ModelId, Node, ProcessId,
-    ProcessReadCursor, ProcessReadOutput, ProcessStartOutput, ProcessStatus, Provider, ProviderId,
-    ResultStream, Scope, SearchParams, SteerMessage, SubagentTaskId, SubagentTaskSession,
-    SubagentTaskSessionFilter, SyncProgress, SyntaxError, Template, ToolCallFull, ToolOutput,
-    WorkspaceAuth, WorkspaceContextManifestDiagnostic, WorkspaceEvidenceReplayDiagnostic,
+    ProcessReadCursor, ProcessReadOutput, ProcessStartOutput, ProcessStatus,
+    ProjectSemanticEmbeddingOutput, Provider, ProviderId, ResultStream, Scope, SearchParams,
+    SteerMessage, SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter, SyncProgress,
+    SyntaxError, Template, ToolCallFull, ToolOutput, WorkspaceAuth,
+    WorkspaceContextManifestDiagnostic, WorkspaceEvidenceReplayDiagnostic,
     WorkspaceEvidenceReplayPreviewDiagnostic, WorkspaceExactFactReferenceReport,
-    WorkspaceExactFactStatusReport, WorkspaceId, WorkspaceInfo,
+    WorkspaceExactFactStatusReport, WorkspaceId, WorkspaceInfo, WorkspaceVectorIndexBuildReport,
 };
 use forge_eventsource::EventSource;
 use reqwest::Response;
@@ -700,6 +701,20 @@ pub trait WorkspaceService: Send + Sync {
         &self,
         path: PathBuf,
     ) -> anyhow::Result<WorkspaceEvidenceReplayPreviewDiagnostic>;
+
+    /// Builds a durable semantic vector index for an indexed workspace.
+    async fn build_workspace_vector_index(
+        &self,
+        path: PathBuf,
+        embedding_model_id: String,
+    ) -> anyhow::Result<WorkspaceVectorIndexBuildReport>;
+
+    /// Embeds a workspace query through the semantic embedding boundary.
+    async fn embed_workspace_query(
+        &self,
+        query: String,
+        embedding_model_id: String,
+    ) -> anyhow::Result<ProjectSemanticEmbeddingOutput>;
 
     /// Query the indexed workspace with semantic search
     async fn query_workspace(
@@ -1759,6 +1774,26 @@ impl<I: Services> WorkspaceService for I {
     ) -> anyhow::Result<WorkspaceEvidenceReplayPreviewDiagnostic> {
         self.workspace_service()
             .workspace_evidence_replay_preview_diagnostic(path)
+            .await
+    }
+
+    async fn build_workspace_vector_index(
+        &self,
+        path: PathBuf,
+        embedding_model_id: String,
+    ) -> anyhow::Result<WorkspaceVectorIndexBuildReport> {
+        self.workspace_service()
+            .build_workspace_vector_index(path, embedding_model_id)
+            .await
+    }
+
+    async fn embed_workspace_query(
+        &self,
+        query: String,
+        embedding_model_id: String,
+    ) -> anyhow::Result<ProjectSemanticEmbeddingOutput> {
+        self.workspace_service()
+            .embed_workspace_query(query, embedding_model_id)
             .await
     }
 
