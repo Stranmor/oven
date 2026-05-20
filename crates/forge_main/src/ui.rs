@@ -2551,9 +2551,11 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                     },
                 "conversation list query returned row outside visibility filter"
             );
-            if !conv.has_context() {
-                continue;
-            }
+            anyhow::ensure!(
+                conv.has_context(),
+                "conversation list query returned contextless row {}",
+                conv.id
+            );
             let title = conv
                 .title
                 .as_deref()

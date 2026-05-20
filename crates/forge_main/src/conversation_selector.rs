@@ -99,15 +99,14 @@ impl ConversationSelector {
             return Ok(None);
         }
 
-        let valid_conversations = Self::primary_conversation_items(conversations);
-
-        if valid_conversations.is_empty() {
-            return Ok(None);
-        }
-
-        let rows = Self::rows_for_items(&valid_conversations);
-        let conv_map: std::collections::HashMap<String, ConversationId> = valid_conversations
-            .into_iter()
+        let rows = Self::rows_for_items(conversations);
+        let preview_command = Self::metadata_selector_preview_command();
+        debug_assert!(
+            preview_command.is_none(),
+            "metadata selector preview must stay disabled for fast first render"
+        );
+        let conv_map: std::collections::HashMap<String, ConversationId> = conversations
+            .iter()
             .map(|c| (c.id.to_string(), c.id))
             .collect();
         let initial_raw = current_conversation_id.map(|id| id.to_string());
@@ -171,12 +170,16 @@ impl ConversationSelector {
         }))
     }
 
-    fn rows_for_items(conversations: &[&ConversationListItem]) -> Vec<SelectRow> {
+    fn rows_for_items(conversations: &[ConversationListItem]) -> Vec<SelectRow> {
         Self::rows_from_parts(
             conversations
                 .iter()
                 .map(|conv| (conv.id, conv.title.as_deref(), conv.display_updated_at())),
         )
+    }
+
+    fn metadata_selector_preview_command() -> Option<&'static str> {
+        None
     }
 
     fn rows_from_parts<'a>(
@@ -229,15 +232,6 @@ impl ConversationSelector {
         rows
     }
 
-    fn primary_conversation_items(
-        conversations: &[ConversationListItem],
-    ) -> Vec<&ConversationListItem> {
-        conversations
-            .iter()
-            .filter(|conv| conv.is_primary_user_conversation())
-            .collect()
-    }
-
     fn primary_conversations(conversations: &[Conversation]) -> Vec<&Conversation> {
         conversations
             .iter()
@@ -272,6 +266,23 @@ mod tests {
             visibility: forge_domain::ConversationVisibility::Normal,
             context: Some(Context::default()),
             metrics: Metrics::default().started_at(now),
+            metadata: MetaData { created_at: now, updated_at: Some(now) },
+        }
+    }
+
+    fn create_test_conversation_item(
+        id: &str,
+        title: Option<&str>,
+        initiator: forge_domain::Initiator,
+    ) -> ConversationListItem {
+        let now = Utc::now();
+        ConversationListItem {
+            id: ConversationId::parse(id).expect("fixture conversation ID should be valid"),
+            parent_id: None,
+            title: title.map(|title| title.to_string()),
+            initiator,
+            visibility: forge_domain::ConversationVisibility::Normal,
+            context_present: true,
             metadata: MetaData { created_at: now, updated_at: Some(now) },
         }
     }
@@ -337,6 +348,35 @@ mod tests {
         let expected = 0;
 
         assert_eq!(actual.len(), expected);
+    }
+
+    #[test]
+    fn test_metadata_selector_rows_do_not_apply_membership_filters() {
+        let conversations = [
+            create_test_conversation_item(
+                "550e8400-e29b-41d4-a716-446655440008",
+                Some("Agent"),
+                forge_domain::Initiator::Agent,
+            ),
+            create_test_conversation_item(
+                "550e8400-e29b-41d4-a716-446655440009",
+                Some("User"),
+                forge_domain::Initiator::User,
+            ),
+        ];
+
+        let actual = ConversationSelector::rows_for_items(&conversations).len();
+        let expected = 3;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_metadata_selector_preview_remains_disabled() {
+        let actual = ConversationSelector::metadata_selector_preview_command();
+        let expected = None;
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
