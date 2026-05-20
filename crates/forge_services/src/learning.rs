@@ -4,9 +4,9 @@ use anyhow::Result;
 use chrono::Utc;
 use forge_app::LearningService;
 use forge_app::domain::{
-    ConversationId, LearningCaptureMetadata, LearningLedgerEvent, LearningLedgerFreshness,
-    LearningProvenance, LearningRecordProjection, LearningRepository, LearningReviewOutcome,
-    LearningReviewState, RedactedLearningSummary,
+    ConversationId, LearningCaptureMetadata, LearningLedgerAppendOutcome, LearningLedgerEvent,
+    LearningLedgerFreshness, LearningProvenance, LearningRecordProjection, LearningRepository,
+    LearningReviewOutcome, LearningReviewState, RedactedLearningSummary,
 };
 
 /// Domain service for capture/query operations over the append-only learning
@@ -34,7 +34,7 @@ impl<R: LearningRepository> LearningService for ForgeLearningService<R> {
         source_event_id: String,
         summary: String,
         metadata: LearningCaptureMetadata,
-    ) -> Result<LearningLedgerEvent> {
+    ) -> Result<LearningLedgerAppendOutcome> {
         metadata.validate_current()?;
         let redacted = RedactedLearningSummary::from_raw(&summary);
         let mut event = LearningLedgerEvent::capture_candidate(
@@ -54,7 +54,7 @@ impl<R: LearningRepository> LearningService for ForgeLearningService<R> {
     async fn insert_learning_event(
         &self,
         event: LearningLedgerEvent,
-    ) -> Result<LearningLedgerEvent> {
+    ) -> Result<LearningLedgerAppendOutcome> {
         self.repository.insert_learning_event(event).await
     }
 
@@ -111,17 +111,22 @@ mod tests {
         async fn insert_learning_event(
             &self,
             event: LearningLedgerEvent,
-        ) -> Result<LearningLedgerEvent> {
+        ) -> Result<LearningLedgerAppendOutcome> {
             let mut events = self.events.lock().unwrap();
-            let entry = events.entry(event.idempotency_key.clone()).or_insert(event);
-            Ok(entry.clone())
+            let key = event.idempotency_key.clone();
+            if let Some(existing) = events.get(&key) {
+                return Ok(LearningLedgerAppendOutcome::existing(existing.clone()));
+            }
+            events.insert(key, event.clone());
+            Ok(LearningLedgerAppendOutcome::inserted(event))
         }
 
         async fn review_learning_candidate_event(
             &self,
             event: LearningLedgerEvent,
         ) -> Result<LearningReviewOutcome> {
-            let event = self.insert_learning_event(event).await?;
+            let outcome = self.insert_learning_event(event).await?;
+            let event = outcome.event;
             Ok(LearningReviewOutcome {
                 projection: LearningRecordProjection {
                     record_id: event.record_id,
@@ -211,11 +216,19 @@ mod tests {
             .await?;
 
         let actual = (
-            first.event_id == second.event_id,
-            first.summary.contains("sk-"),
-            first.redaction_status,
+            first.event.event_id == second.event.event_id,
+            first.event.summary.contains("sk-"),
+            first.event.redaction_status,
+            first.freshness,
+            second.freshness,
         );
-        let expected = (true, false, LearningRedactionStatus::Redacted);
+        let expected = (
+            true,
+            false,
+            LearningRedactionStatus::Redacted,
+            forge_app::domain::LearningLedgerEventFreshness::Inserted,
+            forge_app::domain::LearningLedgerEventFreshness::Existing,
+        );
 
         assert_eq!(actual, expected);
         Ok(())
@@ -245,7 +258,7 @@ mod tests {
         };
 
         let actual = service.insert_learning_event(event.clone()).await?;
-        let expected = event;
+        let expected = LearningLedgerAppendOutcome::inserted(event);
 
         assert_eq!(actual, expected);
         Ok(())

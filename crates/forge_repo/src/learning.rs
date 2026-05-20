@@ -6,10 +6,10 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use diesel::prelude::*;
 use forge_domain::{
     ConversationId, LearningCaptureMetadata, LearningEventId, LearningEventKind,
-    LearningLedgerEvent, LearningLedgerFreshness, LearningProvenance, LearningRecordId,
-    LearningRecordProjection, LearningRedactionStatus, LearningRepository, LearningReviewOutcome,
-    LearningReviewState, LearningSourceKind, RedactedLearningSummary, SubagentTaskId,
-    WorkspaceHash,
+    LearningLedgerAppendOutcome, LearningLedgerEvent, LearningLedgerFreshness, LearningProvenance,
+    LearningRecordId, LearningRecordProjection, LearningRedactionStatus, LearningRepository,
+    LearningReviewOutcome, LearningReviewState, LearningSourceKind, RedactedLearningSummary,
+    SubagentTaskId, WorkspaceHash,
 };
 use sha2::{Digest, Sha256};
 
@@ -92,7 +92,7 @@ impl LearningRepository for LearningRepositoryImpl {
     async fn insert_learning_event(
         &self,
         event: LearningLedgerEvent,
-    ) -> anyhow::Result<LearningLedgerEvent> {
+    ) -> anyhow::Result<LearningLedgerAppendOutcome> {
         self.run_with_connection(move |connection, wid| {
             event.provenance.validate()?;
             let workspace_id = workspace_db_id(wid);
@@ -104,7 +104,9 @@ impl LearningRepository for LearningRepositoryImpl {
                     .first::<LearningLedgerEventRecord>(connection)
                     .optional()?;
                 if let Some(existing) = existing {
-                    return existing.try_into_event();
+                    return existing
+                        .try_into_event()
+                        .map(LearningLedgerAppendOutcome::existing);
                 }
                 diesel::insert_into(learning_ledger_events::table)
                     .values((
@@ -134,6 +136,7 @@ impl LearningRepository for LearningRepositoryImpl {
                     .filter(learning_ledger_events::idempotency_key.eq(&record.idempotency_key))
                     .first::<LearningLedgerEventRecord>(connection)?
                     .try_into_event()
+                    .map(LearningLedgerAppendOutcome::inserted)
             })
         })
         .await
@@ -611,8 +614,20 @@ mod tests {
         let left = fixture.insert_learning_event(first).await?;
         let right = fixture.insert_learning_event(second).await?;
         let records = fixture.list_learning_records(None, 10).await?;
-        let actual = (left.event_id, right.event_id, records.len());
-        let expected = (left.event_id, left.event_id, 1usize);
+        let actual = (
+            left.event.event_id,
+            right.event.event_id,
+            left.freshness,
+            right.freshness,
+            records.len(),
+        );
+        let expected = (
+            left.event.event_id,
+            left.event.event_id,
+            forge_domain::LearningLedgerEventFreshness::Inserted,
+            forge_domain::LearningLedgerEventFreshness::Existing,
+            1usize,
+        );
 
         assert_eq!(actual, expected);
         Ok(())
@@ -631,7 +646,8 @@ mod tests {
                 "accept reviewed learning only",
                 created_at,
             )?)
-            .await?;
+            .await?
+            .event;
         let review = LearningLedgerEvent::review(
             candidate.record_id,
             LearningEventKind::ReviewAccepted,
@@ -668,7 +684,8 @@ mod tests {
                 "terminal review transition",
                 created_at,
             )?)
-            .await?;
+            .await?
+            .event;
         let accepted = LearningLedgerEvent::review(
             candidate.record_id,
             LearningEventKind::ReviewAccepted,
@@ -734,7 +751,8 @@ mod tests {
                 "first terminal review transition",
                 created_at,
             )?)
-            .await?;
+            .await?
+            .event;
         let second_candidate = fixture
             .insert_learning_event(fixture_event(
                 conversation_id,
@@ -742,7 +760,8 @@ mod tests {
                 "second terminal review transition",
                 created_at + Duration::seconds(1),
             )?)
-            .await?;
+            .await?
+            .event;
         let first_review = LearningLedgerEvent::review(
             first_candidate.record_id,
             LearningEventKind::ReviewAccepted,
@@ -804,7 +823,8 @@ mod tests {
                 "same record different event kind collision",
                 created_at,
             )?)
-            .await?;
+            .await?
+            .event;
         let mut colliding_review = LearningLedgerEvent::review(
             candidate.record_id,
             LearningEventKind::ReviewAccepted,

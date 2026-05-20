@@ -5,10 +5,10 @@ use url::Url;
 
 use crate::{
     AnyProvider, AuthCredential, ChatCompletionMessage, Context, Conversation, ConversationId,
-    LearningLedgerEvent, LearningLedgerFreshness, LearningRecordId, LearningRecordProjection,
-    LearningReviewOutcome, LearningReviewState, MigrationResult, Model, ModelId, Provider,
-    ProviderId, ProviderTemplate, ResultStream, SearchMatch, Skill, Snapshot, SubagentTaskId,
-    SubagentTaskSession, SubagentTaskSessionFilter, WorkspaceAuth, WorkspaceId,
+    LearningLedgerAppendOutcome, LearningLedgerEvent, LearningLedgerFreshness, LearningRecordId,
+    LearningRecordProjection, LearningReviewOutcome, LearningReviewState, MigrationResult, Model,
+    ModelId, Provider, ProviderId, ProviderTemplate, ResultStream, SearchMatch, Skill, Snapshot,
+    SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter, WorkspaceAuth, WorkspaceId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,7 +182,7 @@ pub trait LearningRepository: Send + Sync {
     async fn insert_learning_event(
         &self,
         event: LearningLedgerEvent,
-    ) -> Result<LearningLedgerEvent>;
+    ) -> Result<LearningLedgerAppendOutcome>;
 
     /// Atomically appends or deduplicates one review event only when the target record is still reviewable.
     ///

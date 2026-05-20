@@ -13,13 +13,13 @@ use forge_config::ForgeConfig;
 use forge_domain::{
     AnyProvider, AuthCredential, ChatCompletionMessage, ChatRepository, CommandExecutionOutput,
     Context, Conversation, ConversationId, ConversationRepository, Environment, FileInfo,
-    FuzzySearchRepository, LearningLedgerEvent, LearningLedgerFreshness, LearningRecordId,
-    LearningRecordProjection, LearningRepository, LearningReviewOutcome, LearningReviewState,
-    McpServerConfig, MigrationResult, Model, ModelId, ProcessId, ProcessReadCursor,
-    ProcessReadOutput, ProcessStartOutput, ProcessStatus, Provider, ProviderId, ProviderRepository,
-    ResultStream, SearchMatch, Skill, SkillRepository, Snapshot, SnapshotRepository,
-    SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter, TextPatchBlock,
-    TextPatchRepository,
+    FuzzySearchRepository, LearningLedgerAppendOutcome, LearningLedgerEvent,
+    LearningLedgerFreshness, LearningRecordId, LearningRecordProjection, LearningRepository,
+    LearningReviewOutcome, LearningReviewState, McpServerConfig, MigrationResult, Model, ModelId,
+    ProcessId, ProcessReadCursor, ProcessReadOutput, ProcessStartOutput, ProcessStatus, Provider,
+    ProviderId, ProviderRepository, ResultStream, SearchMatch, Skill, SkillRepository, Snapshot,
+    SnapshotRepository, SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter,
+    TextPatchBlock, TextPatchRepository,
 };
 use forge_eventsource::EventSource;
 // Re-export CacacheStorage from forge_infra
@@ -221,7 +221,7 @@ impl<F: Send + Sync> LearningRepository for ForgeRepo<F> {
     async fn insert_learning_event(
         &self,
         event: LearningLedgerEvent,
-    ) -> anyhow::Result<LearningLedgerEvent> {
+    ) -> anyhow::Result<LearningLedgerAppendOutcome> {
         self.learning_repository.insert_learning_event(event).await
     }
 

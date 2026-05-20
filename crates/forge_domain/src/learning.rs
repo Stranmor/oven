@@ -492,6 +492,42 @@ impl LearningLedgerEvent {
     }
 }
 
+/// Freshness of an idempotent learning ledger append.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LearningLedgerEventFreshness {
+    /// Event was inserted by the current persistence call.
+    Inserted,
+    /// Event already existed and was returned as an idempotency replay.
+    Existing,
+}
+
+/// Typed outcome of an idempotent learning ledger append.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LearningLedgerAppendOutcome {
+    /// Event inserted or replayed by the ledger.
+    pub event: LearningLedgerEvent,
+    /// Whether this call inserted the event or returned an existing one.
+    pub freshness: LearningLedgerEventFreshness,
+}
+
+impl LearningLedgerAppendOutcome {
+    /// Creates an append outcome for an event inserted by the current call.
+    ///
+    /// # Arguments
+    /// * `event` - Event inserted by the current persistence call.
+    pub fn inserted(event: LearningLedgerEvent) -> Self {
+        Self { event, freshness: LearningLedgerEventFreshness::Inserted }
+    }
+
+    /// Creates an append outcome for an existing idempotency replay.
+    ///
+    /// # Arguments
+    /// * `event` - Event returned from a previous persistence call.
+    pub fn existing(event: LearningLedgerEvent) -> Self {
+        Self { event, freshness: LearningLedgerEventFreshness::Existing }
+    }
+}
+
 /// Typed request to review one captured learning candidate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Setters)]
 #[setters(into)]

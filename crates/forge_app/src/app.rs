@@ -1244,12 +1244,12 @@ mod tests {
         ChatCompletionMessage, ChatRequest, Content, Context, ContextMessage, Conversation,
         ConversationId, Environment, Event, FileChunk, FileStatus, FinishReason,
         LEARNING_LEDGER_SCHEMA_VERSION, LearningCaptureMetadata, LearningEventKind,
-        LearningLedgerEvent, LearningLedgerFreshness, LearningProvenance, LearningRecordId,
-        LearningRecordProjection, LearningRedactionStatus, LearningReviewState, McpConfig,
-        McpServers, Model, ModelId, Node, NodeData, NodeId, PermissionOperation, Provider,
-        ProviderId, ProviderType, ResultStream, Scope, SearchParams, SteerMessage, SyncProgress,
-        ToolCallContext, ToolCallFull, ToolOutput, ToolResult, WorkspaceAuth,
-        WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
+        LearningLedgerAppendOutcome, LearningLedgerEvent, LearningLedgerFreshness,
+        LearningProvenance, LearningRecordId, LearningRecordProjection, LearningRedactionStatus,
+        LearningReviewState, McpConfig, McpServers, Model, ModelId, Node, NodeData, NodeId,
+        PermissionOperation, Provider, ProviderId, ProviderType, ResultStream, Scope, SearchParams,
+        SteerMessage, SyncProgress, ToolCallContext, ToolCallFull, ToolOutput, ToolResult,
+        WorkspaceAuth, WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
         WorkspaceEvidenceReadinessDiagnostic, WorkspaceId, WorkspaceInfo,
     };
     use futures::StreamExt;
@@ -1551,7 +1551,7 @@ mod tests {
             source_event_id: String,
             summary: String,
             metadata: LearningCaptureMetadata,
-        ) -> Result<LearningLedgerEvent> {
+        ) -> Result<LearningLedgerAppendOutcome> {
             let mut event = LearningLedgerEvent::capture_candidate(
                 summary,
                 LearningProvenance::conversation(
@@ -1563,35 +1563,43 @@ mod tests {
             )?;
             event.capture_metadata = Some(metadata);
             let mut events = self.learning_events.lock().await;
-            let event = events
+            let key = event.idempotency_key.clone();
+            let outcome = if let Some(existing) = events
                 .iter()
-                .find(|existing| existing.idempotency_key == event.idempotency_key)
+                .find(|existing| existing.idempotency_key == key)
                 .cloned()
-                .unwrap_or_else(|| {
-                    events.push(event.clone());
-                    event
-                });
+            {
+                LearningLedgerAppendOutcome::existing(existing)
+            } else {
+                events.push(event.clone());
+                LearningLedgerAppendOutcome::inserted(event)
+            };
+            let event = outcome.event.clone();
             drop(events);
             self.apply_learning_event(&event).await;
-            Ok(event)
+            Ok(outcome)
         }
 
         async fn insert_learning_event(
             &self,
             event: LearningLedgerEvent,
-        ) -> Result<LearningLedgerEvent> {
+        ) -> Result<LearningLedgerAppendOutcome> {
             let mut events = self.learning_events.lock().await;
-            let event = events
+            let key = event.idempotency_key.clone();
+            let outcome = if let Some(existing) = events
                 .iter()
-                .find(|existing| existing.idempotency_key == event.idempotency_key)
+                .find(|existing| existing.idempotency_key == key)
                 .cloned()
-                .unwrap_or_else(|| {
-                    events.push(event.clone());
-                    event
-                });
+            {
+                LearningLedgerAppendOutcome::existing(existing)
+            } else {
+                events.push(event.clone());
+                LearningLedgerAppendOutcome::inserted(event)
+            };
+            let event = outcome.event.clone();
             drop(events);
             self.apply_learning_event(&event).await;
-            Ok(event)
+            Ok(outcome)
         }
 
         async fn review_learning_candidate_event(
@@ -1634,7 +1642,7 @@ mod tests {
                     before.review_state
                 );
             }
-            let event = self.insert_learning_event(event).await?;
+            let event = self.insert_learning_event(event).await?.event;
             let projection = self
                 .learning_records
                 .lock()
@@ -2890,14 +2898,14 @@ mod tests {
             _source_event_id: String,
             _summary: String,
             _metadata: LearningCaptureMetadata,
-        ) -> Result<LearningLedgerEvent> {
+        ) -> Result<LearningLedgerAppendOutcome> {
             anyhow::bail!("unused learning capture")
         }
 
         async fn insert_learning_event(
             &self,
             _event: LearningLedgerEvent,
-        ) -> Result<LearningLedgerEvent> {
+        ) -> Result<LearningLedgerAppendOutcome> {
             anyhow::bail!("unused learning insert")
         }
 

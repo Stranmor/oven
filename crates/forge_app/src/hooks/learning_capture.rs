@@ -4,8 +4,8 @@ use forge_domain::{
     CONVERSATION_SAVE_CAPTURE_VERSION, ContextMessage, Conversation,
     DETERMINISTIC_CONVERSATION_SAVE_AUTO_ACCEPT_REASON,
     DETERMINISTIC_CONVERSATION_SAVE_AUTO_REVIEWER_V1, LearningCaptureMetadata, LearningEventKind,
-    LearningLedgerEvent, LearningProvenance, LearningRedactionStatus, LearningReviewState,
-    LearningSourceKind, Role, learning_digest_hex,
+    LearningLedgerEvent, LearningLedgerEventFreshness, LearningProvenance, LearningRedactionStatus,
+    LearningReviewState, LearningSourceKind, Role, learning_digest_hex,
 };
 use sha2::{Digest, Sha256};
 
@@ -48,9 +48,11 @@ impl<S> LearningCapture<S> {
             )
             .await
         {
-            Ok(event) => {
-                self.auto_review_current_capture(conversation, &draft, event)
-                    .await;
+            Ok(outcome) => {
+                if outcome.freshness == LearningLedgerEventFreshness::Inserted {
+                    self.auto_review_current_capture(conversation, &draft, outcome.event)
+                        .await;
+                }
             }
             Err(error) => {
                 tracing::debug!(error = ?error, conversation_id = %conversation.id, "Learning candidate capture failed; preserving saved conversation");
@@ -266,7 +268,7 @@ mod tests {
             source_event_id: String,
             summary: String,
             metadata: LearningCaptureMetadata,
-        ) -> anyhow::Result<LearningLedgerEvent> {
+        ) -> anyhow::Result<LearningLedgerAppendOutcome> {
             if self.fail_capture {
                 anyhow::bail!("fixture capture failure");
             }
@@ -281,14 +283,18 @@ mod tests {
             )?;
             event.capture_metadata = Some(metadata);
             let mut events = self.events.lock().unwrap();
-            let entry = events.entry(event.idempotency_key.clone()).or_insert(event);
-            Ok(entry.clone())
+            let key = event.idempotency_key.clone();
+            if let Some(existing) = events.get(&key) {
+                return Ok(LearningLedgerAppendOutcome::existing(existing.clone()));
+            }
+            events.insert(key, event.clone());
+            Ok(LearningLedgerAppendOutcome::inserted(event))
         }
 
         async fn insert_learning_event(
             &self,
             _event: LearningLedgerEvent,
-        ) -> anyhow::Result<LearningLedgerEvent> {
+        ) -> anyhow::Result<LearningLedgerAppendOutcome> {
             anyhow::bail!("unused insert")
         }
 
@@ -414,6 +420,46 @@ mod tests {
 
         let actual = fixture.events.lock().unwrap().len();
         let expected = 2usize;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learning_capture_concurrent_duplicate_auto_reviews_once() -> anyhow::Result<()> {
+        let fixture = Arc::new(FixtureLearningService::default());
+        let capture = LearningCapture::new(fixture.clone());
+        let conversation = fixture_conversation();
+        let left_capture = capture.clone();
+        let right_capture = capture;
+        let left_conversation = conversation.clone();
+        let right_conversation = conversation;
+
+        tokio::join!(
+            async move {
+                left_capture
+                    .capture_saved_conversation(&left_conversation)
+                    .await
+            },
+            async move {
+                right_capture
+                    .capture_saved_conversation(&right_conversation)
+                    .await
+            },
+        );
+
+        let events = fixture.events.lock().unwrap();
+        let actual = (
+            events
+                .values()
+                .filter(|event| event.event_kind == LearningEventKind::CandidateCaptured)
+                .count(),
+            events
+                .values()
+                .filter(|event| event.event_kind == LearningEventKind::ReviewAccepted)
+                .count(),
+            events.len(),
+        );
+        let expected = (1usize, 1usize, 2usize);
         assert_eq!(actual, expected);
         Ok(())
     }

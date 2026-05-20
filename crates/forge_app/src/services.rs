@@ -6,15 +6,15 @@ use derive_setters::Setters;
 use forge_domain::{
     AgentId, AnyProvider, Attachment, AuthContextRequest, AuthContextResponse, AuthMethod,
     ChatCompletionMessage, CommandOutput, Context, Conversation, ConversationId, File, FileInfo,
-    FileStatus, Image, LearningCaptureMetadata, LearningLedgerEvent, LearningLedgerFreshness,
-    LearningRecordId, LearningRecordProjection, LearningReviewOutcome, LearningReviewRequest,
-    LearningReviewState, McpConfig, McpServers, Model, ModelId, Node, ProcessId, ProcessReadCursor,
-    ProcessReadOutput, ProcessStartOutput, ProcessStatus, Provider, ProviderId, ResultStream,
-    Scope, SearchParams, SteerMessage, SubagentTaskId, SubagentTaskSession,
-    SubagentTaskSessionFilter, SyncProgress, SyntaxError, Template, ToolCallFull, ToolOutput,
-    WorkspaceAuth, WorkspaceContextManifestDiagnostic, WorkspaceEvidenceReplayDiagnostic,
-    WorkspaceEvidenceReplayPreviewDiagnostic, WorkspaceExactFactReferenceReport,
-    WorkspaceExactFactStatusReport, WorkspaceId, WorkspaceInfo,
+    FileStatus, Image, LearningCaptureMetadata, LearningLedgerAppendOutcome, LearningLedgerEvent,
+    LearningLedgerFreshness, LearningRecordId, LearningRecordProjection, LearningReviewOutcome,
+    LearningReviewRequest, LearningReviewState, McpConfig, McpServers, Model, ModelId, Node,
+    ProcessId, ProcessReadCursor, ProcessReadOutput, ProcessStartOutput, ProcessStatus, Provider,
+    ProviderId, ResultStream, Scope, SearchParams, SteerMessage, SubagentTaskId,
+    SubagentTaskSession, SubagentTaskSessionFilter, SyncProgress, SyntaxError, Template,
+    ToolCallFull, ToolOutput, WorkspaceAuth, WorkspaceContextManifestDiagnostic,
+    WorkspaceEvidenceReplayDiagnostic, WorkspaceEvidenceReplayPreviewDiagnostic,
+    WorkspaceExactFactReferenceReport, WorkspaceExactFactStatusReport, WorkspaceId, WorkspaceInfo,
 };
 use forge_eventsource::EventSource;
 use reqwest::Response;
@@ -459,7 +459,7 @@ pub trait LearningService: Send + Sync {
         source_event_id: String,
         summary: String,
         metadata: LearningCaptureMetadata,
-    ) -> anyhow::Result<LearningLedgerEvent>;
+    ) -> anyhow::Result<LearningLedgerAppendOutcome>;
 
     /// Inserts an append-only learning event.
     /// # Arguments
@@ -470,7 +470,7 @@ pub trait LearningService: Send + Sync {
     async fn insert_learning_event(
         &self,
         event: LearningLedgerEvent,
-    ) -> anyhow::Result<LearningLedgerEvent>;
+    ) -> anyhow::Result<LearningLedgerAppendOutcome>;
 
     /// Atomically reviews a candidate through a repository-backed compare-and-append operation.
     ///
@@ -1139,7 +1139,7 @@ impl<I: Services> LearningService for I {
         source_event_id: String,
         summary: String,
         metadata: LearningCaptureMetadata,
-    ) -> anyhow::Result<LearningLedgerEvent> {
+    ) -> anyhow::Result<LearningLedgerAppendOutcome> {
         self.learning_service()
             .capture_candidate_from_conversation(
                 conversation_id,
@@ -1153,7 +1153,7 @@ impl<I: Services> LearningService for I {
     async fn insert_learning_event(
         &self,
         event: LearningLedgerEvent,
-    ) -> anyhow::Result<LearningLedgerEvent> {
+    ) -> anyhow::Result<LearningLedgerAppendOutcome> {
         self.learning_service().insert_learning_event(event).await
     }
 
@@ -1967,14 +1967,14 @@ mod tests {
             _source_event_id: String,
             _summary: String,
             _metadata: LearningCaptureMetadata,
-        ) -> anyhow::Result<LearningLedgerEvent> {
+        ) -> anyhow::Result<LearningLedgerAppendOutcome> {
             anyhow::bail!("unused learning service")
         }
 
         async fn insert_learning_event(
             &self,
             _event: LearningLedgerEvent,
-        ) -> anyhow::Result<LearningLedgerEvent> {
+        ) -> anyhow::Result<LearningLedgerAppendOutcome> {
             anyhow::bail!("unused learning service")
         }
 
