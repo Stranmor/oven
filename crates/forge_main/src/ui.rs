@@ -1142,17 +1142,18 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                         }
                     }
                     SelectCommand::Conversation { query } => {
-                        let conversations = self.api.get_conversations().await?;
+                        let conversations = self.api.get_conversation_list_items().await?;
 
                         if !conversations.is_empty()
-                            && let Some(conversation) = ConversationSelector::select_conversation(
-                                &conversations,
-                                self.state.conversation_id,
-                                query.clone(),
-                            )
-                            .await?
+                            && let Some(conversation_id) =
+                                ConversationSelector::select_conversation_item(
+                                    &conversations,
+                                    self.state.conversation_id,
+                                    query.clone(),
+                                )
+                                .await?
                         {
-                            self.writeln(conversation.id)?;
+                            self.writeln(conversation_id)?;
                         }
                     }
                 }
@@ -2328,7 +2329,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
     async fn list_conversations(&mut self) -> anyhow::Result<()> {
         self.spinner.start(Some("Loading Conversations"))?;
 
-        let conversations = self.api.get_conversations().await?;
+        let conversations = self.api.get_conversation_list_items().await?;
         self.spinner.stop(None)?;
 
         if conversations.is_empty() {
@@ -2338,14 +2339,14 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             return Ok(());
         }
 
-        if let Some(conversation) = ConversationSelector::select_conversation(
+        if let Some(conversation_id) = ConversationSelector::select_conversation_item(
             &conversations,
             self.state.conversation_id,
             None,
         )
         .await?
         {
-            let conversation_id = conversation.id;
+            let conversation = self.validate_conversation_exists(&conversation_id).await?;
             self.state.conversation_id = Some(conversation_id);
 
             // Show conversation content
@@ -2501,12 +2502,14 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
     ) -> anyhow::Result<()> {
         let conversations = match visibility {
             ConversationVisibilityFilter::Normal if include_agent || initiator.is_some() => {
-                self.api.get_conversations_including_agent().await?
+                self.api
+                    .get_conversation_list_items_including_agent()
+                    .await?
             }
-            ConversationVisibilityFilter::Normal => self.api.get_conversations().await?,
+            ConversationVisibilityFilter::Normal => self.api.get_conversation_list_items().await?,
             other => {
                 self.api
-                    .get_conversations_by_visibility(
+                    .get_conversation_list_items_by_visibility(
                         forge_domain::ConversationVisibilityFilter::from(other),
                     )
                     .await?
@@ -2521,7 +2524,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         let initiator_filter = initiator.map(forge_domain::Initiator::from);
 
         for conv in conversations.into_iter() {
-            if conv.context.is_none() {
+            if !conv.has_context() {
                 continue;
             }
             if let Some(expected) = initiator_filter {
@@ -2553,9 +2556,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                 .unwrap_or_else(|| markers::EMPTY.to_string());
 
             // Format time using humantime library (same as conversation_selector.rs)
-            let time_ago = crate::utils::humanize_time(
-                conv.metadata.updated_at.unwrap_or(conv.metadata.created_at),
-            );
+            let time_ago = crate::utils::humanize_time(conv.display_updated_at());
 
             // Add conversation: Title=<title>, Updated=<time_ago>, with ID as section title
             info = info

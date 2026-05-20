@@ -1,7 +1,7 @@
 use anyhow::Result;
-use forge_api::Conversation;
+use forge_api::{Conversation, ConversationListItem};
 use forge_domain::ConversationId;
-use forge_select::{ForgeWidget, PreviewLayout, PreviewPlacement, SelectRow};
+use forge_select::{ForgeWidget, SelectRow};
 
 use crate::display_constants::markers;
 use crate::info::Info;
@@ -44,6 +44,26 @@ impl ConversationSelector {
         .await
     }
 
+    /// Select a conversation ID from metadata-only rows without loading full contexts.
+    ///
+    /// Preview is intentionally disabled for the fast first slice so selector first
+    /// render never spawns a nested `forge conversation show` process.
+    ///
+    /// # Arguments
+    /// * `conversations` - Metadata-only conversation rows for primary selection.
+    /// * `current_conversation_id` - Optional conversation ID to focus initially.
+    /// * `query` - Optional initial fuzzy-search query.
+    ///
+    /// # Errors
+    /// Returns an error if selector rendering or terminal interaction fails.
+    pub async fn select_conversation_item(
+        conversations: &[ConversationListItem],
+        current_conversation_id: Option<ConversationId>,
+        query: Option<String>,
+    ) -> Result<Option<ConversationId>> {
+        Self::select_from_conversation_items(conversations, current_conversation_id, query).await
+    }
+
     /// Select a sub-conversation from an explicit subchat list.
     ///
     /// Unlike the primary selector, this keeps agent-initiated delegated
@@ -70,6 +90,41 @@ impl ConversationSelector {
         .await
     }
 
+    async fn select_from_conversation_items(
+        conversations: &[ConversationListItem],
+        current_conversation_id: Option<ConversationId>,
+        query: Option<String>,
+    ) -> Result<Option<ConversationId>> {
+        if conversations.is_empty() {
+            return Ok(None);
+        }
+
+        let valid_conversations = Self::primary_conversation_items(conversations);
+
+        if valid_conversations.is_empty() {
+            return Ok(None);
+        }
+
+        let rows = Self::rows_for_items(&valid_conversations);
+        let conv_map: std::collections::HashMap<String, ConversationId> = valid_conversations
+            .into_iter()
+            .map(|c| (c.id.to_string(), c.id))
+            .collect();
+        let initial_raw = current_conversation_id.map(|id| id.to_string());
+
+        let selected_uuid = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+            Ok(ForgeWidget::select_rows("Conversation", rows)
+                .query(query)
+                .header_lines(1_usize)
+                .initial_raw(initial_raw)
+                .prompt()?
+                .map(|row| row.raw))
+        })
+        .await??;
+
+        Ok(selected_uuid.and_then(|uuid| conv_map.get(&uuid).copied()))
+    }
+
     async fn select_from_conversations(
         conversations: &[Conversation],
         current_conversation_id: Option<ConversationId>,
@@ -86,22 +141,65 @@ impl ConversationSelector {
             return Ok(None);
         }
 
-        let mut info = Info::new();
+        let rows = Self::rows_for_conversations(&valid_conversations);
 
-        for conv in &valid_conversations {
-            let title = conv
-                .title
-                .as_deref()
+        let conv_map: std::collections::HashMap<String, Conversation> = valid_conversations
+            .into_iter()
+            .map(|c| (c.id.to_string(), c.clone()))
+            .collect();
+        let initial_raw = current_conversation_id.map(|id| id.to_string());
+        let selected_uuid = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+            Ok(ForgeWidget::select_rows("Conversation", rows)
+                .query(query)
+                .header_lines(1_usize)
+                .initial_raw(initial_raw)
+                .prompt()?
+                .map(|row| row.raw))
+        })
+        .await??;
+
+        Ok(selected_uuid.and_then(|uuid| conv_map.get(&uuid).cloned()))
+    }
+
+    fn rows_for_conversations(conversations: &[&Conversation]) -> Vec<SelectRow> {
+        Self::rows_from_parts(conversations.iter().map(|conv| {
+            (
+                conv.id,
+                conv.title.as_deref(),
+                conv.metadata.updated_at.unwrap_or(conv.metadata.created_at),
+            )
+        }))
+    }
+
+    fn rows_for_items(conversations: &[&ConversationListItem]) -> Vec<SelectRow> {
+        Self::rows_from_parts(
+            conversations
+                .iter()
+                .map(|conv| (conv.id, conv.title.as_deref(), conv.display_updated_at())),
+        )
+    }
+
+    fn rows_from_parts<'a>(
+        conversations: impl Iterator<
+            Item = (
+                ConversationId,
+                Option<&'a str>,
+                chrono::DateTime<chrono::Utc>,
+            ),
+        >,
+    ) -> Vec<SelectRow> {
+        let mut info = Info::new();
+        let mut ids = Vec::new();
+
+        for (id, title, updated_at) in conversations {
+            let title = title
                 .map(|t| t.to_string())
                 .unwrap_or_else(|| markers::EMPTY.to_string());
-
-            let time_ago =
-                humanize_time(conv.metadata.updated_at.unwrap_or(conv.metadata.created_at));
-
             info = info
-                .add_title(conv.id)
+                .add_title(id)
                 .add_key_value("Title", title)
-                .add_key_value("Updated", time_ago);
+                .add_key_value("Updated", humanize_time(updated_at));
+            ids.push(id);
         }
 
         let porcelain_output = Porcelain::from(&info)
@@ -109,12 +207,7 @@ impl ConversationSelector {
             .truncate(0, 60)
             .uppercase_headers();
         let porcelain_str = porcelain_output.to_string();
-
         let all_lines: Vec<&str> = porcelain_str.lines().collect();
-        if all_lines.is_empty() {
-            return Ok(None);
-        }
-
         let mut rows: Vec<SelectRow> = Vec::with_capacity(all_lines.len());
 
         if let Some(header) = all_lines.first() {
@@ -122,8 +215,8 @@ impl ConversationSelector {
         }
 
         for (i, line) in all_lines.iter().skip(1).enumerate() {
-            if let Some(conv) = valid_conversations.get(i) {
-                let uuid = conv.id.to_string();
+            if let Some(id) = ids.get(i) {
+                let uuid = id.to_string();
                 rows.push(SelectRow {
                     raw: uuid.clone(),
                     display: line.to_string(),
@@ -133,28 +226,16 @@ impl ConversationSelector {
             }
         }
 
-        let conv_map: std::collections::HashMap<String, Conversation> = valid_conversations
-            .into_iter()
-            .map(|c| (c.id.to_string(), c.clone()))
-            .collect();
-        let initial_raw = current_conversation_id.map(|id| id.to_string());
-        let preview_command =
-            "CLICOLOR_FORCE=1 forge conversation info {1}; echo; CLICOLOR_FORCE=1 forge conversation show {1}"
-                .to_string();
+        rows
+    }
 
-        let selected_uuid = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
-            Ok(ForgeWidget::select_rows("Conversation", rows)
-                .query(query)
-                .header_lines(1_usize)
-                .initial_raw(initial_raw)
-                .preview(Some(preview_command))
-                .preview_layout(PreviewLayout { placement: PreviewPlacement::Bottom, percent: 60 })
-                .prompt()?
-                .map(|row| row.raw))
-        })
-        .await??;
-
-        Ok(selected_uuid.and_then(|uuid| conv_map.get(&uuid).cloned()))
+    fn primary_conversation_items(
+        conversations: &[ConversationListItem],
+    ) -> Vec<&ConversationListItem> {
+        conversations
+            .iter()
+            .filter(|conv| conv.is_primary_user_conversation())
+            .collect()
     }
 
     fn primary_conversations(conversations: &[Conversation]) -> Vec<&Conversation> {

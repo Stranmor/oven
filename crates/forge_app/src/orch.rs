@@ -14,7 +14,9 @@ use url::Url;
 
 use crate::agent::AgentService;
 use crate::compact::Compactor;
-use crate::dto::openai::{ProviderRequestEstimate, Request};
+use crate::dto::openai::{
+    Error as OpenAiError, ErrorCode, ErrorResponse, ProviderRequestEstimate, Request,
+};
 use crate::dto::{anthropic as anthropic_dto, google as google_dto};
 use crate::transformers::{DropReasoningOnlyMessages, ModelSpecificReasoning};
 use crate::{EnvironmentInfra, TemplateEngine};
@@ -1165,7 +1167,130 @@ safety_minimum:
         }
     }
 
-    // Returns if agent supports tool or not.
+    fn error_response_has_context_window_signal(error: &ErrorResponse) -> bool {
+        let code_matches = error
+            .code
+            .as_ref()
+            .and_then(ErrorCode::as_str)
+            .is_some_and(Self::text_has_context_window_signal);
+        let message_matches = error
+            .message
+            .as_deref()
+            .is_some_and(Self::text_has_context_window_signal);
+        let nested_matches = error
+            .error
+            .as_deref()
+            .is_some_and(Self::error_response_has_context_window_signal);
+
+        code_matches || message_matches || nested_matches
+    }
+
+    fn text_has_context_window_signal(text: &str) -> bool {
+        let normalized = text.to_lowercase();
+        normalized.contains("context_length_exceeded")
+            || normalized.contains("maximum context length")
+            || normalized.contains("context window")
+            || normalized.contains("context length") && normalized.contains("exceed")
+    }
+
+    /// Returns true only for provider errors that explicitly indicate the
+    /// request exceeded the provider-side context window.
+    ///
+    /// # Arguments
+    /// * `error` - Error chain returned by provider dispatch.
+    fn is_provider_context_window_error(error: &anyhow::Error) -> bool {
+        let has_provider_error = error
+            .chain()
+            .any(|cause| cause.downcast_ref::<OpenAiError>().is_some());
+        if !has_provider_error {
+            return false;
+        }
+
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<OpenAiError>()
+                .is_some_and(|error| match error {
+                    OpenAiError::Response(response) => {
+                        Self::error_response_has_context_window_signal(response)
+                    }
+                    OpenAiError::InvalidStatusCode(_) => false,
+                })
+                || Self::text_has_context_window_signal(&cause.to_string())
+        })
+    }
+
+    async fn recover_provider_context_window_once(
+        &mut self,
+        context: Context,
+    ) -> anyhow::Result<PreflightContexts> {
+        let recovered_context = self.max_compacted_canonical_context(context)?;
+        self.conversation.context = Some(recovered_context.clone());
+        self.services.update(self.conversation.clone()).await?;
+        self.preflight_context_window(recovered_context)
+            .map_err(Into::into)
+    }
+
+    async fn execute_prepared_chat_turn_with_provider_context_recovery(
+        &mut self,
+        model_id: &ModelId,
+        context: Context,
+        outbound_context: Context,
+    ) -> anyhow::Result<(Context, ChatCompletionMessageFull)> {
+        let first_result = crate::retry::retry_with_config(
+            &self.config.clone().retry.unwrap_or_default(),
+            || self.execute_prepared_chat_turn_vetted(model_id, outbound_context.clone()),
+            self.sender.as_ref().map(|sender| {
+                let sender = sender.clone();
+                let agent_id = self.agent.id.clone();
+                let model_id = model_id.clone();
+                move |error: &anyhow::Error, duration: Duration| {
+                    let root_cause = error.root_cause();
+                    // Log retry attempts - critical for debugging API failures
+                    tracing::error!(
+                        agent_id = %agent_id,
+                        error = ?root_cause,
+                        model = %model_id,
+                        "Retry attempt due to error"
+                    );
+                    let retry_event = ChatResponse::RetryAttempt { cause: error.into(), duration };
+                    let _ = sender.try_send(Ok(retry_event));
+                }
+            }),
+        )
+        .await;
+
+        match first_result {
+            Ok(message) => Ok((context, message)),
+            Err(error) if Self::is_provider_context_window_error(&error) => {
+                let preflight = self.recover_provider_context_window_once(context).await?;
+                let message = crate::retry::retry_with_config(
+                    &self.config.clone().retry.unwrap_or_default(),
+                    || self.execute_prepared_chat_turn_vetted(model_id, preflight.outbound.clone()),
+                    self.sender.as_ref().map(|sender| {
+                        let sender = sender.clone();
+                        let agent_id = self.agent.id.clone();
+                        let model_id = model_id.clone();
+                        move |error: &anyhow::Error, duration: Duration| {
+                            let root_cause = error.root_cause();
+                            tracing::error!(
+                                agent_id = %agent_id,
+                                error = ?root_cause,
+                                model = %model_id,
+                                "Retry attempt due to error"
+                            );
+                            let retry_event =
+                                ChatResponse::RetryAttempt { cause: error.into(), duration };
+                            let _ = sender.try_send(Ok(retry_event));
+                        }
+                    }),
+                )
+                .await?;
+                Ok((preflight.canonical, message))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn is_tool_supported(&self) -> anyhow::Result<bool> {
         // Check if at agent level tool support is defined
         let tool_supported = match self.agent.tool_supported {
@@ -1342,29 +1467,16 @@ safety_minimum:
             self.conversation.context = Some(context.clone());
             self.services.update(self.conversation.clone()).await?;
 
-            let message = crate::retry::retry_with_config(
-                &self.config.clone().retry.unwrap_or_default(),
-                || self.execute_prepared_chat_turn_vetted(&model_id, outbound_context.clone()),
-                self.sender.as_ref().map(|sender| {
-                    let sender = sender.clone();
-                    let agent_id = self.agent.id.clone();
-                    let model_id = model_id.clone();
-                    move |error: &anyhow::Error, duration: Duration| {
-                        let root_cause = error.root_cause();
-                        // Log retry attempts - critical for debugging API failures
-                        tracing::error!(
-                            agent_id = %agent_id,
-                            error = ?root_cause,
-                            model = %model_id,
-                            "Retry attempt due to error"
-                        );
-                        let retry_event =
-                            ChatResponse::RetryAttempt { cause: error.into(), duration };
-                        let _ = sender.try_send(Ok(retry_event));
-                    }
-                }),
-            )
-            .await?;
+            let (recovered_context, message) = self
+                .execute_prepared_chat_turn_with_provider_context_recovery(
+                    &model_id,
+                    context.clone(),
+                    outbound_context,
+                )
+                .await?;
+            context = recovered_context;
+            self.conversation.context = Some(context.clone());
+            self.services.update(self.conversation.clone()).await?;
 
             // Fire the Response lifecycle event
             let response_event = LifecycleEvent::Response(EventData::new(
@@ -1555,6 +1667,7 @@ mod tests {
     use super::Orchestrator;
     use crate::compact::Compactor;
     use crate::dto::anthropic as anthropic_dto;
+    use crate::dto::openai::{Error as OpenAiError, ErrorCode, ErrorResponse};
     use crate::{AgentService, EnvironmentInfra};
 
     struct FixtureServices;
@@ -1712,6 +1825,127 @@ mod tests {
         }
     }
 
+    enum ProviderFailureKind {
+        ContextWindow,
+        GenericBadRequest,
+        TokenQuotaExceeded,
+    }
+
+    struct ProviderRecoveryFixtureServices {
+        updates: Mutex<Vec<forge_domain::Conversation>>,
+        requests: Mutex<Vec<Context>>,
+        attempt_count: Mutex<usize>,
+        failure_kind: ProviderFailureKind,
+    }
+
+    impl ProviderRecoveryFixtureServices {
+        fn new(failure_kind: ProviderFailureKind) -> Arc<Self> {
+            Arc::new(Self {
+                updates: Mutex::new(Vec::new()),
+                requests: Mutex::new(Vec::new()),
+                attempt_count: Mutex::new(0),
+                failure_kind,
+            })
+        }
+
+        async fn updated_contexts(&self) -> Vec<Context> {
+            self.updates
+                .lock()
+                .await
+                .iter()
+                .filter_map(|conversation| conversation.context.clone())
+                .collect()
+        }
+
+        async fn requested_contexts(&self) -> Vec<Context> {
+            self.requests.lock().await.clone()
+        }
+
+        fn first_error(&self) -> anyhow::Error {
+            match self.failure_kind {
+                ProviderFailureKind::ContextWindow => anyhow::Error::from(OpenAiError::Response(
+                    ErrorResponse::default()
+                        .code(ErrorCode::String("context_length_exceeded".to_string()))
+                        .message("This model's maximum context length was exceeded".to_string()),
+                )),
+                ProviderFailureKind::GenericBadRequest => {
+                    anyhow::Error::from(OpenAiError::Response(
+                        ErrorResponse::default()
+                            .code(ErrorCode::Number(400))
+                            .message("Generic invalid request".to_string()),
+                    ))
+                }
+                ProviderFailureKind::TokenQuotaExceeded => {
+                    anyhow::Error::from(OpenAiError::Response(ErrorResponse::default().message(
+                        "The per-minute token quota has been exceeded; retry later".to_string(),
+                    )))
+                }
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentService for ProviderRecoveryFixtureServices {
+        async fn chat_agent(
+            &self,
+            _id: &ModelId,
+            context: Context,
+            _provider_id: Option<ProviderId>,
+        ) -> ResultStream<ChatCompletionMessage, anyhow::Error> {
+            self.requests.lock().await.push(context);
+            let mut attempt_count = self.attempt_count.lock().await;
+            *attempt_count += 1;
+            if *attempt_count == 1 {
+                return Err(self.first_error());
+            }
+
+            let message = ChatCompletionMessage::assistant(Content::full("recovered"))
+                .finish_reason(FinishReason::Stop);
+            Ok(Box::pin(tokio_stream::iter(std::iter::once(Ok(message)))))
+        }
+
+        async fn call(
+            &self,
+            _agent: &Agent,
+            _context: &ToolCallContext,
+            _call: ToolCallFull,
+        ) -> ToolResult {
+            panic!("tool calls should not run for stop response")
+        }
+
+        async fn update(&self, conversation: forge_domain::Conversation) -> anyhow::Result<()> {
+            self.updates.lock().await.push(conversation);
+            Ok(())
+        }
+    }
+
+    impl EnvironmentInfra for ProviderRecoveryFixtureServices {
+        type Config = forge_config::ForgeConfig;
+
+        fn get_env_var(&self, _key: &str) -> Option<String> {
+            None
+        }
+
+        fn get_env_vars(&self) -> BTreeMap<String, String> {
+            BTreeMap::new()
+        }
+
+        fn get_environment(&self) -> Environment {
+            environment_fixture()
+        }
+
+        fn get_config(&self) -> anyhow::Result<Self::Config> {
+            Ok(forge_config::ForgeConfig::default())
+        }
+
+        async fn update_environment(
+            &self,
+            _ops: Vec<forge_domain::ConfigOperation>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     impl EnvironmentInfra for DispatchingFixtureServices {
         type Config = forge_config::ForgeConfig;
 
@@ -1850,6 +2084,27 @@ mod tests {
             forge_config::ForgeConfig::default(),
         )
         .models(vec![model_fixture(context_length)])
+    }
+
+    fn provider_recovery_orchestrator_fixture(
+        services: Arc<ProviderRecoveryFixtureServices>,
+        context: Context,
+    ) -> Orchestrator<ProviderRecoveryFixtureServices> {
+        let agent = Agent::new(
+            AgentId::new("context_guard_agent"),
+            ProviderId::OPENAI,
+            ModelId::new("context-guard-model"),
+        )
+        .compact(Compact::new().retention_window(1_usize));
+        let conversation = forge_domain::Conversation::generate().context(context);
+
+        Orchestrator::new(
+            services,
+            conversation,
+            agent,
+            forge_config::ForgeConfig::default(),
+        )
+        .models(vec![model_fixture(128_000)])
     }
 
     fn provider_fixture(provider_id: ProviderId) -> Provider<url::Url> {
@@ -2642,6 +2897,77 @@ mod tests {
         assert_eq!(actual.contains("messages="), expected);
         assert_eq!(actual.contains("tools="), expected);
         assert_eq!(actual.contains("full serialized request="), expected);
+    }
+
+    #[tokio::test]
+    async fn test_run_recovers_once_after_provider_context_length_exceeded() {
+        let services = ProviderRecoveryFixtureServices::new(ProviderFailureKind::ContextWindow);
+        let setup = Context::default()
+            .add_message(ContextMessage::system("system prompt"))
+            .add_message(droppable_user_message(large_text(20_000)))
+            .add_message(ContextMessage::user("fresh user request", None))
+            .max_tokens(512_usize);
+        let mut fixture = provider_recovery_orchestrator_fixture(services.clone(), setup);
+
+        fixture.run().await.unwrap();
+
+        let requested_contexts = services.requested_contexts().await;
+        let updated_contexts = services.updated_contexts().await;
+        let first_request = requested_contexts
+            .first()
+            .expect("first provider attempt should be recorded");
+        let second_request = requested_contexts
+            .get(1)
+            .expect("context-window recovery should retry provider once");
+        let recovered_context = updated_contexts
+            .iter()
+            .find(|context| context.token_count_approx() < first_request.token_count_approx())
+            .expect("max-compacted canonical context should be persisted before retry");
+        let expected = 2;
+
+        assert_eq!(requested_contexts.len(), expected);
+        assert!(second_request.token_count_approx() < first_request.token_count_approx());
+        assert_eq!(
+            recovered_context.token_count_approx(),
+            second_request.token_count_approx()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_does_not_recover_generic_provider_bad_request() {
+        let services = ProviderRecoveryFixtureServices::new(ProviderFailureKind::GenericBadRequest);
+        let setup = Context::default()
+            .add_message(ContextMessage::system("system prompt"))
+            .add_message(droppable_user_message(large_text(20_000)))
+            .add_message(ContextMessage::user("fresh user request", None))
+            .max_tokens(512_usize);
+        let mut fixture = provider_recovery_orchestrator_fixture(services.clone(), setup);
+
+        let actual = fixture.run().await.unwrap_err().to_string();
+        let requested_contexts = services.requested_contexts().await;
+        let expected = 1;
+
+        assert_eq!(requested_contexts.len(), expected);
+        assert!(actual.contains("Generic invalid request"));
+    }
+
+    #[tokio::test]
+    async fn test_run_does_not_recover_token_quota_exceeded_as_context_window() {
+        let services =
+            ProviderRecoveryFixtureServices::new(ProviderFailureKind::TokenQuotaExceeded);
+        let setup = Context::default()
+            .add_message(ContextMessage::system("system prompt"))
+            .add_message(droppable_user_message(large_text(20_000)))
+            .add_message(ContextMessage::user("fresh user request", None))
+            .max_tokens(512_usize);
+        let mut fixture = provider_recovery_orchestrator_fixture(services.clone(), setup);
+
+        let actual = fixture.run().await.unwrap_err().to_string();
+        let requested_contexts = services.requested_contexts().await;
+        let expected = 1;
+
+        assert_eq!(requested_contexts.len(), expected);
+        assert!(actual.contains("per-minute token quota"));
     }
 
     #[tokio::test]

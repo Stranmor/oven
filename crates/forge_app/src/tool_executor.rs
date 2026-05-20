@@ -238,7 +238,12 @@ impl<
                             search_query.query.clone(),
                             embedding_model_id.clone(),
                         )
-                        .await?;
+                        .await
+                        .map_err(|error| {
+                            anyhow!(
+                                "sem_search provider unavailable after readiness preflight: {error}"
+                            )
+                        })?;
                     if output.embedding_model_id != embedding_model_id {
                         anyhow::bail!(
                             "semantic search embedding model id mismatch: expected {}, got {}",
@@ -511,18 +516,18 @@ mod tests {
     use forge_domain::{
         Agent, AgentId, AnyProvider, Attachment, AuthContextRequest, AuthContextResponse,
         AuthCredential, AuthMethod, ChatCompletionMessage, CodebaseQueryResult, ConfigOperation,
-        Context, Conversation, ConversationId, Effort, Environment, File, FileStatus,
-        LearningCaptureMetadata, LearningLedgerAppendOutcome, LearningLedgerEvent,
+        Context, Conversation, ConversationId, ConversationListItem, Effort, Environment, File,
+        FileStatus, LearningCaptureMetadata, LearningLedgerAppendOutcome, LearningLedgerEvent,
         LearningLedgerFreshness, LearningRecordId, LearningRecordProjection, LearningReviewOutcome,
         LearningReviewState, McpConfig, McpServers, Metrics, Model, ModelConfig, ModelId, Node,
         NodeData, NodeId, PermissionOperation, ProjectSemanticEmbeddingOutput,
         ProjectSemanticEmbeddingVector, Provider, ProviderId, ResultStream, Scope, SearchParams,
-        SemSearchAvailability, Shell, SteerMessage, SubagentTaskId, SubagentTaskSession,
-        SubagentTaskSessionFilter, SyncProgress, ToolCallContext, ToolCallFull, WorkspaceAuth,
-        WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
-        WorkspaceEvidenceReplayDiagnostic, WorkspaceEvidenceReplayPreviewDiagnostic,
-        WorkspaceExactFactStatusReport, WorkspaceId, WorkspaceInfo,
-        WorkspaceSemanticInjectionReadiness, WorkspaceVectorIndexBuildReport,
+        SemSearchAvailability, SemSearchUnknownReason, SemSearchUnsupportedReason, Shell,
+        SteerMessage, SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter, SyncProgress,
+        ToolCallContext, ToolCallFull, WorkspaceAuth, WorkspaceContextFreshness,
+        WorkspaceContextManifestDiagnostic, WorkspaceEvidenceReplayDiagnostic,
+        WorkspaceEvidenceReplayPreviewDiagnostic, WorkspaceExactFactStatusReport, WorkspaceId,
+        WorkspaceInfo, WorkspaceSemanticInjectionReadiness, WorkspaceVectorIndexBuildReport,
     };
     use pretty_assertions::assert_eq;
     use tokio::sync::Mutex;
@@ -711,7 +716,7 @@ mod tests {
                 .is_none()
             {
                 return Ok(SemSearchAvailability::Unsupported {
-                    reason: "semantic_embedding_model_id_not_configured".to_string(),
+                    reason: SemSearchUnsupportedReason::NoModelConfig,
                 });
             }
             Ok(self.readiness.clone())
@@ -909,6 +914,25 @@ mod tests {
                 ) -> anyhow::Result<Conversation> {
                     anyhow::bail!("unused branch conversation")
                 }
+                async fn get_conversation_list_items(
+                    &self,
+                    _limit: usize,
+                ) -> anyhow::Result<Vec<ConversationListItem>> {
+                    Ok(Vec::new())
+                }
+                async fn get_conversation_list_items_including_agent(
+                    &self,
+                    _limit: usize,
+                ) -> anyhow::Result<Vec<ConversationListItem>> {
+                    Ok(Vec::new())
+                }
+                async fn get_conversation_list_items_by_visibility(
+                    &self,
+                    _visibility: forge_domain::ConversationVisibilityFilter,
+                    _limit: usize,
+                ) -> anyhow::Result<Vec<ConversationListItem>> {
+                    Ok(Vec::new())
+                }
                 async fn get_conversations(&self) -> anyhow::Result<Vec<Conversation>> {
                     Ok(Vec::new())
                 }
@@ -986,6 +1010,12 @@ mod tests {
                     _event: LearningLedgerEvent,
                 ) -> anyhow::Result<LearningReviewOutcome> {
                     anyhow::bail!("unused learning review")
+                }
+                async fn promote_sensor_lesson(
+                    &self,
+                    _request: forge_domain::SensorLessonPromotionRequest,
+                ) -> anyhow::Result<forge_domain::SensorLessonPromotionOutcome> {
+                    anyhow::bail!("unused learning promotion")
                 }
                 async fn get_learning_record(
                     &self,
@@ -1538,9 +1568,12 @@ mod tests {
             .call_internal(sem_search_tool("semantic unavailable"), &tool_context())
             .await;
 
-        assert!(actual.unwrap_err().to_string().contains(
-            "sem_search unavailable: unsupported: semantic_embedding_model_id_not_configured"
-        ));
+        assert!(
+            actual
+                .unwrap_err()
+                .to_string()
+                .contains("sem_search unavailable: unsupported: no_model_config")
+        );
         assert_eq!(setup.workspace.embedding_calls.lock().await.len(), 0);
         assert_eq!(setup.workspace.query_calls.lock().await.len(), 0);
         assert_eq!(setup.workspace.build_calls.load(Ordering::SeqCst), 0);
@@ -1580,7 +1613,9 @@ mod tests {
     async fn sem_search_unknown_readiness_fails_before_embedding_provider() -> anyhow::Result<()> {
         let setup = Arc::new(
             SemSearchFixture::new(sem_search_config(Some("fixture-model"))).with_readiness(
-                SemSearchAvailability::Unknown { reason: "vector_index_ambiguous".to_string() },
+                SemSearchAvailability::Unknown {
+                    reason: SemSearchUnknownReason::AmbiguousVectorArtifact,
+                },
             ),
         );
         let executor = ToolExecutor::new(Arc::clone(&setup));
@@ -1593,7 +1628,7 @@ mod tests {
             actual
                 .unwrap_err()
                 .to_string()
-                .contains("sem_search unavailable: unknown: vector_index_ambiguous")
+                .contains("sem_search unavailable: unknown: ambiguous_vector_artifact")
         );
         assert_eq!(setup.workspace.embedding_calls.lock().await.len(), 0);
         assert_eq!(setup.workspace.query_calls.lock().await.len(), 0);

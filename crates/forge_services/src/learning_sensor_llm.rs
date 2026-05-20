@@ -753,6 +753,7 @@ mod tests {
         LearningRecordProjection {
             record_id: LearningRecordId::generate(),
             summary: "conversation_saved message_count=2 user_message_count=1 context_fingerprint=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            accepted_summary: None,
             review_state: LearningReviewState::Candidate,
             redaction_status: LearningRedactionStatus::Clean,
             provenance,

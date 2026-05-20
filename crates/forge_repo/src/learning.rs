@@ -5,11 +5,14 @@ use std::sync::Arc;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use diesel::prelude::*;
 use forge_domain::{
-    ConversationId, LearningCaptureMetadata, LearningEventId, LearningEventKind,
-    LearningLedgerAppendOutcome, LearningLedgerEvent, LearningLedgerFreshness, LearningProvenance,
+    AcceptedLearningSummary, ConversationId, LearningCaptureMetadata, LearningEventId,
+    LearningEventKind, LearningEventSeq, LearningLedgerAppendOutcome, LearningLedgerCursor,
+    LearningLedgerEvent, LearningLedgerEventView, LearningLedgerFreshness, LearningProvenance,
     LearningRecordId, LearningRecordProjection, LearningRedactionStatus, LearningRepository,
     LearningReviewOutcome, LearningReviewState, LearningSourceKind, RedactedLearningSummary,
-    SubagentTaskId, WorkspaceHash,
+    SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REASON,
+    SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REVIEWER_ID, SensorLessonPromotionOutcome,
+    SensorLessonPromotionProposal, SensorLessonPromotionRequest, SubagentTaskId, WorkspaceHash,
 };
 use sha2::{Digest, Sha256};
 
@@ -157,7 +160,7 @@ impl LearningRepository for LearningRepositoryImpl {
                     .filter(learning_ledger_events::workspace_id.eq(workspace_id))
                     .order(learning_ledger_events::event_seq.asc())
                     .load::<LearningLedgerEventRecord>(connection)?;
-                let projection = project_records(records)?
+                let projection = project_records(records.clone())?
                     .into_iter()
                     .find(|projection| projection.record_id.into_string() == record.record_id)
                     .ok_or_else(|| anyhow::anyhow!("learning candidate record not found"))?;
@@ -176,6 +179,17 @@ impl LearningRepository for LearningRepositoryImpl {
                     anyhow::bail!(
                         "learning record cannot be reviewed from state {}",
                         projection.review_state
+                    );
+                }
+                if target_state == LearningReviewState::Accepted
+                    && records.iter().any(|existing| {
+                        existing.record_id == record.record_id
+                            && existing.event_kind
+                                == LearningEventKind::SensorLessonProposed.to_string()
+                    })
+                {
+                    anyhow::bail!(
+                        "sensor-derived learning candidates require promotion proof before acceptance"
                     );
                 }
                 let existing = learning_ledger_events::table
@@ -227,7 +241,7 @@ impl LearningRepository for LearningRepositoryImpl {
                     .filter(learning_ledger_events::workspace_id.eq(workspace_id))
                     .order(learning_ledger_events::event_seq.asc())
                     .load::<LearningLedgerEventRecord>(connection)?;
-                let projection = project_records(records)?
+                let projection = project_records(records.clone())?
                     .into_iter()
                     .find(|projection| projection.record_id.into_string() == record.record_id)
                     .ok_or_else(|| {
@@ -244,6 +258,149 @@ impl LearningRepository for LearningRepositoryImpl {
         .await
     }
 
+    async fn get_learning_event_view(
+        &self,
+        event_id: LearningEventId,
+    ) -> anyhow::Result<Option<LearningLedgerEventView>> {
+        self.run_with_connection(move |connection, wid| {
+            let workspace_id = workspace_db_id(wid);
+            let ledger_cursor = learning_ledger_events::table
+                .filter(learning_ledger_events::workspace_id.eq(workspace_id))
+                .select(diesel::dsl::max(learning_ledger_events::event_seq))
+                .first::<Option<i64>>(connection)?
+                .unwrap_or(0);
+            let Some(record) = learning_ledger_events::table
+                .filter(learning_ledger_events::workspace_id.eq(workspace_id))
+                .filter(learning_ledger_events::event_id.eq(event_id.into_string()))
+                .first::<LearningLedgerEventRecord>(connection)
+                .optional()?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(LearningLedgerEventView {
+                event_seq: LearningEventSeq::new(record.event_seq)?,
+                ledger_cursor: LearningLedgerCursor::new(ledger_cursor)?,
+                event: record.try_into_event()?,
+            }))
+        })
+        .await
+    }
+
+    async fn promote_sensor_lesson(
+        &self,
+        request: SensorLessonPromotionRequest,
+    ) -> anyhow::Result<SensorLessonPromotionOutcome> {
+        self.run_with_connection(move |connection, wid| {
+            request.audit_event().provenance.validate()?;
+            request.review_event().provenance.validate()?;
+            let workspace_id = workspace_db_id(wid);
+            let audit_record =
+                LearningLedgerEventRecord::new(request.audit_event().clone(), workspace_id)?;
+            let review_record =
+                LearningLedgerEventRecord::new(request.review_event().clone(), workspace_id)?;
+            connection.immediate_transaction::<_, anyhow::Error, _>(|connection| {
+                let records = learning_ledger_events::table
+                    .filter(learning_ledger_events::workspace_id.eq(workspace_id))
+                    .order(learning_ledger_events::event_seq.asc())
+                    .load::<LearningLedgerEventRecord>(connection)?;
+                let ledger_cursor = records
+                    .iter()
+                    .map(|record| record.event_seq)
+                    .max()
+                    .unwrap_or(0);
+                let projection_before = project_records(records.clone())?
+                    .into_iter()
+                    .find(|projection| projection.record_id == request.proposal().candidate_id());
+                if let Some(projection) = projection_before.as_ref()
+                    && projection.review_state == LearningReviewState::Accepted
+                {
+                    let audit_event = learning_ledger_events::table
+                        .filter(learning_ledger_events::workspace_id.eq(workspace_id))
+                        .filter(
+                            learning_ledger_events::idempotency_key
+                                .eq(&audit_record.idempotency_key),
+                        )
+                        .first::<LearningLedgerEventRecord>(connection)?;
+                    let review_event = learning_ledger_events::table
+                        .filter(learning_ledger_events::workspace_id.eq(workspace_id))
+                        .filter(
+                            learning_ledger_events::idempotency_key
+                                .eq(&review_record.idempotency_key),
+                        )
+                        .first::<LearningLedgerEventRecord>(connection)?;
+                    ensure_learning_event_idempotency_replay(&audit_event, &audit_record)?;
+                    ensure_learning_event_idempotency_replay(&review_event, &review_record)?;
+                    anyhow::ensure!(
+                        projection.accepted_summary.as_deref()
+                            == Some(request.proposal().accepted_summary()),
+                        "sensor promotion replay accepted summary mismatch"
+                    );
+                    return Ok(SensorLessonPromotionOutcome {
+                        audit_event: audit_event.try_into_event()?,
+                        review_event: review_event.try_into_event()?,
+                        projection: projection.clone(),
+                    });
+                }
+                anyhow::ensure!(
+                    ledger_cursor == request.proposal().observed_ledger_cursor().get(),
+                    "sensor promotion ledger cursor changed after proof construction"
+                );
+                let proposal_record = records
+                    .iter()
+                    .find(|record| {
+                        record.event_seq == request.proposal().proposal_event_seq().get()
+                            && record.record_id == request.proposal().candidate_id().into_string()
+                            && record.event_kind
+                                == LearningEventKind::SensorLessonProposed.to_string()
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("sensor promotion proposal event not found"))?;
+                let projection = project_records(records.clone())?
+                    .into_iter()
+                    .find(|projection| projection.record_id == request.proposal().candidate_id())
+                    .ok_or_else(|| anyhow::anyhow!("sensor promotion candidate not found"))?;
+                anyhow::ensure!(
+                    projection.review_state == LearningReviewState::Candidate,
+                    "sensor promotion candidate is no longer reviewable: {}",
+                    projection.review_state
+                );
+                anyhow::ensure!(
+                    forge_domain::learning_projection_hash(&projection)
+                        == request.proposal().projection_hash(),
+                    "sensor promotion candidate projection hash mismatch"
+                );
+                let event_view = LearningLedgerEventView {
+                    event_seq: LearningEventSeq::new(proposal_record.event_seq)?,
+                    ledger_cursor: LearningLedgerCursor::new(ledger_cursor)?,
+                    event: proposal_record.clone().try_into_event()?,
+                };
+                SensorLessonPromotionProposal::new(&event_view, &projection)?;
+
+                let audit_event = insert_or_replay_learning_event(connection, &audit_record)?;
+                let review_event = insert_or_replay_learning_event(connection, &review_record)?;
+
+                let records = learning_ledger_events::table
+                    .filter(learning_ledger_events::workspace_id.eq(workspace_id))
+                    .order(learning_ledger_events::event_seq.asc())
+                    .load::<LearningLedgerEventRecord>(connection)?;
+                let projection = project_records(records.clone())?
+                    .into_iter()
+                    .find(|projection| projection.record_id == request.proposal().candidate_id())
+                    .ok_or_else(|| anyhow::anyhow!("sensor promotion projection missing"))?;
+                anyhow::ensure!(
+                    projection.review_state == LearningReviewState::Accepted,
+                    "sensor promotion did not accept projection"
+                );
+                anyhow::ensure!(
+                    projection.accepted_summary.as_deref()
+                        == Some(request.proposal().accepted_summary()),
+                    "sensor promotion accepted summary projection mismatch"
+                );
+                Ok(SensorLessonPromotionOutcome { audit_event, review_event, projection })
+            })
+        })
+        .await
+    }
+
     async fn get_learning_record(
         &self,
         record_id: LearningRecordId,
@@ -254,7 +411,7 @@ impl LearningRepository for LearningRepositoryImpl {
                 .filter(learning_ledger_events::workspace_id.eq(workspace_id))
                 .order(learning_ledger_events::event_seq.asc())
                 .load::<LearningLedgerEventRecord>(connection)?;
-            Ok(project_records(records)?
+            Ok(project_records(records.clone())?
                 .into_iter()
                 .find(|projection| projection.record_id == record_id))
         })
@@ -272,7 +429,7 @@ impl LearningRepository for LearningRepositoryImpl {
                 .filter(learning_ledger_events::workspace_id.eq(workspace_id))
                 .order(learning_ledger_events::event_seq.asc())
                 .load::<LearningLedgerEventRecord>(connection)?;
-            let mut projections = project_records(records)?;
+            let mut projections = project_records(records.clone())?;
             if let Some(review_state) = review_state {
                 projections.retain(|projection| projection.review_state == review_state);
             }
@@ -304,7 +461,7 @@ impl LearningRepository for LearningRepositoryImpl {
                 .map(|record| record.event_seq)
                 .max()
                 .unwrap_or(0);
-            let mut projections = project_records(records)?;
+            let mut projections = project_records(records.clone())?;
             if let Some(review_state) = review_state {
                 projections.retain(|projection| projection.review_state == review_state);
             }
@@ -465,6 +622,7 @@ impl LearningLedgerEventRecord {
 struct ProjectionBuilder {
     record_id: LearningRecordId,
     summary: String,
+    accepted_summary: Option<String>,
     review_state: LearningReviewState,
     redaction_status: LearningRedactionStatus,
     provenance: LearningProvenance,
@@ -472,6 +630,49 @@ struct ProjectionBuilder {
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     schema_version: i32,
+}
+
+fn insert_or_replay_learning_event(
+    connection: &mut diesel::sqlite::SqliteConnection,
+    record: &LearningLedgerEventRecord,
+) -> anyhow::Result<LearningLedgerEvent> {
+    let existing = learning_ledger_events::table
+        .filter(learning_ledger_events::workspace_id.eq(record.workspace_id))
+        .filter(learning_ledger_events::idempotency_key.eq(&record.idempotency_key))
+        .first::<LearningLedgerEventRecord>(connection)
+        .optional()?;
+    if let Some(existing) = existing {
+        ensure_learning_event_idempotency_replay(&existing, record)?;
+        return existing.try_into_event();
+    }
+    diesel::insert_into(learning_ledger_events::table)
+        .values((
+            learning_ledger_events::event_id.eq(&record.event_id),
+            learning_ledger_events::record_id.eq(&record.record_id),
+            learning_ledger_events::idempotency_key.eq(&record.idempotency_key),
+            learning_ledger_events::workspace_id.eq(record.workspace_id),
+            learning_ledger_events::event_kind.eq(&record.event_kind),
+            learning_ledger_events::summary.eq(&record.summary),
+            learning_ledger_events::content_fingerprint.eq(&record.content_fingerprint),
+            learning_ledger_events::redaction_status.eq(&record.redaction_status),
+            learning_ledger_events::source_kind.eq(&record.source_kind),
+            learning_ledger_events::source_id.eq(&record.source_id),
+            learning_ledger_events::source_event_id.eq(&record.source_event_id),
+            learning_ledger_events::source_fingerprint.eq(&record.source_fingerprint),
+            learning_ledger_events::conversation_id.eq(&record.conversation_id),
+            learning_ledger_events::task_id.eq(&record.task_id),
+            learning_ledger_events::tool_name.eq(&record.tool_name),
+            learning_ledger_events::eval_id.eq(&record.eval_id),
+            learning_ledger_events::capture_metadata.eq(&record.capture_metadata),
+            learning_ledger_events::created_at.eq(record.created_at),
+            learning_ledger_events::schema_version.eq(record.schema_version),
+        ))
+        .execute(connection)?;
+    learning_ledger_events::table
+        .filter(learning_ledger_events::workspace_id.eq(record.workspace_id))
+        .filter(learning_ledger_events::idempotency_key.eq(&record.idempotency_key))
+        .first::<LearningLedgerEventRecord>(connection)?
+        .try_into_event()
 }
 
 fn ensure_learning_event_idempotency_replay(
@@ -514,6 +715,7 @@ fn project_records(
                 projections.entry(record_key).or_insert(ProjectionBuilder {
                     record_id: event.record_id,
                     summary: event.summary,
+                    accepted_summary: None,
                     review_state: LearningReviewState::Candidate,
                     redaction_status: event.redaction_status,
                     provenance: event.provenance,
@@ -526,6 +728,7 @@ fn project_records(
             LearningEventKind::ReviewAccepted => {
                 if let Some(projection) = projections.get_mut(&record_key) {
                     projection.review_state = LearningReviewState::Accepted;
+                    projection.accepted_summary = accepted_summary_from_review_event(&event)?;
                     projection.updated_at = event.created_at;
                 }
             }
@@ -537,7 +740,8 @@ fn project_records(
             }
             LearningEventKind::SensorLessonProposed
             | LearningEventKind::SensorReviewPending
-            | LearningEventKind::SensorReviewRejected => {
+            | LearningEventKind::SensorReviewRejected
+            | LearningEventKind::PromotionAudit => {
                 if let Some(projection) = projections.get_mut(&record_key) {
                     projection.updated_at = event.created_at;
                 }
@@ -555,6 +759,7 @@ fn project_records(
         .map(|projection| LearningRecordProjection {
             record_id: projection.record_id,
             summary: projection.summary,
+            accepted_summary: projection.accepted_summary,
             review_state: projection.review_state,
             redaction_status: projection.redaction_status,
             provenance: projection.provenance,
@@ -564,6 +769,31 @@ fn project_records(
             schema_version: projection.schema_version,
         })
         .collect())
+}
+
+fn accepted_summary_from_review_event(
+    event: &LearningLedgerEvent,
+) -> anyhow::Result<Option<String>> {
+    if event.provenance.eval_id.as_deref()
+        != Some(SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REVIEWER_ID)
+    {
+        return Ok(None);
+    }
+    if !event
+        .summary
+        .contains(SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REASON)
+        || !event.summary.contains(
+            "accepted_summary=sanctioned_sanitized_observation:validated_counters_and_fingerprints",
+        )
+    {
+        anyhow::bail!("sensor promotion review summary is not canonical");
+    }
+    Ok(Some(
+        AcceptedLearningSummary::new(
+            "sanctioned_sanitized_observation:validated_counters_and_fingerprints",
+        )?
+        .into_string(),
+    ))
 }
 
 fn fingerprint_projection(projections: &[LearningRecordProjection]) -> String {
@@ -588,7 +818,8 @@ fn review_target_state(event_kind: LearningEventKind) -> anyhow::Result<Learning
         LearningEventKind::CandidateCaptured
         | LearningEventKind::SensorLessonProposed
         | LearningEventKind::SensorReviewPending
-        | LearningEventKind::SensorReviewRejected => {
+        | LearningEventKind::SensorReviewRejected
+        | LearningEventKind::PromotionAudit => {
             anyhow::bail!("event kind {} cannot review learning record", event_kind)
         }
     }
@@ -1679,6 +1910,146 @@ mod tests {
 
         assert_eq!(actual, expected);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn sanitized_observation_sensor_proposal_promotes_atomically_with_accepted_summary()
+    -> anyhow::Result<()> {
+        let fixture = fixture_repo(28)?;
+        let created_at = Utc::now();
+        let request = fixture_promotion_request(&fixture, created_at).await?;
+
+        let outcome = fixture.promote_sensor_lesson(request.clone()).await?;
+        let replay = fixture.promote_sensor_lesson(request).await?;
+        let events = fixture
+            .run_with_connection(move |connection, wid| {
+                learning_ledger_events::table
+                    .filter(learning_ledger_events::workspace_id.eq(workspace_db_id(wid)))
+                    .order(learning_ledger_events::event_seq.asc())
+                    .load::<LearningLedgerEventRecord>(connection)
+                    .map_err(Into::into)
+            })
+            .await?;
+        let actual = (
+            outcome.projection.review_state,
+            outcome.projection.accepted_summary.clone(),
+            outcome.review_event.event_id == replay.review_event.event_id,
+            events
+                .iter()
+                .filter(|event| event.event_kind == LearningEventKind::PromotionAudit.to_string())
+                .count(),
+            events
+                .iter()
+                .filter(|event| event.event_kind == LearningEventKind::ReviewAccepted.to_string())
+                .count(),
+        );
+        let expected = (
+            LearningReviewState::Accepted,
+            Some(
+                "sanctioned_sanitized_observation:validated_counters_and_fingerprints".to_string(),
+            ),
+            true,
+            1usize,
+            1usize,
+        );
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generic_review_acceptance_is_blocked_for_sensor_derived_candidate()
+    -> anyhow::Result<()> {
+        let fixture = fixture_repo(29)?;
+        let created_at = Utc::now();
+        let request = fixture_promotion_request(&fixture, created_at).await?;
+        let generic_review = LearningLedgerEvent::review(
+            request.proposal().candidate_id(),
+            LearningEventKind::ReviewAccepted,
+            "generic unsafe acceptance",
+            LearningProvenance::conversation(
+                ConversationId::generate(),
+                "generic-review",
+                "generic-review-fingerprint",
+            ),
+            created_at + Duration::seconds(2),
+        )?;
+
+        let actual = fixture
+            .review_learning_candidate_event(generic_review)
+            .await
+            .is_err();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sensor_promotion_rejects_stale_cursor_after_later_terminal_event() -> anyhow::Result<()>
+    {
+        let fixture = fixture_repo(30)?;
+        let created_at = Utc::now();
+        let request = fixture_promotion_request(&fixture, created_at).await?;
+        let rejection = LearningLedgerEvent::review(
+            request.proposal().candidate_id(),
+            LearningEventKind::ReviewRejected,
+            "terminal rejection wins race",
+            LearningProvenance::conversation(
+                ConversationId::generate(),
+                "reject-review",
+                "reject-review-fingerprint",
+            ),
+            created_at + Duration::seconds(2),
+        )?;
+        fixture.review_learning_candidate_event(rejection).await?;
+
+        let actual = fixture.promote_sensor_lesson(request).await.is_err();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    async fn fixture_promotion_request(
+        fixture: &LearningRepositoryImpl,
+        created_at: DateTime<Utc>,
+    ) -> anyhow::Result<SensorLessonPromotionRequest> {
+        let conversation_id = ConversationId::generate();
+        let candidate = fixture
+            .insert_learning_event(fixture_event(
+                conversation_id,
+                "event-promotion",
+                "raw candidate summary must not be injected after sensor promotion",
+                created_at,
+            )?)
+            .await?
+            .event;
+        let projection = fixture
+            .get_learning_record(candidate.record_id)
+            .await?
+            .expect("candidate projection should exist");
+        let input = LearningSensorReviewInput::from_sanitized_chat_observation(
+            &projection,
+            fixture_sanitized_observation().validate()?,
+        );
+        let output = FakeLearningSensorReviewer.review(input.clone())?;
+        let sensor_event = fixture
+            .insert_learning_event(
+                output.into_sensor_event(&input, created_at + Duration::seconds(1))?,
+            )
+            .await?
+            .event;
+        let view = fixture
+            .get_learning_event_view(sensor_event.event_id)
+            .await?
+            .expect("sensor event view should exist");
+        let projection = fixture
+            .get_learning_record(candidate.record_id)
+            .await?
+            .expect("candidate projection should still exist");
+        let proposal = SensorLessonPromotionProposal::new(&view, &projection)?;
+        SensorLessonPromotionRequest::new(proposal, created_at + Duration::seconds(2))
     }
 
     fn fixture_sanitized_observation() -> SanitizedChatLessonObservation {

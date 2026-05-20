@@ -11,13 +11,14 @@ use forge_domain::{
     AuthCredential, AuthDetails, FileChunk, Node, NodeData, NodeId, ProjectSemanticEmbeddingInput,
     ProjectSemanticEmbeddingOutput, ProjectSemanticEmbeddingRequest,
     ProjectSemanticEmbeddingVector, ProviderId, ProviderRepository, SearchParams,
-    SemSearchAvailability, SyncProgress, UserId, WorkspaceContextFreshness,
-    WorkspaceContextManifestDiagnostic, WorkspaceEvidenceLedgerActivationDiagnostic,
-    WorkspaceEvidenceLedgerActivationSummary, WorkspaceEvidenceLedgerGraphMetadata,
-    WorkspaceEvidenceReadinessDiagnostic, WorkspaceEvidenceReplayBudgetSummary,
-    WorkspaceEvidenceReplayDiagnostic, WorkspaceEvidenceReplayIssueSummary,
-    WorkspaceEvidenceReplayPreviewDiagnostic, WorkspaceEvidenceReplayPreviewStatus,
-    WorkspaceEvidenceReplayReference, WorkspaceEvidenceReplayStatus, WorkspaceExactFactBoundedLoss,
+    SemSearchAvailability, SemSearchUnknownReason, SemSearchUnsupportedReason, SyncProgress,
+    UserId, WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
+    WorkspaceEvidenceLedgerActivationDiagnostic, WorkspaceEvidenceLedgerActivationSummary,
+    WorkspaceEvidenceLedgerGraphMetadata, WorkspaceEvidenceReadinessDiagnostic,
+    WorkspaceEvidenceReplayBudgetSummary, WorkspaceEvidenceReplayDiagnostic,
+    WorkspaceEvidenceReplayIssueSummary, WorkspaceEvidenceReplayPreviewDiagnostic,
+    WorkspaceEvidenceReplayPreviewStatus, WorkspaceEvidenceReplayReference,
+    WorkspaceEvidenceReplayStatus, WorkspaceExactFactBoundedLoss,
     WorkspaceExactFactIngestionSummary, WorkspaceExactFactIssue,
     WorkspaceExactFactReadinessDiagnostic, WorkspaceExactFactReferenceReport,
     WorkspaceExactFactReferenceStatus, WorkspaceExactFactStatusReport, WorkspaceId,
@@ -1082,22 +1083,29 @@ impl<
             embedding_model_id.filter(|model_id| !model_id.trim().is_empty())
         else {
             return Ok(SemSearchAvailability::Unsupported {
-                reason: "semantic_embedding_model_id_not_configured".to_string(),
+                reason: SemSearchUnsupportedReason::NoModelConfig,
             });
         };
-        let root = canonicalize_path(path)?;
+        let root = match canonicalize_path(path) {
+            Ok(root) => root,
+            Err(_error) => {
+                return Ok(SemSearchAvailability::Unknown {
+                    reason: SemSearchUnknownReason::WorkspaceProbeFailed,
+                });
+            }
+        };
         let manifest_path = local_project_model_manifest(&root);
         if !root.is_dir() || !manifest_path.is_file() {
             return Ok(SemSearchAvailability::Unsupported {
-                reason: "project_model_manifest_missing".to_string(),
+                reason: SemSearchUnsupportedReason::ManifestMissing,
             });
         }
         let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
         let manifest = match indexer.read_manifest() {
             Ok(manifest) => manifest,
-            Err(error) => {
+            Err(_error) => {
                 return Ok(SemSearchAvailability::Unknown {
-                    reason: format!("project_model_manifest_unreadable: {error}"),
+                    reason: SemSearchUnknownReason::ManifestUnreadable,
                 });
             }
         };
@@ -1115,19 +1123,14 @@ impl<
         };
         match freshness {
             WorkspaceContextFreshness::Fresh => {}
-            WorkspaceContextFreshness::Stale { changed, deleted, added } => {
+            WorkspaceContextFreshness::Stale { .. } => {
                 return Ok(SemSearchAvailability::Unknown {
-                    reason: format!(
-                        "project_model_manifest_stale: changed={}, deleted={}, added={}",
-                        changed.len(),
-                        deleted.len(),
-                        added.len()
-                    ),
+                    reason: SemSearchUnknownReason::StaleManifest,
                 });
             }
-            WorkspaceContextFreshness::Unknown { reason } => {
+            WorkspaceContextFreshness::Unknown { .. } => {
                 return Ok(SemSearchAvailability::Unknown {
-                    reason: format!("project_model_manifest_freshness_unknown: {reason}"),
+                    reason: SemSearchUnknownReason::ManifestFreshnessUnknown,
                 });
             }
         }
@@ -1482,9 +1485,9 @@ fn sem_search_availability_from_indexer(
 ) -> Result<SemSearchAvailability> {
     let ids = match indexer.list_vector_indexes() {
         Ok(ids) => ids,
-        Err(error) => {
+        Err(_error) => {
             return Ok(SemSearchAvailability::Unknown {
-                reason: format!("vector_index_listing_failed: {error}"),
+                reason: SemSearchUnknownReason::VectorArtifactListingFailed,
             });
         }
     };
@@ -1499,9 +1502,9 @@ fn sem_search_availability_from_indexer(
                     has_unreadable_artifact = true;
                     continue;
                 }
-                Err(error) => {
+                Err(_error) => {
                     return Ok(SemSearchAvailability::Unknown {
-                        reason: format!("vector_index_artifact_corrupt: {error}"),
+                        reason: SemSearchUnknownReason::VectorArtifactCorruptOrNotReady,
                     });
                 }
             };
@@ -1509,17 +1512,17 @@ fn sem_search_availability_from_indexer(
     }
     match matching.as_slice() {
         [] if has_unreadable_artifact => Ok(SemSearchAvailability::Unknown {
-            reason: "vector_index_corrupt_or_not_ready".to_string(),
+            reason: SemSearchUnknownReason::VectorArtifactCorruptOrNotReady,
         }),
         [] => Ok(SemSearchAvailability::Unsupported {
-            reason: "vector_index_absent_or_no_match".to_string(),
+            reason: SemSearchUnsupportedReason::VectorArtifactAbsentOrNoMatch,
         }),
         [(id, artifact)] => {
-            if let Err(error) =
+            if let Err(_error) =
                 forge_project_model::DurableVectorIndex::new(manifest, artifact.clone())
             {
                 return Ok(SemSearchAvailability::Unknown {
-                    reason: format!("vector_index_corrupt_or_not_ready: {error}"),
+                    reason: SemSearchUnknownReason::VectorArtifactCorruptOrNotReady,
                 });
             }
             Ok(SemSearchAvailability::Ready {
@@ -1529,7 +1532,9 @@ fn sem_search_availability_from_indexer(
                 dimension: artifact.dimension,
             })
         }
-        _ => Ok(SemSearchAvailability::Unknown { reason: "vector_index_ambiguous".to_string() }),
+        _ => Ok(SemSearchAvailability::Unknown {
+            reason: SemSearchUnknownReason::AmbiguousVectorArtifact,
+        }),
     }
 }
 
@@ -2846,7 +2851,7 @@ mod tests {
 
         let actual = sem_search_availability_from_indexer(&indexer, &manifest, "fixture-model")?;
         let expected = SemSearchAvailability::Unsupported {
-            reason: "vector_index_absent_or_no_match".to_string(),
+            reason: SemSearchUnsupportedReason::VectorArtifactAbsentOrNoMatch,
         };
 
         assert_eq!(actual, expected);
@@ -2863,8 +2868,111 @@ mod tests {
         let manifest = indexer.read_manifest()?;
 
         let actual = sem_search_availability_from_indexer(&indexer, &manifest, "fixture-model")?;
+        let expected = SemSearchAvailability::Unknown {
+            reason: SemSearchUnknownReason::AmbiguousVectorArtifact,
+        };
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn sem_search_availability_corrupt_vector_is_unknown() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let vector_dir = local_project_model_dir(&root).join("vector_indexes");
+        fs::create_dir_all(&vector_dir)?;
+        fs::write(vector_dir.join(format!("{}.json", "f".repeat(64))), "{")?;
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+        let manifest = indexer.read_manifest()?;
+
+        let actual = sem_search_availability_from_indexer(&indexer, &manifest, "fixture-model")?;
+        let expected = SemSearchAvailability::Unknown {
+            reason: SemSearchUnknownReason::VectorArtifactCorruptOrNotReady,
+        };
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn sem_search_availability_closed_reason_fingerprints_are_stable() {
+        let setup = vec![
+            SemSearchAvailability::Unsupported {
+                reason: SemSearchUnsupportedReason::NoModelConfig,
+            },
+            SemSearchAvailability::Unsupported {
+                reason: SemSearchUnsupportedReason::ManifestMissing,
+            },
+            SemSearchAvailability::Unsupported {
+                reason: SemSearchUnsupportedReason::VectorArtifactAbsentOrNoMatch,
+            },
+            SemSearchAvailability::Unknown { reason: SemSearchUnknownReason::ManifestUnreadable },
+            SemSearchAvailability::Unknown { reason: SemSearchUnknownReason::StaleManifest },
+            SemSearchAvailability::Unknown {
+                reason: SemSearchUnknownReason::ManifestFreshnessUnknown,
+            },
+            SemSearchAvailability::Unknown {
+                reason: SemSearchUnknownReason::VectorArtifactListingFailed,
+            },
+            SemSearchAvailability::Unknown {
+                reason: SemSearchUnknownReason::VectorArtifactCorruptOrNotReady,
+            },
+            SemSearchAvailability::Unknown {
+                reason: SemSearchUnknownReason::AmbiguousVectorArtifact,
+            },
+            SemSearchAvailability::Unknown { reason: SemSearchUnknownReason::UnknownProbeFailure },
+        ];
+
+        let actual = setup
+            .into_iter()
+            .map(|availability| availability.semantic_fingerprint())
+            .collect::<Vec<_>>();
+        let expected = vec![
+            "unsupported:no_model_config".to_string(),
+            "unsupported:manifest_missing".to_string(),
+            "unsupported:vector_artifact_absent_or_no_match".to_string(),
+            "unknown:manifest_unreadable".to_string(),
+            "unknown:stale_manifest".to_string(),
+            "unknown:manifest_freshness_unknown".to_string(),
+            "unknown:vector_artifact_listing_failed".to_string(),
+            "unknown:vector_artifact_corrupt_or_not_ready".to_string(),
+            "unknown:ambiguous_vector_artifact".to_string(),
+            "unknown:unknown_probe_failure".to_string(),
+        ];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn sem_search_availability_no_model_config_is_unsupported() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let setup = fixture_sync_service(&root);
+
+        let actual = setup.sem_search_availability_for_model(root, None)?;
+        let expected = SemSearchAvailability::Unsupported {
+            reason: SemSearchUnsupportedReason::NoModelConfig,
+        };
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn sem_search_availability_stale_manifest_is_unknown_before_ready() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        write_fixture_vector_index(&root, "fixture-model", "RuntimeNeedle")?;
+        fs::write(
+            root.join("src").join("lib.rs"),
+            "pub struct RuntimeNeedle {\n    pub value: usize,\n}\n\npub fn build_runtime_needle() -> RuntimeNeedle {\n    RuntimeNeedle { value: 7 }\n}\n\npub fn stale_runtime_needle() -> RuntimeNeedle {\n    RuntimeNeedle { value: 13 }\n}\n",
+        )?;
+        let setup = fixture_sync_service(&root);
+
+        let actual = setup.sem_search_availability_for_model(root, Some("fixture-model"))?;
         let expected =
-            SemSearchAvailability::Unknown { reason: "vector_index_ambiguous".to_string() };
+            SemSearchAvailability::Unknown { reason: SemSearchUnknownReason::StaleManifest };
 
         assert_eq!(actual, expected);
         Ok(())

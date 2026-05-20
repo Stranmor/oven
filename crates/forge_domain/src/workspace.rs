@@ -47,6 +47,65 @@ pub struct ProjectSemanticEmbeddingOutput {
     pub vectors: Vec<ProjectSemanticEmbeddingVector>,
 }
 
+/// Stable unsupported reason for direct `sem_search` availability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SemSearchUnsupportedReason {
+    /// Semantic embedding model configuration is absent or blank.
+    NoModelConfig,
+    /// Project-model manifest is absent for the workspace root.
+    ManifestMissing,
+    /// No durable vector artifact matches the fresh manifest and configured model.
+    VectorArtifactAbsentOrNoMatch,
+}
+
+impl SemSearchUnsupportedReason {
+    /// Returns the stable cache/user diagnostic label for this reason.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::NoModelConfig => "no_model_config",
+            Self::ManifestMissing => "manifest_missing",
+            Self::VectorArtifactAbsentOrNoMatch => "vector_artifact_absent_or_no_match",
+        }
+    }
+}
+
+/// Stable unknown reason for direct `sem_search` availability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SemSearchUnknownReason {
+    /// Workspace root could not be canonicalized or inspected.
+    WorkspaceProbeFailed,
+    /// Project-model manifest exists but could not be read as typed data.
+    ManifestUnreadable,
+    /// Project-model manifest exists but is stale relative to the filesystem.
+    StaleManifest,
+    /// Project-model manifest freshness could not be proven.
+    ManifestFreshnessUnknown,
+    /// Durable vector artifact listing failed.
+    VectorArtifactListingFailed,
+    /// Durable vector artifact is unreadable, corrupt, or structurally not ready.
+    VectorArtifactCorruptOrNotReady,
+    /// Multiple durable vector artifacts match the same fresh manifest and model.
+    AmbiguousVectorArtifact,
+    /// Read-only availability adapter received an unexpected legacy readiness state.
+    UnknownProbeFailure,
+}
+
+impl SemSearchUnknownReason {
+    /// Returns the stable cache/user diagnostic label for this reason.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::WorkspaceProbeFailed => "workspace_probe_failed",
+            Self::ManifestUnreadable => "manifest_unreadable",
+            Self::StaleManifest => "stale_manifest",
+            Self::ManifestFreshnessUnknown => "manifest_freshness_unknown",
+            Self::VectorArtifactListingFailed => "vector_artifact_listing_failed",
+            Self::VectorArtifactCorruptOrNotReady => "vector_artifact_corrupt_or_not_ready",
+            Self::AmbiguousVectorArtifact => "ambiguous_vector_artifact",
+            Self::UnknownProbeFailure => "unknown_probe_failure",
+        }
+    }
+}
+
 /// Typed read-only readiness classification for direct `sem_search` availability.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SemSearchAvailability {
@@ -63,13 +122,13 @@ pub enum SemSearchAvailability {
     },
     /// Semantic search is intentionally unavailable and should normally not be advertised.
     Unsupported {
-        /// Stable redaction-safe reason.
-        reason: String,
+        /// Closed stable reason class.
+        reason: SemSearchUnsupportedReason,
     },
     /// Readiness could not be proven; direct calls must fail during typed preflight.
     Unknown {
-        /// Stable redaction-safe reason.
-        reason: String,
+        /// Closed stable reason class.
+        reason: SemSearchUnknownReason,
     },
 }
 
@@ -85,8 +144,8 @@ impl SemSearchAvailability {
             Self::Ready { manifest_hash, vector_artifact_id, dimension, .. } => {
                 format!("ready:{manifest_hash}:{vector_artifact_id}:{dimension}")
             }
-            Self::Unsupported { reason } => format!("unsupported:{reason}"),
-            Self::Unknown { reason } => format!("unknown:{reason}"),
+            Self::Unsupported { reason } => format!("unsupported:{}", reason.label()),
+            Self::Unknown { reason } => format!("unknown:{}", reason.label()),
         }
     }
 
@@ -98,9 +157,11 @@ impl SemSearchAvailability {
         match self {
             Self::Ready { .. } => Ok(()),
             Self::Unsupported { reason } => {
-                anyhow::bail!("sem_search unavailable: unsupported: {reason}")
+                anyhow::bail!("sem_search unavailable: unsupported: {}", reason.label())
             }
-            Self::Unknown { reason } => anyhow::bail!("sem_search unavailable: unknown: {reason}"),
+            Self::Unknown { reason } => {
+                anyhow::bail!("sem_search unavailable: unknown: {}", reason.label())
+            }
         }
     }
 }

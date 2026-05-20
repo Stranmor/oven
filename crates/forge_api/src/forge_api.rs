@@ -220,6 +220,34 @@ impl<
             .await
     }
 
+    async fn get_conversation_list_items(&self) -> anyhow::Result<Vec<ConversationListItem>> {
+        self.services
+            .get_conversation_list_items(self.services.get_config()?.max_conversations)
+            .await
+    }
+
+    async fn get_conversation_list_items_including_agent(
+        &self,
+    ) -> anyhow::Result<Vec<ConversationListItem>> {
+        self.services
+            .get_conversation_list_items_including_agent(
+                self.services.get_config()?.max_conversations,
+            )
+            .await
+    }
+
+    async fn get_conversation_list_items_by_visibility(
+        &self,
+        visibility: forge_domain::ConversationVisibilityFilter,
+    ) -> anyhow::Result<Vec<ConversationListItem>> {
+        self.services
+            .get_conversation_list_items_by_visibility(
+                visibility,
+                self.services.get_config()?.max_conversations,
+            )
+            .await
+    }
+
     async fn get_conversations(&self) -> anyhow::Result<Vec<Conversation>> {
         let mut conversations = self.services.get_conversations().await?;
         conversations.truncate(self.services.get_config()?.max_conversations);

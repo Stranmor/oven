@@ -5,11 +5,13 @@ use url::Url;
 
 use crate::{
     AnyProvider, AuthCredential, ChatCompletionMessage, Context, Conversation, ConversationId,
-    ConversationVisibilityFilter, LearningLedgerAppendOutcome, LearningLedgerEvent,
+    ConversationListItem, ConversationVisibilityFilter, LearningEventId,
+    LearningLedgerAppendOutcome, LearningLedgerEvent, LearningLedgerEventView,
     LearningLedgerFreshness, LearningRecordId, LearningRecordProjection, LearningReviewOutcome,
     LearningReviewState, MigrationResult, Model, ModelId, Provider, ProviderId, ProviderTemplate,
-    ResultStream, SearchMatch, Skill, Snapshot, SubagentTaskId, SubagentTaskSession,
-    SubagentTaskSessionFilter, WorkspaceAuth, WorkspaceId,
+    ResultStream, SearchMatch, SensorLessonPromotionOutcome, SensorLessonPromotionRequest, Skill,
+    Snapshot, SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter, WorkspaceAuth,
+    WorkspaceId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +89,46 @@ pub trait ConversationRepository: Send + Sync {
         &self,
         conversation_id: &ConversationId,
     ) -> Result<Option<Conversation>>;
+
+    /// Retrieves bounded metadata-only primary user conversation list items.
+    ///
+    /// # Arguments
+    /// * `limit` - Maximum number of rows returned by the repository query.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    async fn get_all_conversation_list_items(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ConversationListItem>>;
+
+    /// Retrieves bounded metadata-only root conversation list items, including internal
+    /// agent conversations for diagnostic surfaces.
+    ///
+    /// # Arguments
+    /// * `limit` - Maximum number of rows returned by the repository query.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    async fn get_all_conversation_list_items_including_agent(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ConversationListItem>>;
+
+    /// Retrieves bounded metadata-only root conversation list items for the selected
+    /// visibility classes.
+    ///
+    /// # Arguments
+    /// * `visibility` - Visibility classes to include in the result.
+    /// * `limit` - Maximum number of rows returned by the repository query.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    async fn get_all_conversation_list_items_by_visibility(
+        &self,
+        visibility: ConversationVisibilityFilter,
+        limit: usize,
+    ) -> Result<Vec<ConversationListItem>>;
 
     /// Retrieves all primary user conversations
     ///
@@ -208,6 +250,30 @@ pub trait LearningRepository: Send + Sync {
         &self,
         event: LearningLedgerEvent,
     ) -> Result<LearningReviewOutcome>;
+
+    /// Returns a workspace-scoped read-only event view for one learning event.
+    ///
+    /// # Arguments
+    /// * `event_id` - Event identifier to view with append sequence metadata.
+    ///
+    /// # Errors
+    /// Returns an error if projection query fails.
+    async fn get_learning_event_view(
+        &self,
+        event_id: LearningEventId,
+    ) -> Result<Option<LearningLedgerEventView>>;
+
+    /// Atomically promotes a sanctioned sanitized sensor proposal into an accepted review.
+    ///
+    /// # Arguments
+    /// * `request` - Closed promotion request containing proof, audit event, and review event.
+    ///
+    /// # Errors
+    /// Returns an error if proof validation, concurrency checks, or persistence fails.
+    async fn promote_sensor_lesson(
+        &self,
+        request: SensorLessonPromotionRequest,
+    ) -> Result<SensorLessonPromotionOutcome>;
 
     /// Returns one projected learning record by identifier.
     ///

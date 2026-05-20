@@ -22,6 +22,21 @@ pub const FAKE_LEARNING_SENSOR_REVIEWER_ID: &str = "fake_learning_sensor_reviewe
 /// Deterministic fake sensor reviewer version used by the first self-learning slice.
 pub const FAKE_LEARNING_SENSOR_REVIEWER_VERSION: i32 = 1;
 
+/// Deterministic promotion policy reviewer identity for sanctioned sanitized observation proposals.
+pub const SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REVIEWER_ID: &str =
+    "sanctioned_sanitized_observation_promotion_policy_v1";
+
+/// Deterministic promotion policy reviewer implementation version.
+pub const SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REVIEWER_VERSION: i32 = 1;
+
+/// Machine-readable reason code for deterministic sanitized observation promotion.
+pub const SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REASON: &str =
+    "sanctioned_sanitized_observation_promotion";
+
+/// Audit marker for deterministic sanitized observation promotion proof events.
+pub const SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_AUDIT_KIND: &str =
+    "sanctioned_sanitized_observation_promotion_audit_v1";
+
 /// Current deterministic conversation-save capture version.
 pub const CONVERSATION_SAVE_CAPTURE_VERSION: i32 = 1;
 
@@ -68,6 +83,84 @@ impl FromStr for LearningRecordId {
 
     fn from_str(s: &str) -> Result<Self> {
         Self::parse(s)
+    }
+}
+
+/// Workspace-scoped append-only sequence number for a persisted learning ledger event.
+#[derive(
+    Debug,
+    Default,
+    Display,
+    Serialize,
+    Deserialize,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+)]
+#[serde(transparent)]
+pub struct LearningEventSeq(i64);
+
+impl LearningEventSeq {
+    /// Creates a validated positive ledger event sequence.
+    ///
+    /// # Arguments
+    /// * `value` - Database-assigned append-only sequence.
+    ///
+    /// # Errors
+    /// Returns an error when `value` is not positive.
+    pub fn new(value: i64) -> anyhow::Result<Self> {
+        if value <= 0 {
+            anyhow::bail!("learning event sequence must be positive");
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the raw sequence value.
+    pub fn get(&self) -> i64 {
+        self.0
+    }
+}
+
+/// Workspace-scoped cursor proving the latest observed learning ledger event.
+#[derive(
+    Debug,
+    Default,
+    Display,
+    Serialize,
+    Deserialize,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+)]
+#[serde(transparent)]
+pub struct LearningLedgerCursor(i64);
+
+impl LearningLedgerCursor {
+    /// Creates a non-negative workspace ledger cursor.
+    ///
+    /// # Arguments
+    /// * `value` - Highest observed workspace event sequence, or zero for an empty ledger.
+    ///
+    /// # Errors
+    /// Returns an error when `value` is negative.
+    pub fn new(value: i64) -> anyhow::Result<Self> {
+        if value < 0 {
+            anyhow::bail!("learning ledger cursor cannot be negative");
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the raw cursor value.
+    pub fn get(&self) -> i64 {
+        self.0
     }
 }
 
@@ -141,6 +234,8 @@ pub enum LearningEventKind {
     SensorReviewPending,
     /// Non-injection sensor reviewer rejected the sanitized evidence.
     SensorReviewRejected,
+    /// Non-state-changing audit proof for deterministic sensor proposal promotion.
+    PromotionAudit,
     /// Record was superseded by a newer event.
     Superseded,
 }
@@ -1075,7 +1170,290 @@ impl LearningSensorReviewOutput {
     }
 }
 
-/// Pure side-effect-free Sensor reviewer interface.
+/// Closed typestate proving a sensor proposal is eligible for deterministic promotion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SensorLessonPromotionProposal {
+    candidate_id: LearningRecordId,
+    proposal_event_id: LearningEventId,
+    proposal_event_seq: LearningEventSeq,
+    observed_ledger_cursor: LearningLedgerCursor,
+    proposal_source_event_id: String,
+    proposal_source_fingerprint: String,
+    accepted_summary: String,
+    projection_hash: String,
+}
+
+impl SensorLessonPromotionProposal {
+    /// Builds a promotion proposal proof from a sanitized sensor proposal event and current projection.
+    ///
+    /// # Arguments
+    /// * `event_view` - Workspace-scoped read-only proposal event view.
+    /// * `projection` - Current candidate projection at promotion-planning time.
+    ///
+    /// # Errors
+    /// Returns an error when the event is not a sanctioned sanitized observation proposal.
+    pub fn new(
+        event_view: &LearningLedgerEventView,
+        projection: &LearningRecordProjection,
+    ) -> anyhow::Result<Self> {
+        let event = &event_view.event;
+        if event.event_kind != LearningEventKind::SensorLessonProposed {
+            anyhow::bail!("sensor promotion requires SensorLessonProposed event");
+        }
+        if projection.record_id != event.record_id {
+            anyhow::bail!("sensor promotion projection record mismatch");
+        }
+        if projection.review_state != LearningReviewState::Candidate {
+            anyhow::bail!("sensor promotion requires candidate projection");
+        }
+        if event.provenance.source_kind != LearningSourceKind::Eval {
+            anyhow::bail!("sensor promotion requires eval provenance");
+        }
+        if event.provenance.eval_id.as_deref() != Some(FAKE_LEARNING_SENSOR_REVIEWER_ID) {
+            anyhow::bail!("sensor promotion proposal reviewer is not allowlisted");
+        }
+        ensure_canonical_sanctioned_sensor_proposal_event(event)?;
+        let accepted_summary = AcceptedLearningSummary::from_sensor_proposal(event)?;
+        Ok(Self {
+            candidate_id: event.record_id,
+            proposal_event_id: event.event_id,
+            proposal_event_seq: event_view.event_seq,
+            observed_ledger_cursor: event_view.ledger_cursor,
+            proposal_source_event_id: event.provenance.source_event_id.clone(),
+            proposal_source_fingerprint: event.provenance.source_fingerprint.clone(),
+            accepted_summary: accepted_summary.into_string(),
+            projection_hash: learning_projection_hash(projection),
+        })
+    }
+
+    /// Returns the candidate record identifier proven by this proposal.
+    pub fn candidate_id(&self) -> LearningRecordId {
+        self.candidate_id
+    }
+
+    /// Returns the source proposal event sequence.
+    pub fn proposal_event_seq(&self) -> LearningEventSeq {
+        self.proposal_event_seq
+    }
+
+    /// Returns the observed workspace ledger cursor.
+    pub fn observed_ledger_cursor(&self) -> LearningLedgerCursor {
+        self.observed_ledger_cursor
+    }
+
+    /// Returns the accepted summary safe for injection.
+    pub fn accepted_summary(&self) -> &str {
+        &self.accepted_summary
+    }
+
+    /// Returns the projection hash captured at promotion proof construction.
+    pub fn projection_hash(&self) -> &str {
+        &self.projection_hash
+    }
+}
+
+/// Typed accepted summary that cannot be constructed from raw candidate text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct AcceptedLearningSummary(String);
+
+impl AcceptedLearningSummary {
+    /// Builds an accepted summary from a sanctioned sensor proposal event.
+    ///
+    /// # Arguments
+    /// * `event` - Sensor proposal event already proven to be sanitized.
+    ///
+    /// # Errors
+    /// Returns an error when the event is not the sanctioned proposal shape.
+    pub fn from_sensor_proposal(event: &LearningLedgerEvent) -> anyhow::Result<Self> {
+        ensure_canonical_sanctioned_sensor_proposal_event(event)?;
+        Self::new("sanctioned_sanitized_observation:validated_counters_and_fingerprints")
+    }
+
+    /// Creates a validated accepted summary projection.
+    ///
+    /// # Arguments
+    /// * `value` - Closed summary text safe for accepted injection.
+    ///
+    /// # Errors
+    /// Returns an error when the summary is not in the closed allowlist.
+    pub fn new(value: impl Into<String>) -> anyhow::Result<Self> {
+        let value = value.into();
+        if value != "sanctioned_sanitized_observation:validated_counters_and_fingerprints" {
+            anyhow::bail!("accepted learning summary is not allowlisted");
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the accepted summary string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consumes this accepted summary into a string.
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl TryFrom<String> for AcceptedLearningSummary {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> anyhow::Result<Self> {
+        Self::new(value)
+    }
+}
+
+impl From<AcceptedLearningSummary> for String {
+    fn from(value: AcceptedLearningSummary) -> Self {
+        value.0
+    }
+}
+
+/// Workspace-scoped read-only learning event view including append sequence and cursor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LearningLedgerEventView {
+    /// Workspace-scoped append-only event sequence.
+    pub event_seq: LearningEventSeq,
+    /// Highest ledger sequence observed by the read-only query.
+    pub ledger_cursor: LearningLedgerCursor,
+    /// Redacted event payload.
+    pub event: LearningLedgerEvent,
+}
+
+/// Atomic request for deterministic promotion of a sanctioned sanitized sensor proposal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SensorLessonPromotionRequest {
+    proposal: SensorLessonPromotionProposal,
+    review_event: LearningLedgerEvent,
+    audit_event: LearningLedgerEvent,
+}
+
+impl SensorLessonPromotionRequest {
+    /// Creates deterministic audit and accepted review events from a closed promotion proof.
+    ///
+    /// # Arguments
+    /// * `proposal` - Closed typestate proving promotion eligibility.
+    /// * `created_at` - Timestamp for generated promotion events.
+    ///
+    /// # Errors
+    /// Returns an error when deterministic event construction fails.
+    pub fn new(
+        proposal: SensorLessonPromotionProposal,
+        created_at: DateTime<Utc>,
+    ) -> anyhow::Result<Self> {
+        let audit_source_event_id = format!(
+            "promotion-audit:{}:proposal-seq:{}:cursor:{}:source:{}",
+            proposal.candidate_id.into_string(),
+            proposal.proposal_event_seq.get(),
+            proposal.observed_ledger_cursor.get(),
+            proposal.proposal_source_event_id
+        );
+        let audit_source_fingerprint = learning_digest_hex(format!(
+            "{}:{}:{}:{}:{}:{}",
+            SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_AUDIT_KIND,
+            proposal.candidate_id.into_string(),
+            proposal.proposal_event_id.into_string(),
+            proposal.proposal_event_seq.get(),
+            proposal.observed_ledger_cursor.get(),
+            proposal.proposal_source_fingerprint
+        ));
+        let mut audit_event = LearningLedgerEvent::review(
+            proposal.candidate_id,
+            LearningEventKind::PromotionAudit,
+            format!(
+                "promotion_audit kind={} proposal_seq={} cursor={} accepted_summary={}",
+                SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_AUDIT_KIND,
+                proposal.proposal_event_seq.get(),
+                proposal.observed_ledger_cursor.get(),
+                proposal.accepted_summary
+            ),
+            LearningProvenance::eval(
+                SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REVIEWER_ID,
+                audit_source_event_id,
+                audit_source_fingerprint,
+            ),
+            created_at,
+        )?;
+        audit_event.idempotency_key = learning_digest_hex(format!(
+            "promotion-audit:v{}:candidate={}:proposal_seq={}:cursor={}:summary={}",
+            SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REVIEWER_VERSION,
+            proposal.candidate_id.into_string(),
+            proposal.proposal_event_seq.get(),
+            proposal.observed_ledger_cursor.get(),
+            proposal.accepted_summary
+        ));
+
+        let review_source_event_id = format!(
+            "promotion-review:{}:proposal-seq:{}:cursor:{}:audit:{}",
+            proposal.candidate_id.into_string(),
+            proposal.proposal_event_seq.get(),
+            proposal.observed_ledger_cursor.get(),
+            audit_event.idempotency_key
+        );
+        let review_source_fingerprint = learning_digest_hex(format!(
+            "{}:{}:{}:{}:{}",
+            SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REASON,
+            proposal.candidate_id.into_string(),
+            proposal.proposal_event_seq.get(),
+            proposal.observed_ledger_cursor.get(),
+            proposal.accepted_summary
+        ));
+        let mut review_event = LearningLedgerEvent::review(
+            proposal.candidate_id,
+            LearningEventKind::ReviewAccepted,
+            format!(
+                "reviewer={} version={} reason_code={} accepted_summary={}",
+                SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REVIEWER_ID,
+                SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REVIEWER_VERSION,
+                SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REASON,
+                proposal.accepted_summary
+            ),
+            LearningProvenance::eval(
+                SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REVIEWER_ID,
+                review_source_event_id,
+                review_source_fingerprint,
+            ),
+            created_at,
+        )?;
+        review_event.idempotency_key = learning_digest_hex(format!(
+            "promotion-review:v{}:candidate={}:proposal_seq={}:cursor={}:summary={}",
+            SANCTIONED_SANITIZED_OBSERVATION_PROMOTION_REVIEWER_VERSION,
+            proposal.candidate_id.into_string(),
+            proposal.proposal_event_seq.get(),
+            proposal.observed_ledger_cursor.get(),
+            proposal.accepted_summary
+        ));
+        Ok(Self { proposal, review_event, audit_event })
+    }
+
+    /// Returns the closed promotion proof.
+    pub fn proposal(&self) -> &SensorLessonPromotionProposal {
+        &self.proposal
+    }
+
+    /// Returns the deterministic accepted review event.
+    pub fn review_event(&self) -> &LearningLedgerEvent {
+        &self.review_event
+    }
+
+    /// Returns the deterministic audit event.
+    pub fn audit_event(&self) -> &LearningLedgerEvent {
+        &self.audit_event
+    }
+}
+
+/// Result of atomically promoting a sanctioned sensor proposal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SensorLessonPromotionOutcome {
+    /// Audit event appended or replayed with the accepted review.
+    pub audit_event: LearningLedgerEvent,
+    /// Review event appended or replayed by the promotion transaction.
+    pub review_event: LearningLedgerEvent,
+    /// Projection after promotion.
+    pub projection: LearningRecordProjection,
+}
+
 pub trait LearningSensorReviewer {
     /// Reviews sanitized typed evidence and returns only an untrusted Sensor output.
     ///
@@ -1165,6 +1543,89 @@ pub fn learning_projection_hash(projection: &LearningRecordProjection) -> String
     ))
 }
 
+fn ensure_canonical_sanctioned_sensor_proposal_event(
+    event: &LearningLedgerEvent,
+) -> anyhow::Result<()> {
+    if event.event_kind != LearningEventKind::SensorLessonProposed {
+        anyhow::bail!("sanctioned sensor proposal requires SensorLessonProposed event");
+    }
+    if event.provenance.eval_id.as_deref() != Some(FAKE_LEARNING_SENSOR_REVIEWER_ID) {
+        anyhow::bail!("sanctioned sensor proposal reviewer is not canonical");
+    }
+    let expected_summary = format!(
+        "sensor_proposal reviewer={} version={} reason={} title={} body={}",
+        FAKE_LEARNING_SENSOR_REVIEWER_ID,
+        FAKE_LEARNING_SENSOR_REVIEWER_VERSION,
+        "sanctioned_sanitized_chat_observation",
+        "sanctioned_sanitized_observation",
+        "validated_counters_and_fingerprints"
+    );
+    if event.summary != expected_summary {
+        anyhow::bail!("sanctioned sensor proposal summary is not canonical");
+    }
+    let Some((source_prefix, payload_fingerprint)) =
+        event.provenance.source_event_id.rsplit_once(":payload:")
+    else {
+        anyhow::bail!("sanctioned sensor proposal source event is not canonical");
+    };
+    let expected_prefix = format!(
+        "sensor:{}:candidate:{}:input:",
+        FAKE_LEARNING_SENSOR_REVIEWER_ID,
+        event.record_id.into_string()
+    );
+    if !source_prefix.starts_with(&expected_prefix) {
+        anyhow::bail!("sanctioned sensor proposal source prefix mismatch");
+    }
+    let Some((input_fingerprint, decision_text)) = source_prefix
+        .trim_start_matches(&expected_prefix)
+        .split_once(":decision:")
+    else {
+        anyhow::bail!("sanctioned sensor proposal source decision is not canonical");
+    };
+    if input_fingerprint.len() != 64
+        || !input_fingerprint.chars().all(|ch| ch.is_ascii_hexdigit())
+        || decision_text != LearningSensorDecisionKind::ProposeLesson.to_string()
+    {
+        anyhow::bail!("sanctioned sensor proposal source evidence is not canonical");
+    }
+    let expected_payload = learning_digest_hex(format!(
+        "{}:{}:{}:{}",
+        LearningSensorDecisionKind::ProposeLesson,
+        "sanctioned_sanitized_chat_observation",
+        "sanctioned_sanitized_observation",
+        "validated_counters_and_fingerprints"
+    ));
+    if payload_fingerprint != expected_payload {
+        anyhow::bail!("sanctioned sensor proposal payload fingerprint mismatch");
+    }
+    let expected_source_fingerprint = learning_digest_hex(format!(
+        "schema:{}:candidate:{}:input:{}:reviewer:{}:{}:decision:{}:payload:{}",
+        LEARNING_SENSOR_REVIEW_SCHEMA_VERSION,
+        event.record_id.into_string(),
+        input_fingerprint,
+        FAKE_LEARNING_SENSOR_REVIEWER_ID,
+        FAKE_LEARNING_SENSOR_REVIEWER_VERSION,
+        LearningSensorDecisionKind::ProposeLesson,
+        payload_fingerprint
+    ));
+    if event.provenance.source_fingerprint != expected_source_fingerprint {
+        anyhow::bail!("sanctioned sensor proposal source fingerprint mismatch");
+    }
+    let expected_idempotency_key = learning_digest_hex(format!(
+        "sensor-event:schema={}:candidate={}:input={}:reviewer={}:version={}:decision={}:payload={}",
+        LEARNING_SENSOR_REVIEW_SCHEMA_VERSION,
+        event.record_id.into_string(),
+        input_fingerprint,
+        FAKE_LEARNING_SENSOR_REVIEWER_ID,
+        FAKE_LEARNING_SENSOR_REVIEWER_VERSION,
+        LearningSensorDecisionKind::ProposeLesson,
+        payload_fingerprint
+    ));
+    if event.idempotency_key != expected_idempotency_key {
+        anyhow::bail!("sanctioned sensor proposal idempotency key mismatch");
+    }
+    Ok(())
+}
 fn ensure_learning_sensor_proposal_code(
     name: &str,
     value: &str,
@@ -1492,6 +1953,8 @@ pub struct LearningRecordProjection {
     pub record_id: LearningRecordId,
     /// Redacted candidate summary.
     pub summary: String,
+    /// Optional accepted-only summary used for injection after promotion review.
+    pub accepted_summary: Option<String>,
     /// Current projected review state.
     pub review_state: LearningReviewState,
     /// Redaction status for the candidate summary.
@@ -2170,6 +2633,66 @@ mod tests {
     }
 
     #[test]
+    fn forged_sensor_proposal_event_cannot_build_promotion_typestate() {
+        let projection = fixture_learning_projection(LearningReviewState::Candidate);
+        let mut event = LearningLedgerEvent::review(
+            projection.record_id,
+            LearningEventKind::SensorLessonProposed,
+            format!(
+                "sensor_proposal reviewer={} version={} reason={} title={} body={}",
+                FAKE_LEARNING_SENSOR_REVIEWER_ID,
+                FAKE_LEARNING_SENSOR_REVIEWER_VERSION,
+                "sanctioned_sanitized_chat_observation",
+                "sanctioned_sanitized_observation",
+                "validated_counters_and_fingerprints"
+            ),
+            LearningProvenance::eval(
+                FAKE_LEARNING_SENSOR_REVIEWER_ID,
+                "forged-source-event",
+                "forged-source-fingerprint",
+            ),
+            Utc::now(),
+        )
+        .unwrap();
+        event.idempotency_key = "forged-idempotency".to_string();
+        let view = LearningLedgerEventView {
+            event_seq: LearningEventSeq::new(1).unwrap(),
+            ledger_cursor: LearningLedgerCursor::new(1).unwrap(),
+            event,
+        };
+
+        let actual = SensorLessonPromotionProposal::new(&view, &projection).is_err();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn forged_sensor_proposal_source_fingerprint_cannot_build_promotion_typestate() {
+        let projection = fixture_learning_projection(LearningReviewState::Candidate);
+        let input = LearningSensorReviewInput::from_sanitized_chat_observation(
+            &projection,
+            fixture_sanitized_observation().validate().unwrap(),
+        );
+        let mut event = FakeLearningSensorReviewer
+            .review(input.clone())
+            .unwrap()
+            .into_sensor_event(&input, Utc::now())
+            .unwrap();
+        event.provenance.source_fingerprint = "forged-source-fingerprint".to_string();
+        let view = LearningLedgerEventView {
+            event_seq: LearningEventSeq::new(1).unwrap(),
+            ledger_cursor: LearningLedgerCursor::new(1).unwrap(),
+            event,
+        };
+
+        let actual = SensorLessonPromotionProposal::new(&view, &projection).is_err();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn stage_two_output_cannot_carry_commands_patches_rule_text_or_freeform_payloads() {
         let projection = fixture_learning_projection(LearningReviewState::Candidate);
         let input = LearningSensorReviewInput::from_sanitized_chat_observation(
@@ -2289,6 +2812,7 @@ mod tests {
         LearningRecordProjection {
             record_id: LearningRecordId::generate(),
             summary: "conversation_saved message_count=2 user_message_count=1 context_fingerprint=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            accepted_summary: None,
             review_state,
             redaction_status: LearningRedactionStatus::Clean,
             provenance,

@@ -652,7 +652,8 @@ mod tests {
     use std::path::PathBuf;
 
     use forge_domain::{
-        Agent, AgentId, Environment, ModelId, ProviderId, TemplateConfig, ToolCatalog, ToolName,
+        Agent, AgentId, Environment, ModelId, ProviderId, SemSearchAvailability,
+        SemSearchUnknownReason, SemSearchUnsupportedReason, TemplateConfig, ToolCatalog, ToolName,
     };
     use pretty_assertions::assert_eq;
 
@@ -731,6 +732,43 @@ mod tests {
         let expected = false;
 
         assert_eq!(actual == setup, expected);
+    }
+
+    #[test]
+    fn test_tool_definition_cache_key_is_scoped_to_sem_search_readiness() {
+        let setup = cache_key_fixture();
+        let mut actual = setup.clone();
+        actual.sem_search_readiness_fingerprint = SemSearchAvailability::Unknown {
+            reason: SemSearchUnknownReason::AmbiguousVectorArtifact,
+        }
+        .semantic_fingerprint();
+        let expected = false;
+
+        assert_eq!(actual == setup, expected);
+    }
+
+    #[test]
+    fn test_sem_search_availability_advertising_policy_is_typed() {
+        let actual = (
+            SemSearchAvailability::Unsupported {
+                reason: SemSearchUnsupportedReason::NoModelConfig,
+            }
+            .should_advertise(),
+            SemSearchAvailability::Unknown {
+                reason: SemSearchUnknownReason::AmbiguousVectorArtifact,
+            }
+            .should_advertise(),
+            SemSearchAvailability::Ready {
+                workspace_root: PathBuf::from("/workspace"),
+                manifest_hash: "manifest".to_string(),
+                vector_artifact_id: "artifact".to_string(),
+                dimension: 2,
+            }
+            .should_advertise(),
+        );
+        let expected = (false, true, true);
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

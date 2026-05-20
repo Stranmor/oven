@@ -8,7 +8,7 @@ use forge_app::domain::{
     SubagentTaskSessionFilter,
 };
 use forge_app::dto::ConversationBranchTarget;
-use forge_domain::{ConversationRepository, ConversationVisibilityFilter};
+use forge_domain::{ConversationListItem, ConversationRepository, ConversationVisibilityFilter};
 
 /// Service for managing conversations, including creation, retrieval, and
 /// updates
@@ -151,6 +151,31 @@ impl<S: ConversationRepository> ConversationService for ForgeConversationService
             .upsert_conversation(branch.clone())
             .await?;
         Ok(branch)
+    }
+
+    async fn get_conversation_list_items(&self, limit: usize) -> Result<Vec<ConversationListItem>> {
+        self.conversation_repository
+            .get_all_conversation_list_items(limit)
+            .await
+    }
+
+    async fn get_conversation_list_items_including_agent(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ConversationListItem>> {
+        self.conversation_repository
+            .get_all_conversation_list_items_including_agent(limit)
+            .await
+    }
+
+    async fn get_conversation_list_items_by_visibility(
+        &self,
+        visibility: ConversationVisibilityFilter,
+        limit: usize,
+    ) -> Result<Vec<ConversationListItem>> {
+        self.conversation_repository
+            .get_all_conversation_list_items_by_visibility(visibility, limit)
+            .await
     }
 
     async fn get_conversations(&self) -> Result<Vec<Conversation>> {
@@ -299,6 +324,44 @@ mod tests {
                 .cloned())
         }
 
+        async fn get_all_conversation_list_items(
+            &self,
+            limit: usize,
+        ) -> anyhow::Result<Vec<forge_app::domain::ConversationListItem>> {
+            let conversations = self.get_all_conversations().await?;
+            Ok(conversations
+                .into_iter()
+                .filter(|conversation| conversation.is_primary_user_conversation())
+                .take(limit)
+                .map(conversation_list_item_fixture)
+                .collect())
+        }
+
+        async fn get_all_conversation_list_items_including_agent(
+            &self,
+            limit: usize,
+        ) -> anyhow::Result<Vec<forge_app::domain::ConversationListItem>> {
+            let conversations = self.get_all_conversations_including_agent().await?;
+            Ok(conversations
+                .into_iter()
+                .take(limit)
+                .map(conversation_list_item_fixture)
+                .collect())
+        }
+
+        async fn get_all_conversation_list_items_by_visibility(
+            &self,
+            visibility: forge_app::domain::ConversationVisibilityFilter,
+            limit: usize,
+        ) -> anyhow::Result<Vec<forge_app::domain::ConversationListItem>> {
+            let conversations = self.get_all_conversations_by_visibility(visibility).await?;
+            Ok(conversations
+                .into_iter()
+                .take(limit)
+                .map(conversation_list_item_fixture)
+                .collect())
+        }
+
         async fn get_all_conversations(&self) -> anyhow::Result<Vec<Conversation>> {
             Ok(self
                 .conversations
@@ -401,6 +464,20 @@ mod tests {
             *self.delete_count.lock().unwrap() += 1;
             self.conversations.lock().unwrap().remove(conversation_id);
             Ok(())
+        }
+    }
+
+    fn conversation_list_item_fixture(
+        conversation: Conversation,
+    ) -> forge_app::domain::ConversationListItem {
+        forge_app::domain::ConversationListItem {
+            id: conversation.id,
+            parent_id: conversation.parent_id,
+            title: conversation.title,
+            initiator: conversation.initiator,
+            visibility: conversation.visibility,
+            context_present: conversation.context.is_some(),
+            metadata: conversation.metadata,
         }
     }
 

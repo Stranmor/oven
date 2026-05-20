@@ -5,16 +5,17 @@ use bytes::Bytes;
 use derive_setters::Setters;
 use forge_domain::{
     AgentId, AnyProvider, Attachment, AuthContextRequest, AuthContextResponse, AuthMethod,
-    ChatCompletionMessage, CommandOutput, Context, Conversation, ConversationId, File, FileInfo,
-    FileStatus, Image, LearningCaptureMetadata, LearningLedgerAppendOutcome, LearningLedgerEvent,
-    LearningLedgerFreshness, LearningRecordId, LearningRecordProjection, LearningReviewOutcome,
-    LearningReviewRequest, LearningReviewState, LearningSensorReviewInput,
-    LearningSensorReviewOutput, McpConfig, McpServers, Model, ModelId, Node, ProcessId,
-    ProcessReadCursor, ProcessReadOutput, ProcessStartOutput, ProcessStatus,
+    ChatCompletionMessage, CommandOutput, Context, Conversation, ConversationId,
+    ConversationListItem, File, FileInfo, FileStatus, Image, LearningCaptureMetadata,
+    LearningLedgerAppendOutcome, LearningLedgerEvent, LearningLedgerFreshness, LearningRecordId,
+    LearningRecordProjection, LearningReviewOutcome, LearningReviewRequest, LearningReviewState,
+    LearningSensorReviewInput, LearningSensorReviewOutput, McpConfig, McpServers, Model, ModelId,
+    Node, ProcessId, ProcessReadCursor, ProcessReadOutput, ProcessStartOutput, ProcessStatus,
     ProjectSemanticEmbeddingOutput, Provider, ProviderId, ResultStream, Scope, SearchParams,
-    SemSearchAvailability, SteerMessage, SubagentTaskId, SubagentTaskSession,
-    SubagentTaskSessionFilter, SyncProgress, SyntaxError, Template, ToolCallFull, ToolOutput,
-    WorkspaceAuth, WorkspaceContextManifestDiagnostic, WorkspaceEvidenceReplayDiagnostic,
+    SemSearchAvailability, SensorLessonPromotionOutcome, SensorLessonPromotionRequest,
+    SteerMessage, SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter, SyncProgress,
+    SyntaxError, Template, ToolCallFull, ToolOutput, WorkspaceAuth,
+    WorkspaceContextManifestDiagnostic, WorkspaceEvidenceReplayDiagnostic,
     WorkspaceEvidenceReplayPreviewDiagnostic, WorkspaceExactFactReferenceReport,
     WorkspaceExactFactStatusReport, WorkspaceId, WorkspaceInfo,
     WorkspaceSemanticInjectionReadiness, WorkspaceVectorIndexBuildReport,
@@ -355,6 +356,44 @@ pub trait ConversationService: Send + Sync {
         target_id: forge_domain::MessageId,
     ) -> anyhow::Result<Conversation>;
 
+    /// Lists bounded metadata-only primary user conversation rows.
+    ///
+    /// # Arguments
+    /// * `limit` - Maximum number of rows returned by the repository query.
+    ///
+    /// # Errors
+    /// Returns an error if listing conversations fails.
+    async fn get_conversation_list_items(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ConversationListItem>>;
+
+    /// Lists bounded metadata-only root conversation rows including internal agent sessions.
+    ///
+    /// # Arguments
+    /// * `limit` - Maximum number of rows returned by the repository query.
+    ///
+    /// # Errors
+    /// Returns an error if listing conversations fails.
+    async fn get_conversation_list_items_including_agent(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ConversationListItem>>;
+
+    /// Lists bounded metadata-only root conversation rows for selected visibility classes.
+    ///
+    /// # Arguments
+    /// * `visibility` - Visibility classes to include.
+    /// * `limit` - Maximum number of rows returned by the repository query.
+    ///
+    /// # Errors
+    /// Returns an error if listing conversations fails.
+    async fn get_conversation_list_items_by_visibility(
+        &self,
+        visibility: forge_domain::ConversationVisibilityFilter,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ConversationListItem>>;
+
     /// Find primary user conversations.
     ///
     /// # Errors
@@ -581,6 +620,18 @@ pub trait LearningService: Send + Sync {
             output.into_sensor_event_with_identity(&input, &identity, chrono::Utc::now())?;
         self.insert_learning_event(event).await
     }
+
+    /// Atomically promotes a sanctioned sanitized sensor lesson proposal into accepted state.
+    ///
+    /// # Arguments
+    /// * `request` - Closed promotion request with proof, audit, and review events.
+    ///
+    /// # Errors
+    /// Returns an error when repository promotion checks fail.
+    async fn promote_sensor_lesson(
+        &self,
+        request: SensorLessonPromotionRequest,
+    ) -> anyhow::Result<SensorLessonPromotionOutcome>;
 
     /// Returns one projected learning record by identifier.
     ///
@@ -1163,6 +1214,34 @@ impl<I: Services> ConversationService for I {
             .await
     }
 
+    async fn get_conversation_list_items(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ConversationListItem>> {
+        self.conversation_service()
+            .get_conversation_list_items(limit)
+            .await
+    }
+
+    async fn get_conversation_list_items_including_agent(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ConversationListItem>> {
+        self.conversation_service()
+            .get_conversation_list_items_including_agent(limit)
+            .await
+    }
+
+    async fn get_conversation_list_items_by_visibility(
+        &self,
+        visibility: forge_domain::ConversationVisibilityFilter,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ConversationListItem>> {
+        self.conversation_service()
+            .get_conversation_list_items_by_visibility(visibility, limit)
+            .await
+    }
+
     async fn get_conversations(&self) -> anyhow::Result<Vec<Conversation>> {
         self.conversation_service().get_conversations().await
     }
@@ -1280,6 +1359,13 @@ impl<I: Services> LearningService for I {
         self.learning_service()
             .review_learning_candidate(request)
             .await
+    }
+
+    async fn promote_sensor_lesson(
+        &self,
+        request: SensorLessonPromotionRequest,
+    ) -> anyhow::Result<SensorLessonPromotionOutcome> {
+        self.learning_service().promote_sensor_lesson(request).await
     }
 
     async fn get_learning_record(
@@ -1906,6 +1992,20 @@ mod tests {
         conversations: Mutex<HashMap<ConversationId, Conversation>>,
     }
 
+    fn conversation_list_item_from_conversation(
+        conversation: &Conversation,
+    ) -> ConversationListItem {
+        ConversationListItem {
+            id: conversation.id,
+            parent_id: conversation.parent_id,
+            title: conversation.title.clone(),
+            initiator: conversation.initiator,
+            visibility: conversation.visibility,
+            context_present: conversation.context.is_some(),
+            metadata: conversation.metadata.clone(),
+        }
+    }
+
     #[async_trait::async_trait]
     impl ConversationService for RawConversationService {
         async fn find_conversation(
@@ -1996,6 +2096,58 @@ mod tests {
             _target_id: forge_domain::MessageId,
         ) -> anyhow::Result<Conversation> {
             anyhow::bail!("branch conversation is not implemented for raw fixture service")
+        }
+
+        async fn get_conversation_list_items(
+            &self,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<ConversationListItem>> {
+            Ok(self
+                .conversations
+                .lock()
+                .await
+                .values()
+                .filter(|conversation| conversation.is_primary_user_conversation())
+                .map(conversation_list_item_from_conversation)
+                .collect())
+        }
+
+        async fn get_conversation_list_items_including_agent(
+            &self,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<ConversationListItem>> {
+            Ok(self
+                .conversations
+                .lock()
+                .await
+                .values()
+                .filter(|conversation| {
+                    conversation.parent_id.is_none() && conversation.context.is_some()
+                })
+                .map(conversation_list_item_from_conversation)
+                .collect())
+        }
+
+        async fn get_conversation_list_items_by_visibility(
+            &self,
+            visibility: forge_domain::ConversationVisibilityFilter,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<ConversationListItem>> {
+            let conversations = self
+                .get_conversation_list_items_including_agent(usize::MAX)
+                .await?;
+            Ok(conversations
+                .into_iter()
+                .filter(|conversation| match visibility {
+                    forge_domain::ConversationVisibilityFilter::Normal => {
+                        conversation.is_normal_visibility()
+                    }
+                    forge_domain::ConversationVisibilityFilter::Background => {
+                        conversation.is_background()
+                    }
+                    forge_domain::ConversationVisibilityFilter::All => true,
+                })
+                .collect())
         }
 
         async fn get_conversations(&self) -> anyhow::Result<Vec<Conversation>> {
@@ -2148,6 +2300,13 @@ mod tests {
             &self,
             _event: LearningLedgerEvent,
         ) -> anyhow::Result<LearningReviewOutcome> {
+            anyhow::bail!("unused learning service")
+        }
+
+        async fn promote_sensor_lesson(
+            &self,
+            _request: SensorLessonPromotionRequest,
+        ) -> anyhow::Result<SensorLessonPromotionOutcome> {
             anyhow::bail!("unused learning service")
         }
 

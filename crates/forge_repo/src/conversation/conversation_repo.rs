@@ -4,12 +4,12 @@ use chrono::{Duration, Utc};
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 use forge_domain::{
-    Conversation, ConversationId, ConversationRepository, ConversationVisibilityFilter,
-    SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter, SubagentTaskStatus,
-    WorkspaceHash,
+    Conversation, ConversationId, ConversationListItem, ConversationRepository,
+    ConversationVisibilityFilter, SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter,
+    SubagentTaskStatus, WorkspaceHash,
 };
 
-use crate::conversation::conversation_record::ConversationRecord;
+use crate::conversation::conversation_record::{ConversationListItemRecord, ConversationRecord};
 use crate::conversation::subagent_task_record::SubagentTaskSessionRecord;
 use crate::database::schema::{conversations, subagent_task_sessions};
 use crate::database::{DatabasePool, PooledSqliteConnection};
@@ -241,6 +241,19 @@ fn apply_visibility_filter(
     }
 }
 
+fn repository_limit(limit: usize) -> i64 {
+    i64::try_from(limit).unwrap_or(i64::MAX)
+}
+
+fn conversation_list_items_from_records(
+    records: Vec<ConversationListItemRecord>,
+) -> anyhow::Result<Vec<ConversationListItem>> {
+    records
+        .into_iter()
+        .map(ConversationListItem::try_from)
+        .collect::<Result<Vec<_>, _>>()
+}
+
 pub struct ConversationRepositoryImpl {
     pool: Arc<DatabasePool>,
     wid: WorkspaceHash,
@@ -424,6 +437,74 @@ impl ConversationRepository for ConversationRepositoryImpl {
                 Some(record) => Ok(Some(Conversation::try_from(record)?)),
                 None => Ok(None),
             }
+        })
+        .await
+    }
+
+    async fn get_all_conversation_list_items(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ConversationListItem>> {
+        self.run_with_connection(move |connection, wid| {
+            let workspace_id = workspace_db_id(wid);
+            let records = diesel::sql_query(
+                "SELECT conversation_id, title, parent_id, created_at, updated_at, initiator,
+                    visibility, context IS NOT NULL AS context_present
+                 FROM conversations
+                 WHERE workspace_id = ?
+                    AND context IS NOT NULL
+                    AND parent_id IS NULL
+                    AND visibility IS NULL
+                    AND initiator IS NULL
+                    AND context NOT LIKE '%\"initiator\":\"agent\"%'
+                    AND context NOT LIKE '%\"initiator\": \"agent\"%'
+                 ORDER BY updated_at DESC
+                 LIMIT ?",
+            )
+            .bind::<diesel::sql_types::BigInt, _>(workspace_id)
+            .bind::<diesel::sql_types::BigInt, _>(repository_limit(limit))
+            .load::<ConversationListItemRecord>(connection)?;
+            conversation_list_items_from_records(records)
+        })
+        .await
+    }
+
+    async fn get_all_conversation_list_items_including_agent(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ConversationListItem>> {
+        self.get_all_conversation_list_items_by_visibility(
+            ConversationVisibilityFilter::Normal,
+            limit,
+        )
+        .await
+    }
+
+    async fn get_all_conversation_list_items_by_visibility(
+        &self,
+        visibility: ConversationVisibilityFilter,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ConversationListItem>> {
+        self.run_with_connection(move |connection, wid| {
+            let workspace_id = workspace_db_id(wid);
+            let base_query =
+                "SELECT conversation_id, title, parent_id, created_at, updated_at, initiator,
+                    visibility, context IS NOT NULL AS context_present
+                 FROM conversations
+                 WHERE workspace_id = ?
+                    AND context IS NOT NULL
+                    AND parent_id IS NULL";
+            let visibility_clause = match visibility {
+                ConversationVisibilityFilter::Normal => " AND visibility IS NULL",
+                ConversationVisibilityFilter::Background => " AND visibility = 'background'",
+                ConversationVisibilityFilter::All => "",
+            };
+            let query = format!("{base_query}{visibility_clause} ORDER BY updated_at DESC LIMIT ?");
+            let records = diesel::sql_query(query)
+                .bind::<diesel::sql_types::BigInt, _>(workspace_id)
+                .bind::<diesel::sql_types::BigInt, _>(repository_limit(limit))
+                .load::<ConversationListItemRecord>(connection)?;
+            conversation_list_items_from_records(records)
         })
         .await
     }
@@ -719,6 +800,37 @@ mod tests {
         ConversationRepositoryImpl::new(pool, workspace_id)
     }
 
+    async fn insert_raw_context_record(
+        repo: &ConversationRepositoryImpl,
+        title: &str,
+        context: &str,
+    ) -> anyhow::Result<ConversationId> {
+        let id = ConversationId::generate();
+        let now = Utc::now().naive_utc();
+        let record = ConversationRecord {
+            conversation_id: id.into_string(),
+            title: Some(title.to_string()),
+            workspace_id: 0,
+            context: Some(context.to_string()),
+            created_at: now,
+            updated_at: Some(now),
+            metrics: None,
+            parent_id: None,
+            initiator: None,
+            visibility: None,
+        };
+
+        repo.run_with_connection(move |connection, _wid| {
+            diesel::insert_into(conversations::table)
+                .values(&record)
+                .execute(connection)?;
+            Ok(())
+        })
+        .await?;
+
+        Ok(id)
+    }
+
     async fn insert_legacy_agent_record(
         repo: &ConversationRepositoryImpl,
         title: &str,
@@ -988,6 +1100,98 @@ mod tests {
         assert!(changed);
         assert_eq!(actual_phase, Some(MessagePhase::FinalAnswer));
         assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_conversation_list_items_do_not_deserialize_context() -> anyhow::Result<()> {
+        let repo = repository()?;
+        let fixture = insert_raw_context_record(&repo, "Broken Context", "{not-json").await?;
+
+        let actual = repo.get_all_conversation_list_items(10).await?;
+        let expected = (vec![fixture], true, Some("Broken Context".to_string()));
+        let actual_item = actual
+            .first()
+            .expect("metadata-only item should be returned despite invalid context JSON");
+
+        assert_eq!(
+            (
+                actual.iter().map(|item| item.id).collect::<Vec<_>>(),
+                actual_item.has_context(),
+                actual_item.title.clone(),
+            ),
+            expected
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_conversation_list_items_apply_limit_in_query() -> anyhow::Result<()> {
+        let context1 =
+            Context::default().messages(vec![ContextMessage::user("First", None).into()]);
+        let context2 =
+            Context::default().messages(vec![ContextMessage::user("Second", None).into()]);
+        let conversation1 = Conversation::new(ConversationId::generate())
+            .title(Some("First Conversation".to_string()))
+            .context(Some(context1));
+        let conversation2 = Conversation::new(ConversationId::generate())
+            .title(Some("Second Conversation".to_string()))
+            .context(Some(context2));
+        let repo = repository()?;
+
+        repo.upsert_conversation(conversation1).await?;
+        repo.upsert_conversation(conversation2).await?;
+
+        let actual = repo.get_all_conversation_list_items(1).await?;
+        let expected = 1;
+
+        assert_eq!(actual.len(), expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_conversation_list_items_preserve_visibility_filters() -> anyhow::Result<()> {
+        let normal_context =
+            Context::default().messages(vec![ContextMessage::user("User", None).into()]);
+        let background_context =
+            Context::default().messages(vec![ContextMessage::user("Cron", None).into()]);
+        let normal_conversation = Conversation::new(ConversationId::generate())
+            .title(Some("Normal Conversation".to_string()))
+            .context(Some(normal_context));
+        let background_conversation = Conversation::new(ConversationId::generate())
+            .visibility(forge_domain::ConversationVisibility::Background)
+            .title(Some("Background Conversation".to_string()))
+            .context(Some(background_context));
+        let repo = repository()?;
+
+        repo.upsert_conversation(background_conversation.clone())
+            .await?;
+        repo.upsert_conversation(normal_conversation.clone())
+            .await?;
+
+        let actual_background = repo
+            .get_all_conversation_list_items_by_visibility(
+                ConversationVisibilityFilter::Background,
+                10,
+            )
+            .await?;
+        let actual_all = repo
+            .get_all_conversation_list_items_by_visibility(ConversationVisibilityFilter::All, 10)
+            .await?;
+        let expected_background = vec![background_conversation.id];
+        let expected_all = vec![normal_conversation.id, background_conversation.id];
+
+        assert_eq!(
+            actual_background
+                .iter()
+                .map(|conv| conv.id)
+                .collect::<Vec<_>>(),
+            expected_background
+        );
+        assert_eq!(
+            actual_all.iter().map(|conv| conv.id).collect::<Vec<_>>(),
+            expected_all
+        );
         Ok(())
     }
 

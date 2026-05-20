@@ -63,9 +63,9 @@ pub use ingestion::{
     validate_external_fact_batch, write_external_fact_artifact,
 };
 pub use learning::{
-    LearningContextPayload, LearningContextRecord, LearningContextTransport,
-    LearningLedgerFreshness, LearningProvenance, LearningRedactionStatus, LearningReviewState,
-    LearningSourceKind, learning_records_to_graph,
+    AcceptedLearningSummary, LearningContextPayload, LearningContextRecord,
+    LearningContextTransport, LearningLedgerFreshness, LearningProvenance, LearningRedactionStatus,
+    LearningReviewState, LearningSourceKind, learning_records_to_graph,
 };
 pub use lexical::{LexicalIndex, documents_from_manifest};
 pub use policy::{

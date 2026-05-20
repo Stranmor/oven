@@ -72,7 +72,8 @@ mod tests {
     use std::collections::HashMap;
 
     use forge_domain::{
-        Context, Conversation, ConversationId, Initiator, SteerMessage, SteerQueue,
+        Context, Conversation, ConversationId, ConversationListItem, Initiator, SteerMessage,
+        SteerQueue,
     };
     use pretty_assertions::assert_eq;
     use tokio::sync::Mutex;
@@ -207,6 +208,28 @@ mod tests {
             _target_id: forge_domain::MessageId,
         ) -> anyhow::Result<Conversation> {
             anyhow::bail!("branch conversation is not implemented for steer fixture service")
+        }
+
+        async fn get_conversation_list_items(
+            &self,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<ConversationListItem>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_conversation_list_items_including_agent(
+            &self,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<ConversationListItem>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_conversation_list_items_by_visibility(
+            &self,
+            _visibility: forge_domain::ConversationVisibilityFilter,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<ConversationListItem>> {
+            Ok(Vec::new())
         }
 
         async fn get_conversations(&self) -> anyhow::Result<Vec<Conversation>> {

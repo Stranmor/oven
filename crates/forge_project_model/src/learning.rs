@@ -8,6 +8,47 @@ use crate::{
     KnowledgeGraphNodeId, Provenance, RetrievedEvidenceGraphNode,
 };
 
+/// Typed summary projection for accepted sensor-promoted lessons.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct AcceptedLearningSummary(String);
+
+impl AcceptedLearningSummary {
+    /// Creates a validated accepted summary projection.
+    ///
+    /// # Arguments
+    /// * `value` - Summary text safe for accepted context injection.
+    ///
+    /// # Errors
+    /// Returns an error when `value` is not in the closed promotion allowlist.
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        if value != "sanctioned_sanitized_observation:validated_counters_and_fingerprints" {
+            bail!("accepted learning summary is not allowlisted");
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the accepted summary text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for AcceptedLearningSummary {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        Self::new(value)
+    }
+}
+
+impl From<AcceptedLearningSummary> for String {
+    fn from(value: AcceptedLearningSummary) -> Self {
+        value.0
+    }
+}
+
 /// Transport invariants for rendered self-learning context payloads.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LearningContextTransport {
@@ -69,9 +110,7 @@ impl LearningContextPayload {
             bail!("learning context transport must be droppable and cache-ineligible");
         }
         for record in &self.records {
-            if record.review_state != LearningReviewState::Accepted {
-                bail!("learning context can only render accepted records");
-            }
+            record.validate_for_render()?;
         }
         serde_json::to_string(self).map_err(Into::into)
     }
@@ -90,6 +129,31 @@ pub struct LearningContextRecord {
     pub redaction_status: LearningRedactionStatus,
     /// Source provenance for this learning item.
     pub provenance: LearningProvenance,
+}
+
+impl LearningContextRecord {
+    /// Validates this accepted record before rendering into model context.
+    ///
+    /// # Errors
+    /// Returns an error when the record is not accepted, lacks provenance, or
+    /// carries a sensor-promotion-shaped raw summary instead of an accepted projection.
+    pub fn validate_for_render(&self) -> Result<()> {
+        if self.review_state != LearningReviewState::Accepted {
+            bail!("learning context can only render accepted records");
+        }
+        self.provenance.validate()?;
+        let summary = self.summary.trim();
+        if summary.is_empty() {
+            bail!("learning context summary is required");
+        }
+        if summary.starts_with("sensor_proposal ") || summary.contains("body=") {
+            bail!("learning context cannot render raw sensor proposal summaries");
+        }
+        if summary.starts_with("sanctioned_sanitized_observation:") {
+            AcceptedLearningSummary::new(summary.to_string())?;
+        }
+        Ok(())
+    }
 }
 
 /// Review state projected from append-only learning ledger events.
@@ -300,6 +364,34 @@ mod tests {
         let expected = true;
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn learning_context_payload_rejects_raw_sensor_proposal_summary() {
+        let mut fixture = fixture_record("learning-1", LearningReviewState::Accepted);
+        fixture.summary =
+            "sensor_proposal reviewer=fake body=validated_counters_and_fingerprints".to_string();
+        let payload =
+            LearningContextPayload::new(LearningLedgerFreshness::default(), vec![fixture]);
+
+        let actual = payload.render().is_err();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn accepted_learning_summary_roundtrips_through_json() -> Result<()> {
+        let fixture = AcceptedLearningSummary::new(
+            "sanctioned_sanitized_observation:validated_counters_and_fingerprints",
+        )?;
+
+        let serialized = serde_json::to_string(&fixture)?;
+        let actual: AcceptedLearningSummary = serde_json::from_str(&serialized)?;
+        let expected = fixture;
+
+        assert_eq!(actual, expected);
+        Ok(())
     }
 
     #[test]

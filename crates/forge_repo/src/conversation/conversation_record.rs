@@ -1020,6 +1020,26 @@ pub(super) struct ConversationRecord {
     pub visibility: Option<String>,
 }
 
+#[derive(Debug, diesel::QueryableByName)]
+pub(super) struct ConversationListItemRecord {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub conversation_id: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    pub title: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    pub parent_id: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Timestamp)]
+    pub created_at: chrono::NaiveDateTime,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamp>)]
+    pub updated_at: Option<chrono::NaiveDateTime>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    pub initiator: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    pub visibility: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    pub context_present: bool,
+}
+
 impl ConversationRecord {
     /// Creates a new ConversationRecord from a Conversation domain object
     pub fn new(conversation: forge_domain::Conversation, workspace_id: i64) -> Self {
@@ -1053,6 +1073,47 @@ impl ConversationRecord {
             initiator,
             visibility,
         }
+    }
+}
+
+impl TryFrom<ConversationListItemRecord> for forge_domain::ConversationListItem {
+    type Error = anyhow::Error;
+
+    fn try_from(record: ConversationListItemRecord) -> anyhow::Result<Self> {
+        let conversation_id = record.conversation_id.clone();
+        let id = ConversationId::parse(conversation_id.clone())
+            .with_context(|| format!("Failed to parse conversation ID: {}", conversation_id))?;
+        let parent_id = record
+            .parent_id
+            .map(ConversationId::parse)
+            .transpose()
+            .with_context(|| {
+                format!("Failed to parse parent ID for conversation {conversation_id}")
+            })?;
+        let initiator = match record.initiator.as_deref() {
+            Some("agent") => forge_domain::Initiator::Agent,
+            _ => forge_domain::Initiator::User,
+        };
+        let visibility = match record.visibility.as_deref() {
+            None => forge_domain::ConversationVisibility::Normal,
+            Some("background") => forge_domain::ConversationVisibility::Background,
+            Some(value) => anyhow::bail!(
+                "Conversation {} has unsupported visibility value {:?}",
+                conversation_id,
+                value
+            ),
+        };
+
+        Ok(forge_domain::ConversationListItem {
+            id,
+            parent_id,
+            title: record.title,
+            initiator,
+            visibility,
+            context_present: record.context_present,
+            metadata: forge_domain::MetaData::new(record.created_at.and_utc())
+                .updated_at(record.updated_at.map(|updated_at| updated_at.and_utc())),
+        })
     }
 }
 

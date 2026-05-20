@@ -8,8 +8,8 @@ use chrono::Local;
 use forge_config::ForgeConfig;
 use forge_domain::*;
 use forge_project_model::{
-    LearningContextPayload, LearningContextRecord,
-    LearningLedgerFreshness as ProjectLearningLedgerFreshness,
+    AcceptedLearningSummary as ProjectAcceptedLearningSummary, LearningContextPayload,
+    LearningContextRecord, LearningLedgerFreshness as ProjectLearningLedgerFreshness,
     LearningProvenance as ProjectLearningProvenance,
     LearningRedactionStatus as ProjectLearningRedactionStatus,
     LearningReviewState as ProjectLearningReviewState,
@@ -176,15 +176,38 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
         }
     }
 
+    fn is_deterministic_conversation_save_accepted(projection: &LearningRecordProjection) -> bool {
+        projection.provenance.source_kind == LearningSourceKind::Conversation
+            && projection.provenance.conversation_id.is_some()
+            && projection
+                .capture_metadata
+                .as_ref()
+                .is_some_and(|metadata| {
+                    metadata.validate_current().is_ok()
+                        && projection.summary.starts_with("conversation_saved ")
+                })
+            && projection.review_state == LearningReviewState::Accepted
+    }
+
     fn learning_record_to_project(
         projection: LearningRecordProjection,
     ) -> Option<LearningContextRecord> {
         if projection.review_state != LearningReviewState::Accepted {
             return None;
         }
+        let summary = match projection.accepted_summary {
+            Some(accepted_summary) => ProjectAcceptedLearningSummary::new(accepted_summary)
+                .ok()?
+                .as_str()
+                .to_string(),
+            None if Self::is_deterministic_conversation_save_accepted(&projection) => {
+                projection.summary
+            }
+            None => return None,
+        };
         Some(LearningContextRecord {
             id: projection.record_id.into_string(),
-            summary: projection.summary,
+            summary,
             review_state: ProjectLearningReviewState::Accepted,
             redaction_status: Self::learning_redaction_to_project(projection.redaction_status),
             provenance: Self::learning_provenance_to_project(projection.provenance)?,
@@ -1817,6 +1840,35 @@ mod tests {
         UserUsage, Walker,
     };
 
+    #[test]
+    fn learning_context_rejects_generic_accepted_raw_summary_without_closed_projection() {
+        let projection = LearningRecordProjection {
+            record_id: LearningRecordId::generate(),
+            summary: "generic raw accepted text".to_string(),
+            accepted_summary: None,
+            review_state: LearningReviewState::Accepted,
+            redaction_status: LearningRedactionStatus::Clean,
+            provenance: LearningProvenance::conversation(
+                ConversationId::generate(),
+                "raw-accepted",
+                "raw-accepted-fingerprint",
+            ),
+            capture_metadata: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            schema_version: LEARNING_LEDGER_SCHEMA_VERSION,
+        };
+
+        let actual =
+            ProjectContextInjection::<ChatFlowLearningHarness>::learning_record_to_project(
+                projection,
+            )
+            .is_none();
+        let expected = true;
+
+        assert_eq!(actual, expected);
+    }
+
     #[derive(Clone)]
     struct ChatFlowLearningHarness {
         state: Arc<ChatFlowLearningState>,
@@ -1919,6 +1971,7 @@ mod tests {
                     records.push(LearningRecordProjection {
                         record_id: event.record_id,
                         summary: event.summary.clone(),
+                        accepted_summary: None,
                         review_state: LearningReviewState::Candidate,
                         redaction_status: event.redaction_status,
                         provenance: event.provenance.clone(),
@@ -1948,7 +2001,8 @@ mod tests {
                 }
                 LearningEventKind::SensorLessonProposed
                 | LearningEventKind::SensorReviewPending
-                | LearningEventKind::SensorReviewRejected => {
+                | LearningEventKind::SensorReviewRejected
+                | LearningEventKind::PromotionAudit => {
                     if let Some(record) = records
                         .iter_mut()
                         .find(|record| record.record_id == event.record_id)
@@ -2039,6 +2093,28 @@ mod tests {
             _target_id: forge_domain::MessageId,
         ) -> Result<Conversation> {
             anyhow::bail!("unused branch conversation")
+        }
+
+        async fn get_conversation_list_items(
+            &self,
+            _limit: usize,
+        ) -> Result<Vec<ConversationListItem>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_conversation_list_items_including_agent(
+            &self,
+            _limit: usize,
+        ) -> Result<Vec<ConversationListItem>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_conversation_list_items_by_visibility(
+            &self,
+            _visibility: forge_domain::ConversationVisibilityFilter,
+            _limit: usize,
+        ) -> Result<Vec<ConversationListItem>> {
+            Ok(Vec::new())
         }
 
         async fn get_conversations(&self) -> Result<Vec<Conversation>> {
@@ -2190,7 +2266,8 @@ mod tests {
                 LearningEventKind::CandidateCaptured
                 | LearningEventKind::SensorLessonProposed
                 | LearningEventKind::SensorReviewPending
-                | LearningEventKind::SensorReviewRejected => {
+                | LearningEventKind::SensorReviewRejected
+                | LearningEventKind::PromotionAudit => {
                     anyhow::bail!(
                         "event kind {} cannot review learning record",
                         event.event_kind
@@ -2274,6 +2351,13 @@ mod tests {
                 projection_version: 1,
                 review_state_fingerprint: "runtime-proof-learning".to_string(),
             })
+        }
+
+        async fn promote_sensor_lesson(
+            &self,
+            _request: SensorLessonPromotionRequest,
+        ) -> Result<SensorLessonPromotionOutcome> {
+            anyhow::bail!("unused learning promotion")
         }
     }
 
@@ -2486,7 +2570,7 @@ mod tests {
             _embedding_model_id: Option<String>,
         ) -> Result<SemSearchAvailability> {
             Ok(SemSearchAvailability::Unsupported {
-                reason: "vector_index_absent_or_no_match".to_string(),
+                reason: SemSearchUnsupportedReason::VectorArtifactAbsentOrNoMatch,
             })
         }
 
@@ -3382,12 +3466,12 @@ mod tests {
             {
                 WorkspaceSemanticInjectionReadiness::SemanticDisabledNoModelConfig => {
                     Ok(SemSearchAvailability::Unsupported {
-                        reason: "semantic_embedding_model_id_not_configured".to_string(),
+                        reason: SemSearchUnsupportedReason::NoModelConfig,
                     })
                 }
                 WorkspaceSemanticInjectionReadiness::VectorIndexAbsentOrNoMatch => {
                     Ok(SemSearchAvailability::Unsupported {
-                        reason: "vector_index_absent_or_no_match".to_string(),
+                        reason: SemSearchUnsupportedReason::VectorArtifactAbsentOrNoMatch,
                     })
                 }
                 WorkspaceSemanticInjectionReadiness::VectorIndexReady { dimension } => {
@@ -3400,30 +3484,27 @@ mod tests {
                 }
                 WorkspaceSemanticInjectionReadiness::VectorIndexAmbiguous => {
                     Ok(SemSearchAvailability::Unknown {
-                        reason: "vector_index_ambiguous".to_string(),
+                        reason: SemSearchUnknownReason::AmbiguousVectorArtifact,
                     })
                 }
                 WorkspaceSemanticInjectionReadiness::VectorIndexCorruptOrNotReady => {
                     Ok(SemSearchAvailability::Unknown {
-                        reason: "vector_index_corrupt_or_not_ready".to_string(),
+                        reason: SemSearchUnknownReason::VectorArtifactCorruptOrNotReady,
                     })
                 }
-                WorkspaceSemanticInjectionReadiness::VectorDimensionMismatch {
-                    expected,
-                    actual,
-                } => Ok(SemSearchAvailability::Unknown {
-                    reason: format!(
-                        "vector_dimension_mismatch: expected={expected}, actual={actual}"
-                    ),
-                }),
+                WorkspaceSemanticInjectionReadiness::VectorDimensionMismatch { .. } => {
+                    Ok(SemSearchAvailability::Unknown {
+                        reason: SemSearchUnknownReason::UnknownProbeFailure,
+                    })
+                }
                 WorkspaceSemanticInjectionReadiness::EmbeddingProviderUnavailable => {
                     Ok(SemSearchAvailability::Unknown {
-                        reason: "embedding_provider_unavailable".to_string(),
+                        reason: SemSearchUnknownReason::UnknownProbeFailure,
                     })
                 }
                 WorkspaceSemanticInjectionReadiness::EmbeddingProviderTimeout => {
                     Ok(SemSearchAvailability::Unknown {
-                        reason: "embedding_provider_timeout".to_string(),
+                        reason: SemSearchUnknownReason::UnknownProbeFailure,
                     })
                 }
             }
@@ -3710,6 +3791,13 @@ mod tests {
             anyhow::bail!("unused learning review")
         }
 
+        async fn promote_sensor_lesson(
+            &self,
+            _request: SensorLessonPromotionRequest,
+        ) -> Result<SensorLessonPromotionOutcome> {
+            anyhow::bail!("unused learning promotion")
+        }
+
         async fn get_learning_record(
             &self,
             _record_id: LearningRecordId,
@@ -3801,6 +3889,7 @@ mod tests {
         LearningRecordProjection {
             record_id: LearningRecordId::generate(),
             summary: summary.to_string(),
+            accepted_summary: None,
             review_state,
             redaction_status: LearningRedactionStatus::Clean,
             provenance: LearningProvenance::conversation(

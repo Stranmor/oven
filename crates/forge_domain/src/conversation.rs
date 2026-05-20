@@ -72,6 +72,54 @@ pub enum ConversationVisibilityFilter {
 
 #[derive(Debug, Setters, Serialize, Deserialize, Clone)]
 #[setters(into)]
+pub struct ConversationListItem {
+    pub id: ConversationId,
+    pub parent_id: Option<ConversationId>,
+    pub title: Option<String>,
+    pub initiator: Initiator,
+    #[serde(default)]
+    pub visibility: ConversationVisibility,
+    pub context_present: bool,
+    pub metadata: MetaData,
+}
+
+impl ConversationListItem {
+    /// Returns the stable timestamp used for ordering and humanized display.
+    pub fn display_updated_at(&self) -> DateTime<Utc> {
+        self.metadata.updated_at.unwrap_or(self.metadata.created_at)
+    }
+
+    /// Returns whether this item has persisted conversation context.
+    pub fn has_context(&self) -> bool {
+        self.context_present
+    }
+
+    /// Returns whether this item was spawned by another agent.
+    pub fn is_agent_initiated(&self) -> bool {
+        self.initiator == Initiator::Agent
+    }
+
+    /// Returns whether this item is hidden from normal user-facing surfaces.
+    pub fn is_background(&self) -> bool {
+        self.visibility == ConversationVisibility::Background
+    }
+
+    /// Returns whether this item is visible on normal user-facing surfaces.
+    pub fn is_normal_visibility(&self) -> bool {
+        self.visibility == ConversationVisibility::Normal
+    }
+
+    /// Returns whether this metadata row represents a primary human/user chat.
+    pub fn is_primary_user_conversation(&self) -> bool {
+        self.context_present
+            && self.parent_id.is_none()
+            && !self.is_agent_initiated()
+            && self.is_normal_visibility()
+    }
+}
+
+#[derive(Debug, Setters, Serialize, Deserialize, Clone)]
+#[setters(into)]
 pub struct Conversation {
     pub id: ConversationId,
     pub parent_id: Option<ConversationId>,

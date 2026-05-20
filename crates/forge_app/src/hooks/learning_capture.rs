@@ -317,6 +317,7 @@ mod tests {
                 projection: LearningRecordProjection {
                     record_id: candidate.record_id,
                     summary: candidate.summary,
+                    accepted_summary: None,
                     review_state: LearningReviewState::Accepted,
                     redaction_status: candidate.redaction_status,
                     provenance: candidate.provenance,
@@ -326,6 +327,13 @@ mod tests {
                     schema_version: candidate.schema_version,
                 },
             })
+        }
+
+        async fn promote_sensor_lesson(
+            &self,
+            _request: forge_domain::SensorLessonPromotionRequest,
+        ) -> anyhow::Result<forge_domain::SensorLessonPromotionOutcome> {
+            anyhow::bail!("unused learning promotion")
         }
 
         async fn get_learning_record(
@@ -345,6 +353,7 @@ mod tests {
                 .map(|event| LearningRecordProjection {
                     record_id: event.record_id,
                     summary: event.summary,
+                    accepted_summary: None,
                     review_state: LearningReviewState::Candidate,
                     redaction_status: event.redaction_status,
                     provenance: event.provenance,

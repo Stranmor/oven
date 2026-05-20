@@ -7,7 +7,8 @@ use forge_app::domain::{
     ConversationId, FakeLearningSensorReviewer, LearningCaptureMetadata,
     LearningLedgerAppendOutcome, LearningLedgerEvent, LearningLedgerFreshness, LearningProvenance,
     LearningRecordProjection, LearningRepository, LearningReviewOutcome, LearningReviewState,
-    LearningSensorReviewInput, RedactedLearningSummary,
+    LearningSensorReviewInput, RedactedLearningSummary, SensorLessonPromotionOutcome,
+    SensorLessonPromotionRequest,
 };
 use forge_domain::LearningSensorReviewer;
 
@@ -84,6 +85,13 @@ impl<R: LearningRepository> LearningService for ForgeLearningService<R> {
         self.repository.review_learning_candidate_event(event).await
     }
 
+    async fn promote_sensor_lesson(
+        &self,
+        request: SensorLessonPromotionRequest,
+    ) -> Result<SensorLessonPromotionOutcome> {
+        self.repository.promote_sensor_lesson(request).await
+    }
+
     async fn get_learning_record(
         &self,
         record_id: forge_app::domain::LearningRecordId,
@@ -154,6 +162,7 @@ mod tests {
                 projection: LearningRecordProjection {
                     record_id: event.record_id,
                     summary: event.summary.clone(),
+                    accepted_summary: None,
                     review_state: LearningReviewState::Accepted,
                     redaction_status: event.redaction_status,
                     provenance: event.provenance.clone(),
@@ -164,6 +173,20 @@ mod tests {
                 },
                 event,
             })
+        }
+
+        async fn get_learning_event_view(
+            &self,
+            _event_id: LearningEventId,
+        ) -> Result<Option<forge_app::domain::LearningLedgerEventView>> {
+            anyhow::bail!("unused learning event view")
+        }
+
+        async fn promote_sensor_lesson(
+            &self,
+            _request: SensorLessonPromotionRequest,
+        ) -> Result<SensorLessonPromotionOutcome> {
+            anyhow::bail!("unused promotion")
         }
 
         async fn get_learning_record(
@@ -179,6 +202,7 @@ mod tests {
                 .map(|event| LearningRecordProjection {
                     record_id: event.record_id,
                     summary: event.summary.clone(),
+                    accepted_summary: None,
                     review_state: LearningReviewState::Candidate,
                     redaction_status: event.redaction_status,
                     provenance: event.provenance.clone(),

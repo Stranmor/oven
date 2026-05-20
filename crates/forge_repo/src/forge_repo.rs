@@ -12,14 +12,16 @@ use forge_app::{
 use forge_config::ForgeConfig;
 use forge_domain::{
     AnyProvider, AuthCredential, ChatCompletionMessage, ChatRepository, CommandExecutionOutput,
-    Context, Conversation, ConversationId, ConversationRepository, ConversationVisibilityFilter,
-    Environment, FileInfo, FuzzySearchRepository, LearningLedgerAppendOutcome, LearningLedgerEvent,
+    Context, Conversation, ConversationId, ConversationListItem, ConversationRepository,
+    ConversationVisibilityFilter, Environment, FileInfo, FuzzySearchRepository, LearningEventId,
+    LearningLedgerAppendOutcome, LearningLedgerEvent, LearningLedgerEventView,
     LearningLedgerFreshness, LearningRecordId, LearningRecordProjection, LearningRepository,
     LearningReviewOutcome, LearningReviewState, McpServerConfig, MigrationResult, Model, ModelId,
     ProcessId, ProcessReadCursor, ProcessReadOutput, ProcessStartOutput, ProcessStatus, Provider,
-    ProviderId, ProviderRepository, ResultStream, SearchMatch, Skill, SkillRepository, Snapshot,
-    SnapshotRepository, SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter,
-    TextPatchBlock, TextPatchRepository,
+    ProviderId, ProviderRepository, ResultStream, SearchMatch, SensorLessonPromotionOutcome,
+    SensorLessonPromotionRequest, Skill, SkillRepository, Snapshot, SnapshotRepository,
+    SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter, TextPatchBlock,
+    TextPatchRepository,
 };
 use forge_eventsource::EventSource;
 // Re-export CacacheStorage from forge_infra
@@ -150,6 +152,34 @@ impl<F: Send + Sync> ConversationRepository for ForgeRepo<F> {
             .await
     }
 
+    async fn get_all_conversation_list_items(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ConversationListItem>> {
+        self.conversation_repository
+            .get_all_conversation_list_items(limit)
+            .await
+    }
+
+    async fn get_all_conversation_list_items_including_agent(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ConversationListItem>> {
+        self.conversation_repository
+            .get_all_conversation_list_items_including_agent(limit)
+            .await
+    }
+
+    async fn get_all_conversation_list_items_by_visibility(
+        &self,
+        visibility: ConversationVisibilityFilter,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ConversationListItem>> {
+        self.conversation_repository
+            .get_all_conversation_list_items_by_visibility(visibility, limit)
+            .await
+    }
+
     async fn get_all_conversations(&self) -> anyhow::Result<Vec<Conversation>> {
         self.conversation_repository.get_all_conversations().await
     }
@@ -240,6 +270,24 @@ impl<F: Send + Sync> LearningRepository for ForgeRepo<F> {
     ) -> anyhow::Result<LearningReviewOutcome> {
         self.learning_repository
             .review_learning_candidate_event(event)
+            .await
+    }
+
+    async fn get_learning_event_view(
+        &self,
+        event_id: LearningEventId,
+    ) -> anyhow::Result<Option<LearningLedgerEventView>> {
+        self.learning_repository
+            .get_learning_event_view(event_id)
+            .await
+    }
+
+    async fn promote_sensor_lesson(
+        &self,
+        request: SensorLessonPromotionRequest,
+    ) -> anyhow::Result<SensorLessonPromotionOutcome> {
+        self.learning_repository
+            .promote_sensor_lesson(request)
             .await
     }
 
