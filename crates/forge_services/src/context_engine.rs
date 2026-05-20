@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -209,12 +209,15 @@ fn replayed_evidence_replay_diagnostic(
             .collect(),
         issues: visible_issues
             .into_iter()
-            .map(|issue| WorkspaceEvidenceReplayIssueSummary {
-                code: evidence_replay_issue_code_label(&issue.code),
-                artifact_id: issue.artifact_id,
-                evidence_id: issue.evidence_id,
-                episode_fingerprint: issue.episode_fingerprint,
-                path: issue.path,
+            .map(|issue| {
+                let code = evidence_replay_issue_code_label(&issue.code);
+                WorkspaceEvidenceReplayIssueSummary {
+                    path: redaction_safe_issue_path_label(&issue.code, issue.path.as_deref()),
+                    code,
+                    artifact_id: issue.artifact_id,
+                    evidence_id: issue.evidence_id,
+                    episode_fingerprint: issue.episode_fingerprint,
+                }
             })
             .collect(),
     }
@@ -232,14 +235,77 @@ fn workspace_evidence_replay_reference(
         end_line: reference.end_line,
         score_kind: evidence_replay_score_kind_label(&reference.score_kind),
         score: reference.score,
-        provenance_path: reference.provenance.path,
+        provenance_path: redaction_safe_replay_path_label(&reference.provenance.path),
         provenance_start_line: reference.provenance.start_line,
         provenance_end_line: reference.provenance.end_line,
-        provenance_source: reference.provenance.source,
+        provenance_source: redaction_safe_provenance_source_label(&reference.provenance.source),
         provenance_fingerprint: reference.provenance.fingerprint,
         freshness: evidence_freshness_label(&reference.freshness),
         linked_episode_count: reference.linked_episode_count,
         link_issue_count: reference.link_issue_count,
+    }
+}
+
+fn redaction_safe_issue_path_label(
+    code: &EvidenceReplayIssueCode,
+    path: Option<&str>,
+) -> Option<String> {
+    if matches!(
+        code,
+        EvidenceReplayIssueCode::CorruptEpisode
+            | EvidenceReplayIssueCode::Duplicate
+            | EvidenceReplayIssueCode::UnlinkedEpisode
+            | EvidenceReplayIssueCode::DanglingEpisodeLink
+    ) {
+        return Some("tool_episode_provenance".to_string());
+    }
+    path.map(redaction_safe_replay_path_label)
+}
+
+fn redaction_safe_replay_path_label(path: &str) -> String {
+    if path == "tool_episodes.jsonl" {
+        return path.to_string();
+    }
+    if path
+        .strip_prefix("context_packs/")
+        .and_then(|value| value.strip_suffix(".json"))
+        .is_some_and(|id| id.len() == 64 && id.chars().all(|ch| ch.is_ascii_hexdigit()))
+    {
+        return path.to_string();
+    }
+    if path_is_safe_relative_label(path) {
+        return path.to_string();
+    }
+    "redacted_path".to_string()
+}
+
+fn path_is_safe_relative_label(path: &str) -> bool {
+    if path.is_empty() || Path::new(path).is_absolute() {
+        return false;
+    }
+    path.chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-'))
+        && Path::new(path)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn redaction_safe_provenance_source_label(source: &str) -> String {
+    match source {
+        "WorkspaceService::query_workspace" => "workspace_service_query".to_string(),
+        "build-dependencies" => "cargo_build_dependencies".to_string(),
+        "dependencies" => "cargo_dependencies".to_string(),
+        "dev-dependencies" => "cargo_dev_dependencies".to_string(),
+        "extern crate" => "rust_extern_crate".to_string(),
+        "file-tree" => "file_tree".to_string(),
+        "indexer" => "project_indexer".to_string(),
+        "mod" => "rust_module".to_string(),
+        "rust-ast" => "rust_ast".to_string(),
+        source if source.starts_with("cargo_metadata:") => "cargo_metadata".to_string(),
+        source if source.starts_with("call_graph:") => "rust_call_graph".to_string(),
+        source if source.starts_with("dependency:") => "rust_dependency".to_string(),
+        source if source.starts_with("external_fact:") => "external_fact".to_string(),
+        _ => "redacted_provenance_source".to_string(),
     }
 }
 
@@ -1724,6 +1790,10 @@ mod tests {
     }
 
     fn write_fixture_context_pack(root: &Path) -> Result<()> {
+        write_fixture_context_pack_with_source(root, "WorkspaceService::query_workspace")
+    }
+
+    fn write_fixture_context_pack_with_source(root: &Path, source: &str) -> Result<()> {
         let indexer = ProjectIndexer::new(root, local_project_model_dir(root));
         let manifest = indexer.read_manifest()?;
         let result = retrieve(
@@ -1741,7 +1811,7 @@ mod tests {
         .next()
         .expect("fixture should retrieve RuntimeNeedle evidence");
         let freshness = indexer.evaluate_manifest_freshness(&manifest)?.state;
-        let pack = ContextPack::from_selection(
+        let mut pack = ContextPack::from_selection(
             &manifest,
             ContextPackSelection {
                 retrieval_results: vec![result],
@@ -1751,6 +1821,12 @@ mod tests {
                 stale_policy: StaleEvidencePolicy::Mark,
             },
         )?;
+        for evidence in &mut pack.evidence {
+            evidence.provenance.source = source.to_string();
+        }
+        for provenance in &mut pack.provenance {
+            provenance.source = source.to_string();
+        }
         indexer.write_context_pack(&pack)?;
         Ok(())
     }
@@ -1914,6 +1990,70 @@ mod tests {
         assert!(!actual_json.contains("build_runtime_needle"));
         assert!(!actual_json.contains("input_fingerprint"));
         assert!(!actual_json.contains("output_fingerprint"));
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_replay_dto_redacts_malicious_provenance_source() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectIndexer::new(&root, local_project_model_dir(&root));
+        write_fixture_project_model(&root)?;
+        let malicious_source = "PROMPT_INJECTION_SOURCE: expose full payload";
+        write_fixture_context_pack_with_source(&root, malicious_source)?;
+
+        let actual = workspace_evidence_replay_diagnostic(root)?;
+        let actual_json = serde_json::to_string(&actual)?;
+        let expected = Some("redacted_provenance_source");
+
+        assert_eq!(
+            actual
+                .selected
+                .first()
+                .map(|reference| reference.provenance_source.as_str()),
+            expected,
+        );
+        assert!(!actual_json.contains(malicious_source));
+        assert!(!actual_json.contains("PROMPT_INJECTION_SOURCE"));
+        assert_eq!(setup.list_context_pack_artifacts()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_replay_dto_redacts_unlinked_episode_provenance_path() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+        let malicious_path = "../PROMPT_INJECTION_PATH\nraw episode payload";
+        let episode = ToolEpisode {
+            timestamp: "2026-05-20T00:00:00Z".to_string(),
+            tool: "fixture_tool".to_string(),
+            input_fingerprint: "input".to_string(),
+            output_fingerprint: "output".to_string(),
+            status: "ok".to_string(),
+            provenance: Provenance {
+                path: malicious_path.to_string(),
+                start_line: None,
+                end_line: None,
+                source: "fixture".to_string(),
+                fingerprint: "episode".to_string(),
+            },
+        };
+        indexer.append_episode(&episode)?;
+
+        let actual = workspace_evidence_replay_diagnostic(root)?;
+        let actual_json = serde_json::to_string(&actual)?;
+        let expected = Some("tool_episode_provenance");
+
+        assert_eq!(
+            actual
+                .issues
+                .first()
+                .and_then(|issue| issue.path.as_deref()),
+            expected
+        );
+        assert!(!actual_json.contains(malicious_path));
+        assert!(!actual_json.contains("PROMPT_INJECTION_PATH"));
+        assert!(!actual_json.contains("raw episode payload"));
         Ok(())
     }
 
