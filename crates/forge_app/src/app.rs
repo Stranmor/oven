@@ -3135,8 +3135,10 @@ mod tests {
             inactive_exact_fact_paths: Vec<PathBuf>,
             replay_preview_empty_paths: Vec<PathBuf>,
         ) -> Arc<Self> {
-            let mut config = ForgeConfig::default();
-            config.semantic_embedding_model_id = Some("fixture-embedding-model".to_string());
+            let config = ForgeConfig {
+                semantic_embedding_model_id: Some("fixture-embedding-model".to_string()),
+                ..Default::default()
+            };
             Arc::new(Self {
                 cwd,
                 empty_paths,

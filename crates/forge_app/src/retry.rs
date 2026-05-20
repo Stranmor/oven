@@ -35,7 +35,7 @@ where
 /// This function checks if the error is a retryable domain error.
 /// Currently, only `Error::Retryable` errors will trigger retries.
 pub(crate) fn is_provider_context_window_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
+    let has_typed_context_signal = error.chain().any(|cause| {
         cause
             .downcast_ref::<OpenAiError>()
             .is_some_and(|error| match error {
@@ -44,7 +44,16 @@ pub(crate) fn is_provider_context_window_error(error: &anyhow::Error) -> bool {
                 }
                 OpenAiError::InvalidStatusCode(_) => false,
             })
-    })
+    });
+    if has_typed_context_signal {
+        return true;
+    }
+
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<OpenAiError>()
+            .is_some_and(|error| matches!(error, OpenAiError::InvalidStatusCode(400)))
+    }) && error_chain_has_context_window_error_body(error)
 }
 
 fn should_retry(error: &anyhow::Error) -> bool {
@@ -54,6 +63,44 @@ fn should_retry(error: &anyhow::Error) -> bool {
             Error::Retryable(source) => !is_provider_context_window_error(source),
             _ => false,
         })
+}
+
+fn error_chain_has_context_window_error_body(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let text = cause.to_string();
+        parse_error_response_from_text(&text)
+            .is_some_and(|response| error_response_has_strict_context_length_exceeded(&response))
+    })
+}
+
+fn parse_error_response_from_text(text: &str) -> Option<ErrorResponse> {
+    serde_json::from_str::<ErrorResponse>(text)
+        .ok()
+        .or_else(|| json_object_slice(text).and_then(|json| serde_json::from_str(json).ok()))
+}
+
+fn json_object_slice(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    (start < end).then_some(&text[start..=end])
+}
+
+fn error_response_has_strict_context_length_exceeded(error: &ErrorResponse) -> bool {
+    let code_matches = error
+        .code
+        .as_ref()
+        .and_then(ErrorCode::as_str)
+        .is_some_and(|text| text.eq_ignore_ascii_case("context_length_exceeded"));
+    let message_matches = error
+        .message
+        .as_deref()
+        .is_some_and(text_has_context_length_exceeded_signal);
+    let nested_matches = error
+        .error
+        .as_deref()
+        .is_some_and(error_response_has_strict_context_length_exceeded);
+
+    code_matches || message_matches || nested_matches
 }
 
 fn error_response_has_context_window_signal(error: &ErrorResponse) -> bool {
@@ -74,12 +121,15 @@ fn error_response_has_context_window_signal(error: &ErrorResponse) -> bool {
     code_matches || message_matches || nested_matches
 }
 
-fn text_has_context_window_signal(text: &str) -> bool {
+fn text_has_context_length_exceeded_signal(text: &str) -> bool {
     let normalized = text.to_lowercase();
     normalized.contains("context_length_exceeded")
         || normalized.contains("maximum context length")
-        || normalized.contains("context window")
         || normalized.contains("context length") && normalized.contains("exceed")
+}
+
+fn text_has_context_window_signal(text: &str) -> bool {
+    text_has_context_length_exceeded_signal(text) || text.to_lowercase().contains("context window")
 }
 
 #[cfg(test)]
@@ -88,6 +138,68 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn test_provider_context_window_error_detects_invalid_status_code_with_openai_body() {
+        let body = serde_json::json!({
+            "error": {
+                "message": "This model's maximum context length was exceeded.",
+                "code": "context_length_exceeded"
+            }
+        })
+        .to_string();
+        let fixture = anyhow::Error::from(OpenAiError::InvalidStatusCode(400)).context(body);
+
+        let actual = is_provider_context_window_error(&fixture);
+        let expected = true;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_provider_context_window_error_rejects_generic_invalid_status_code() {
+        let body = serde_json::json!({
+            "error": {
+                "message": "Generic invalid request",
+                "code": 400
+            }
+        })
+        .to_string();
+        let fixture = anyhow::Error::from(OpenAiError::InvalidStatusCode(400)).context(body);
+
+        let actual = is_provider_context_window_error(&fixture);
+        let expected = false;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_provider_context_window_error_rejects_non_json_invalid_status_context() {
+        let fixture = anyhow::Error::from(OpenAiError::InvalidStatusCode(400))
+            .context("requested context window tier quota exceeded for current plan");
+
+        let actual = is_provider_context_window_error(&fixture);
+        let expected = false;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_provider_context_window_error_rejects_context_window_quota_json_body() {
+        let body = serde_json::json!({
+            "error": {
+                "message": "requested context window tier quota exceeded for current plan",
+                "code": "quota_exceeded"
+            }
+        })
+        .to_string();
+        let fixture = anyhow::Error::from(OpenAiError::InvalidStatusCode(400)).context(body);
+
+        let actual = is_provider_context_window_error(&fixture);
+        let expected = false;
+
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn test_should_retry_rejects_retryable_provider_context_window_error() {

@@ -199,6 +199,17 @@ mod tests {
     }
 
     #[test]
+    fn test_effective_input_budget_caps_266k_window_with_120k_output_reservation() {
+        let fixture = ContextWindowBudget::new(266_300, 120_000);
+
+        let actual = fixture.effective_input_budget();
+        let expected = Some(113_532);
+
+        assert_eq!(actual, expected);
+        assert!(actual.expect("budget should fit") < 250_000);
+    }
+
+    #[test]
     fn test_context_window_budget_safety_margin_is_capped_for_large_windows() {
         let fixture = 266_300;
 

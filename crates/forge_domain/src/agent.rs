@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use strum_macros::{Display as StrumDisplay, EnumString};
 
 use crate::{
-    Compact, Error, EventContext, MaxTokens, Model, ModelId, ProviderId, Result, SystemContext,
-    Temperature, Template, ToolDefinition, ToolName, TopK, TopP,
+    Compact, ContextWindowBudget, Error, EventContext, MaxTokens, Model, ModelId, ProviderId,
+    Result, SystemContext, Temperature, Template, ToolDefinition, ToolName, TopK, TopP,
 };
 
 // Unique identifier for an agent
@@ -242,16 +242,21 @@ impl Agent {
 
     /// Applies the effective `token_threshold` for automatic compaction.
     ///
-    /// Explicit `compact.token_threshold` values are treated as absolute user
-    /// thresholds unless `compact.token_threshold_percentage` is also set. When
-    /// both are set and the model's `context_length` is known, the lower value
-    /// wins. When the absolute threshold is absent, Forge derives a default from
-    /// the model context window using the configured percentage, or 70% when no
-    /// percentage is configured.
+    /// Explicit `compact.token_threshold` values are capped by the selected
+    /// model's effective input budget when the model context window is known.
+    /// The effective budget reserves the configured output tokens plus the
+    /// same conservative provider safety margin used by preflight, so an
+    /// oversized absolute threshold cannot delay compaction until provider
+    /// dispatch is already unsafe. When `compact.token_threshold_percentage` is
+    /// configured, it also participates as a percentage-derived cap and the
+    /// lowest available threshold wins. When the absolute threshold is absent,
+    /// Forge derives a default from the model context window using the
+    /// configured percentage, or 70% when no percentage is configured, then
+    /// applies the effective-input-budget cap.
     ///
-    /// When the model's `context_length` is unknown, no percentage-derived cap
-    /// can be computed, so the explicit threshold or the default threshold is
-    /// used as-is.
+    /// When the model's `context_length` is unknown, no context-window cap can
+    /// be computed, so the explicit threshold or the default threshold is used
+    /// as-is.
     ///
     /// # Arguments
     /// * `selected_model` - The model that will be used for this agent
@@ -267,6 +272,14 @@ impl Agent {
         let known_context_window = selected_model
             .and_then(|model| model.context_length)
             .and_then(|cl| usize::try_from(cl).ok());
+
+        let output_reservation = self
+            .max_tokens
+            .map(|max_tokens| max_tokens.value() as usize)
+            .unwrap_or(ContextWindowBudget::DEFAULT_OUTPUT_TOKEN_RESERVATION);
+        let effective_input_budget = known_context_window.and_then(|context_window| {
+            ContextWindowBudget::new(context_window, output_reservation).effective_input_budget()
+        });
 
         let percentage_threshold = known_context_window.and_then(|context_window| {
             self.compact
@@ -285,16 +298,21 @@ impl Agent {
                 .unwrap_or(DEFAULT_TOKEN_THRESHOLD)
         };
 
-        let final_threshold = match (configured_threshold, percentage_threshold) {
-            (Some(threshold), Some(context_window_threshold)) => {
-                threshold.min(context_window_threshold)
-            }
-            (Some(threshold), None) => threshold,
-            (None, Some(context_window_threshold)) => {
-                DEFAULT_TOKEN_THRESHOLD.min(context_window_threshold)
-            }
-            (None, None) => default_threshold(),
-        };
+        let mut candidates = Vec::new();
+        match configured_threshold {
+            Some(threshold) => candidates.push(threshold),
+            None => candidates.push(default_threshold()),
+        }
+        if let Some(percentage_threshold) = percentage_threshold {
+            candidates.push(percentage_threshold);
+        }
+        if let Some(effective_input_budget) = effective_input_budget {
+            candidates.push(effective_input_budget);
+        }
+        let final_threshold = candidates
+            .into_iter()
+            .min()
+            .expect("at least one compaction threshold candidate should exist");
 
         self.compact.token_threshold = Some(final_threshold);
 
@@ -366,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compaction_threshold_preserves_explicit_threshold_without_percentage() {
+    fn test_compaction_threshold_caps_explicit_threshold_without_percentage() {
         let fixture = Agent::new(
             AgentId::new("test"),
             ProviderId::OPENAI,
@@ -377,7 +395,7 @@ mod tests {
         let selected_model = model_fixture("selected-model", Some(80_000));
 
         let actual = fixture.compaction_threshold(Some(&selected_model));
-        let expected = Some(100_000);
+        let expected = Some(59_904);
 
         assert_eq!(actual.compact.token_threshold, expected);
     }
@@ -394,9 +412,8 @@ mod tests {
         let selected_model = model_fixture("selected-model", Some(80_000));
 
         let actual = fixture.compaction_threshold(Some(&selected_model));
-        // The explicit threshold is preserved because no explicit
-        // token_threshold_percentage was configured.
-        let expected = Some(60_000);
+        // The explicit threshold is capped to the effective input budget.
+        let expected = Some(59_904);
 
         assert_eq!(actual.compact.token_threshold, expected);
     }
@@ -474,17 +491,18 @@ mod tests {
     }
 
     #[test]
-    fn test_compaction_threshold_preserves_antigravity_250k_threshold_for_266k_window() {
+    fn test_compaction_threshold_caps_antigravity_250k_threshold_by_effective_input_budget() {
         let fixture = Agent::new(
             AgentId::new("test"),
             ProviderId::OPENAI,
             ModelId::new("gpt-5.5"),
         )
+        .max_tokens(MaxTokens::new(100_000).unwrap())
         .compact(Compact::new().token_threshold(250_000_usize));
         let selected_model = model_fixture("gpt-5.5", Some(266_300));
 
         let actual = fixture.compaction_threshold(Some(&selected_model));
-        let expected = Some(250_000);
+        let expected = Some(133_532);
 
         assert_eq!(actual.compact.token_threshold, expected);
     }
@@ -512,12 +530,12 @@ mod tests {
         assert_eq!(actual.compact.token_threshold, expected_threshold);
     }
 
-    /// Explicit token_threshold is preserved for models with shorter context
-    /// windows. Provider preflight owns final request-size safety, while
-    /// compaction respects the user's absolute threshold unless an explicit
-    /// percentage cap is configured.
+    /// Explicit token_threshold is capped by the effective input budget for
+    /// known model windows. Provider preflight remains the final request-size
+    /// guard, while automatic compaction now starts before the configured
+    /// threshold can exceed the safe prompt budget.
     #[test]
-    fn test_compaction_threshold_preserves_explicit_threshold_for_codex_spark() {
+    fn test_compaction_threshold_caps_explicit_threshold_for_codex_spark() {
         let fixture = Agent::new(
             AgentId::new("test"),
             ProviderId::OPENAI,
@@ -528,7 +546,7 @@ mod tests {
         let selected_model = model_fixture("gpt-5.3-codex-spark", Some(128_000));
 
         let actual = fixture.compaction_threshold(Some(&selected_model));
-        let expected = Some(100_000);
+        let expected = Some(98_304);
 
         assert_eq!(actual.compact.token_threshold, expected);
     }

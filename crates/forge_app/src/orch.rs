@@ -1802,6 +1802,8 @@ mod tests {
 
     enum ProviderFailureKind {
         ContextWindow,
+        InvalidStatusContextWindow,
+        InvalidStatusGenericBadRequest,
         GenericBadRequest,
         TokenQuotaExceeded,
     }
@@ -1843,6 +1845,26 @@ mod tests {
                         .code(ErrorCode::String("context_length_exceeded".to_string()))
                         .message("This model's maximum context length was exceeded".to_string()),
                 )),
+                ProviderFailureKind::InvalidStatusContextWindow => {
+                    let body = serde_json::json!({
+                        "error": {
+                            "message": "This model's maximum context length was exceeded.",
+                            "code": "context_length_exceeded"
+                        }
+                    })
+                    .to_string();
+                    anyhow::Error::from(OpenAiError::InvalidStatusCode(400)).context(body)
+                }
+                ProviderFailureKind::InvalidStatusGenericBadRequest => {
+                    let body = serde_json::json!({
+                        "error": {
+                            "message": "Generic invalid request",
+                            "code": 400
+                        }
+                    })
+                    .to_string();
+                    anyhow::Error::from(OpenAiError::InvalidStatusCode(400)).context(body)
+                }
                 ProviderFailureKind::GenericBadRequest => {
                     anyhow::Error::from(OpenAiError::Response(
                         ErrorResponse::default()
@@ -2906,6 +2928,52 @@ mod tests {
             recovered_context.token_count_approx(),
             second_request.token_count_approx()
         );
+    }
+
+    #[tokio::test]
+    async fn test_run_recovers_once_after_invalid_status_context_length_exceeded() {
+        let services =
+            ProviderRecoveryFixtureServices::new(ProviderFailureKind::InvalidStatusContextWindow);
+        let setup = Context::default()
+            .add_message(ContextMessage::system("system prompt"))
+            .add_message(droppable_user_message(large_text(20_000)))
+            .add_message(ContextMessage::user("fresh user request", None))
+            .max_tokens(512_usize);
+        let mut fixture = provider_recovery_orchestrator_fixture(services.clone(), setup);
+
+        fixture.run().await.unwrap();
+
+        let requested_contexts = services.requested_contexts().await;
+        let first_request = requested_contexts
+            .first()
+            .expect("first provider attempt should be recorded");
+        let second_request = requested_contexts
+            .get(1)
+            .expect("context-window recovery should retry provider once");
+        let expected = 2;
+
+        assert_eq!(requested_contexts.len(), expected);
+        assert!(second_request.token_count_approx() < first_request.token_count_approx());
+    }
+
+    #[tokio::test]
+    async fn test_run_does_not_recover_generic_invalid_status_bad_request() {
+        let services = ProviderRecoveryFixtureServices::new(
+            ProviderFailureKind::InvalidStatusGenericBadRequest,
+        );
+        let setup = Context::default()
+            .add_message(ContextMessage::system("system prompt"))
+            .add_message(droppable_user_message(large_text(20_000)))
+            .add_message(ContextMessage::user("fresh user request", None))
+            .max_tokens(512_usize);
+        let mut fixture = provider_recovery_orchestrator_fixture(services.clone(), setup);
+
+        let actual = fixture.run().await.unwrap_err().to_string();
+        let requested_contexts = services.requested_contexts().await;
+        let expected = 1;
+
+        assert_eq!(requested_contexts.len(), expected);
+        assert!(actual.contains("Generic invalid request"));
     }
 
     #[tokio::test]
