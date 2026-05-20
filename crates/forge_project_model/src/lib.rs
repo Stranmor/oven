@@ -20,8 +20,11 @@ mod util;
 mod vector;
 
 pub use context_adapter::{
-    ProjectModelContextRenderRoot, ProjectModelSourceNode, evidence_line_range,
-    render_source_from_evidence, render_sources_from_context_pack, render_sources_from_nodes,
+    EvidenceReplayPreviewError, ProjectModelContextRenderRoot, ProjectModelSourceNode,
+    evidence_line_range, redaction_safe_issue_path_label, redaction_safe_provenance_source_label,
+    redaction_safe_replay_path_label, render_source_from_evidence,
+    render_sources_from_context_pack, render_sources_from_evidence_replay,
+    render_sources_from_nodes,
 };
 pub use durable_vector_index::{
     DURABLE_VECTOR_INDEX_VERSION, DurableVectorIndex, VectorIndexArtifact, VectorIndexArtifactId,

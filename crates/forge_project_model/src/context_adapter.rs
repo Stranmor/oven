@@ -1,10 +1,40 @@
 //! Typed adapters for project-model context rendering and pack evidence.
 
+use std::path::{Component, Path};
+
+use crate::evidence_replay::{EvidenceLedgerReplayReport, EvidenceReplayIssueCode};
 use crate::render::ProjectModelContextSource;
 use crate::types::{
     ContextPack, ContextPackEvidence, EvidenceFreshness, ProjectManifest, ShardManifest,
     SourceFile, SymbolNode,
 };
+
+const EVIDENCE_REPLAY_METADATA_ONLY_REASON: &str = "evidence_replay_reference_only";
+
+/// Typed refusal returned by evidence-replay preview rendering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EvidenceReplayPreviewError {
+    /// Replay report was produced for a different manifest hash than the current manifest.
+    ManifestHashMismatch {
+        /// Current manifest hash supplied by the manifest.
+        manifest_hash: String,
+        /// Manifest hash recorded by the replay report.
+        report_manifest_hash: String,
+    },
+}
+
+impl std::fmt::Display for EvidenceReplayPreviewError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ManifestHashMismatch { manifest_hash, report_manifest_hash } => write!(
+                formatter,
+                "evidence replay manifest hash mismatch: manifest={manifest_hash}, report={report_manifest_hash}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EvidenceReplayPreviewError {}
 
 /// Typed render root metadata for a project-model context payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -178,6 +208,128 @@ pub fn render_sources_from_nodes(
         .collect()
 }
 
+/// Converts a narrowed evidence-ledger replay report into metadata-only render sources.
+///
+/// This adapter is intentionally read-only and never exposes source content or
+/// tool payloads. It only reflects selected fresh/additional references that are
+/// bound to the current manifest and safe relative paths.
+///
+/// # Arguments
+///
+/// * `manifest` - Current project manifest used for hash and path validation.
+/// * `report` - Read-only evidence-ledger replay report to preview.
+///
+/// # Errors
+///
+/// Returns a typed refusal when the replay report does not match the current
+/// manifest hash.
+pub fn render_sources_from_evidence_replay(
+    manifest: &ProjectManifest,
+    report: &EvidenceLedgerReplayReport,
+) -> Result<Vec<ProjectModelContextSource>, EvidenceReplayPreviewError> {
+    if manifest.manifest_hash != report.manifest_hash {
+        return Err(EvidenceReplayPreviewError::ManifestHashMismatch {
+            manifest_hash: manifest.manifest_hash.clone(),
+            report_manifest_hash: report.manifest_hash.clone(),
+        });
+    }
+
+    Ok(report
+        .selected
+        .iter()
+        .filter(|reference| evidence_replay_reference_is_allowed(&reference.freshness))
+        .filter_map(|reference| {
+            let target = resolve_manifest_evidence_target(manifest, &reference.evidence_id)?;
+            if !path_is_safe_relative_label(&reference.evidence_path)
+                || reference.evidence_path != target.path
+            {
+                return None;
+            }
+            let mut source = ProjectModelContextSource::new(
+                target.path,
+                evidence_freshness_label(&reference.freshness),
+                redaction_safe_provenance_source_label(&reference.provenance.source),
+                reference.evidence_id.clone(),
+            )
+            .score(Some(reference.score))
+            .content_hash(target.content_hash)
+            .metadata_only(EVIDENCE_REPLAY_METADATA_ONLY_REASON);
+            if let Some((start_line, end_line)) = target.line_range {
+                source = source.line_range(start_line, end_line);
+            }
+            Some(source)
+        })
+        .collect())
+}
+
+/// Returns a redaction-safe label for replay diagnostic paths.
+///
+/// # Arguments
+///
+/// * `path` - Candidate path or storage label to sanitize.
+pub fn redaction_safe_replay_path_label(path: &str) -> String {
+    if path == "tool_episodes.jsonl" {
+        return path.to_string();
+    }
+    if path
+        .strip_prefix("context_packs/")
+        .and_then(|value| value.strip_suffix(".json"))
+        .is_some_and(|id| id.len() == 64 && id.chars().all(|ch| ch.is_ascii_hexdigit()))
+    {
+        return path.to_string();
+    }
+    if path_is_safe_relative_label(path) {
+        return path.to_string();
+    }
+    "redacted_path".to_string()
+}
+
+/// Returns a redaction-safe issue-path label for replay diagnostics.
+///
+/// # Arguments
+///
+/// * `code` - Issue code that determines whether tool-episode provenance must be hidden.
+/// * `path` - Optional path or storage label to sanitize.
+pub fn redaction_safe_issue_path_label(
+    code: &EvidenceReplayIssueCode,
+    path: Option<&str>,
+) -> Option<String> {
+    if matches!(
+        code,
+        EvidenceReplayIssueCode::CorruptEpisode
+            | EvidenceReplayIssueCode::Duplicate
+            | EvidenceReplayIssueCode::UnlinkedEpisode
+            | EvidenceReplayIssueCode::DanglingEpisodeLink
+    ) {
+        return Some("tool_episode_provenance".to_string());
+    }
+    path.map(redaction_safe_replay_path_label)
+}
+
+/// Returns a stable redaction-safe provenance source label.
+///
+/// # Arguments
+///
+/// * `source` - Raw provenance source label to classify.
+pub fn redaction_safe_provenance_source_label(source: &str) -> String {
+    match source {
+        "WorkspaceService::query_workspace" => "workspace_service_query".to_string(),
+        "build-dependencies" => "cargo_build_dependencies".to_string(),
+        "dependencies" => "cargo_dependencies".to_string(),
+        "dev-dependencies" => "cargo_dev_dependencies".to_string(),
+        "extern crate" => "rust_extern_crate".to_string(),
+        "file-tree" => "file_tree".to_string(),
+        "indexer" => "project_indexer".to_string(),
+        "mod" => "rust_module".to_string(),
+        "rust-ast" => "rust_ast".to_string(),
+        source if source.starts_with("cargo_metadata:") => "cargo_metadata".to_string(),
+        source if source.starts_with("call_graph:") => "rust_call_graph".to_string(),
+        source if source.starts_with("dependency:") => "rust_dependency".to_string(),
+        source if source.starts_with("external_fact:") => "external_fact".to_string(),
+        _ => "redacted_provenance_source".to_string(),
+    }
+}
+
 /// Converts a context pack into render sources using manifest metadata when
 /// available.
 ///
@@ -249,11 +401,83 @@ pub fn evidence_line_range(manifest: &ProjectManifest, evidence_id: &str) -> Opt
         })
 }
 
+fn evidence_replay_reference_is_allowed(freshness: &EvidenceFreshness) -> bool {
+    matches!(
+        freshness,
+        EvidenceFreshness::Fresh | EvidenceFreshness::Added
+    )
+}
+
+struct ManifestEvidenceTarget {
+    path: String,
+    line_range: Option<(u32, u32)>,
+    content_hash: String,
+}
+
+fn resolve_manifest_evidence_target(
+    manifest: &ProjectManifest,
+    evidence_id: &str,
+) -> Option<ManifestEvidenceTarget> {
+    if let Some(symbol) = manifest
+        .symbols
+        .iter()
+        .find(|symbol| symbol.id == evidence_id)
+    {
+        let file = manifest
+            .files
+            .iter()
+            .find(|file| file.path == symbol.path)?;
+        return Some(ManifestEvidenceTarget {
+            path: symbol.path.clone(),
+            line_range: Some(symbol_line_range(symbol)),
+            content_hash: file.content_hash.clone(),
+        });
+    }
+    if let Some(shard) = manifest.shards.iter().find(|shard| shard.id == evidence_id) {
+        return Some(ManifestEvidenceTarget {
+            path: shard.path.clone(),
+            line_range: Some(shard_line_range(shard)),
+            content_hash: shard.content_hash.clone(),
+        });
+    }
+    manifest
+        .files
+        .iter()
+        .find(|file| file.path == evidence_id)
+        .map(|file| ManifestEvidenceTarget {
+            path: file.path.clone(),
+            line_range: Some(file_line_range(file)),
+            content_hash: file.content_hash.clone(),
+        })
+}
+
+fn path_is_safe_relative_label(path: &str) -> bool {
+    if path.is_empty() || Path::new(path).is_absolute() {
+        return false;
+    }
+    path.chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-'))
+        && Path::new(path)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
 fn evidence_content_hash(
     manifest: &ProjectManifest,
     evidence_id: &str,
     evidence_path: &str,
 ) -> Option<String> {
+    if let Some(symbol) = manifest
+        .symbols
+        .iter()
+        .find(|symbol| symbol.id == evidence_id)
+    {
+        return manifest
+            .files
+            .iter()
+            .find(|file| file.path == symbol.path)
+            .map(|file| file.content_hash.clone());
+    }
     manifest
         .shards
         .iter()
@@ -291,11 +515,332 @@ fn evidence_freshness_label(freshness: &EvidenceFreshness) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use pretty_assertions::assert_eq;
 
     use super::*;
+    use crate::evidence_replay::{
+        EvidenceLedgerReplayReport, EvidenceReplayBudget, EvidenceReplayBudgetReport,
+        EvidenceReplayContentPolicy, EvidenceReplayFreshnessPolicy, EvidenceReplayReference,
+        EvidenceReplayScoreKind, EvidenceReplayStalePolicyReport,
+    };
     use crate::indexer::tests::fixture_project;
     use crate::{ContextPackSelection, FreshnessState, ProjectIndexer, RetrievalQuery, retrieve};
+
+    fn fixture_replay_manifest() -> ProjectManifest {
+        ProjectManifest {
+            version: 1,
+            root: "/workspace".into(),
+            files: vec![SourceFile {
+                path: "src/lib.rs".to_string(),
+                language: crate::Language::Rust,
+                bytes: 128,
+                lines: 12,
+                content_hash: "file-hash".to_string(),
+                provenance: fixture_provenance("indexer"),
+            }],
+            symbols: vec![SymbolNode {
+                id: "symbol:root".to_string(),
+                name: "Root".to_string(),
+                kind: crate::SymbolKind::Struct,
+                path: "src/lib.rs".to_string(),
+                parent: None,
+                start_line: 3,
+                end_line: 7,
+                provenance: fixture_provenance("rust-ast"),
+            }],
+            shards: vec![ShardManifest {
+                id: "shard:src/lib.rs:1-12".to_string(),
+                path: "src/lib.rs".to_string(),
+                start_line: 1,
+                end_line: 12,
+                content_hash: "shard-hash".to_string(),
+                symbol_ids: vec!["symbol:root".to_string()],
+                provenance: fixture_provenance("indexer"),
+            }],
+            manifest_hash: "manifest-hash".to_string(),
+            ..ProjectManifest::default()
+        }
+    }
+
+    fn fixture_provenance(source: &str) -> crate::Provenance {
+        crate::Provenance {
+            path: "src/lib.rs".to_string(),
+            start_line: Some(1),
+            end_line: Some(1),
+            source: source.to_string(),
+            fingerprint: "fingerprint".to_string(),
+        }
+    }
+
+    fn fixture_replay_reference(
+        evidence_id: impl Into<String>,
+        evidence_path: impl Into<String>,
+        freshness: EvidenceFreshness,
+        provenance_source: impl Into<String>,
+    ) -> EvidenceReplayReference {
+        EvidenceReplayReference {
+            artifact_id: "artifact".to_string(),
+            artifact_path: "context_packs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json".to_string(),
+            evidence_id: evidence_id.into(),
+            evidence_path: evidence_path.into(),
+            start_line: Some(3),
+            end_line: Some(7),
+            score_kind: EvidenceReplayScoreKind::RetrievalResult,
+            score: 0.875,
+            provenance: crate::Provenance {
+                source: provenance_source.into(),
+                ..fixture_provenance("indexer")
+            },
+            freshness,
+            linked_episode_count: 1,
+            link_issue_count: 0,
+        }
+    }
+
+    fn fixture_replay_report(
+        manifest_hash: impl Into<String>,
+        selected: Vec<EvidenceReplayReference>,
+    ) -> EvidenceLedgerReplayReport {
+        let selected_count = selected.len();
+        EvidenceLedgerReplayReport {
+            manifest_hash: manifest_hash.into(),
+            content_policy: EvidenceReplayContentPolicy::ReferenceOnly,
+            stale_policy: EvidenceReplayStalePolicyReport {
+                policy: EvidenceReplayFreshnessPolicy::ExcludeChangedAndDeleted,
+                changed_excluded: 2,
+                deleted_excluded: 1,
+            },
+            selected,
+            issues: Vec::new(),
+            budget: EvidenceReplayBudgetReport {
+                original_candidate_count: selected_count,
+                selected_count,
+                excluded_count: 3,
+                excluded_by_reason: BTreeMap::new(),
+                truncated: false,
+                budget: EvidenceReplayBudget::default(),
+                stable_ordering: "fixture".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn evidence_replay_adapter_converts_fresh_reference_to_metadata_only_source() {
+        let setup = fixture_replay_manifest();
+        let report = fixture_replay_report(
+            setup.manifest_hash.clone(),
+            vec![fixture_replay_reference(
+                "symbol:root",
+                "src/lib.rs",
+                EvidenceFreshness::Fresh,
+                "WorkspaceService::query_workspace",
+            )],
+        );
+
+        let actual = render_sources_from_evidence_replay(&setup, &report).unwrap();
+        let actual = actual.first().expect("fixture should render one source");
+        let expected = (
+            "src/lib.rs".to_string(),
+            None,
+            Some("evidence_replay_reference_only".to_string()),
+            "workspace_service_query".to_string(),
+            Some(3),
+            Some(7),
+            Some(0.875),
+            "fresh".to_string(),
+            "symbol:root".to_string(),
+            Some("file-hash".to_string()),
+        );
+
+        assert_eq!(
+            (
+                actual.path.clone(),
+                actual.content.clone(),
+                actual.metadata_only_reason.clone(),
+                actual.provenance.clone(),
+                actual.start_line,
+                actual.end_line,
+                actual.score,
+                actual.freshness.clone(),
+                actual.node_id.clone(),
+                actual.content_hash.clone(),
+            ),
+            expected,
+        );
+    }
+
+    #[test]
+    fn evidence_replay_adapter_refuses_manifest_hash_mismatch_without_sources() {
+        let setup = fixture_replay_manifest();
+        let report = fixture_replay_report(
+            "different-hash",
+            vec![fixture_replay_reference(
+                "symbol:root",
+                "src/lib.rs",
+                EvidenceFreshness::Fresh,
+                "indexer",
+            )],
+        );
+
+        let actual = render_sources_from_evidence_replay(&setup, &report);
+        let expected = Err(EvidenceReplayPreviewError::ManifestHashMismatch {
+            manifest_hash: "manifest-hash".to_string(),
+            report_manifest_hash: "different-hash".to_string(),
+        });
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn evidence_replay_adapter_redacts_unknown_raw_provenance_source() {
+        let setup = fixture_replay_manifest();
+        let report = fixture_replay_report(
+            setup.manifest_hash.clone(),
+            vec![fixture_replay_reference(
+                "symbol:root",
+                "src/lib.rs",
+                EvidenceFreshness::Fresh,
+                "https://secret.example/raw/source",
+            )],
+        );
+
+        let actual = render_sources_from_evidence_replay(&setup, &report).unwrap();
+        let expected = Some("redacted_provenance_source".to_string());
+
+        assert_eq!(
+            actual.first().map(|source| source.provenance.clone()),
+            expected
+        );
+    }
+
+    #[test]
+    fn evidence_replay_adapter_skips_absolute_traversal_unmanifested_and_stale_paths() {
+        let setup = fixture_replay_manifest();
+        let report = fixture_replay_report(
+            setup.manifest_hash.clone(),
+            vec![
+                fixture_replay_reference(
+                    "absolute",
+                    "/tmp/secret.rs",
+                    EvidenceFreshness::Fresh,
+                    "indexer",
+                ),
+                fixture_replay_reference(
+                    "traversal",
+                    "../secret.rs",
+                    EvidenceFreshness::Fresh,
+                    "indexer",
+                ),
+                fixture_replay_reference(
+                    "unmanifested",
+                    "src/unknown.rs",
+                    EvidenceFreshness::Fresh,
+                    "indexer",
+                ),
+                fixture_replay_reference(
+                    "changed",
+                    "src/lib.rs",
+                    EvidenceFreshness::Changed,
+                    "indexer",
+                ),
+                fixture_replay_reference(
+                    "deleted",
+                    "src/lib.rs",
+                    EvidenceFreshness::Deleted,
+                    "indexer",
+                ),
+                fixture_replay_reference(
+                    "symbol:root",
+                    "src/lib.rs",
+                    EvidenceFreshness::Added,
+                    "indexer",
+                ),
+            ],
+        );
+
+        let actual = render_sources_from_evidence_replay(&setup, &report).unwrap();
+        let expected = vec!["src/lib.rs".to_string()];
+
+        assert_eq!(
+            actual
+                .into_iter()
+                .map(|source| source.path)
+                .collect::<Vec<_>>(),
+            expected,
+        );
+    }
+
+    #[test]
+    fn evidence_replay_adapter_rejects_reference_when_evidence_id_path_mismatches_manifest_path() {
+        let mut setup = fixture_replay_manifest();
+        setup.files.push(SourceFile {
+            path: "src/other.rs".to_string(),
+            language: crate::Language::Rust,
+            bytes: 64,
+            lines: 4,
+            content_hash: "other-file-hash".to_string(),
+            provenance: fixture_provenance("indexer"),
+        });
+        let report = fixture_replay_report(
+            setup.manifest_hash.clone(),
+            vec![fixture_replay_reference(
+                "symbol:root",
+                "src/other.rs",
+                EvidenceFreshness::Fresh,
+                "indexer",
+            )],
+        );
+
+        let actual = render_sources_from_evidence_replay(&setup, &report).unwrap();
+        let expected = Vec::<ProjectModelContextSource>::new();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn evidence_replay_adapter_never_includes_source_content_or_tool_payload() {
+        let setup = fixture_replay_manifest();
+        let report = fixture_replay_report(
+            setup.manifest_hash.clone(),
+            vec![fixture_replay_reference(
+                "shard:src/lib.rs:1-12",
+                "src/lib.rs",
+                EvidenceFreshness::Fresh,
+                "indexer",
+            )],
+        );
+
+        let actual = render_sources_from_evidence_replay(&setup, &report).unwrap();
+        let expected = Some((None, Some("evidence_replay_reference_only".to_string())));
+
+        assert_eq!(
+            actual
+                .first()
+                .map(|source| (source.content.clone(), source.metadata_only_reason.clone())),
+            expected,
+        );
+    }
+
+    #[test]
+    fn evidence_replay_adapter_is_pure_and_does_not_mutate_fixture_manifest_or_report() {
+        let setup = fixture_replay_manifest();
+        let report = fixture_replay_report(
+            setup.manifest_hash.clone(),
+            vec![fixture_replay_reference(
+                "symbol:root",
+                "src/lib.rs",
+                EvidenceFreshness::Fresh,
+                "indexer",
+            )],
+        );
+        let expected = (setup.clone(), report.clone());
+
+        let _actual = render_sources_from_evidence_replay(&setup, &report).unwrap();
+
+        assert_eq!((setup, report), expected);
+    }
 
     #[test]
     fn converts_source_node_to_metadata_only_file_render_source() {

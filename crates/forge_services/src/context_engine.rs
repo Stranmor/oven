@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -29,7 +29,9 @@ use forge_project_model::{
     RustAnalyzerCapabilityStatus, RustAnalyzerProbe, StaleEvidencePolicy, StdRustAnalyzerProcess,
     ToolEpisode, derive_native_lsp_reference_request, evidence_line_range, fingerprint,
     load_evidence_ledger_activation, local_project_model_dir, local_project_model_manifest,
-    read_exact_fact_status, retrieve, select_evidence_ledger_replay,
+    read_exact_fact_status, redaction_safe_issue_path_label,
+    redaction_safe_provenance_source_label, redaction_safe_replay_path_label, retrieve,
+    select_evidence_ledger_replay,
 };
 use forge_stream::MpscStream;
 use futures::future::join_all;
@@ -243,69 +245,6 @@ fn workspace_evidence_replay_reference(
         freshness: evidence_freshness_label(&reference.freshness),
         linked_episode_count: reference.linked_episode_count,
         link_issue_count: reference.link_issue_count,
-    }
-}
-
-fn redaction_safe_issue_path_label(
-    code: &EvidenceReplayIssueCode,
-    path: Option<&str>,
-) -> Option<String> {
-    if matches!(
-        code,
-        EvidenceReplayIssueCode::CorruptEpisode
-            | EvidenceReplayIssueCode::Duplicate
-            | EvidenceReplayIssueCode::UnlinkedEpisode
-            | EvidenceReplayIssueCode::DanglingEpisodeLink
-    ) {
-        return Some("tool_episode_provenance".to_string());
-    }
-    path.map(redaction_safe_replay_path_label)
-}
-
-fn redaction_safe_replay_path_label(path: &str) -> String {
-    if path == "tool_episodes.jsonl" {
-        return path.to_string();
-    }
-    if path
-        .strip_prefix("context_packs/")
-        .and_then(|value| value.strip_suffix(".json"))
-        .is_some_and(|id| id.len() == 64 && id.chars().all(|ch| ch.is_ascii_hexdigit()))
-    {
-        return path.to_string();
-    }
-    if path_is_safe_relative_label(path) {
-        return path.to_string();
-    }
-    "redacted_path".to_string()
-}
-
-fn path_is_safe_relative_label(path: &str) -> bool {
-    if path.is_empty() || Path::new(path).is_absolute() {
-        return false;
-    }
-    path.chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-'))
-        && Path::new(path)
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
-}
-
-fn redaction_safe_provenance_source_label(source: &str) -> String {
-    match source {
-        "WorkspaceService::query_workspace" => "workspace_service_query".to_string(),
-        "build-dependencies" => "cargo_build_dependencies".to_string(),
-        "dependencies" => "cargo_dependencies".to_string(),
-        "dev-dependencies" => "cargo_dev_dependencies".to_string(),
-        "extern crate" => "rust_extern_crate".to_string(),
-        "file-tree" => "file_tree".to_string(),
-        "indexer" => "project_indexer".to_string(),
-        "mod" => "rust_module".to_string(),
-        "rust-ast" => "rust_ast".to_string(),
-        source if source.starts_with("cargo_metadata:") => "cargo_metadata".to_string(),
-        source if source.starts_with("call_graph:") => "rust_call_graph".to_string(),
-        source if source.starts_with("dependency:") => "rust_dependency".to_string(),
-        source if source.starts_with("external_fact:") => "external_fact".to_string(),
-        _ => "redacted_provenance_source".to_string(),
     }
 }
 
