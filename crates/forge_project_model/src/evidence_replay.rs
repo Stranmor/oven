@@ -565,7 +565,7 @@ fn list_artifact_candidates(
 
 #[derive(Default)]
 struct EpisodeLinks {
-    by_artifact_id: BTreeMap<String, Vec<String>>,
+    by_artifact_id: BTreeMap<String, BTreeSet<String>>,
     invalid_link_count_by_artifact_id: BTreeMap<String, usize>,
     truncated: bool,
 }
@@ -636,11 +636,18 @@ fn read_episode_links(
             );
             continue;
         };
-        links
-            .by_artifact_id
-            .entry(artifact_id.as_str().to_string())
-            .or_default()
-            .push(episode_fingerprint);
+        let artifact_id = artifact_id.as_str().to_string();
+        let fingerprints = links.by_artifact_id.entry(artifact_id.clone()).or_default();
+        if !fingerprints.insert(episode_fingerprint.clone()) {
+            builder.push_issue(
+                EvidenceReplayIssueCode::Duplicate,
+                Some(artifact_id.as_str()),
+                None,
+                Some(episode_fingerprint.as_str()),
+                Some(episode.provenance.path.as_str()),
+            );
+            continue;
+        }
     }
     links
 }
@@ -671,7 +678,7 @@ impl PackReferenceCollector<'_, '_> {
             .episode_links
             .by_artifact_id
             .get(self.candidate.id.as_str())
-            .map(Vec::len)
+            .map(BTreeSet::len)
             .unwrap_or_default();
         let link_issue_count = self
             .episode_links
@@ -691,17 +698,34 @@ impl PackReferenceCollector<'_, '_> {
                 self.push_evidence_issue(EvidenceReplayIssueCode::PathEscape, evidence);
                 continue;
             }
-            if invalid_range(evidence.provenance.start_line, evidence.provenance.end_line) {
-                self.push_evidence_issue(EvidenceReplayIssueCode::InvalidRange, evidence);
-                continue;
-            }
-            if !self
+            let Some(source_file) = self
                 .current_manifest
                 .files
                 .iter()
-                .any(|file| file.path == evidence.path)
-            {
+                .find(|file| file.path == evidence.path)
+            else {
                 self.push_evidence_issue(EvidenceReplayIssueCode::DeletedEvidence, evidence);
+                continue;
+            };
+            let Some(provenance_file) = self
+                .current_manifest
+                .files
+                .iter()
+                .find(|file| file.path == evidence.provenance.path)
+            else {
+                self.push_evidence_issue(EvidenceReplayIssueCode::DeletedEvidence, evidence);
+                continue;
+            };
+            if invalid_range(
+                evidence.provenance.start_line,
+                evidence.provenance.end_line,
+                source_file.lines,
+            ) || invalid_range(
+                evidence.provenance.start_line,
+                evidence.provenance.end_line,
+                provenance_file.lines,
+            ) {
+                self.push_evidence_issue(EvidenceReplayIssueCode::InvalidRange, evidence);
                 continue;
             }
             if evidence.freshness == EvidenceFreshness::Deleted {
@@ -829,10 +853,11 @@ fn validate_source_path(root: &Path, relative: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn invalid_range(start_line: Option<u32>, end_line: Option<u32>) -> bool {
+fn invalid_range(start_line: Option<u32>, end_line: Option<u32>, file_lines: u32) -> bool {
     match (start_line, end_line) {
         (Some(0), _) | (_, Some(0)) => true,
-        (Some(start), Some(end)) => end < start,
+        (Some(start), Some(end)) => end < start || start > file_lines || end > file_lines,
+        (Some(start), None) => start > file_lines,
         (None, Some(_)) => true,
         _ => false,
     }
@@ -1048,6 +1073,44 @@ mod tests {
         assert_eq!(
             actual.selected.first().map(|item| item.artifact_id.clone()),
             expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replay_deduplicates_repeated_episode_links_before_scoring() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let indexer = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = indexer.index()?;
+        let (linked_id, _linked_pack) =
+            write_fixture_context_pack(&indexer, &manifest, EvidenceFreshness::Fresh, 1.0)?;
+        let setup = fixture_episode(&linked_id);
+        indexer.append_episode(&setup)?;
+        indexer.append_episode(&setup)?;
+
+        let actual =
+            select_evidence_ledger_replay(&indexer, &manifest, &fixture_request(&manifest));
+        let expected = (Some(1usize), 1usize, true);
+
+        assert_eq!(
+            (
+                actual
+                    .selected
+                    .first()
+                    .map(|reference| reference.linked_episode_count),
+                actual
+                    .issues
+                    .iter()
+                    .filter(|issue| issue.code == EvidenceReplayIssueCode::Duplicate)
+                    .count(),
+                actual.issues.iter().any(|issue| {
+                    issue.code == EvidenceReplayIssueCode::Duplicate
+                        && issue.artifact_id.as_deref() == Some(linked_id.as_str())
+                        && issue.episode_fingerprint.as_deref()
+                            == Some(tool_episode_graph_id(&setup).as_str())
+                }),
+            ),
+            expected,
         );
         Ok(())
     }
@@ -1272,6 +1335,85 @@ mod tests {
                     .issues
                     .iter()
                     .any(|issue| issue.code == EvidenceReplayIssueCode::PathEscape),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replay_rejects_range_beyond_current_manifest_file_lines() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let indexer = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = indexer.index()?;
+        let (original_id, mut pack) =
+            write_fixture_context_pack(&indexer, &manifest, EvidenceFreshness::Fresh, 1.0)?;
+        fs::remove_file(artifact_path(fixture.path(), &original_id))?;
+        let evidence = pack
+            .evidence
+            .first_mut()
+            .expect("fixture evidence should exist");
+        evidence.provenance.end_line = Some(u32::MAX);
+        let out_of_bounds_id = indexer.context_pack_artifact_id(&pack)?;
+        fs::write(
+            artifact_path(fixture.path(), &out_of_bounds_id),
+            pack.to_stable_json()?,
+        )?;
+
+        let actual =
+            select_evidence_ledger_replay(&indexer, &manifest, &fixture_request(&manifest));
+        let expected = (0usize, true);
+
+        assert_eq!(
+            (
+                actual.selected.len(),
+                actual
+                    .issues
+                    .iter()
+                    .any(|issue| issue.code == EvidenceReplayIssueCode::InvalidRange),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replay_rejects_range_out_of_bounds_for_distinct_provenance_path() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        fs::write(
+            root.join("src").join("long.rs"),
+            "pub struct Long;\n".repeat(64),
+        )?;
+        let indexer = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = indexer.index()?;
+        let (original_id, mut pack) =
+            write_fixture_context_pack(&indexer, &manifest, EvidenceFreshness::Fresh, 1.0)?;
+        fs::remove_file(artifact_path(fixture.path(), &original_id))?;
+        let evidence = pack
+            .evidence
+            .first_mut()
+            .expect("fixture evidence should exist");
+        evidence.path = "src/long.rs".to_string();
+        evidence.provenance.path = "src/model.rs".to_string();
+        evidence.provenance.start_line = Some(32);
+        evidence.provenance.end_line = Some(32);
+        let out_of_bounds_id = indexer.context_pack_artifact_id(&pack)?;
+        fs::write(
+            artifact_path(fixture.path(), &out_of_bounds_id),
+            pack.to_stable_json()?,
+        )?;
+
+        let actual =
+            select_evidence_ledger_replay(&indexer, &manifest, &fixture_request(&manifest));
+        let expected = (0usize, true);
+
+        assert_eq!(
+            (
+                actual.selected.len(),
+                actual
+                    .issues
+                    .iter()
+                    .any(|issue| issue.code == EvidenceReplayIssueCode::InvalidRange),
             ),
             expected,
         );
