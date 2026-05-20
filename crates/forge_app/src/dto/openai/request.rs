@@ -732,15 +732,16 @@ impl From<Context> for Request {
 fn estimate_serialized_text_tokens(serialized_request: &[u8]) -> usize {
     std::str::from_utf8(serialized_request)
         .map(|text| {
-            let (ascii_chars, non_ascii_chars) = text.chars().fold((0usize, 0usize), |acc, ch| {
-                if ch.is_ascii() {
-                    (acc.0 + 1, acc.1)
-                } else {
-                    (acc.0, acc.1 + 1)
-                }
-            });
+            let (ascii_chars, non_ascii_utf8_bytes) =
+                text.chars().fold((0usize, 0usize), |acc, ch| {
+                    if ch.is_ascii() {
+                        (acc.0 + 1, acc.1)
+                    } else {
+                        (acc.0, acc.1 + ch.len_utf8())
+                    }
+                });
 
-            ascii_chars.div_ceil(4).saturating_add(non_ascii_chars)
+            ascii_chars.div_ceil(4).saturating_add(non_ascii_utf8_bytes)
         })
         .unwrap_or(serialized_request.len())
 }
@@ -1028,6 +1029,37 @@ mod tests {
             actual >= content.chars().count(),
             "multibyte text must not be estimated at ASCII 4-chars/token density: actual={actual}, chars={}",
             content.chars().count()
+        );
+    }
+
+    #[test]
+    fn test_context_window_guard_does_not_underestimate_non_ascii_multi_token_scalars() {
+        let content = "😀".repeat(10_000);
+        let fixture = Request {
+            model: Some(ModelId::new("context-guard-model")),
+            messages: Some(vec![Message {
+                role: super::Role::User,
+                content: Some(MessageContent::Text(content.clone())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_details: None,
+                reasoning_text: None,
+                reasoning_opaque: None,
+                reasoning_content: None,
+                extra_content: None,
+            }]),
+            context_window: Some(1_048_576),
+            max_completion_tokens: Some(10_444),
+            ..Default::default()
+        };
+        let serialized = serde_json::to_vec(&fixture).unwrap();
+        let actual = fixture.estimated_input_tokens_from_serialized(&serialized);
+        let minimum_safe_non_ascii_estimate = content.len();
+
+        assert!(
+            actual >= minimum_safe_non_ascii_estimate,
+            "non-ASCII scalars can tokenize to multiple tokens; estimator must not count them as one token each: actual={actual}, minimum_safe={minimum_safe_non_ascii_estimate}"
         );
     }
 
