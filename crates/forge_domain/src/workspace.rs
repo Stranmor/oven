@@ -491,6 +491,45 @@ pub enum WorkspaceVectorIndexBuildContinuationStatus {
     BuildFailed,
 }
 
+/// Closed status returned by the explicit agent-invoked exact-fact continuation tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceExactFactReferenceContinuationStatus {
+    /// Preflight status already proved exact facts are active; no producer was called.
+    AlreadyActive,
+    /// The producer was called once and postflight status proved exact facts are active.
+    ProducedActive,
+    /// No producer call was made because the project-model manifest is missing.
+    NotProducedManifestMissing,
+    /// No producer call was made because the manifest is stale.
+    NotProducedManifestStale,
+    /// No producer call was made or trusted because status could not be read safely.
+    NotProducedStatusUnreadable,
+    /// The producer was called once and failed through the service boundary.
+    ProducerFailed,
+    /// The producer returned success but postflight status did not prove active exact facts.
+    ProducedButInactive,
+    /// No producer call was made or no active facts were expected for this safe terminal state.
+    NotProducedNoEligibleProductionState,
+}
+
+/// Typed output for the explicit agent-invoked exact-fact reference continuation tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceExactFactReferenceContinuationReport {
+    /// Status captured immediately before any possible producer mutation.
+    pub preflight_status: Option<WorkspaceExactFactStatusReport>,
+    /// Service-owned producer report when a producer call was safely attempted and succeeded.
+    pub producer_report: Option<WorkspaceExactFactReferenceReport>,
+    /// Redaction-safe marker that the producer failed without exposing raw errors.
+    pub producer_failed: bool,
+    /// Status captured after no-production classification or attempted production.
+    pub postflight_status: Option<WorkspaceExactFactStatusReport>,
+    /// Redaction-safe diagnostic when preflight or postflight status was unreadable.
+    pub status_unreadable_diagnostic: Option<String>,
+    /// Closed final status for agent control flow.
+    pub final_status: WorkspaceExactFactReferenceContinuationStatus,
+}
+
 impl WorkspaceVectorIndexBuildContinuationStatus {
     /// Maps non-build-safe diagnostic statuses into closed continuation statuses.
     pub fn from_non_build_diagnostic_status(status: SemSearchDiagnosticStatus) -> Self {

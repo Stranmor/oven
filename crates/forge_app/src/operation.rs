@@ -9,7 +9,7 @@ use forge_display::DiffFormat;
 use forge_domain::{
     CodebaseSearchResults, Environment, FSMultiPatch, FSPatch, FSRead, FSRemove, FSSearch, FSUndo,
     FSWrite, FileOperation, LineNumbers, Metrics, NetFetch, PlanCreate, ToolKind,
-    WorkspaceVectorIndexBuildContinuationReport,
+    WorkspaceExactFactReferenceContinuationReport, WorkspaceVectorIndexBuildContinuationReport,
 };
 use forge_template::Element;
 
@@ -53,7 +53,10 @@ pub enum ToolOperation {
         output: CodebaseSearchResults,
     },
     WorkspaceVectorIndexBuildContinuation {
-        output: WorkspaceVectorIndexBuildContinuationReport,
+        output: Box<WorkspaceVectorIndexBuildContinuationReport>,
+    },
+    WorkspaceExactFactReferenceContinuation {
+        output: Box<WorkspaceExactFactReferenceContinuationReport>,
     },
     FsPatch {
         input: FSPatch,
@@ -483,6 +486,14 @@ impl ToolOperation {
                 let body = serde_json::to_string(&output)
                     .expect("workspace vector index build continuation report should serialize");
                 let elm = Element::new("workspace_vector_index_build_continuation")
+                    .attr("final_status", format!("{:?}", output.final_status))
+                    .cdata(body);
+                forge_domain::ToolOutput::text(elm)
+            }
+            ToolOperation::WorkspaceExactFactReferenceContinuation { output } => {
+                let body = serde_json::to_string(&output)
+                    .expect("workspace exact-fact reference continuation report should serialize");
+                let elm = Element::new("workspace_exact_fact_reference_continuation")
                     .attr("final_status", format!("{:?}", output.final_status))
                     .cdata(body);
                 forge_domain::ToolOutput::text(elm)

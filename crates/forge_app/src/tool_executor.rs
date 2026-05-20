@@ -16,7 +16,8 @@ use crate::{
     ShellService, SkillFetchService, WorkspaceService,
 };
 
-fn canonicalize_workspace_build_path(
+fn canonicalize_current_workspace_root(
+    tool_name: &str,
     requested_path: &Path,
     environment_cwd: &Path,
 ) -> anyhow::Result<PathBuf> {
@@ -27,25 +28,47 @@ fn canonicalize_workspace_build_path(
     };
     let canonical_requested = std::fs::canonicalize(&requested).map_err(|error| {
         anyhow!(
-            "workspace_vector_index_build_continuation workspace path '{}' could not be canonicalized: {error}",
+            "{tool_name} workspace path '{}' could not be canonicalized: {error}",
             requested.display()
         )
     })?;
     let canonical_allowed = std::fs::canonicalize(environment_cwd).map_err(|error| {
         anyhow!(
-            "workspace_vector_index_build_continuation current workspace root '{}' could not be canonicalized: {error}",
+            "{tool_name} current workspace root '{}' could not be canonicalized: {error}",
             environment_cwd.display()
         )
     })?;
     if canonical_requested != canonical_allowed {
         anyhow::bail!(
-            "workspace_vector_index_build_continuation rejected workspace path '{}': canonical path '{}' does not match current workspace root '{}'",
+            "{tool_name} rejected workspace path '{}': canonical path '{}' does not match current workspace root '{}'",
             requested.display(),
             canonical_requested.display(),
             canonical_allowed.display()
         );
     }
     Ok(canonical_requested)
+}
+
+fn canonicalize_workspace_build_path(
+    requested_path: &Path,
+    environment_cwd: &Path,
+) -> anyhow::Result<PathBuf> {
+    canonicalize_current_workspace_root(
+        "workspace_vector_index_build_continuation",
+        requested_path,
+        environment_cwd,
+    )
+}
+
+fn canonicalize_workspace_exact_fact_path(
+    requested_path: &Path,
+    environment_cwd: &Path,
+) -> anyhow::Result<PathBuf> {
+    canonicalize_current_workspace_root(
+        "workspace_exact_fact_reference_continuation",
+        requested_path,
+        environment_cwd,
+    )
 }
 
 pub struct ToolExecutor<S> {
@@ -190,6 +213,134 @@ impl<
             )
             .await?;
         Ok(path)
+    }
+
+    async fn workspace_exact_fact_reference_continuation(
+        &self,
+        workspace_root: PathBuf,
+    ) -> forge_domain::WorkspaceExactFactReferenceContinuationReport {
+        use forge_domain::{
+            WorkspaceExactFactReferenceContinuationReport,
+            WorkspaceExactFactReferenceContinuationStatus, WorkspaceExactFactReferenceStatus,
+            WorkspaceExactFactStatusReport,
+        };
+
+        fn no_producer_report(
+            preflight_status: Option<WorkspaceExactFactStatusReport>,
+            final_status: WorkspaceExactFactReferenceContinuationStatus,
+            diagnostic: Option<&str>,
+        ) -> WorkspaceExactFactReferenceContinuationReport {
+            WorkspaceExactFactReferenceContinuationReport {
+                postflight_status: preflight_status.clone(),
+                preflight_status,
+                producer_report: None,
+                producer_failed: false,
+                status_unreadable_diagnostic: diagnostic.map(str::to_string),
+                final_status,
+            }
+        }
+
+        fn inactive_success_status(
+            producer_status: WorkspaceExactFactReferenceStatus,
+        ) -> WorkspaceExactFactReferenceContinuationStatus {
+            match producer_status {
+                WorkspaceExactFactReferenceStatus::ArtifactWritten => {
+                    WorkspaceExactFactReferenceContinuationStatus::ProducedButInactive
+                }
+                WorkspaceExactFactReferenceStatus::NoEligibleEndpoint
+                | WorkspaceExactFactReferenceStatus::RustAnalyzerUnavailable
+                | WorkspaceExactFactReferenceStatus::Timeout
+                | WorkspaceExactFactReferenceStatus::NoFacts => {
+                    WorkspaceExactFactReferenceContinuationStatus::NotProducedNoEligibleProductionState
+                }
+                WorkspaceExactFactReferenceStatus::Failed => {
+                    WorkspaceExactFactReferenceContinuationStatus::ProducerFailed
+                }
+            }
+        }
+
+        let preflight_status = match self
+            .services
+            .workspace_exact_fact_status(workspace_root.clone())
+            .await
+        {
+            Ok(report) => report,
+            Err(_error) => {
+                return no_producer_report(
+                    None,
+                    WorkspaceExactFactReferenceContinuationStatus::NotProducedStatusUnreadable,
+                    Some("preflight_status_unreadable"),
+                );
+            }
+        };
+
+        if preflight_status.exact_facts_active || preflight_status.status == "active" {
+            return no_producer_report(
+                Some(preflight_status),
+                WorkspaceExactFactReferenceContinuationStatus::AlreadyActive,
+                None,
+            );
+        }
+
+        let non_produced_status = match preflight_status.status.as_str() {
+            "not_indexed" => {
+                Some(WorkspaceExactFactReferenceContinuationStatus::NotProducedManifestMissing)
+            }
+            "stale_manifest" => {
+                Some(WorkspaceExactFactReferenceContinuationStatus::NotProducedManifestStale)
+            }
+            "report_missing_or_corrupt" => {
+                Some(WorkspaceExactFactReferenceContinuationStatus::NotProducedStatusUnreadable)
+            }
+            _ => None,
+        };
+        if let Some(final_status) = non_produced_status {
+            return no_producer_report(Some(preflight_status), final_status, None);
+        }
+
+        let producer_result = self
+            .services
+            .produce_workspace_exact_fact_reference(workspace_root.clone())
+            .await;
+        let postflight_status = self
+            .services
+            .workspace_exact_fact_status(workspace_root)
+            .await
+            .ok();
+        let status_unreadable_diagnostic = postflight_status
+            .is_none()
+            .then(|| "postflight_status_unreadable".to_string());
+
+        let (producer_report, producer_failed, final_status) = match producer_result {
+            Ok(report) => {
+                let producer_failed = report.status == WorkspaceExactFactReferenceStatus::Failed;
+                let final_status = if postflight_status
+                    .as_ref()
+                    .is_some_and(|status| status.exact_facts_active)
+                {
+                    WorkspaceExactFactReferenceContinuationStatus::ProducedActive
+                } else if status_unreadable_diagnostic.is_some() {
+                    WorkspaceExactFactReferenceContinuationStatus::NotProducedStatusUnreadable
+                } else {
+                    inactive_success_status(report.status.clone())
+                };
+                (Some(report), producer_failed, final_status)
+            }
+            Err(_error) => (
+                None,
+                true,
+                WorkspaceExactFactReferenceContinuationStatus::ProducerFailed,
+            ),
+        };
+
+        WorkspaceExactFactReferenceContinuationReport {
+            preflight_status: Some(preflight_status),
+            producer_report,
+            producer_failed,
+            postflight_status,
+            status_unreadable_diagnostic,
+            final_status,
+        }
     }
 
     async fn call_internal(
@@ -390,7 +541,9 @@ impl<
                         post_build_diagnostic,
                         final_status: forge_domain::WorkspaceVectorIndexBuildContinuationStatus::NotBuiltConfigRequired,
                     };
-                    return Ok(ToolOperation::WorkspaceVectorIndexBuildContinuation { output });
+                    return Ok(ToolOperation::WorkspaceVectorIndexBuildContinuation {
+                        output: Box::new(output),
+                    });
                 };
                 if let Some(explicit_model_id) = explicit_model_id
                     && explicit_model_id != embedding_model_id
@@ -416,7 +569,9 @@ impl<
                         post_build_diagnostic,
                         final_status,
                     };
-                    return Ok(ToolOperation::WorkspaceVectorIndexBuildContinuation { output });
+                    return Ok(ToolOperation::WorkspaceVectorIndexBuildContinuation {
+                        output: Box::new(output),
+                    });
                 }
 
                 let build_report = match self
@@ -439,7 +594,9 @@ impl<
                             post_build_diagnostic,
                             final_status: forge_domain::WorkspaceVectorIndexBuildContinuationStatus::BuildFailed,
                         };
-                        return Ok(ToolOperation::WorkspaceVectorIndexBuildContinuation { output });
+                        return Ok(ToolOperation::WorkspaceVectorIndexBuildContinuation {
+                            output: Box::new(output),
+                        });
                     }
                 };
                 let post_build_diagnostic = self
@@ -458,7 +615,18 @@ impl<
                     post_build_diagnostic,
                     final_status,
                 };
-                ToolOperation::WorkspaceVectorIndexBuildContinuation { output }
+                ToolOperation::WorkspaceVectorIndexBuildContinuation { output: Box::new(output) }
+            }
+            ToolCatalog::WorkspaceExactFactReferenceContinuation(input) => {
+                let env = self.services.get_environment();
+                let workspace_root = canonicalize_workspace_exact_fact_path(
+                    input.workspace_path.as_path(),
+                    env.cwd.as_path(),
+                )?;
+                let output = self
+                    .workspace_exact_fact_reference_continuation(workspace_root)
+                    .await;
+                ToolOperation::WorkspaceExactFactReferenceContinuation { output: Box::new(output) }
             }
             ToolCatalog::Remove(input) => {
                 let normalized_path = self.normalize_path(input.path.clone());
@@ -662,9 +830,11 @@ mod tests {
         SubagentTaskSession, SubagentTaskSessionFilter, SyncProgress, ToolCallContext,
         ToolCallFull, WorkspaceAuth, WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
         WorkspaceEvidenceReplayDiagnostic, WorkspaceEvidenceReplayPreviewDiagnostic,
-        WorkspaceExactFactStatusReport, WorkspaceId, WorkspaceInfo,
-        WorkspaceSemanticInjectionReadiness, WorkspaceVectorIndexBuildContinuationStatus,
-        WorkspaceVectorIndexBuildReport, WorkspaceVectorIndexBuildStatus,
+        WorkspaceExactFactReferenceContinuationStatus, WorkspaceExactFactReferenceReport,
+        WorkspaceExactFactReferenceStatus, WorkspaceExactFactStatusReport, WorkspaceId,
+        WorkspaceInfo, WorkspaceSemanticInjectionReadiness,
+        WorkspaceVectorIndexBuildContinuationStatus, WorkspaceVectorIndexBuildReport,
+        WorkspaceVectorIndexBuildStatus,
     };
     use pretty_assertions::assert_eq;
     use tokio::sync::Mutex;
@@ -705,6 +875,12 @@ mod tests {
         query_error: Option<String>,
         readiness: Arc<StdMutex<SemSearchAvailability>>,
         post_build_readiness: Arc<StdMutex<Option<SemSearchAvailability>>>,
+        exact_fact_statuses: Arc<Mutex<Vec<WorkspaceExactFactStatusReport>>>,
+        exact_fact_status_calls: Arc<AtomicUsize>,
+        exact_fact_status_error: Arc<StdMutex<Option<String>>>,
+        exact_fact_producer_calls: Arc<AtomicUsize>,
+        exact_fact_producer_error: Arc<StdMutex<Option<String>>>,
+        exact_fact_producer_status: Arc<StdMutex<WorkspaceExactFactReferenceStatus>>,
     }
 
     impl SemSearchFixture {
@@ -724,6 +900,14 @@ mod tests {
                         dimension: 2,
                     })),
                     post_build_readiness: Arc::new(StdMutex::new(None)),
+                    exact_fact_statuses: Arc::new(Mutex::new(Vec::new())),
+                    exact_fact_status_calls: Arc::new(AtomicUsize::new(0)),
+                    exact_fact_status_error: Arc::new(StdMutex::new(None)),
+                    exact_fact_producer_calls: Arc::new(AtomicUsize::new(0)),
+                    exact_fact_producer_error: Arc::new(StdMutex::new(None)),
+                    exact_fact_producer_status: Arc::new(StdMutex::new(
+                        WorkspaceExactFactReferenceStatus::ArtifactWritten,
+                    )),
                 },
                 unused: SemSearchUnusedService,
             }
@@ -746,6 +930,32 @@ mod tests {
 
         fn with_post_build_readiness(self, readiness: SemSearchAvailability) -> Self {
             *self.workspace.post_build_readiness.lock().unwrap() = Some(readiness);
+            self
+        }
+
+        async fn with_exact_fact_statuses(
+            self,
+            statuses: Vec<WorkspaceExactFactStatusReport>,
+        ) -> Self {
+            *self.workspace.exact_fact_statuses.lock().await = statuses;
+            self
+        }
+
+        fn with_exact_fact_status_error(self, error: &str) -> Self {
+            *self.workspace.exact_fact_status_error.lock().unwrap() = Some(error.to_string());
+            self
+        }
+
+        fn with_exact_fact_producer_error(self, error: &str) -> Self {
+            *self.workspace.exact_fact_producer_error.lock().unwrap() = Some(error.to_string());
+            self
+        }
+
+        fn with_exact_fact_producer_status(
+            self,
+            status: WorkspaceExactFactReferenceStatus,
+        ) -> Self {
+            *self.workspace.exact_fact_producer_status.lock().unwrap() = status;
             self
         }
     }
@@ -791,16 +1001,45 @@ mod tests {
 
         async fn produce_workspace_exact_fact_reference(
             &self,
-            _path: PathBuf,
+            path: PathBuf,
         ) -> anyhow::Result<forge_domain::WorkspaceExactFactReferenceReport> {
-            anyhow::bail!("unused exact-fact reference")
+            self.exact_fact_producer_calls
+                .fetch_add(1, Ordering::SeqCst);
+            if let Some(error) = self.exact_fact_producer_error.lock().unwrap().clone() {
+                anyhow::bail!(error);
+            }
+            let status = self.exact_fact_producer_status.lock().unwrap().clone();
+            Ok(WorkspaceExactFactReferenceReport {
+                status,
+                artifact_path: None,
+                batch_fingerprint: None,
+                produced_reference_count: 0,
+                bounded_loss: Default::default(),
+                manifest_hash_input: "fixture-manifest".to_string(),
+                issues: Vec::new(),
+                ingestion_summary: Default::default(),
+                manifest_path: path.join(".forge_project_model/project_manifest.json"),
+                ingestion_report_path: path
+                    .join(".forge_project_model/external-facts/ingestion-report.json"),
+            })
         }
 
         async fn workspace_exact_fact_status(
             &self,
             _path: PathBuf,
         ) -> anyhow::Result<WorkspaceExactFactStatusReport> {
-            anyhow::bail!("unused exact-fact status")
+            self.exact_fact_status_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(error) = self.exact_fact_status_error.lock().unwrap().clone() {
+                anyhow::bail!(error);
+            }
+            let mut statuses = self.exact_fact_statuses.lock().await;
+            if statuses.is_empty() {
+                anyhow::bail!("fixture exact-fact status is not configured");
+            }
+            if statuses.len() == 1 {
+                return Ok(statuses[0].clone());
+            }
+            Ok(statuses.remove(0))
         }
 
         async fn workspace_evidence_replay_diagnostic(
@@ -1649,6 +1888,409 @@ mod tests {
         ToolCallContext::new(Metrics::default())
     }
 
+    fn exact_fact_status(
+        status: &str,
+        active: bool,
+        workspace: &Path,
+    ) -> WorkspaceExactFactStatusReport {
+        WorkspaceExactFactStatusReport {
+            status: status.to_string(),
+            manifest_path: workspace.join(".forge_project_model/project_manifest.json"),
+            manifest_hash: Some("fixture-manifest".to_string()),
+            manifest_freshness_proof_level: Some("complete".to_string()),
+            ingestion_report_path: workspace
+                .join(".forge_project_model/external-facts/ingestion-report.json"),
+            artifact_store_state: "present".to_string(),
+            inspected_artifact_count: 0,
+            accepted_artifact_count: 0,
+            accepted_batch_fingerprints: Vec::new(),
+            manifest_external_fact_batch_count: 0,
+            manifest_external_facts_fingerprint: None,
+            reference_edge_count: 0,
+            exact_compiler_reference_edge_count: 0,
+            issue_count: 0,
+            issue_summaries: Vec::new(),
+            exact_facts_active: active,
+        }
+    }
+
+    fn workspace_exact_fact_tool(workspace_path: PathBuf) -> ToolCatalog {
+        ToolCatalog::WorkspaceExactFactReferenceContinuation(
+            forge_domain::WorkspaceExactFactReferenceContinuation { workspace_path },
+        )
+    }
+
+    async fn exact_fact_output(
+        executor: &ToolExecutor<SemSearchFixture>,
+        workspace: PathBuf,
+    ) -> anyhow::Result<forge_domain::WorkspaceExactFactReferenceContinuationReport> {
+        let actual = executor
+            .call_internal(workspace_exact_fact_tool(workspace), &tool_context())
+            .await?;
+        match actual {
+            ToolOperation::WorkspaceExactFactReferenceContinuation { output } => Ok(*output),
+            _ => panic!("expected workspace exact-fact reference continuation output"),
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_exact_fact_continuation_already_active_skips_producer() -> anyhow::Result<()>
+    {
+        let fixture = tempfile::tempdir()?;
+        let workspace = std::fs::canonicalize(fixture.path())?;
+        let setup = Arc::new(
+            SemSearchFixture::new(sem_search_config(Some("fixture-model")))
+                .with_cwd(workspace.clone())
+                .with_exact_fact_statuses(vec![exact_fact_status("active", true, &workspace)])
+                .await,
+        );
+        let executor = ToolExecutor::new(Arc::clone(&setup));
+
+        let actual = exact_fact_output(&executor, workspace).await?;
+
+        let expected = WorkspaceExactFactReferenceContinuationStatus::AlreadyActive;
+        assert_eq!(actual.final_status, expected);
+        assert_eq!(
+            setup
+                .workspace
+                .exact_fact_producer_calls
+                .load(Ordering::SeqCst),
+            0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_exact_fact_continuation_produces_once_when_fresh_inactive()
+    -> anyhow::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let workspace = std::fs::canonicalize(fixture.path())?;
+        let setup = Arc::new(
+            SemSearchFixture::new(sem_search_config(Some("fixture-model")))
+                .with_cwd(workspace.clone())
+                .with_exact_fact_statuses(vec![
+                    exact_fact_status("no_artifact_store", false, &workspace),
+                    exact_fact_status("active", true, &workspace),
+                ])
+                .await,
+        );
+        let executor = ToolExecutor::new(Arc::clone(&setup));
+
+        let actual = exact_fact_output(&executor, workspace).await?;
+
+        let expected = WorkspaceExactFactReferenceContinuationStatus::ProducedActive;
+        assert_eq!(actual.final_status, expected);
+        assert_eq!(
+            setup
+                .workspace
+                .exact_fact_producer_calls
+                .load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            setup
+                .workspace
+                .exact_fact_status_calls
+                .load(Ordering::SeqCst),
+            2
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_exact_fact_continuation_preflight_non_produced_states_skip_producer()
+    -> anyhow::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let workspace = std::fs::canonicalize(fixture.path())?;
+        let cases = [
+            (
+                "not_indexed",
+                WorkspaceExactFactReferenceContinuationStatus::NotProducedManifestMissing,
+            ),
+            (
+                "stale_manifest",
+                WorkspaceExactFactReferenceContinuationStatus::NotProducedManifestStale,
+            ),
+            (
+                "report_missing_or_corrupt",
+                WorkspaceExactFactReferenceContinuationStatus::NotProducedStatusUnreadable,
+            ),
+        ];
+
+        for (status, expected) in cases {
+            let setup = Arc::new(
+                SemSearchFixture::new(sem_search_config(Some("fixture-model")))
+                    .with_cwd(workspace.clone())
+                    .with_exact_fact_statuses(vec![exact_fact_status(status, false, &workspace)])
+                    .await,
+            );
+            let executor = ToolExecutor::new(Arc::clone(&setup));
+
+            let actual = exact_fact_output(&executor, workspace.clone()).await?;
+
+            assert_eq!(actual.final_status, expected);
+            assert_eq!(
+                setup
+                    .workspace
+                    .exact_fact_producer_calls
+                    .load(Ordering::SeqCst),
+                0
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_exact_fact_continuation_preflight_error_is_typed_unreadable()
+    -> anyhow::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let workspace = std::fs::canonicalize(fixture.path())?;
+        let setup = Arc::new(
+            SemSearchFixture::new(sem_search_config(Some("fixture-model")))
+                .with_cwd(workspace.clone())
+                .with_exact_fact_status_error("raw JSON-RPC stdout stderr source failure payload"),
+        );
+        let executor = ToolExecutor::new(Arc::clone(&setup));
+
+        let actual = exact_fact_output(&executor, workspace).await?;
+
+        let expected = WorkspaceExactFactReferenceContinuationStatus::NotProducedStatusUnreadable;
+        assert_eq!(actual.final_status, expected);
+        assert_eq!(
+            actual.status_unreadable_diagnostic.as_deref(),
+            Some("preflight_status_unreadable")
+        );
+        assert_eq!(
+            setup
+                .workspace
+                .exact_fact_producer_calls
+                .load(Ordering::SeqCst),
+            0
+        );
+        let serialized = serde_json::to_string(&actual)?;
+        assert!(!serialized.contains("JSON-RPC"));
+        assert!(!serialized.contains("stdout"));
+        assert!(!serialized.contains("stderr"));
+        assert!(!serialized.contains("source failure payload"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_exact_fact_continuation_producer_error_attempts_postflight()
+    -> anyhow::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let workspace = std::fs::canonicalize(fixture.path())?;
+        let setup = Arc::new(
+            SemSearchFixture::new(sem_search_config(Some("fixture-model")))
+                .with_cwd(workspace.clone())
+                .with_exact_fact_statuses(vec![
+                    exact_fact_status("no_artifact_store", false, &workspace),
+                    exact_fact_status("no_artifact_store", false, &workspace),
+                ])
+                .await
+                .with_exact_fact_producer_error(
+                    "raw JSON-RPC stdout stderr source failure payload",
+                ),
+        );
+        let executor = ToolExecutor::new(Arc::clone(&setup));
+
+        let actual = exact_fact_output(&executor, workspace).await?;
+
+        let expected = WorkspaceExactFactReferenceContinuationStatus::ProducerFailed;
+        assert_eq!(actual.final_status, expected);
+        assert!(actual.producer_failed);
+        assert_eq!(
+            setup
+                .workspace
+                .exact_fact_producer_calls
+                .load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            setup
+                .workspace
+                .exact_fact_status_calls
+                .load(Ordering::SeqCst),
+            2
+        );
+        let serialized = serde_json::to_string(&actual)?;
+        assert!(!serialized.contains("JSON-RPC"));
+        assert!(!serialized.contains("stdout"));
+        assert!(!serialized.contains("stderr"));
+        assert!(!serialized.contains("source failure payload"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_exact_fact_continuation_success_with_inactive_postflight_is_inactive()
+    -> anyhow::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let workspace = std::fs::canonicalize(fixture.path())?;
+        let setup = Arc::new(
+            SemSearchFixture::new(sem_search_config(Some("fixture-model")))
+                .with_cwd(workspace.clone())
+                .with_exact_fact_statuses(vec![
+                    exact_fact_status("no_artifact_store", false, &workspace),
+                    exact_fact_status("accepted_but_no_graph_edges", false, &workspace),
+                ])
+                .await,
+        );
+        let executor = ToolExecutor::new(Arc::clone(&setup));
+
+        let actual = exact_fact_output(&executor, workspace).await?;
+
+        let expected = WorkspaceExactFactReferenceContinuationStatus::ProducedButInactive;
+        assert_eq!(actual.final_status, expected);
+        assert_eq!(
+            setup
+                .workspace
+                .exact_fact_producer_calls
+                .load(Ordering::SeqCst),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_exact_fact_continuation_no_eligible_producer_status_is_closed_state()
+    -> anyhow::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let workspace = std::fs::canonicalize(fixture.path())?;
+        let setup = Arc::new(
+            SemSearchFixture::new(sem_search_config(Some("fixture-model")))
+                .with_cwd(workspace.clone())
+                .with_exact_fact_statuses(vec![
+                    exact_fact_status("no_artifact_store", false, &workspace),
+                    exact_fact_status("no_artifact_store", false, &workspace),
+                ])
+                .await
+                .with_exact_fact_producer_status(WorkspaceExactFactReferenceStatus::NoFacts),
+        );
+        let executor = ToolExecutor::new(Arc::clone(&setup));
+
+        let actual = exact_fact_output(&executor, workspace).await?;
+
+        let expected =
+            WorkspaceExactFactReferenceContinuationStatus::NotProducedNoEligibleProductionState;
+        assert_eq!(actual.final_status, expected);
+        assert_eq!(
+            setup
+                .workspace
+                .exact_fact_producer_calls
+                .load(Ordering::SeqCst),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_exact_fact_continuation_failed_producer_status_sets_failure_marker()
+    -> anyhow::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let workspace = std::fs::canonicalize(fixture.path())?;
+        let setup = Arc::new(
+            SemSearchFixture::new(sem_search_config(Some("fixture-model")))
+                .with_cwd(workspace.clone())
+                .with_exact_fact_statuses(vec![
+                    exact_fact_status("no_artifact_store", false, &workspace),
+                    exact_fact_status("no_artifact_store", false, &workspace),
+                ])
+                .await
+                .with_exact_fact_producer_status(WorkspaceExactFactReferenceStatus::Failed),
+        );
+        let executor = ToolExecutor::new(Arc::clone(&setup));
+
+        let actual = exact_fact_output(&executor, workspace).await?;
+
+        let expected = WorkspaceExactFactReferenceContinuationStatus::ProducerFailed;
+        assert_eq!(actual.final_status, expected);
+        assert!(actual.producer_failed);
+        assert_eq!(
+            setup
+                .workspace
+                .exact_fact_producer_calls
+                .load(Ordering::SeqCst),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_exact_fact_continuation_failed_producer_status_keeps_failure_marker_when_postflight_active()
+    -> anyhow::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let workspace = std::fs::canonicalize(fixture.path())?;
+        let setup = Arc::new(
+            SemSearchFixture::new(sem_search_config(Some("fixture-model")))
+                .with_cwd(workspace.clone())
+                .with_exact_fact_statuses(vec![
+                    exact_fact_status("no_artifact_store", false, &workspace),
+                    exact_fact_status("active", true, &workspace),
+                ])
+                .await
+                .with_exact_fact_producer_status(WorkspaceExactFactReferenceStatus::Failed),
+        );
+        let executor = ToolExecutor::new(Arc::clone(&setup));
+
+        let actual = exact_fact_output(&executor, workspace).await?;
+
+        assert!(actual.producer_failed);
+        assert_eq!(
+            setup
+                .workspace
+                .exact_fact_producer_calls
+                .load(Ordering::SeqCst),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_exact_fact_continuation_rejects_symlink_escape_before_side_effects()
+    -> anyhow::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let workspace = fixture.path().join("workspace");
+        let outside = fixture.path().join("outside");
+        let alias = workspace.join("alias");
+        std::fs::create_dir_all(&workspace)?;
+        std::fs::create_dir_all(&outside)?;
+        create_directory_symlink(&outside, &alias)?;
+        if !alias.exists() {
+            return Ok(());
+        }
+        let workspace = std::fs::canonicalize(workspace)?;
+        let setup = Arc::new(
+            SemSearchFixture::new(sem_search_config(Some("fixture-model"))).with_cwd(workspace),
+        );
+        let executor = ToolExecutor::new(Arc::clone(&setup));
+
+        let actual = executor
+            .call_internal(workspace_exact_fact_tool(alias), &tool_context())
+            .await;
+
+        assert!(
+            actual
+                .unwrap_err()
+                .to_string()
+                .contains("does not match current workspace root")
+        );
+        assert_eq!(
+            setup
+                .workspace
+                .exact_fact_status_calls
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            setup
+                .workspace
+                .exact_fact_producer_calls
+                .load(Ordering::SeqCst),
+            0
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn sem_search_embeds_each_query_and_passes_vector_params_to_workspace_query()
     -> anyhow::Result<()> {
@@ -1888,7 +2530,7 @@ mod tests {
             .await?;
 
         let actual = match actual {
-            ToolOperation::WorkspaceVectorIndexBuildContinuation { output } => output,
+            ToolOperation::WorkspaceVectorIndexBuildContinuation { output } => *output,
             _ => panic!("expected workspace vector build continuation output"),
         };
         let expected = WorkspaceVectorIndexBuildContinuationStatus::BuiltReady;
@@ -1928,7 +2570,7 @@ mod tests {
             .await?;
 
         let actual = match actual {
-            ToolOperation::WorkspaceVectorIndexBuildContinuation { output } => output,
+            ToolOperation::WorkspaceVectorIndexBuildContinuation { output } => *output,
             _ => panic!("expected workspace vector build continuation output"),
         };
         let expected = WorkspaceVectorIndexBuildContinuationStatus::NotBuiltRepairRequired;
@@ -1963,7 +2605,7 @@ mod tests {
             .await?;
 
         let actual = match actual {
-            ToolOperation::WorkspaceVectorIndexBuildContinuation { output } => output,
+            ToolOperation::WorkspaceVectorIndexBuildContinuation { output } => *output,
             _ => panic!("expected workspace vector build continuation output"),
         };
         assert!(

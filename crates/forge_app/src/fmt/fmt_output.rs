@@ -49,6 +49,7 @@ impl FormatContent for ToolOperation {
             | ToolOperation::FsSearch { input: _, output: _ }
             | ToolOperation::CodebaseSearch { output: _ }
             | ToolOperation::WorkspaceVectorIndexBuildContinuation { output: _ }
+            | ToolOperation::WorkspaceExactFactReferenceContinuation { output: _ }
             | ToolOperation::FsUndo { input: _, output: _ }
             | ToolOperation::NetFetch { input: _, output: _ }
             | ToolOperation::Shell { output: _ }

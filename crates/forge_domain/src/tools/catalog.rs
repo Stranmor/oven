@@ -52,6 +52,7 @@ pub enum ToolCatalog {
     FsSearch(FSSearch),
     SemSearch(SemanticSearch),
     WorkspaceVectorIndexBuildContinuation(WorkspaceVectorIndexBuildContinuation),
+    WorkspaceExactFactReferenceContinuation(WorkspaceExactFactReferenceContinuation),
     Remove(FSRemove),
     Patch(FSPatch),
     MultiPatch(FSMultiPatch),
@@ -471,6 +472,17 @@ pub struct WorkspaceVectorIndexBuildContinuation {
     /// configured semantic embedding model for this build path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding_model_id: Option<String>,
+}
+
+#[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema, ToolDescription, PartialEq)]
+#[tool_description_file = "crates/forge_domain/src/tools/descriptions/workspace_exact_fact_reference_continuation.md"]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct WorkspaceExactFactReferenceContinuation {
+    /// Workspace root path to validate and produce exact facts for. The path
+    /// must resolve to the current allowed workspace root without escaping
+    /// through symlinks.
+    pub workspace_path: PathBuf,
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema, ToolDescription, PartialEq)]
@@ -900,6 +912,7 @@ impl ToolDescription for ToolCatalog {
             ToolCatalog::FsSearch(v) => v.description(),
             ToolCatalog::SemSearch(v) => v.description(),
             ToolCatalog::WorkspaceVectorIndexBuildContinuation(v) => v.description(),
+            ToolCatalog::WorkspaceExactFactReferenceContinuation(v) => v.description(),
             ToolCatalog::Read(v) => v.description(),
             ToolCatalog::Remove(v) => v.description(),
             ToolCatalog::Undo(v) => v.description(),
@@ -976,6 +989,9 @@ impl ToolCatalog {
             ToolCatalog::SemSearch(_) => r#gen.into_root_schema_for::<SemanticSearch>(),
             ToolCatalog::WorkspaceVectorIndexBuildContinuation(_) => {
                 r#gen.into_root_schema_for::<WorkspaceVectorIndexBuildContinuation>()
+            }
+            ToolCatalog::WorkspaceExactFactReferenceContinuation(_) => {
+                r#gen.into_root_schema_for::<WorkspaceExactFactReferenceContinuation>()
             }
             ToolCatalog::Read(_) => r#gen.into_root_schema_for::<FSRead>(),
             ToolCatalog::Remove(_) => r#gen.into_root_schema_for::<FSRemove>(),
@@ -1085,6 +1101,16 @@ impl ToolCatalog {
                     cwd,
                     message: format!(
                         "Build workspace vector index for: {}",
+                        display_path_for(input.workspace_path.to_string_lossy().as_ref())
+                    ),
+                })
+            }
+            ToolCatalog::WorkspaceExactFactReferenceContinuation(input) => {
+                Some(crate::policies::PermissionOperation::Write {
+                    path: input.workspace_path.clone(),
+                    cwd,
+                    message: format!(
+                        "Produce workspace exact-fact references for: {}",
                         display_path_for(input.workspace_path.to_string_lossy().as_ref())
                     ),
                 })
@@ -1391,6 +1417,24 @@ mod tests {
             call_id: None,
             arguments: ToolCallArguments::from_json(
                 r#"{"agent_id":"forge","tasks":["run"],"session_id":"not-a-uuid"}"#,
+            ),
+            thought_signature: None,
+        };
+
+        let actual = ToolCatalog::try_from(fixture);
+
+        assert!(actual.is_err());
+    }
+
+    #[test]
+    fn test_workspace_exact_fact_continuation_rejects_unknown_arguments() {
+        use crate::{ToolCallArguments, ToolCallFull};
+
+        let fixture = ToolCallFull {
+            name: ToolKind::WorkspaceExactFactReferenceContinuation.name(),
+            call_id: None,
+            arguments: ToolCallArguments::from_json(
+                r#"{"workspace_path":".","embedding_model_id":"must-not-be-accepted"}"#,
             ),
             thought_signature: None,
         };
