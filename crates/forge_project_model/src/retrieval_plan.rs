@@ -1080,6 +1080,52 @@ mod tests {
     }
 
     #[test]
+    fn empty_artifact_files_still_produce_validated_readback_requests() -> Result<()> {
+        let fixture = tempfile::TempDir::new()?;
+        let root = fixture.path().join("project");
+        std::fs::create_dir_all(root.join("src"))?;
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"empty-artifact\"\nversion = \"0.1.0\"\n",
+        )?;
+        std::fs::write(root.join("settings.json"), "")?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let request = ProjectContextRetrievalRequest::new(
+            "config schema".to_string(),
+            5,
+            ProjectContextPathScope::default(),
+            false,
+        );
+
+        let actual = expect_plan(plan_project_context_retrieval(
+            &manifest,
+            &freshness(&manifest),
+            request,
+        ));
+        let expected = Some(("settings.json".to_string(), 1u32, 1u32));
+
+        assert_eq!(
+            actual
+                .read_requests
+                .iter()
+                .find(|request| {
+                    request.evidence_id.starts_with("artifact:")
+                        && request.relative_manifest_path() == "settings.json"
+                })
+                .map(|request| {
+                    (
+                        request.relative_manifest_path().to_string(),
+                        request.start_line,
+                        request.end_line,
+                    )
+                }),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
     fn invalid_or_suspicious_cargo_metadata_ids_do_not_produce_read_requests() {
         let setup = cargo_plan_manifest();
         let candidates = [

@@ -720,7 +720,7 @@ fn shard_line_range(shard: &ShardManifest) -> (u32, u32) {
 }
 
 fn file_line_range(file: &SourceFile) -> (u32, u32) {
-    (1, file.lines)
+    (1, file.lines.max(1))
 }
 
 fn evidence_freshness_label(freshness: &EvidenceFreshness) -> &'static str {
