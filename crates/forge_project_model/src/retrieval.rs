@@ -340,7 +340,7 @@ mod tests {
     use crate::{DurableVectorIndex, VectorIndexArtifact, vector_entries_from_manifest_embeddings};
 
     #[test]
-    fn content_only_query_returns_source_body_shard() -> Result<()> {
+    fn source_body_only_query_no_longer_matches_metadata_lexical() -> Result<()> {
         let fixture = tempfile::TempDir::new()?;
         let root = fixture.path().join("project");
         std::fs::create_dir_all(root.join("src"))?;
@@ -360,17 +360,56 @@ mod tests {
         };
 
         let actual = retrieve(&manifest, &query);
-        let expected = Some(("src/only.rs".to_string(), Some(1), Some(3)));
-        assert_eq!(
-            actual.first().map(|result| {
-                (
-                    result.path.clone(),
-                    result.provenance.start_line,
-                    result.provenance.end_line,
-                )
-            }),
-            expected
-        );
+        let expected: Vec<RetrievalResult> = Vec::new();
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn documents_from_manifest_is_manifest_only_after_backing_file_changes() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let before = documents_from_manifest(&manifest);
+        std::fs::write(
+            root.join("src").join("lib.rs"),
+            "mutated_live_body_only_token\n",
+        )?;
+        std::fs::remove_file(root.join("src").join("model.rs"))?;
+
+        let actual = documents_from_manifest(&manifest);
+        let expected = before;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn lexical_index_from_manifest_is_manifest_only_after_backing_file_removed() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let before = LexicalIndex::from_manifest(&manifest).search("Root Struct symbol");
+        std::fs::remove_file(root.join("src").join("lib.rs"))?;
+
+        let actual = LexicalIndex::from_manifest(&manifest).search("Root Struct symbol");
+        let expected = before;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn lexical_module_has_no_filesystem_dependency() -> Result<()> {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("lexical.rs"),
+        )?;
+        let actual = ["std::fs", "fs::", "read_to_string"]
+            .into_iter()
+            .filter(|needle| source.contains(needle))
+            .collect::<Vec<_>>();
+        let expected: Vec<&str> = Vec::new();
+        assert_eq!(actual, expected);
         Ok(())
     }
 
@@ -391,7 +430,7 @@ mod tests {
         let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
         let manifest = setup.index()?;
         let query = RetrievalQuery {
-            text: Some("scopedneedle".to_string()),
+            text: Some("target Function".to_string()),
             path: None,
             path_prefix: Some("src/in/".to_string()),
             symbol: None,
@@ -451,7 +490,7 @@ mod tests {
         let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
         let manifest = setup.index()?;
         let query = RetrievalQuery {
-            text: Some("exactneedle".to_string()),
+            text: Some("target Function".to_string()),
             path: Some("src/in/target.rs".to_string()),
             path_prefix: None,
             symbol: None,

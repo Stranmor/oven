@@ -446,7 +446,7 @@ mod tests {
         let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
         let manifest = setup.index()?;
         let request = ProjectContextRetrievalRequest::new(
-            "scopedneedle",
+            "target Function",
             1,
             ProjectContextPathScope::new(Some("src/in/".to_string()), vec![".rs".to_string()]),
             true,

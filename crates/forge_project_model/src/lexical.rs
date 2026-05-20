@@ -1,7 +1,6 @@
 //! Deterministic lexical retrieval index with BM25-like scoring.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 
 use crate::types::{LexicalDocument, LexicalDocumentKind, LexicalSearchHit, ProjectManifest};
 
@@ -183,21 +182,43 @@ pub fn documents_from_manifest(manifest: &ProjectManifest) -> Vec<LexicalDocumen
 }
 
 fn shard_search_text(manifest: &ProjectManifest, shard: &crate::types::ShardManifest) -> String {
-    let mut surfaces = vec![shard.path.clone(), shard.symbol_ids.join(" ")];
-    if let Ok(content) = fs::read_to_string(manifest.root.join(&shard.path)) {
-        let selected = content
-            .lines()
-            .skip(shard.start_line.saturating_sub(1) as usize)
-            .take(
-                shard
-                    .end_line
-                    .saturating_sub(shard.start_line)
-                    .saturating_add(1) as usize,
-            )
-            .collect::<Vec<_>>()
-            .join("\n");
-        surfaces.push(selected);
+    let symbols_by_id = manifest
+        .symbols
+        .iter()
+        .map(|symbol| (symbol.id.as_str(), symbol))
+        .collect::<BTreeMap<_, _>>();
+    let unique_symbol_ids = shard.symbol_ids.iter().collect::<BTreeSet<_>>();
+    let mut surfaces = vec![
+        "shard".to_string(),
+        shard.id.clone(),
+        shard.path.clone(),
+        format!("start_line_{}", shard.start_line),
+        format!("end_line_{}", shard.end_line),
+        format!("line_{}", shard.start_line),
+        format!("line_{}", shard.end_line),
+        format!("lines_{}_{}", shard.start_line, shard.end_line),
+        format!("range_{}_{}", shard.start_line, shard.end_line),
+    ];
+
+    for symbol_id in unique_symbol_ids {
+        surfaces.push(symbol_id.clone());
+        if let Some(symbol) = symbols_by_id.get(symbol_id.as_str()) {
+            surfaces.push("symbol".to_string());
+            surfaces.push(symbol.id.clone());
+            surfaces.push(symbol.name.clone());
+            surfaces.push(format!("{:?}", symbol.kind));
+            surfaces.push(symbol.path.clone());
+            surfaces.push(format!("symbol_start_line_{}", symbol.start_line));
+            surfaces.push(format!("symbol_end_line_{}", symbol.end_line));
+            surfaces.push(format!(
+                "symbol_lines_{}_{}",
+                symbol.start_line, symbol.end_line
+            ));
+        } else {
+            surfaces.push("missing_symbol".to_string());
+        }
     }
+
     surfaces.join(" ")
 }
 
@@ -241,6 +262,69 @@ mod tests {
     use super::*;
     use crate::indexer::tests::fixture_project;
     use crate::{ProjectIndexer, SymbolKind};
+
+    #[test]
+    fn shard_documents_include_resolved_symbol_terms() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let root_symbol = manifest
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "Root")
+            .expect("fixture should include Root symbol");
+
+        let actual = LexicalIndex::from_manifest(&manifest).search("Root Struct");
+        let expected = true;
+        assert_eq!(
+            actual.iter().any(|hit| hit.id != root_symbol.id
+                && hit.id.starts_with("shard:")
+                && hit.path == root_symbol.path),
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shard_documents_include_missing_symbol_marker_and_deduplicate_symbol_ids() {
+        let known_symbol = "symbol:src/lib.rs:Struct:Known".to_string();
+        let missing_symbol = "symbol:src/lib.rs:Function:Missing".to_string();
+        let setup = ProjectManifest {
+            symbols: vec![crate::SymbolNode {
+                id: known_symbol.clone(),
+                name: "Known".to_string(),
+                kind: SymbolKind::Struct,
+                path: "src/lib.rs".to_string(),
+                parent: None,
+                start_line: 5,
+                end_line: 9,
+                provenance: Default::default(),
+            }],
+            shards: vec![crate::ShardManifest {
+                id: "shard:src/lib.rs:1-10".to_string(),
+                path: "src/lib.rs".to_string(),
+                start_line: 1,
+                end_line: 10,
+                content_hash: "must_not_be_indexed".to_string(),
+                symbol_ids: vec![
+                    missing_symbol.clone(),
+                    known_symbol.clone(),
+                    known_symbol.clone(),
+                ],
+                provenance: Default::default(),
+            }],
+            ..ProjectManifest::default()
+        };
+
+        let actual = documents_from_manifest(&setup)
+            .into_iter()
+            .find(|document| document.kind == LexicalDocumentKind::Shard)
+            .map(|document| document.text)
+            .expect("fixture should include shard document");
+        let expected = "shard shard:src/lib.rs:1-10 src/lib.rs start_line_1 end_line_10 line_1 line_10 lines_1_10 range_1_10 symbol:src/lib.rs:Function:Missing missing_symbol symbol:src/lib.rs:Struct:Known symbol symbol:src/lib.rs:Struct:Known Known Struct src/lib.rs symbol_start_line_5 symbol_end_line_9 symbol_lines_5_9".to_string();
+        assert_eq!(actual, expected);
+        assert_eq!(actual.contains("must_not_be_indexed"), false);
+    }
 
     #[test]
     fn lexical_index_scores_symbols_above_file_path_matches() -> Result<()> {
