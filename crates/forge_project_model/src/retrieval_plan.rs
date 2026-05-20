@@ -1019,6 +1019,67 @@ mod tests {
     }
 
     #[test]
+    fn artifact_queries_surface_lexical_candidates_and_validated_readback_requests() -> Result<()> {
+        let fixture = tempfile::TempDir::new()?;
+        let root = fixture.path().join("project");
+        std::fs::create_dir_all(root.join("src"))?;
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"context_engine\"\nversion = \"0.1.0\"\n",
+        )?;
+        std::fs::write(
+            root.join("AGENTS.md"),
+            "# Target goal\nworkspace context engine\n",
+        )?;
+        std::fs::write(root.join("settings.json"), "{\"schema\":true}\n")?;
+        std::fs::write(root.join("src").join("ui.rs"), "pub fn renderer() {}\n")?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let queries = [
+            ("AGENTS target goal", "AGENTS.md"),
+            ("workspace context engine", "Cargo.toml"),
+            ("TUI renderer", "src/ui.rs"),
+            ("config schema", "settings.json"),
+        ];
+
+        let actual = queries
+            .iter()
+            .map(|(query, expected_path)| {
+                let request = ProjectContextRetrievalRequest::new(
+                    (*query).to_string(),
+                    5,
+                    ProjectContextPathScope::default(),
+                    false,
+                );
+                let plan = expect_plan(plan_project_context_retrieval(
+                    &manifest,
+                    &freshness(&manifest),
+                    request,
+                ));
+                (
+                    query.to_string(),
+                    plan.selected_results.iter().any(|result| {
+                        result.id.starts_with("artifact:") && result.path == *expected_path
+                    }),
+                    plan.read_requests.iter().any(|request| {
+                        request.evidence_id.starts_with("artifact:")
+                            && request.relative_manifest_path() == *expected_path
+                            && request.start_line == 1
+                            && request.end_line >= request.start_line
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = queries
+            .iter()
+            .map(|(query, _)| (query.to_string(), true, true))
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
     fn invalid_or_suspicious_cargo_metadata_ids_do_not_produce_read_requests() {
         let setup = cargo_plan_manifest();
         let candidates = [

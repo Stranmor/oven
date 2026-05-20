@@ -6,8 +6,8 @@ use crate::evidence_replay::{EvidenceLedgerReplayReport, EvidenceReplayIssueCode
 use crate::render::ProjectModelContextSource;
 use crate::types::{
     CargoFeatureMetadata, CargoPackageDependency, CargoPackageMetadata, CargoTargetMetadata,
-    CargoWorkspaceMetadata, ContextPack, ContextPackEvidence, EvidenceFreshness, ProjectManifest,
-    ShardManifest, SourceFile, SymbolNode,
+    CargoWorkspaceMetadata, ContextPack, ContextPackEvidence, EvidenceFreshness, ProjectArtifact,
+    ProjectManifest, ShardManifest, SourceFile, SymbolNode,
 };
 
 const EVIDENCE_REPLAY_METADATA_ONLY_REASON: &str = "evidence_replay_reference_only";
@@ -419,6 +419,34 @@ pub fn is_reserved_cargo_evidence_id(evidence_id: &str) -> bool {
     evidence_id.starts_with("cargo:")
 }
 
+/// Returns true when an evidence identifier uses the reserved artifact namespace.
+///
+/// # Arguments
+///
+/// * `evidence_id` - Candidate evidence identifier.
+pub fn is_reserved_artifact_evidence_id(evidence_id: &str) -> bool {
+    evidence_id.starts_with("artifact:")
+}
+
+/// Resolves a manifest-owned project artifact by stable identifier.
+///
+/// # Arguments
+///
+/// * `manifest` - Manifest owning the artifact inventory.
+/// * `evidence_id` - Candidate artifact identifier.
+pub fn resolve_project_artifact_evidence<'a>(
+    manifest: &'a ProjectManifest,
+    evidence_id: &str,
+) -> Option<&'a ProjectArtifact> {
+    if !is_reserved_artifact_evidence_id(evidence_id) {
+        return None;
+    }
+    manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.id == evidence_id)
+}
+
 /// Builds a stable opaque Cargo evidence identifier for a typed manifest item.
 ///
 /// # Arguments
@@ -472,6 +500,17 @@ pub fn resolve_manifest_evidence_target(
     if let Some(file) = manifest.files.iter().find(|file| file.path == evidence_id) {
         return Some(ManifestEvidenceTarget {
             path: file.path.clone(),
+            line_range: Some(file_line_range(file)),
+            content_hash: file.content_hash.clone(),
+        });
+    }
+    if let Some(artifact) = resolve_project_artifact_evidence(manifest, evidence_id) {
+        let file = manifest
+            .files
+            .iter()
+            .find(|file| file.path == artifact.path)?;
+        return Some(ManifestEvidenceTarget {
+            path: artifact.path.clone(),
             line_range: Some(file_line_range(file)),
             content_hash: file.content_hash.clone(),
         });

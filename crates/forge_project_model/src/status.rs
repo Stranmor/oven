@@ -591,6 +591,7 @@ mod tests {
             version: 1,
             root: root.to_path_buf(),
             files,
+            artifacts: Vec::new(),
             file_nodes: Vec::new(),
             symbols: Vec::new(),
             cargo_workspace: None,

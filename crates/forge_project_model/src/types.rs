@@ -17,6 +17,9 @@ pub struct ProjectManifest {
     pub root: PathBuf,
     /// Indexed source files keyed by relative path ordering.
     pub files: Vec<SourceFile>,
+    /// Metadata-only inventory of project artifacts derived from indexed files.
+    #[serde(default)]
+    pub artifacts: Vec<ProjectArtifact>,
     /// Hierarchical file nodes derived from indexed files.
     pub file_nodes: Vec<FileNode>,
     /// Rust symbols extracted from source files.
@@ -199,6 +202,78 @@ pub struct ExternalFactProductionBaseline {
     pub manifest: ProjectManifest,
     /// Complete Rust source text keyed by manifest-relative path.
     pub rust_source_texts: BTreeMap<String, String>,
+}
+
+/// Metadata-only project artifact derived from an indexed file.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectArtifact {
+    /// Stable artifact identifier derived from kind and normalized relative path.
+    pub id: String,
+    /// Conservative artifact taxonomy kind.
+    pub kind: ProjectArtifactKind,
+    /// Normalized path relative to the project root using `/` separators.
+    pub path: String,
+    /// Optional implementation or document language from the source file metadata.
+    pub language: Option<Language>,
+    /// Optional configuration format for metadata-only config artifacts.
+    pub config_format: Option<ProjectArtifactConfigFormat>,
+    /// Redaction-safe source fingerprint, normally the indexed file content hash.
+    pub source_fingerprint: String,
+    /// Indexed source line count.
+    pub line_count: u32,
+    /// Provenance for the artifact classification.
+    pub provenance: Provenance,
+    /// Deterministic classifier rule that produced this artifact.
+    pub classifier_rule: String,
+    /// Conservative classifier confidence from 0 to 100.
+    pub classifier_confidence: u8,
+    /// Linked file node identifier for validated readback.
+    pub linked_file_node_id: String,
+    /// Linked evidence identifier for validated readback or richer typed metadata.
+    pub linked_evidence_id: String,
+}
+
+/// Conservative metadata-only project artifact taxonomy.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ProjectArtifactKind {
+    /// Rule, agent, policy, or prompt/control surface owned by the repository.
+    PolicyControlSurface,
+    /// Cargo manifest linked to existing static Cargo metadata.
+    CargoManifest,
+    /// Runtime or application configuration file; metadata only.
+    RuntimeConfig,
+    /// Build, CI, package, or lockfile surface; metadata only.
+    BuildOrCiSurface,
+    /// Strong deterministic UI module or presentation surface.
+    UiSurface,
+    /// Strong deterministic service module surface.
+    ServiceSurface,
+    /// Strong deterministic provider module surface.
+    ProviderSurface,
+    /// Strong deterministic tool module surface.
+    ToolSurface,
+    /// Indexed project surface intentionally not overclassified in v1.
+    #[default]
+    UnclassifiedProjectSurface,
+}
+
+/// Configuration file format tracked without storing configuration values.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ProjectArtifactConfigFormat {
+    /// TOML configuration format.
+    Toml,
+    /// JSON configuration format.
+    Json,
+    /// YAML configuration format.
+    Yaml,
+    /// Markdown control/config-like format.
+    Markdown,
+    /// Environment-style configuration file.
+    Env,
+    /// INI-style configuration file.
+    Ini,
+    /// Other recognized configuration format.
+    Other(String),
 }
 
 /// A source file known to the project model.
@@ -1314,6 +1389,8 @@ pub enum LexicalDocumentKind {
     Symbol,
     /// Manifest-owned Cargo metadata document.
     CargoMetadata,
+    /// Metadata-only project artifact document.
+    Artifact,
 }
 
 /// BM25-like lexical search hit.

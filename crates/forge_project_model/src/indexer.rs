@@ -21,8 +21,9 @@ use crate::policy::{
 use crate::types::{
     ContextPack, ContextPackArtifactId, ExternalFactArtifactIngestionReport,
     ExternalFactProductionBaseline, FileNode, FileNodeKind, FreshnessProofLevel, FreshnessState,
-    Language, ManifestFreshnessEvaluation, ProjectManifest, ShardManifest, ShardStrategy,
-    SourceFile, SymbolNode, ToolEpisode,
+    Language, ManifestFreshnessEvaluation, ProjectArtifact, ProjectArtifactConfigFormat,
+    ProjectArtifactKind, ProjectManifest, ShardManifest, ShardStrategy, SourceFile, SymbolNode,
+    ToolEpisode,
 };
 use crate::util::{
     detect_language, edge_sort_key, hash_text, line_count, manifest_hash, normalize_path,
@@ -273,12 +274,14 @@ impl ProjectIndexer {
         let external_fact_batches = Vec::new();
         let external_facts_fingerprint =
             crate::util::external_facts_fingerprint(&external_fact_batches);
+        let artifacts = build_project_artifacts(&files, &cargo_metadata);
         let manifest_hash =
             manifest_hash(&files, &external_fact_batches, &external_facts_fingerprint);
         Ok(ProjectManifest {
             version: 1,
             root: self.root.clone(),
             files,
+            artifacts,
             file_nodes,
             symbols,
             cargo_workspace: cargo_metadata.workspace,
@@ -880,6 +883,225 @@ fn build_file_nodes(files: &[SourceFile]) -> Vec<FileNode> {
     nodes.into_values().collect()
 }
 
+fn build_project_artifacts(
+    files: &[SourceFile],
+    cargo_metadata: &crate::extraction::StaticCargoMetadata,
+) -> Vec<ProjectArtifact> {
+    let cargo_metadata_evidence_by_path = cargo_artifact_evidence_by_path(cargo_metadata);
+    let mut artifacts = files
+        .iter()
+        .filter_map(|file| classify_project_artifact(file, &cargo_metadata_evidence_by_path))
+        .collect::<Vec<_>>();
+    artifacts.sort_by(|left, right| left.id.cmp(&right.id));
+    artifacts
+}
+
+fn cargo_artifact_evidence_by_path(
+    cargo_metadata: &crate::extraction::StaticCargoMetadata,
+) -> BTreeMap<String, String> {
+    let mut evidence_by_path = BTreeMap::new();
+    if let Some(workspace) = &cargo_metadata.workspace {
+        evidence_by_path.insert(
+            workspace.manifest_path.clone(),
+            crate::context_adapter::cargo_workspace_evidence_id(workspace),
+        );
+    }
+    for package in &cargo_metadata.packages {
+        evidence_by_path
+            .entry(package.manifest_path.clone())
+            .or_insert_with(|| crate::context_adapter::cargo_package_evidence_id(package));
+    }
+    evidence_by_path
+}
+
+fn classify_project_artifact(
+    file: &SourceFile,
+    cargo_metadata_evidence_by_path: &BTreeMap<String, String>,
+) -> Option<ProjectArtifact> {
+    let (kind, config_format, classifier_rule, classifier_confidence, linked_evidence_id) =
+        if is_policy_control_surface(&file.path) {
+            (
+                ProjectArtifactKind::PolicyControlSurface,
+                policy_config_format(file),
+                "policy-control-surface-known-path".to_string(),
+                100,
+                file.path.clone(),
+            )
+        } else if file.path.ends_with("Cargo.toml") {
+            (
+                ProjectArtifactKind::CargoManifest,
+                Some(ProjectArtifactConfigFormat::Toml),
+                "cargo-manifest-static-metadata".to_string(),
+                100,
+                cargo_metadata_evidence_by_path
+                    .get(&file.path)
+                    .cloned()
+                    .unwrap_or_else(|| file.path.clone()),
+            )
+        } else if is_build_or_ci_surface(&file.path) {
+            (
+                ProjectArtifactKind::BuildOrCiSurface,
+                build_config_format(&file.path),
+                "build-or-ci-recognized-path".to_string(),
+                90,
+                file.path.clone(),
+            )
+        } else if let Some(format) = runtime_config_format(&file.path) {
+            (
+                ProjectArtifactKind::RuntimeConfig,
+                Some(format),
+                "runtime-config-recognized-name-or-extension".to_string(),
+                85,
+                file.path.clone(),
+            )
+        } else if let Some((kind, rule)) = deterministic_module_surface_kind(&file.path) {
+            (kind, None, rule.to_string(), 90, file.path.clone())
+        } else {
+            return None;
+        };
+
+    let id = project_artifact_id(&kind, &file.path);
+    Some(ProjectArtifact {
+        id: id.clone(),
+        kind,
+        path: file.path.clone(),
+        language: Some(file.language.clone()),
+        config_format,
+        source_fingerprint: file.content_hash.clone(),
+        line_count: file.lines,
+        provenance: provenance(
+            &file.path,
+            Some(1),
+            Some(file.lines.max(1)),
+            "artifact-indexer",
+            &id,
+        ),
+        classifier_rule,
+        classifier_confidence,
+        linked_file_node_id: file.path.clone(),
+        linked_evidence_id,
+    })
+}
+
+fn project_artifact_id(kind: &ProjectArtifactKind, path: &str) -> String {
+    format!(
+        "artifact:v1:{}:{}",
+        project_artifact_kind_label(kind),
+        crate::util::fingerprint(path)
+    )
+}
+
+fn project_artifact_kind_label(kind: &ProjectArtifactKind) -> &'static str {
+    match kind {
+        ProjectArtifactKind::PolicyControlSurface => "policy-control-surface",
+        ProjectArtifactKind::CargoManifest => "cargo-manifest",
+        ProjectArtifactKind::RuntimeConfig => "runtime-config",
+        ProjectArtifactKind::BuildOrCiSurface => "build-or-ci-surface",
+        ProjectArtifactKind::UiSurface => "ui-surface",
+        ProjectArtifactKind::ServiceSurface => "service-surface",
+        ProjectArtifactKind::ProviderSurface => "provider-surface",
+        ProjectArtifactKind::ToolSurface => "tool-surface",
+        ProjectArtifactKind::UnclassifiedProjectSurface => "unclassified-project-surface",
+    }
+}
+
+fn is_policy_control_surface(path: &str) -> bool {
+    path == "AGENTS.md"
+        || path.ends_with("/AGENTS.md")
+        || path.starts_with(".forge/agents/")
+        || path.starts_with(".forge/rules/")
+        || path.starts_with("prompts/")
+        || path.ends_with("/prompts.md")
+        || path.ends_with("/prompt.md")
+        || path.ends_with("/rules.md")
+}
+
+fn policy_config_format(file: &SourceFile) -> Option<ProjectArtifactConfigFormat> {
+    match file.language {
+        Language::Markdown => Some(ProjectArtifactConfigFormat::Markdown),
+        Language::Toml => Some(ProjectArtifactConfigFormat::Toml),
+        Language::Json => Some(ProjectArtifactConfigFormat::Json),
+        Language::Rust | Language::Unknown => None,
+    }
+}
+
+fn runtime_config_format(path: &str) -> Option<ProjectArtifactConfigFormat> {
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    match file_name {
+        ".env" | ".env.example" | ".env.sample" => Some(ProjectArtifactConfigFormat::Env),
+        ".editorconfig" => Some(ProjectArtifactConfigFormat::Ini),
+        "rust-toolchain.toml" | "deny.toml" | "taplo.toml" | "config.toml" | "settings.toml" => {
+            Some(ProjectArtifactConfigFormat::Toml)
+        }
+        "package.json" | "tsconfig.json" | "biome.json" | "deno.json" | "config.json"
+        | "settings.json" | "appsettings.json" => Some(ProjectArtifactConfigFormat::Json),
+        "config.yaml" | "config.yml" | "settings.yaml" | "settings.yml" => {
+            Some(ProjectArtifactConfigFormat::Yaml)
+        }
+        _ => None,
+    }
+}
+
+fn is_build_or_ci_surface(path: &str) -> bool {
+    path.starts_with(".github/workflows/")
+        || matches!(
+            path.rsplit('/').next().unwrap_or(path),
+            "Cargo.lock"
+                | "package-lock.json"
+                | "pnpm-lock.yaml"
+                | "yarn.lock"
+                | "flake.nix"
+                | "flake.lock"
+                | "Justfile"
+                | "Makefile"
+                | "Dockerfile"
+                | "docker-compose.yml"
+                | "docker-compose.yaml"
+        )
+}
+
+fn build_config_format(path: &str) -> Option<ProjectArtifactConfigFormat> {
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    let extension = path.rsplit('.').next().unwrap_or_default();
+    match file_name {
+        "Cargo.lock" | "flake.nix" | "Justfile" | "Makefile" | "Dockerfile" => None,
+        "flake.lock" | "package-lock.json" => Some(ProjectArtifactConfigFormat::Json),
+        "pnpm-lock.yaml" | "docker-compose.yaml" | "docker-compose.yml" => {
+            Some(ProjectArtifactConfigFormat::Yaml)
+        }
+        _ if path.starts_with(".github/workflows/") => Some(ProjectArtifactConfigFormat::Yaml),
+        _ => match extension {
+            "json" => Some(ProjectArtifactConfigFormat::Json),
+            "yaml" | "yml" => Some(ProjectArtifactConfigFormat::Yaml),
+            "toml" => Some(ProjectArtifactConfigFormat::Toml),
+            _ => None,
+        },
+    }
+}
+
+fn deterministic_module_surface_kind(path: &str) -> Option<(ProjectArtifactKind, &'static str)> {
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    let module_stem = file_name.strip_suffix(".rs")?;
+    match module_stem {
+        "ui" | "tui" | "renderer" | "render" => {
+            Some((ProjectArtifactKind::UiSurface, "rust-module-strong-ui-name"))
+        }
+        "service" | "services" => Some((
+            ProjectArtifactKind::ServiceSurface,
+            "rust-module-strong-service-name",
+        )),
+        "provider" | "providers" => Some((
+            ProjectArtifactKind::ProviderSurface,
+            "rust-module-strong-provider-name",
+        )),
+        "tool" | "tools" => Some((
+            ProjectArtifactKind::ToolSurface,
+            "rust-module-strong-tool-name",
+        )),
+        _ => None,
+    }
+}
+
 fn build_shards(
     files: &[SourceFile],
     symbols: &[SymbolNode],
@@ -1008,11 +1230,11 @@ pub(crate) mod tests {
         CargoDependencyDeclaration, CargoDependencyKind, CargoPackageDependency,
         CargoTargetDeclaration, CargoTargetKind, ContextPackSelection, EdgeConfidence,
         ExternalFactBatch, ExternalFactBatchMetadata, ExternalFactSource, GraphEdgeKind,
-        RetrievalQuery, StaleEvidencePolicy, SymbolKind, TypedExternalFacts,
-        TypedExternalReferenceFact, TypedExternalSymbolFact, VectorIndexArtifact,
-        compare_freshness, external_fact_artifact_fingerprint, external_fact_batch_fingerprint,
-        fingerprint, retrieve, vector_entries_from_manifest_embeddings,
-        write_external_fact_artifact,
+        ProjectArtifactConfigFormat, ProjectArtifactKind, RetrievalQuery, StaleEvidencePolicy,
+        SymbolKind, TypedExternalFacts, TypedExternalReferenceFact, TypedExternalSymbolFact,
+        VectorIndexArtifact, compare_freshness, external_fact_artifact_fingerprint,
+        external_fact_batch_fingerprint, fingerprint, retrieve,
+        vector_entries_from_manifest_embeddings, write_external_fact_artifact,
     };
 
     pub(crate) fn fixture_project() -> Result<(TempDir, PathBuf)> {
@@ -1734,6 +1956,245 @@ pub(crate) mod tests {
             .collect::<BTreeSet<_>>();
 
         assert_eq!(actual.contains("symbol:src/lib.rs:Struct:Root"), true);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_manifest_json_without_artifacts_deserializes_to_empty_inventory() -> Result<()> {
+        let setup = r#"{
+  "version": 1,
+  "root": "/workspace",
+  "files": [],
+  "file_nodes": [],
+  "symbols": [],
+  "edges": [],
+  "external_fact_batches": [],
+  "external_facts_fingerprint": "",
+  "shards": [],
+  "manifest_hash": "legacy"
+}"#;
+
+        let actual: ProjectManifest = serde_json::from_str(setup)?;
+        let expected = Vec::new();
+
+        assert_eq!(actual.artifacts, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_artifact_indexing_produces_identical_ordering_and_stable_ids() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        fs::write(root.join("AGENTS.md"), "# Target goal\n")?;
+        fs::write(root.join("settings.json"), "{\"api_key\":\"secret\"}\n")?;
+        fs::create_dir_all(root.join(".github").join("workflows"))?;
+        fs::write(
+            root.join(".github").join("workflows").join("ci.yml"),
+            "name: ci\n",
+        )?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+
+        let left = setup.index()?;
+        let right = setup.index()?;
+        let actual = (
+            left.artifacts
+                .iter()
+                .map(|artifact| artifact.id.clone())
+                .collect::<Vec<_>>(),
+            right
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.id.clone())
+                .collect::<Vec<_>>(),
+            left.artifacts,
+            right.artifacts,
+        );
+
+        assert_eq!(actual.0, actual.1);
+        assert_eq!(actual.2, actual.3);
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_metadata_and_lexical_text_do_not_store_raw_body_or_secret_values() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        fs::write(
+            root.join("AGENTS.md"),
+            "# TARGET GOAL\nSECRET_TOKEN=super-secret-value\nworkspace context engine\n",
+        )?;
+        fs::write(
+            root.join("settings.json"),
+            "{\"api_key\":\"super-secret-value\",\"schema\":true}\n",
+        )?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+
+        let actual = serde_json::to_string(&manifest.artifacts)?;
+        let lexical = crate::documents_from_manifest(&manifest)
+            .into_iter()
+            .filter(|document| document.kind == crate::LexicalDocumentKind::Artifact)
+            .map(|document| document.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(actual.contains("super-secret-value"), false);
+        assert_eq!(actual.contains("SECRET_TOKEN"), false);
+        assert_eq!(actual.contains("api_key"), false);
+        assert_eq!(lexical.contains("super-secret-value"), false);
+        assert_eq!(lexical.contains("SECRET_TOKEN"), false);
+        assert_eq!(lexical.contains("api_key"), false);
+        Ok(())
+    }
+
+    #[test]
+    fn ignored_and_model_storage_files_do_not_create_artifacts() -> Result<()> {
+        let (_fixture, root) = fixture_project()?;
+        fs::write(root.join(".ignore"), "ignored.toml\n")?;
+        fs::write(root.join("ignored.toml"), "[ignored]\nsecret = \"value\"\n")?;
+        let model_dir = root.join(".forge_project_model");
+        fs::create_dir_all(&model_dir)?;
+        fs::write(model_dir.join("settings.json"), "{\"secret\":true}\n")?;
+        let setup = ProjectIndexer::new(&root, &model_dir);
+
+        let actual = setup.index()?;
+
+        assert_eq!(
+            actual
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.path == "ignored.toml"),
+            false
+        );
+        assert_eq!(
+            actual
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.path.contains("settings.json")),
+            false
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_toml_artifact_reuses_existing_cargo_metadata_evidence_id() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let actual = manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path == "Cargo.toml")
+            .expect("Cargo.toml artifact should exist");
+        let package = manifest
+            .cargo_packages
+            .iter()
+            .find(|package| package.manifest_path == "Cargo.toml")
+            .expect("Cargo metadata should include package");
+        let expected = (
+            ProjectArtifactKind::CargoManifest,
+            Some(ProjectArtifactConfigFormat::Toml),
+            crate::cargo_package_evidence_id(package),
+        );
+
+        assert_eq!(
+            (
+                actual.kind.clone(),
+                actual.config_format.clone(),
+                actual.linked_evidence_id.clone(),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ambiguous_path_tokens_do_not_overclassify_artifacts_into_strong_surface_kinds() -> Result<()>
+    {
+        let fixture = TempDir::new()?;
+        let root = fixture.path().join("project");
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"ambiguous\"\nversion = \"0.1.0\"\n",
+        )?;
+        fs::write(
+            root.join("src").join("provider_notes.rs"),
+            "pub fn provider_notes() {}\n",
+        )?;
+        fs::write(
+            root.join("src").join("serviceable.rs"),
+            "pub fn serviceable() {}\n",
+        )?;
+        fs::write(
+            root.join("src").join("ui_state.rs"),
+            "pub fn ui_state() {}\n",
+        )?;
+        fs::write(root.join("src").join("toolbox.rs"), "pub fn toolbox() {}\n")?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+
+        let actual = setup.index()?;
+
+        assert_eq!(
+            actual.artifacts.iter().any(|artifact| matches!(
+                artifact.kind,
+                ProjectArtifactKind::ProviderSurface
+                    | ProjectArtifactKind::ServiceSurface
+                    | ProjectArtifactKind::UiSurface
+                    | ProjectArtifactKind::ToolSurface
+            ) && artifact.path != "Cargo.toml"),
+            false,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn extension_only_data_files_are_not_classified_as_runtime_config_artifacts() -> Result<()> {
+        let fixture = TempDir::new()?;
+        let root = fixture.path().join("project");
+        fs::create_dir_all(root.join("data"))?;
+        fs::create_dir_all(root.join("fixtures"))?;
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"data-files\"\nversion = \"0.1.0\"\n",
+        )?;
+        fs::write(
+            root.join("data").join("payload.json"),
+            "{\"not_config\":true}\n",
+        )?;
+        fs::write(
+            root.join("fixtures").join("sample.toml"),
+            "name = \"fixture\"\n",
+        )?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+
+        let actual = setup.index()?;
+
+        assert_eq!(
+            actual.artifacts.iter().any(|artifact| {
+                matches!(artifact.kind, ProjectArtifactKind::RuntimeConfig)
+                    && matches!(
+                        artifact.path.as_str(),
+                        "data/payload.json" | "fixtures/sample.toml"
+                    )
+            }),
+            false,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_inventory_freshness_changes_only_with_source_hash_or_metadata() -> Result<()> {
+        let (fixture, root) = fixture_project()?;
+        fs::write(root.join("settings.json"), "{\"schema\":true}\n")?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let previous = setup.index()?;
+        fs::write(root.join("notes.txt"), "unindexed text note\n")?;
+        let after_non_artifact = setup.index()?;
+        fs::write(root.join("settings.json"), "{\"schema\":false}\n")?;
+        let after_artifact_change = setup.index()?;
+
+        assert_eq!(after_non_artifact.artifacts, previous.artifacts);
+        assert_ne!(after_artifact_change.artifacts, previous.artifacts);
+        assert_ne!(after_artifact_change.manifest_hash, previous.manifest_hash);
         Ok(())
     }
 

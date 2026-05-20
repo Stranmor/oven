@@ -309,6 +309,13 @@ fn manifest_result_surface(
                 .find(|shard| shard.id == id)
                 .map(|shard| (shard.path.clone(), None, shard.provenance.clone()))
         })
+        .or_else(|| {
+            manifest
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.id == id)
+                .map(|artifact| (artifact.path.clone(), None, artifact.provenance.clone()))
+        })
 }
 
 fn rerank_candidates(

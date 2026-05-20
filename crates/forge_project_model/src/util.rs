@@ -115,6 +115,8 @@ pub(crate) fn manifest_hash(
         content.push_str(&file.path);
         content.push('\0');
         content.push_str(&file.content_hash);
+        content.push('\0');
+        content.push_str(&file.lines.to_string());
         content.push('\n');
     }
     content.push_str("external_facts_fingerprint");

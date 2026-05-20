@@ -8,7 +8,8 @@ use crate::context_adapter::{
 };
 use crate::types::{
     CargoDependencyKind, CargoPackageDependency, CargoPackageMetadata, LexicalDocument,
-    LexicalDocumentKind, LexicalSearchHit, ProjectManifest,
+    LexicalDocumentKind, LexicalSearchHit, ProjectArtifact, ProjectArtifactConfigFormat,
+    ProjectArtifactKind, ProjectManifest,
 };
 
 const K1: f32 = 1.2;
@@ -107,6 +108,7 @@ impl LexicalIndex {
             if score > 0.0 {
                 let kind_weight = match document.document.kind {
                     LexicalDocumentKind::Symbol => 1.25,
+                    LexicalDocumentKind::Artifact => 1.2,
                     LexicalDocumentKind::CargoMetadata => 1.1,
                     LexicalDocumentKind::Shard => 1.0,
                     LexicalDocumentKind::File => 0.8,
@@ -186,8 +188,80 @@ pub fn documents_from_manifest(manifest: &ProjectManifest) -> Vec<LexicalDocumen
         });
     }
     documents.extend(cargo_documents_from_manifest(manifest));
+    documents.extend(artifact_documents_from_manifest(manifest));
     documents.sort_by(|left, right| left.id.cmp(&right.id));
     documents
+}
+
+fn artifact_documents_from_manifest(manifest: &ProjectManifest) -> Vec<LexicalDocument> {
+    manifest
+        .artifacts
+        .iter()
+        .map(|artifact| LexicalDocument {
+            id: artifact.id.clone(),
+            path: artifact.path.clone(),
+            symbol: None,
+            kind: LexicalDocumentKind::Artifact,
+            text: artifact_search_text(artifact),
+            provenance: artifact.provenance.clone(),
+        })
+        .collect()
+}
+
+fn artifact_search_text(artifact: &ProjectArtifact) -> String {
+    [
+        "project artifact metadata".to_string(),
+        format!("kind {}", artifact_kind_terms(&artifact.kind)),
+        format!("path {}", artifact.path.replace(['/', '.', '_', '-'], " ")),
+        format!("language {}", artifact_language_label(artifact)),
+        format!(
+            "config_format {}",
+            config_format_label(&artifact.config_format)
+        ),
+        format!("classifier_rule {}", artifact.classifier_rule),
+        format!("linked_evidence_id {}", artifact.linked_evidence_id),
+        "metadata only source derived stable inventory".to_string(),
+    ]
+    .join(" ")
+}
+
+fn artifact_kind_terms(kind: &ProjectArtifactKind) -> &'static str {
+    match kind {
+        ProjectArtifactKind::PolicyControlSurface => {
+            "policy control surface agents rules prompt target goal instructions"
+        }
+        ProjectArtifactKind::CargoManifest => "cargo manifest workspace context engine package",
+        ProjectArtifactKind::RuntimeConfig => "runtime config configuration schema settings",
+        ProjectArtifactKind::BuildOrCiSurface => "build ci workflow package lock manifest",
+        ProjectArtifactKind::UiSurface => "ui surface tui renderer render presentation",
+        ProjectArtifactKind::ServiceSurface => "service surface application service",
+        ProjectArtifactKind::ProviderSurface => "provider surface model provider integration",
+        ProjectArtifactKind::ToolSurface => "tool surface tool call command",
+        ProjectArtifactKind::UnclassifiedProjectSurface => "unclassified project surface",
+    }
+}
+
+fn artifact_language_label(artifact: &ProjectArtifact) -> &'static str {
+    match artifact.language {
+        Some(crate::Language::Rust) => "rust",
+        Some(crate::Language::Toml) => "toml",
+        Some(crate::Language::Markdown) => "markdown",
+        Some(crate::Language::Json) => "json",
+        Some(crate::Language::Unknown) | None => "unknown",
+    }
+}
+
+fn config_format_label(format: &Option<ProjectArtifactConfigFormat>) -> String {
+    match format {
+        Some(ProjectArtifactConfigFormat::Toml) => "toml".to_string(),
+        Some(ProjectArtifactConfigFormat::Json) => "json".to_string(),
+        Some(ProjectArtifactConfigFormat::Yaml) => "yaml".to_string(),
+        Some(ProjectArtifactConfigFormat::Markdown) => "markdown".to_string(),
+        Some(ProjectArtifactConfigFormat::Env) => "env".to_string(),
+        Some(ProjectArtifactConfigFormat::Ini) => "ini".to_string(),
+        Some(ProjectArtifactConfigFormat::Other(label)) => format!("other {label}"),
+        None => "none".to_string(),
+    }
 }
 
 fn cargo_documents_from_manifest(manifest: &ProjectManifest) -> Vec<LexicalDocument> {
