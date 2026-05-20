@@ -508,6 +508,20 @@ impl<
             .await
     }
 
+    async fn sem_search_diagnostic(
+        &self,
+        path: PathBuf,
+    ) -> Result<forge_domain::SemSearchDiagnosticReport> {
+        let embedding_model_id = self
+            .services
+            .get_config()
+            .context("Failed to read forge config for sem_search diagnostic")?
+            .semantic_embedding_model_id;
+        self.services
+            .sem_search_diagnostic(path, embedding_model_id)
+            .await
+    }
+
     async fn query_workspace(
         &self,
         path: PathBuf,

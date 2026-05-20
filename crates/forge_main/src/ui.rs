@@ -979,6 +979,9 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                             self.on_workspace_vector_index_build(path, embedding_model_id)
                                 .await?;
                         }
+                        crate::cli::WorkspaceVectorIndexCommand::Diagnostic { path, porcelain } => {
+                            self.on_sem_search_diagnostic(path, porcelain).await?;
+                        }
                     },
                     crate::cli::WorkspaceCommand::List { porcelain } => {
                         self.on_list_workspaces(porcelain).await?;
@@ -5669,6 +5672,47 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             .add_key_value("Dimension", report.dimension.to_string())
             .add_key_value("Entries", report.entry_count.to_string())
             .add_key_value("Manifest", report.manifest_hash);
+        self.writeln(info)
+    }
+
+    async fn on_sem_search_diagnostic(
+        &mut self,
+        path: PathBuf,
+        porcelain: bool,
+    ) -> anyhow::Result<()> {
+        let report = self.api.sem_search_diagnostic(path).await?;
+        if porcelain {
+            return self.writeln(serde_json::to_string_pretty(&report)?);
+        }
+        let mut info = Info::new()
+            .add_title("SEM_SEARCH DIAGNOSTIC")
+            .add_key_value("Status", format!("{:?}", report.status))
+            .add_key_value("Reason", report.reason_label)
+            .add_key_value(
+                "Embedding Model",
+                report
+                    .embedding_model
+                    .configured_model_id
+                    .unwrap_or_else(|| "missing".to_string()),
+            )
+            .add_key_value("Suggested Action", format!("{:?}", report.suggested_action))
+            .add_key_value(
+                "Safe To Suggest Build",
+                report.safe_to_suggest_build.to_string(),
+            );
+        if let Some(manifest) = report.manifest_identity {
+            info = info
+                .add_key_value("Workspace", manifest.workspace_root.display().to_string())
+                .add_key_value("Manifest", manifest.manifest_hash);
+        }
+        if let Some(vector) = report.vector_identity {
+            info = info
+                .add_key_value("Vector Artifact", vector.vector_artifact_id)
+                .add_key_value("Dimension", vector.dimension.to_string());
+        }
+        if let Some(command) = report.command {
+            info = info.add_key_value("Command", command.display);
+        }
         self.writeln(info)
     }
 

@@ -11,14 +11,14 @@ use forge_domain::{
     AuthCredential, AuthDetails, FileChunk, Node, NodeData, NodeId, ProjectSemanticEmbeddingInput,
     ProjectSemanticEmbeddingOutput, ProjectSemanticEmbeddingRequest,
     ProjectSemanticEmbeddingVector, ProviderId, ProviderRepository, SearchParams,
-    SemSearchAvailability, SemSearchUnknownReason, SemSearchUnsupportedReason, SyncProgress,
-    UserId, WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
-    WorkspaceEvidenceLedgerActivationDiagnostic, WorkspaceEvidenceLedgerActivationSummary,
-    WorkspaceEvidenceLedgerGraphMetadata, WorkspaceEvidenceReadinessDiagnostic,
-    WorkspaceEvidenceReplayBudgetSummary, WorkspaceEvidenceReplayDiagnostic,
-    WorkspaceEvidenceReplayIssueSummary, WorkspaceEvidenceReplayPreviewDiagnostic,
-    WorkspaceEvidenceReplayPreviewStatus, WorkspaceEvidenceReplayReference,
-    WorkspaceEvidenceReplayStatus, WorkspaceExactFactBoundedLoss,
+    SemSearchAvailability, SemSearchDiagnosticReport, SemSearchUnknownReason,
+    SemSearchUnsupportedReason, SyncProgress, UserId, WorkspaceContextFreshness,
+    WorkspaceContextManifestDiagnostic, WorkspaceEvidenceLedgerActivationDiagnostic,
+    WorkspaceEvidenceLedgerActivationSummary, WorkspaceEvidenceLedgerGraphMetadata,
+    WorkspaceEvidenceReadinessDiagnostic, WorkspaceEvidenceReplayBudgetSummary,
+    WorkspaceEvidenceReplayDiagnostic, WorkspaceEvidenceReplayIssueSummary,
+    WorkspaceEvidenceReplayPreviewDiagnostic, WorkspaceEvidenceReplayPreviewStatus,
+    WorkspaceEvidenceReplayReference, WorkspaceEvidenceReplayStatus, WorkspaceExactFactBoundedLoss,
     WorkspaceExactFactIngestionSummary, WorkspaceExactFactIssue,
     WorkspaceExactFactReadinessDiagnostic, WorkspaceExactFactReferenceReport,
     WorkspaceExactFactReferenceStatus, WorkspaceExactFactStatusReport, WorkspaceId,
@@ -1137,6 +1137,20 @@ impl<
         sem_search_availability_from_indexer(&indexer, &manifest, embedding_model_id)
     }
 
+    fn sem_search_diagnostic_for_model(
+        &self,
+        path: PathBuf,
+        embedding_model_id: Option<&str>,
+    ) -> Result<SemSearchDiagnosticReport> {
+        let availability =
+            self.sem_search_availability_for_model(path.clone(), embedding_model_id)?;
+        Ok(SemSearchDiagnosticReport::from_availability(
+            &availability,
+            embedding_model_id,
+            &path,
+        ))
+    }
+
     async fn query_local_workspace(
         &self,
         path: PathBuf,
@@ -2121,6 +2135,14 @@ impl<
         self.sem_search_availability_for_model(path, embedding_model_id.as_deref())
     }
 
+    async fn sem_search_diagnostic(
+        &self,
+        path: PathBuf,
+        embedding_model_id: Option<String>,
+    ) -> Result<SemSearchDiagnosticReport> {
+        self.sem_search_diagnostic_for_model(path, embedding_model_id.as_deref())
+    }
+
     /// Performs semantic code search on a workspace.
     async fn query_workspace(
         &self,
@@ -2298,8 +2320,8 @@ mod tests {
     use forge_domain::{
         AnyProvider, AuthCredential, CodeSearchQuery, CommandExecutionOutput, CommandOutput,
         ConfigOperation, Environment, FileHash, ProcessId, ProcessReadCursor, ProcessReadOutput,
-        ProcessStartOutput, ProcessStatus, ProviderTemplate, ShellHandoffTimeoutSeconds,
-        WorkspaceFiles, WorkspaceInfo,
+        ProcessStartOutput, ProcessStatus, ProviderTemplate, SemSearchDiagnosticStatus,
+        SemSearchSuggestedAction, ShellHandoffTimeoutSeconds, WorkspaceFiles, WorkspaceInfo,
     };
     use forge_project_model::{
         ContextPack, ContextPackSelection, EvidenceLedgerReplayReport, EvidenceReplayBudget,
@@ -2315,6 +2337,7 @@ mod tests {
         retrieve, vector_entries_from_manifest_embeddings, write_external_fact_artifact,
     };
     use futures::{Stream, StreamExt};
+    use pretty_assertions::assert_eq;
     use tempfile::TempDir;
 
     use super::*;
@@ -2820,6 +2843,180 @@ mod tests {
         let id = indexer.vector_index_artifact_id(&artifact)?;
         indexer.write_vector_index(&manifest, &artifact)?;
         Ok(id)
+    }
+
+    #[test]
+    fn sem_search_diagnostic_no_model_config_requires_config_without_command() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let setup = fixture_sync_service(&root);
+
+        let actual = setup.sem_search_diagnostic_for_model(root, None)?;
+
+        assert_eq!(actual.status, SemSearchDiagnosticStatus::ConfigRequired);
+        assert_eq!(actual.reason_label, "no_model_config");
+        assert_eq!(actual.embedding_model.configured_model_id, None);
+        assert_eq!(actual.safe_to_suggest_build, false);
+        assert_eq!(actual.command, None);
+        Ok(())
+    }
+
+    #[test]
+    fn sem_search_diagnostic_manifest_missing_requires_manifest_without_build_command() -> Result<()>
+    {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = fixture_sync_service(&root);
+
+        let actual = setup.sem_search_diagnostic_for_model(root, Some("fixture-model"))?;
+
+        assert_eq!(actual.status, SemSearchDiagnosticStatus::ManifestRequired);
+        assert_eq!(actual.reason_label, "manifest_missing");
+        assert_eq!(actual.safe_to_suggest_build, false);
+        assert_eq!(actual.command, None);
+        assert_eq!(
+            actual.suggested_action,
+            SemSearchSuggestedAction::RefreshManifest
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sem_search_diagnostic_vector_absent_suggests_safe_build_command() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let setup = fixture_sync_service(&root);
+
+        let actual = setup.sem_search_diagnostic_for_model(root.clone(), Some("fixture model"))?;
+        let command = actual.command.expect("build command should be present");
+        let expected_argv = vec![
+            "forge".to_string(),
+            "workspace".to_string(),
+            "vector-index".to_string(),
+            "build".to_string(),
+            "--embedding-model-id".to_string(),
+            "fixture model".to_string(),
+            root.display().to_string(),
+        ];
+
+        assert_eq!(
+            actual.status,
+            SemSearchDiagnosticStatus::VectorBuildSuggested
+        );
+        assert_eq!(actual.reason_label, "vector_artifact_absent_or_no_match");
+        assert_eq!(actual.safe_to_suggest_build, true);
+        assert_eq!(command.argv, expected_argv);
+        assert!(command.display.contains("'fixture model'"));
+        assert!(
+            command
+                .display
+                .contains(root.display().to_string().as_str())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sem_search_diagnostic_manifest_states_never_suggest_build_command() -> Result<()> {
+        let setup = vec![
+            (
+                SemSearchUnknownReason::StaleManifest,
+                SemSearchDiagnosticStatus::ManifestRefreshRequired,
+                SemSearchSuggestedAction::RefreshManifest,
+            ),
+            (
+                SemSearchUnknownReason::ManifestFreshnessUnknown,
+                SemSearchDiagnosticStatus::ProbeUnknown,
+                SemSearchSuggestedAction::ProbeReadiness,
+            ),
+            (
+                SemSearchUnknownReason::ManifestUnreadable,
+                SemSearchDiagnosticStatus::ManifestRefreshRequired,
+                SemSearchSuggestedAction::RefreshManifest,
+            ),
+        ];
+
+        for (reason, expected_status, expected_action) in setup {
+            let actual = SemSearchDiagnosticReport::from_availability(
+                &SemSearchAvailability::Unknown { reason },
+                Some("fixture-model"),
+                Path::new("/workspace"),
+            );
+
+            assert_eq!(actual.status, expected_status);
+            assert_eq!(actual.reason_label, reason.label());
+            assert_eq!(actual.suggested_action, expected_action);
+            assert_eq!(actual.safe_to_suggest_build, false);
+            assert_eq!(actual.command, None);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sem_search_diagnostic_vector_problem_states_never_suggest_cleanup_command() -> Result<()> {
+        let setup = vec![
+            (
+                SemSearchUnknownReason::VectorArtifactListingFailed,
+                SemSearchDiagnosticStatus::VectorArtifactRepairRequired,
+                SemSearchSuggestedAction::RepairVectorArtifact,
+            ),
+            (
+                SemSearchUnknownReason::VectorArtifactCorruptOrNotReady,
+                SemSearchDiagnosticStatus::VectorArtifactRepairRequired,
+                SemSearchSuggestedAction::RepairVectorArtifact,
+            ),
+            (
+                SemSearchUnknownReason::AmbiguousVectorArtifact,
+                SemSearchDiagnosticStatus::ProbeUnknown,
+                SemSearchSuggestedAction::ProbeReadiness,
+            ),
+        ];
+
+        for (reason, expected_status, expected_action) in setup {
+            let actual = SemSearchDiagnosticReport::from_availability(
+                &SemSearchAvailability::Unknown { reason },
+                Some("fixture-model"),
+                Path::new("/workspace"),
+            );
+
+            assert_eq!(actual.status, expected_status);
+            assert_eq!(actual.reason_label, reason.label());
+            assert_eq!(actual.suggested_action, expected_action);
+            assert_eq!(actual.safe_to_suggest_build, false);
+            assert_eq!(actual.command, None);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sem_search_diagnostic_ready_reports_manifest_and_vector_identity_without_command()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let expected_id = write_fixture_vector_index(&root, "fixture-model", "RuntimeNeedle")?;
+        let setup = fixture_sync_service(&root);
+        let manifest =
+            ProjectIndexer::new(&root, local_project_model_dir(&root)).read_manifest()?;
+
+        let actual = setup.sem_search_diagnostic_for_model(root.clone(), Some("fixture-model"))?;
+
+        assert_eq!(actual.status, SemSearchDiagnosticStatus::Ready);
+        assert_eq!(actual.reason_label, "ready");
+        assert_eq!(actual.safe_to_suggest_build, false);
+        assert_eq!(actual.command, None);
+        assert_eq!(
+            actual.manifest_identity,
+            Some(forge_domain::SemSearchManifestIdentity {
+                workspace_root: root,
+                manifest_hash: manifest.manifest_hash,
+            })
+        );
+        assert_eq!(
+            actual.vector_identity,
+            Some(forge_domain::SemSearchVectorIdentity {
+                vector_artifact_id: expected_id.to_string(),
+                dimension: 2,
+            })
+        );
+        Ok(())
     }
 
     #[test]

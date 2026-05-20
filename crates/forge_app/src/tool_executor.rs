@@ -522,12 +522,13 @@ mod tests {
         LearningReviewState, McpConfig, McpServers, Metrics, Model, ModelConfig, ModelId, Node,
         NodeData, NodeId, PermissionOperation, ProjectSemanticEmbeddingOutput,
         ProjectSemanticEmbeddingVector, Provider, ProviderId, ResultStream, Scope, SearchParams,
-        SemSearchAvailability, SemSearchUnknownReason, SemSearchUnsupportedReason, Shell,
-        SteerMessage, SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter, SyncProgress,
-        ToolCallContext, ToolCallFull, WorkspaceAuth, WorkspaceContextFreshness,
-        WorkspaceContextManifestDiagnostic, WorkspaceEvidenceReplayDiagnostic,
-        WorkspaceEvidenceReplayPreviewDiagnostic, WorkspaceExactFactStatusReport, WorkspaceId,
-        WorkspaceInfo, WorkspaceSemanticInjectionReadiness, WorkspaceVectorIndexBuildReport,
+        SemSearchAvailability, SemSearchDiagnosticReport, SemSearchUnknownReason,
+        SemSearchUnsupportedReason, Shell, SteerMessage, SubagentTaskId, SubagentTaskSession,
+        SubagentTaskSessionFilter, SyncProgress, ToolCallContext, ToolCallFull, WorkspaceAuth,
+        WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
+        WorkspaceEvidenceReplayDiagnostic, WorkspaceEvidenceReplayPreviewDiagnostic,
+        WorkspaceExactFactStatusReport, WorkspaceId, WorkspaceInfo,
+        WorkspaceSemanticInjectionReadiness, WorkspaceVectorIndexBuildReport,
     };
     use pretty_assertions::assert_eq;
     use tokio::sync::Mutex;
@@ -720,6 +721,21 @@ mod tests {
                 });
             }
             Ok(self.readiness.clone())
+        }
+
+        async fn sem_search_diagnostic(
+            &self,
+            path: PathBuf,
+            embedding_model_id: Option<String>,
+        ) -> anyhow::Result<SemSearchDiagnosticReport> {
+            let availability = self
+                .sem_search_availability(path.clone(), embedding_model_id.clone())
+                .await?;
+            Ok(SemSearchDiagnosticReport::from_availability(
+                &availability,
+                embedding_model_id.as_deref(),
+                &path,
+            ))
         }
 
         async fn query_workspace(

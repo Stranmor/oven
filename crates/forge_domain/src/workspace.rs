@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use derive_more::Display;
 use serde::{Deserialize, Serialize};
@@ -138,6 +138,15 @@ impl SemSearchAvailability {
         matches!(self, Self::Ready { .. } | Self::Unknown { .. })
     }
 
+    /// Returns the stable reason label for this availability classification.
+    pub fn reason_label(&self) -> &'static str {
+        match self {
+            Self::Ready { .. } => "ready",
+            Self::Unsupported { reason } => reason.label(),
+            Self::Unknown { reason } => reason.label(),
+        }
+    }
+
     /// Returns the minimal stable fingerprint for tool-definition cache invalidation.
     pub fn semantic_fingerprint(&self) -> String {
         match self {
@@ -164,6 +173,238 @@ impl SemSearchAvailability {
             }
         }
     }
+}
+
+/// Stable status for the read-only `sem_search` build/update diagnostic report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemSearchDiagnosticStatus {
+    /// A fresh manifest and exactly one matching durable vector artifact are ready.
+    Ready,
+    /// Semantic embedding model configuration is absent or blank.
+    ConfigRequired,
+    /// Project-model manifest is absent for the workspace root.
+    ManifestRequired,
+    /// Project-model manifest exists but must be refreshed before vector work is suggested.
+    ManifestRefreshRequired,
+    /// A fresh manifest exists and a vector build is the safe next action.
+    VectorBuildSuggested,
+    /// Vector artifacts must be inspected or repaired before retrying.
+    VectorArtifactRepairRequired,
+    /// Readiness could not be classified into a safe specific build or repair action.
+    ProbeUnknown,
+}
+
+/// Closed suggested action for the read-only `sem_search` diagnostic report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemSearchSuggestedAction {
+    /// No follow-up command is suggested.
+    None,
+    /// Configure `semantic_embedding_model_id` before semantic search can be used.
+    ConfigureEmbeddingModel,
+    /// Build or refresh the project-model manifest before vector work.
+    RefreshManifest,
+    /// Build the durable vector artifact for the configured embedding model.
+    BuildVectorIndex,
+    /// Inspect or repair existing vector artifacts without destructive cleanup.
+    RepairVectorArtifact,
+    /// Run a read-only probe or inspect diagnostics before choosing a mutation.
+    ProbeReadiness,
+}
+
+/// Redaction-safe embedding model identity in a `sem_search` diagnostic report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemSearchEmbeddingModelDiagnostic {
+    /// Configured embedding model identifier when present and non-blank.
+    pub configured_model_id: Option<String>,
+}
+
+/// Optional typed manifest identity exposed only when a probe already produced it safely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemSearchManifestIdentity {
+    /// Workspace root identity associated with the manifest.
+    pub workspace_root: PathBuf,
+    /// Fresh project-model manifest hash.
+    pub manifest_hash: String,
+}
+
+/// Optional typed vector identity exposed only when the vector artifact is ready.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemSearchVectorIdentity {
+    /// Deterministic durable vector artifact identifier.
+    pub vector_artifact_id: String,
+    /// Fixed vector dimension required by the selected artifact.
+    pub dimension: usize,
+}
+
+/// Structured command suggestion with lossless argv and safe display text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemSearchDiagnosticCommand {
+    /// Command argv without shell parsing.
+    pub argv: Vec<String>,
+    /// Display-only shell command string with conservative quoting.
+    pub display: String,
+}
+
+impl SemSearchDiagnosticCommand {
+    /// Creates a structured command and a display-only safely quoted representation.
+    pub fn new(argv: Vec<String>) -> Self {
+        let display = argv
+            .iter()
+            .map(|arg| shell_quote_display(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Self { argv, display }
+    }
+}
+
+/// Read-only `sem_search` build/update diagnostic report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemSearchDiagnosticReport {
+    /// Closed diagnostic status.
+    pub status: SemSearchDiagnosticStatus,
+    /// Stable reason label from the shared availability classification source.
+    pub reason_label: String,
+    /// Configured embedding model identity without raw provider/config dumps.
+    pub embedding_model: SemSearchEmbeddingModelDiagnostic,
+    /// Manifest identity when safely available from the existing typed probe.
+    pub manifest_identity: Option<SemSearchManifestIdentity>,
+    /// Vector identity only when the vector artifact is ready.
+    pub vector_identity: Option<SemSearchVectorIdentity>,
+    /// Closed suggested next action.
+    pub suggested_action: SemSearchSuggestedAction,
+    /// Whether suggesting a vector build is safe for this classification.
+    pub safe_to_suggest_build: bool,
+    /// Optional structured command for the suggested action.
+    pub command: Option<SemSearchDiagnosticCommand>,
+}
+
+impl SemSearchDiagnosticReport {
+    /// Builds a read-only diagnostic report from the shared `sem_search` availability probe.
+    pub fn from_availability(
+        availability: &SemSearchAvailability,
+        embedding_model_id: Option<&str>,
+        workspace_path: &Path,
+    ) -> Self {
+        let configured_model_id = embedding_model_id.and_then(|model_id| {
+            let trimmed = model_id.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        });
+        let mut report = match availability {
+            SemSearchAvailability::Ready {
+                workspace_root,
+                manifest_hash,
+                vector_artifact_id,
+                dimension,
+            } => Self {
+                status: SemSearchDiagnosticStatus::Ready,
+                reason_label: availability.reason_label().to_string(),
+                embedding_model: SemSearchEmbeddingModelDiagnostic { configured_model_id },
+                manifest_identity: Some(SemSearchManifestIdentity {
+                    workspace_root: workspace_root.clone(),
+                    manifest_hash: manifest_hash.clone(),
+                }),
+                vector_identity: Some(SemSearchVectorIdentity {
+                    vector_artifact_id: vector_artifact_id.clone(),
+                    dimension: *dimension,
+                }),
+                suggested_action: SemSearchSuggestedAction::None,
+                safe_to_suggest_build: false,
+                command: None,
+            },
+            SemSearchAvailability::Unsupported { reason } => {
+                let (status, suggested_action, safe_to_suggest_build) = match reason {
+                    SemSearchUnsupportedReason::NoModelConfig => (
+                        SemSearchDiagnosticStatus::ConfigRequired,
+                        SemSearchSuggestedAction::ConfigureEmbeddingModel,
+                        false,
+                    ),
+                    SemSearchUnsupportedReason::ManifestMissing => (
+                        SemSearchDiagnosticStatus::ManifestRequired,
+                        SemSearchSuggestedAction::RefreshManifest,
+                        false,
+                    ),
+                    SemSearchUnsupportedReason::VectorArtifactAbsentOrNoMatch => (
+                        SemSearchDiagnosticStatus::VectorBuildSuggested,
+                        SemSearchSuggestedAction::BuildVectorIndex,
+                        true,
+                    ),
+                };
+                Self {
+                    status,
+                    reason_label: reason.label().to_string(),
+                    embedding_model: SemSearchEmbeddingModelDiagnostic { configured_model_id },
+                    manifest_identity: None,
+                    vector_identity: None,
+                    suggested_action,
+                    safe_to_suggest_build,
+                    command: None,
+                }
+            }
+            SemSearchAvailability::Unknown { reason } => {
+                let (status, suggested_action) = match reason {
+                    SemSearchUnknownReason::StaleManifest => (
+                        SemSearchDiagnosticStatus::ManifestRefreshRequired,
+                        SemSearchSuggestedAction::RefreshManifest,
+                    ),
+                    SemSearchUnknownReason::ManifestUnreadable => (
+                        SemSearchDiagnosticStatus::ManifestRefreshRequired,
+                        SemSearchSuggestedAction::RefreshManifest,
+                    ),
+                    SemSearchUnknownReason::VectorArtifactListingFailed
+                    | SemSearchUnknownReason::VectorArtifactCorruptOrNotReady => (
+                        SemSearchDiagnosticStatus::VectorArtifactRepairRequired,
+                        SemSearchSuggestedAction::RepairVectorArtifact,
+                    ),
+                    SemSearchUnknownReason::WorkspaceProbeFailed
+                    | SemSearchUnknownReason::ManifestFreshnessUnknown
+                    | SemSearchUnknownReason::AmbiguousVectorArtifact
+                    | SemSearchUnknownReason::UnknownProbeFailure => (
+                        SemSearchDiagnosticStatus::ProbeUnknown,
+                        SemSearchSuggestedAction::ProbeReadiness,
+                    ),
+                };
+                Self {
+                    status,
+                    reason_label: reason.label().to_string(),
+                    embedding_model: SemSearchEmbeddingModelDiagnostic { configured_model_id },
+                    manifest_identity: None,
+                    vector_identity: None,
+                    suggested_action,
+                    safe_to_suggest_build: false,
+                    command: None,
+                }
+            }
+        };
+
+        if report.safe_to_suggest_build
+            && let Some(model_id) = report.embedding_model.configured_model_id.clone()
+        {
+            report.command = Some(SemSearchDiagnosticCommand::new(vec![
+                "forge".to_string(),
+                "workspace".to_string(),
+                "vector-index".to_string(),
+                "build".to_string(),
+                "--embedding-model-id".to_string(),
+                model_id,
+                workspace_path.display().to_string(),
+            ]));
+        }
+        report
+    }
+}
+
+fn shell_quote_display(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    if value.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | '/' | ':' | '=')
+    }) {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Typed readiness classification for automatic semantic project-context injection.

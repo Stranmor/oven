@@ -363,6 +363,17 @@ pub enum WorkspaceVectorIndexCommand {
         #[arg(long)]
         embedding_model_id: String,
     },
+
+    /// Report read-only sem_search vector-index build/update diagnostics.
+    Diagnostic {
+        /// Path to the workspace directory.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Output in machine-readable format.
+        #[arg(short, long)]
+        porcelain: bool,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1242,6 +1253,29 @@ mod tests {
             _ => None,
         };
         let expected = Some((PathBuf::from("."), "fixture-model".to_string()));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn workspace_vector_index_diagnostic_parses_porcelain_path() {
+        let fixture = Cli::parse_from([
+            "forge",
+            "workspace",
+            "vector-index",
+            "diagnostic",
+            "fixture path",
+            "--porcelain",
+        ]);
+        let actual = match fixture.subcommands {
+            Some(TopLevelCommand::Workspace(group)) => match group.command {
+                WorkspaceCommand::VectorIndex {
+                    command: WorkspaceVectorIndexCommand::Diagnostic { path, porcelain },
+                } => Some((path, porcelain)),
+                _ => None,
+            },
+            _ => None,
+        };
+        let expected = Some((PathBuf::from("fixture path"), true));
         assert_eq!(actual, expected);
     }
 

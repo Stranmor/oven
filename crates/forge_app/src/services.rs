@@ -13,10 +13,10 @@ use forge_domain::{
     LearningSensorReviewOutput, McpConfig, McpServers, Model, ModelId, Node, ProcessId,
     ProcessReadCursor, ProcessReadOutput, ProcessStartOutput, ProcessStatus,
     ProjectSemanticEmbeddingOutput, Provider, ProviderId, ResultStream, Scope, SearchParams,
-    SemSearchAvailability, SensorLessonPromotionOutcome, SensorLessonPromotionRequest,
-    SteerMessage, SubagentTaskId, SubagentTaskSession, SubagentTaskSessionFilter, SyncProgress,
-    SyntaxError, Template, ToolCallFull, ToolOutput, WorkspaceAuth,
-    WorkspaceContextManifestDiagnostic, WorkspaceEvidenceReplayDiagnostic,
+    SemSearchAvailability, SemSearchDiagnosticReport, SensorLessonPromotionOutcome,
+    SensorLessonPromotionRequest, SteerMessage, SubagentTaskId, SubagentTaskSession,
+    SubagentTaskSessionFilter, SyncProgress, SyntaxError, Template, ToolCallFull, ToolOutput,
+    WorkspaceAuth, WorkspaceContextManifestDiagnostic, WorkspaceEvidenceReplayDiagnostic,
     WorkspaceEvidenceReplayPreviewDiagnostic, WorkspaceExactFactReferenceReport,
     WorkspaceExactFactStatusReport, WorkspaceId, WorkspaceInfo,
     WorkspaceSemanticInjectionReadiness, WorkspaceVectorIndexBuildReport,
@@ -783,6 +783,13 @@ pub trait WorkspaceService: Send + Sync {
         path: PathBuf,
         embedding_model_id: Option<String>,
     ) -> anyhow::Result<SemSearchAvailability>;
+
+    /// Produces a read-only sem_search build/update diagnostic for the current workspace.
+    async fn sem_search_diagnostic(
+        &self,
+        path: PathBuf,
+        embedding_model_id: Option<String>,
+    ) -> anyhow::Result<SemSearchDiagnosticReport>;
 
     /// Query the indexed workspace with semantic search
     async fn query_workspace(
@@ -1920,6 +1927,16 @@ impl<I: Services> WorkspaceService for I {
             .await
     }
 
+    async fn sem_search_diagnostic(
+        &self,
+        path: PathBuf,
+        embedding_model_id: Option<String>,
+    ) -> anyhow::Result<SemSearchDiagnosticReport> {
+        self.workspace_service()
+            .sem_search_diagnostic(path, embedding_model_id)
+            .await
+    }
+
     async fn query_workspace(
         &self,
         path: PathBuf,
@@ -2755,6 +2772,14 @@ mod tests {
             _path: PathBuf,
             _embedding_model_id: Option<String>,
         ) -> anyhow::Result<SemSearchAvailability> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn sem_search_diagnostic(
+            &self,
+            _path: PathBuf,
+            _embedding_model_id: Option<String>,
+        ) -> anyhow::Result<SemSearchDiagnosticReport> {
             anyhow::bail!("unused workspace service")
         }
 

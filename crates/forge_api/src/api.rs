@@ -308,6 +308,12 @@ pub trait API: Sync + Send {
         embedding_model_id: String,
     ) -> Result<forge_domain::ProjectSemanticEmbeddingOutput>;
 
+    /// Produces a read-only sem_search build/update diagnostic for the active configured model.
+    async fn sem_search_diagnostic(
+        &self,
+        path: PathBuf,
+    ) -> Result<forge_domain::SemSearchDiagnosticReport>;
+
     /// Query the indexed workspace
     async fn query_workspace(
         &self,

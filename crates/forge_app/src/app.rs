@@ -1817,9 +1817,9 @@ mod tests {
         LearningProvenance, LearningRecordId, LearningRecordProjection, LearningRedactionStatus,
         LearningReviewState, McpConfig, McpServers, Model, ModelId, Node, NodeData, NodeId,
         PermissionOperation, ProjectSemanticEmbeddingVector, Provider, ProviderId, ProviderType,
-        ResultStream, Scope, SearchParams, SemSearchAvailability, SteerMessage, SyncProgress,
-        ToolCallContext, ToolCallFull, ToolOutput, ToolResult, WorkspaceAuth,
-        WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
+        ResultStream, Scope, SearchParams, SemSearchAvailability, SemSearchDiagnosticReport,
+        SteerMessage, SyncProgress, ToolCallContext, ToolCallFull, ToolOutput, ToolResult,
+        WorkspaceAuth, WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
         WorkspaceEvidenceReadinessDiagnostic, WorkspaceId, WorkspaceInfo,
         WorkspaceSemanticInjectionReadiness,
     };
@@ -2572,6 +2572,21 @@ mod tests {
             Ok(SemSearchAvailability::Unsupported {
                 reason: SemSearchUnsupportedReason::VectorArtifactAbsentOrNoMatch,
             })
+        }
+
+        async fn sem_search_diagnostic(
+            &self,
+            path: PathBuf,
+            embedding_model_id: Option<String>,
+        ) -> Result<SemSearchDiagnosticReport> {
+            let availability = self
+                .sem_search_availability(path.clone(), embedding_model_id.clone())
+                .await?;
+            Ok(SemSearchDiagnosticReport::from_availability(
+                &availability,
+                embedding_model_id.as_deref(),
+                &path,
+            ))
         }
 
         async fn query_workspace(
@@ -3508,6 +3523,21 @@ mod tests {
                     })
                 }
             }
+        }
+
+        async fn sem_search_diagnostic(
+            &self,
+            path: PathBuf,
+            embedding_model_id: Option<String>,
+        ) -> Result<SemSearchDiagnosticReport> {
+            let availability = self
+                .sem_search_availability(path.clone(), embedding_model_id.clone())
+                .await?;
+            Ok(SemSearchDiagnosticReport::from_availability(
+                &availability,
+                embedding_model_id.as_deref(),
+                &path,
+            ))
         }
 
         async fn query_workspace(
