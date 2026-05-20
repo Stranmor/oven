@@ -9,6 +9,7 @@ use forge_display::DiffFormat;
 use forge_domain::{
     CodebaseSearchResults, Environment, FSMultiPatch, FSPatch, FSRead, FSRemove, FSSearch, FSUndo,
     FSWrite, FileOperation, LineNumbers, Metrics, NetFetch, PlanCreate, ToolKind,
+    WorkspaceVectorIndexBuildContinuationReport,
 };
 use forge_template::Element;
 
@@ -50,6 +51,9 @@ pub enum ToolOperation {
     },
     CodebaseSearch {
         output: CodebaseSearchResults,
+    },
+    WorkspaceVectorIndexBuildContinuation {
+        output: WorkspaceVectorIndexBuildContinuationReport,
     },
     FsPatch {
         input: FSPatch,
@@ -474,6 +478,14 @@ impl ToolOperation {
                 }
 
                 forge_domain::ToolOutput::text(root)
+            }
+            ToolOperation::WorkspaceVectorIndexBuildContinuation { output } => {
+                let body = serde_json::to_string(&output)
+                    .expect("workspace vector index build continuation report should serialize");
+                let elm = Element::new("workspace_vector_index_build_continuation")
+                    .attr("final_status", format!("{:?}", output.final_status))
+                    .cdata(body);
+                forge_domain::ToolOutput::text(elm)
             }
             ToolOperation::FsPatch { input, output } => {
                 let diff_result = DiffFormat::format(&output.before, &output.after);

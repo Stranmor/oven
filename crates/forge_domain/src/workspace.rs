@@ -471,6 +471,56 @@ pub struct WorkspaceVectorIndexBuildReport {
     pub manifest_hash: String,
 }
 
+/// Closed status returned by the explicit agent-invoked vector build continuation tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceVectorIndexBuildContinuationStatus {
+    /// A build was performed and the post-build diagnostic proved sem_search readiness.
+    BuiltReady,
+    /// No build was performed because embedding model configuration is required.
+    NotBuiltConfigRequired,
+    /// No build was performed because a project-model manifest is required.
+    NotBuiltManifestRequired,
+    /// No build was performed because the manifest must be refreshed first.
+    NotBuiltManifestRefreshRequired,
+    /// No build was performed because vector artifacts require repair or inspection.
+    NotBuiltRepairRequired,
+    /// No build was performed because readiness probing is unknown or ambiguous.
+    NotBuiltProbeUnknown,
+    /// A build was attempted through the typed service boundary and failed.
+    BuildFailed,
+}
+
+impl WorkspaceVectorIndexBuildContinuationStatus {
+    /// Maps non-build-safe diagnostic statuses into closed continuation statuses.
+    pub fn from_non_build_diagnostic_status(status: SemSearchDiagnosticStatus) -> Self {
+        match status {
+            SemSearchDiagnosticStatus::Ready => Self::NotBuiltProbeUnknown,
+            SemSearchDiagnosticStatus::ConfigRequired => Self::NotBuiltConfigRequired,
+            SemSearchDiagnosticStatus::ManifestRequired => Self::NotBuiltManifestRequired,
+            SemSearchDiagnosticStatus::ManifestRefreshRequired => {
+                Self::NotBuiltManifestRefreshRequired
+            }
+            SemSearchDiagnosticStatus::VectorBuildSuggested => Self::NotBuiltProbeUnknown,
+            SemSearchDiagnosticStatus::VectorArtifactRepairRequired => Self::NotBuiltRepairRequired,
+            SemSearchDiagnosticStatus::ProbeUnknown => Self::NotBuiltProbeUnknown,
+        }
+    }
+}
+
+/// Typed output for the explicit agent-invoked vector build continuation tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceVectorIndexBuildContinuationReport {
+    /// Diagnostic captured immediately before any possible mutation.
+    pub preflight_diagnostic: SemSearchDiagnosticReport,
+    /// Service-owned build report when a build was safely attempted and succeeded.
+    pub build_report: Option<WorkspaceVectorIndexBuildReport>,
+    /// Diagnostic captured after the no-build classification or attempted build.
+    pub post_build_diagnostic: SemSearchDiagnosticReport,
+    /// Closed final status for agent control flow.
+    pub final_status: WorkspaceVectorIndexBuildContinuationStatus,
+}
+
 /// Workspace identifier (UUID) from workspace server.
 ///
 /// Generated locally and sent to server during CreateWorkspace.

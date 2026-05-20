@@ -16,6 +16,38 @@ use crate::{
     ShellService, SkillFetchService, WorkspaceService,
 };
 
+fn canonicalize_workspace_build_path(
+    requested_path: &Path,
+    environment_cwd: &Path,
+) -> anyhow::Result<PathBuf> {
+    let requested = if requested_path.is_absolute() {
+        requested_path.to_path_buf()
+    } else {
+        environment_cwd.join(requested_path)
+    };
+    let canonical_requested = std::fs::canonicalize(&requested).map_err(|error| {
+        anyhow!(
+            "workspace_vector_index_build_continuation workspace path '{}' could not be canonicalized: {error}",
+            requested.display()
+        )
+    })?;
+    let canonical_allowed = std::fs::canonicalize(environment_cwd).map_err(|error| {
+        anyhow!(
+            "workspace_vector_index_build_continuation current workspace root '{}' could not be canonicalized: {error}",
+            environment_cwd.display()
+        )
+    })?;
+    if canonical_requested != canonical_allowed {
+        anyhow::bail!(
+            "workspace_vector_index_build_continuation rejected workspace path '{}': canonical path '{}' does not match current workspace root '{}'",
+            requested.display(),
+            canonical_requested.display(),
+            canonical_allowed.display()
+        );
+    }
+    Ok(canonical_requested)
+}
+
 pub struct ToolExecutor<S> {
     services: Arc<S>,
 }
@@ -325,6 +357,107 @@ impl<
                 let output = forge_domain::CodebaseSearchResults { queries: output };
                 ToolOperation::CodebaseSearch { output }
             }
+            ToolCatalog::WorkspaceVectorIndexBuildContinuation(input) => {
+                let config = self.services.get_config()?;
+                let env = self.services.get_environment();
+                let workspace_root = canonicalize_workspace_build_path(
+                    input.workspace_path.as_path(),
+                    env.cwd.as_path(),
+                )?;
+                let configured_model_id =
+                    config
+                        .semantic_embedding_model_id
+                        .clone()
+                        .and_then(|model_id| {
+                            let trimmed = model_id.trim().to_string();
+                            (!trimmed.is_empty()).then_some(trimmed)
+                        });
+                let Some(embedding_model_id) = configured_model_id.clone() else {
+                    let preflight_diagnostic = self
+                        .services
+                        .sem_search_diagnostic(workspace_root.clone(), None)
+                        .await?;
+                    let post_build_diagnostic = preflight_diagnostic.clone();
+                    let output = forge_domain::WorkspaceVectorIndexBuildContinuationReport {
+                        preflight_diagnostic,
+                        build_report: None,
+                        post_build_diagnostic,
+                        final_status: forge_domain::WorkspaceVectorIndexBuildContinuationStatus::NotBuiltConfigRequired,
+                    };
+                    return Ok(ToolOperation::WorkspaceVectorIndexBuildContinuation { output });
+                };
+                if let Some(explicit_model_id) = input
+                    .embedding_model_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|model_id| !model_id.is_empty())
+                    && explicit_model_id != embedding_model_id
+                {
+                    anyhow::bail!(
+                        "workspace_vector_index_build_continuation rejected embedding_model_id: explicit model is not configured for this build path"
+                    );
+                }
+
+                let preflight_diagnostic = self
+                    .services
+                    .sem_search_diagnostic(workspace_root.clone(), Some(embedding_model_id.clone()))
+                    .await?;
+                if preflight_diagnostic.status
+                    != forge_domain::SemSearchDiagnosticStatus::VectorBuildSuggested
+                    || !preflight_diagnostic.safe_to_suggest_build
+                {
+                    let final_status = forge_domain::WorkspaceVectorIndexBuildContinuationStatus::from_non_build_diagnostic_status(preflight_diagnostic.status);
+                    let post_build_diagnostic = preflight_diagnostic.clone();
+                    let output = forge_domain::WorkspaceVectorIndexBuildContinuationReport {
+                        preflight_diagnostic,
+                        build_report: None,
+                        post_build_diagnostic,
+                        final_status,
+                    };
+                    return Ok(ToolOperation::WorkspaceVectorIndexBuildContinuation { output });
+                }
+
+                let build_report = match self
+                    .services
+                    .build_workspace_vector_index(
+                        workspace_root.clone(),
+                        embedding_model_id.clone(),
+                    )
+                    .await
+                {
+                    Ok(report) => Some(report),
+                    Err(_error) => {
+                        let post_build_diagnostic = self
+                            .services
+                            .sem_search_diagnostic(workspace_root.clone(), Some(embedding_model_id))
+                            .await?;
+                        let output = forge_domain::WorkspaceVectorIndexBuildContinuationReport {
+                            preflight_diagnostic,
+                            build_report: None,
+                            post_build_diagnostic,
+                            final_status: forge_domain::WorkspaceVectorIndexBuildContinuationStatus::BuildFailed,
+                        };
+                        return Ok(ToolOperation::WorkspaceVectorIndexBuildContinuation { output });
+                    }
+                };
+                let post_build_diagnostic = self
+                    .services
+                    .sem_search_diagnostic(workspace_root, Some(embedding_model_id))
+                    .await?;
+                let final_status = match post_build_diagnostic.status {
+                    forge_domain::SemSearchDiagnosticStatus::Ready => {
+                        forge_domain::WorkspaceVectorIndexBuildContinuationStatus::BuiltReady
+                    }
+                    status => forge_domain::WorkspaceVectorIndexBuildContinuationStatus::from_non_build_diagnostic_status(status),
+                };
+                let output = forge_domain::WorkspaceVectorIndexBuildContinuationReport {
+                    preflight_diagnostic,
+                    build_report,
+                    post_build_diagnostic,
+                    final_status,
+                };
+                ToolOperation::WorkspaceVectorIndexBuildContinuation { output }
+            }
             ToolCatalog::Remove(input) => {
                 let normalized_path = self.normalize_path(input.path.clone());
                 let output = self.services.remove(normalized_path).await?;
@@ -510,8 +643,8 @@ impl<
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex};
 
     use forge_domain::{
         Agent, AgentId, AnyProvider, Attachment, AuthContextRequest, AuthContextResponse,
@@ -522,13 +655,14 @@ mod tests {
         LearningReviewState, McpConfig, McpServers, Metrics, Model, ModelConfig, ModelId, Node,
         NodeData, NodeId, PermissionOperation, ProjectSemanticEmbeddingOutput,
         ProjectSemanticEmbeddingVector, Provider, ProviderId, ResultStream, Scope, SearchParams,
-        SemSearchAvailability, SemSearchDiagnosticReport, SemSearchUnknownReason,
-        SemSearchUnsupportedReason, Shell, SteerMessage, SubagentTaskId, SubagentTaskSession,
-        SubagentTaskSessionFilter, SyncProgress, ToolCallContext, ToolCallFull, WorkspaceAuth,
-        WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
+        SemSearchAvailability, SemSearchDiagnosticReport, SemSearchDiagnosticStatus,
+        SemSearchUnknownReason, SemSearchUnsupportedReason, Shell, SteerMessage, SubagentTaskId,
+        SubagentTaskSession, SubagentTaskSessionFilter, SyncProgress, ToolCallContext,
+        ToolCallFull, WorkspaceAuth, WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
         WorkspaceEvidenceReplayDiagnostic, WorkspaceEvidenceReplayPreviewDiagnostic,
         WorkspaceExactFactStatusReport, WorkspaceId, WorkspaceInfo,
-        WorkspaceSemanticInjectionReadiness, WorkspaceVectorIndexBuildReport,
+        WorkspaceSemanticInjectionReadiness, WorkspaceVectorIndexBuildContinuationStatus,
+        WorkspaceVectorIndexBuildReport, WorkspaceVectorIndexBuildStatus,
     };
     use pretty_assertions::assert_eq;
     use tokio::sync::Mutex;
@@ -567,7 +701,8 @@ mod tests {
         query_calls: Arc<Mutex<Vec<SemSearchParamSnapshot>>>,
         build_calls: Arc<AtomicUsize>,
         query_error: Option<String>,
-        readiness: SemSearchAvailability,
+        readiness: Arc<StdMutex<SemSearchAvailability>>,
+        post_build_readiness: Arc<StdMutex<Option<SemSearchAvailability>>>,
     }
 
     impl SemSearchFixture {
@@ -580,12 +715,13 @@ mod tests {
                     query_calls: Arc::new(Mutex::new(Vec::new())),
                     build_calls: Arc::new(AtomicUsize::new(0)),
                     query_error: None,
-                    readiness: SemSearchAvailability::Ready {
+                    readiness: Arc::new(StdMutex::new(SemSearchAvailability::Ready {
                         workspace_root: PathBuf::from("/workspace"),
                         manifest_hash: "fixture-manifest".to_string(),
                         vector_artifact_id: "fixture-vector-artifact".to_string(),
                         dimension: 2,
-                    },
+                    })),
+                    post_build_readiness: Arc::new(StdMutex::new(None)),
                 },
                 unused: SemSearchUnusedService,
             }
@@ -596,8 +732,18 @@ mod tests {
             self
         }
 
-        fn with_readiness(mut self, readiness: SemSearchAvailability) -> Self {
-            self.workspace.readiness = readiness;
+        fn with_readiness(self, readiness: SemSearchAvailability) -> Self {
+            *self.workspace.readiness.lock().unwrap() = readiness;
+            self
+        }
+
+        fn with_cwd(mut self, cwd: PathBuf) -> Self {
+            self.cwd = cwd;
+            self
+        }
+
+        fn with_post_build_readiness(self, readiness: SemSearchAvailability) -> Self {
+            *self.workspace.post_build_readiness.lock().unwrap() = Some(readiness);
             self
         }
     }
@@ -672,9 +818,23 @@ mod tests {
         async fn build_workspace_vector_index(
             &self,
             _path: PathBuf,
-            _embedding_model_id: String,
+            embedding_model_id: String,
         ) -> anyhow::Result<WorkspaceVectorIndexBuildReport> {
             self.build_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(readiness) = self.post_build_readiness.lock().unwrap().clone() {
+                *self.readiness.lock().unwrap() = readiness;
+                return Ok(WorkspaceVectorIndexBuildReport {
+                    status: WorkspaceVectorIndexBuildStatus::ArtifactWritten,
+                    artifact_path: PathBuf::from(
+                        "/workspace/.forge_project_model/vector-indexes/fixture.json",
+                    ),
+                    artifact_id: "fixture-vector-artifact".to_string(),
+                    embedding_model_id,
+                    dimension: 2,
+                    entry_count: 1,
+                    manifest_hash: "fixture-manifest".to_string(),
+                });
+            }
             anyhow::bail!("sem_search must not build workspace vector indexes")
         }
 
@@ -720,7 +880,7 @@ mod tests {
                     reason: SemSearchUnsupportedReason::NoModelConfig,
                 });
             }
-            Ok(self.readiness.clone())
+            Ok(self.readiness.lock().unwrap().clone())
         }
 
         async fn sem_search_diagnostic(
@@ -1682,6 +1842,194 @@ mod tests {
         );
         assert_eq!(setup.workspace.embedding_calls.lock().await.len(), 1);
         assert_eq!(setup.workspace.query_calls.lock().await.len(), 0);
+        assert_eq!(setup.workspace.build_calls.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    fn workspace_vector_build_tool(
+        workspace_path: PathBuf,
+        embedding_model_id: Option<&str>,
+    ) -> ToolCatalog {
+        ToolCatalog::WorkspaceVectorIndexBuildContinuation(
+            forge_domain::WorkspaceVectorIndexBuildContinuation {
+                workspace_path,
+                embedding_model_id: embedding_model_id.map(str::to_string),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn workspace_vector_build_continuation_builds_once_when_diagnostic_is_safe()
+    -> anyhow::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let workspace = std::fs::canonicalize(fixture.path())?;
+        let setup = Arc::new(
+            SemSearchFixture::new(sem_search_config(Some("fixture-model")))
+                .with_cwd(workspace.clone())
+                .with_readiness(SemSearchAvailability::Unsupported {
+                    reason: SemSearchUnsupportedReason::VectorArtifactAbsentOrNoMatch,
+                })
+                .with_post_build_readiness(SemSearchAvailability::Ready {
+                    workspace_root: workspace.clone(),
+                    manifest_hash: "fixture-manifest".to_string(),
+                    vector_artifact_id: "fixture-vector-artifact".to_string(),
+                    dimension: 2,
+                }),
+        );
+        let executor = ToolExecutor::new(Arc::clone(&setup));
+
+        let actual = executor
+            .call_internal(
+                workspace_vector_build_tool(workspace.clone(), None),
+                &tool_context(),
+            )
+            .await?;
+
+        let actual = match actual {
+            ToolOperation::WorkspaceVectorIndexBuildContinuation { output } => output,
+            _ => panic!("expected workspace vector build continuation output"),
+        };
+        let expected = WorkspaceVectorIndexBuildContinuationStatus::BuiltReady;
+        assert_eq!(actual.final_status, expected);
+        assert_eq!(
+            actual.preflight_diagnostic.status,
+            SemSearchDiagnosticStatus::VectorBuildSuggested
+        );
+        assert_eq!(
+            actual.post_build_diagnostic.status,
+            SemSearchDiagnosticStatus::Ready
+        );
+        assert!(actual.build_report.is_some());
+        assert_eq!(setup.workspace.build_calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_vector_build_continuation_classifies_non_build_safe_without_mutation()
+    -> anyhow::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let workspace = std::fs::canonicalize(fixture.path())?;
+        let setup = Arc::new(
+            SemSearchFixture::new(sem_search_config(Some("fixture-model")))
+                .with_cwd(workspace.clone())
+                .with_readiness(SemSearchAvailability::Unknown {
+                    reason: SemSearchUnknownReason::VectorArtifactCorruptOrNotReady,
+                }),
+        );
+        let executor = ToolExecutor::new(Arc::clone(&setup));
+
+        let actual = executor
+            .call_internal(
+                workspace_vector_build_tool(workspace, None),
+                &tool_context(),
+            )
+            .await?;
+
+        let actual = match actual {
+            ToolOperation::WorkspaceVectorIndexBuildContinuation { output } => output,
+            _ => panic!("expected workspace vector build continuation output"),
+        };
+        let expected = WorkspaceVectorIndexBuildContinuationStatus::NotBuiltRepairRequired;
+        assert_eq!(actual.final_status, expected);
+        assert_eq!(actual.build_report, None);
+        assert_eq!(setup.workspace.build_calls.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_vector_build_continuation_does_not_report_built_when_preflight_already_ready()
+    -> anyhow::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let workspace = std::fs::canonicalize(fixture.path())?;
+        let setup = Arc::new(
+            SemSearchFixture::new(sem_search_config(Some("fixture-model")))
+                .with_cwd(workspace.clone())
+                .with_readiness(SemSearchAvailability::Ready {
+                    workspace_root: workspace.clone(),
+                    manifest_hash: "fixture-manifest".to_string(),
+                    vector_artifact_id: "fixture-vector-artifact".to_string(),
+                    dimension: 2,
+                }),
+        );
+        let executor = ToolExecutor::new(Arc::clone(&setup));
+
+        let actual = executor
+            .call_internal(
+                workspace_vector_build_tool(workspace, None),
+                &tool_context(),
+            )
+            .await?;
+
+        let actual = match actual {
+            ToolOperation::WorkspaceVectorIndexBuildContinuation { output } => output,
+            _ => panic!("expected workspace vector build continuation output"),
+        };
+        assert!(
+            actual.final_status != WorkspaceVectorIndexBuildContinuationStatus::BuiltReady,
+            "BuiltReady means a build was performed; preflight-ready continuation must not claim it built"
+        );
+        assert_eq!(actual.build_report, None);
+        assert_eq!(setup.workspace.build_calls.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_vector_build_continuation_rejects_symlink_escape_workspace_identity()
+    -> anyhow::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let workspace = fixture.path().join("workspace");
+        let outside = fixture.path().join("outside");
+        let alias = workspace.join("alias");
+        std::fs::create_dir_all(&workspace)?;
+        std::fs::create_dir_all(&outside)?;
+        create_directory_symlink(&outside, &alias)?;
+        if !alias.exists() {
+            return Ok(());
+        }
+        let workspace = std::fs::canonicalize(workspace)?;
+        let setup = Arc::new(
+            SemSearchFixture::new(sem_search_config(Some("fixture-model"))).with_cwd(workspace),
+        );
+        let executor = ToolExecutor::new(Arc::clone(&setup));
+
+        let actual = executor
+            .call_internal(workspace_vector_build_tool(alias, None), &tool_context())
+            .await;
+
+        assert!(
+            actual
+                .unwrap_err()
+                .to_string()
+                .contains("does not match current workspace root")
+        );
+        assert_eq!(setup.workspace.build_calls.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_vector_build_continuation_rejects_unconfigured_explicit_model()
+    -> anyhow::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let workspace = std::fs::canonicalize(fixture.path())?;
+        let setup = Arc::new(
+            SemSearchFixture::new(sem_search_config(Some("fixture-model")))
+                .with_cwd(workspace.clone()),
+        );
+        let executor = ToolExecutor::new(Arc::clone(&setup));
+
+        let actual = executor
+            .call_internal(
+                workspace_vector_build_tool(workspace, Some("other-model")),
+                &tool_context(),
+            )
+            .await;
+
+        assert!(
+            actual
+                .unwrap_err()
+                .to_string()
+                .contains("explicit model is not configured")
+        );
         assert_eq!(setup.workspace.build_calls.load(Ordering::SeqCst), 0);
         Ok(())
     }

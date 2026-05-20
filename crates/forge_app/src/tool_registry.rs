@@ -34,7 +34,7 @@ use crate::{
 struct ToolDefinitionsCacheKey {
     cwd: PathBuf,
     agent_id: AgentId,
-    sem_search_readiness_fingerprint: String,
+    sem_search_advertised: bool,
     research_subagent: bool,
     max_read_lines: u64,
     max_line_chars: usize,
@@ -343,7 +343,7 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
         Ok(ToolDefinitionsCacheKey {
             cwd,
             agent_id: agent_id.clone(),
-            sem_search_readiness_fingerprint: sem_search_availability.semantic_fingerprint(),
+            sem_search_advertised: sem_search_availability.should_advertise(),
             research_subagent: config.research_subagent,
             max_read_lines: config.max_read_lines,
             max_line_chars: config.max_line_chars,
@@ -688,7 +688,7 @@ mod tests {
         ToolDefinitionsCacheKey {
             cwd: PathBuf::from("/workspace"),
             agent_id: AgentId::new("chat-agent"),
-            sem_search_readiness_fingerprint: "ready:manifest:artifact:2".to_string(),
+            sem_search_advertised: true,
             research_subagent: true,
             max_read_lines: 2000,
             max_line_chars: 2000,
@@ -735,13 +735,10 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_definition_cache_key_is_scoped_to_sem_search_readiness() {
+    fn test_tool_definition_cache_key_is_scoped_to_sem_search_advertising_only() {
         let setup = cache_key_fixture();
         let mut actual = setup.clone();
-        actual.sem_search_readiness_fingerprint = SemSearchAvailability::Unknown {
-            reason: SemSearchUnknownReason::AmbiguousVectorArtifact,
-        }
-        .semantic_fingerprint();
+        actual.sem_search_advertised = false;
         let expected = false;
 
         assert_eq!(actual == setup, expected);
@@ -769,6 +766,43 @@ mod tests {
         let expected = (false, true, true);
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_build_continuation_tool_is_visible_when_sem_search_is_hidden() {
+        let fixture = ToolRegistry::<()>::get_system_tools(
+            false,
+            &Environment {
+                os: "test".to_string(),
+                cwd: PathBuf::from("/workspace"),
+                home: None,
+                shell: "sh".to_string(),
+                base_path: PathBuf::from("/workspace/.forge"),
+            },
+            None,
+            Vec::new(),
+            &TemplateConfig::default(),
+        );
+
+        let actual = fixture
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(actual.contains(&"workspace_vector_index_build_continuation".to_string()));
+        assert!(!actual.contains(&"sem_search".to_string()));
+    }
+
+    #[test]
+    fn test_read_only_agent_cannot_invoke_build_continuation_tool() {
+        let fixture = agent();
+
+        let actual = ToolRegistry::<()>::validate_tool_call(
+            &fixture,
+            &ToolName::new("workspace_vector_index_build_continuation"),
+        );
+
+        assert!(actual.is_err());
     }
 
     #[test]

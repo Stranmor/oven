@@ -109,6 +109,13 @@ impl FormatContent for ToolCatalog {
                         .into(),
                 )
             }
+            ToolCatalog::WorkspaceVectorIndexBuildContinuation(input) => Some(
+                TitleFormat::debug("Workspace Vector Index Build Continuation")
+                    .sub_title(display_path_for(
+                        &input.workspace_path.display().to_string(),
+                    ))
+                    .into(),
+            ),
             ToolCatalog::Remove(input) => {
                 let display_path = display_path_for(&input.path);
                 Some(TitleFormat::debug("Remove").sub_title(display_path).into())
