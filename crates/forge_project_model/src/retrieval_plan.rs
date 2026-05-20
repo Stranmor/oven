@@ -211,6 +211,10 @@ pub enum ProjectContextVectorInvalidReason {
     ZeroIndexDimension,
     /// Query embedding is empty while vector retrieval was requested.
     EmptyQueryEmbedding,
+    /// Query embedding contains a non-finite value.
+    NonFiniteQueryEmbedding,
+    /// Query embedding has zero norm.
+    ZeroQueryEmbeddingNorm,
 }
 
 /// Typed redaction-safe phase diagnostics for pure retrieval planning.
@@ -287,6 +291,10 @@ pub enum ProjectContextRetrievalPhaseInvalidReason {
     VectorIndexZeroDimension,
     /// Query embedding was empty.
     EmptyQueryEmbedding,
+    /// Query embedding contains a non-finite value.
+    NonFiniteQueryEmbedding,
+    /// Query embedding has zero norm.
+    ZeroQueryEmbeddingNorm,
 }
 
 /// Pure planner refusal for project-context retrieval.
@@ -876,6 +884,8 @@ fn vector_activation<'a>(
                             index_dimension: dimension,
                         },
                     )
+                } else if let Some(reason) = invalid_query_embedding_value_reason(query) {
+                    ProjectContextVectorActivation::invalid(reason)
                 } else {
                     ProjectContextVectorActivation {
                         vector_query: Some(query),
@@ -896,11 +906,26 @@ fn vector_activation<'a>(
                 ProjectContextRetrievalPhaseInvalidReason::EmptyQueryEmbedding,
             )
         }
-        (Some(_), None) => ProjectContextVectorActivation::unavailable(
-            unavailable_reason
-                .map(vector_unavailable_phase_reason)
-                .unwrap_or(ProjectContextRetrievalPhaseUnavailableReason::MissingVectorIndex),
-        ),
+        (Some(query), None) => match invalid_query_embedding_value_reason(query) {
+            Some(reason) => ProjectContextVectorActivation::invalid(reason),
+            None => ProjectContextVectorActivation::unavailable(
+                unavailable_reason
+                    .map(vector_unavailable_phase_reason)
+                    .unwrap_or(ProjectContextRetrievalPhaseUnavailableReason::MissingVectorIndex),
+            ),
+        },
+    }
+}
+
+fn invalid_query_embedding_value_reason(
+    query: &VectorQuery,
+) -> Option<ProjectContextRetrievalPhaseInvalidReason> {
+    if !query.embedding.iter().all(|value| value.is_finite()) {
+        Some(ProjectContextRetrievalPhaseInvalidReason::NonFiniteQueryEmbedding)
+    } else if query.embedding.iter().all(|value| *value == 0.0) {
+        Some(ProjectContextRetrievalPhaseInvalidReason::ZeroQueryEmbeddingNorm)
+    } else {
+        None
     }
 }
 
@@ -1739,6 +1764,92 @@ mod tests {
         let expected = ProjectContextRetrievalPhaseStatus::Invalid(
             ProjectContextRetrievalPhaseInvalidReason::EmptyQueryEmbedding,
         );
+        assert_eq!(
+            actual_plan.query_diagnostics.phase_diagnostics.vector,
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn non_finite_query_embedding_is_rejected_instead_of_reported_active() -> Result<()> {
+        let (_fixture, _root, manifest) = indexed_fixture()?;
+        let root_symbol = manifest
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "Root")
+            .expect("fixture should include Root symbol");
+        let vector_index = DeterministicVectorIndex::new(BTreeMap::from([(
+            root_symbol.id.clone(),
+            vec![1.0, 0.0],
+        )]));
+        let vector_query = VectorQuery { embedding: vec![f32::NAN, 0.0] };
+        let request = ProjectContextRetrievalRequest::new(
+            "Root model",
+            3,
+            ProjectContextPathScope::default(),
+            true,
+        );
+
+        let actual = plan_project_context_retrieval_with_options(
+            &manifest,
+            &freshness(&manifest),
+            request,
+            ProjectContextRetrievalOptions {
+                vector_query: Some(&vector_query),
+                vector_index: Some(ready_vector_boundary(&vector_index, 2)),
+                reranker: None,
+                vector_unavailable_reason: None,
+            },
+        );
+        let actual_plan = expect_plan(actual);
+        let expected = ProjectContextRetrievalPhaseStatus::Invalid(
+            ProjectContextRetrievalPhaseInvalidReason::NonFiniteQueryEmbedding,
+        );
+
+        assert_eq!(
+            actual_plan.query_diagnostics.phase_diagnostics.vector, expected,
+            "non-finite vector queries must be reported as invalid, not active with empty hits"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn zero_norm_query_embedding_is_rejected_instead_of_reported_active() -> Result<()> {
+        let (_fixture, _root, manifest) = indexed_fixture()?;
+        let root_symbol = manifest
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "Root")
+            .expect("fixture should include Root symbol");
+        let vector_index = DeterministicVectorIndex::new(BTreeMap::from([(
+            root_symbol.id.clone(),
+            vec![1.0, 0.0],
+        )]));
+        let vector_query = VectorQuery { embedding: vec![0.0, -0.0] };
+        let request = ProjectContextRetrievalRequest::new(
+            "Root model",
+            3,
+            ProjectContextPathScope::default(),
+            true,
+        );
+
+        let actual = plan_project_context_retrieval_with_options(
+            &manifest,
+            &freshness(&manifest),
+            request,
+            ProjectContextRetrievalOptions {
+                vector_query: Some(&vector_query),
+                vector_index: Some(ready_vector_boundary(&vector_index, 2)),
+                reranker: None,
+                vector_unavailable_reason: None,
+            },
+        );
+        let actual_plan = expect_plan(actual);
+        let expected = ProjectContextRetrievalPhaseStatus::Invalid(
+            ProjectContextRetrievalPhaseInvalidReason::ZeroQueryEmbeddingNorm,
+        );
+
         assert_eq!(
             actual_plan.query_diagnostics.phase_diagnostics.vector,
             expected
