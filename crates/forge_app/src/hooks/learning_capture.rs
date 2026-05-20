@@ -502,6 +502,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn learning_capture_does_not_auto_promote_existing_backlog_candidate_returned_by_idempotency()
+    -> anyhow::Result<()> {
+        let fixture = Arc::new(FixtureLearningService::default());
+        let capture = LearningCapture::new(fixture.clone());
+        let conversation = fixture_conversation();
+        let draft = LearningCapture::<FixtureLearningService>::candidate_draft(&conversation)
+            .expect("fixture conversation should produce a draft");
+        let mut old_event = fixture_capture_event(
+            &conversation,
+            "conversation:old-backlog:context:matching-idempotency".to_string(),
+            draft.metadata.clone(),
+        )?;
+        let current_event = fixture_capture_event(
+            &conversation,
+            draft.source_event_id.clone(),
+            draft.metadata.clone(),
+        )?;
+        old_event.idempotency_key = current_event.idempotency_key;
+        fixture
+            .events
+            .lock()
+            .unwrap()
+            .insert(old_event.idempotency_key.clone(), old_event);
+
+        capture.capture_saved_conversation(&conversation).await;
+
+        let actual = fixture.events.lock().unwrap().len();
+        let expected = 1usize;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn learning_capture_does_not_auto_promote_spoofed_metadata() -> anyhow::Result<()> {
         let fixture = Arc::new(FixtureLearningService::default());
         let capture = LearningCapture::new(fixture.clone());
