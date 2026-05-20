@@ -21,5 +21,5 @@ pub fn generate_labels_workflow() {
     Generate::new(workflow)
         .name("labels.yml")
         .generate()
-        .unwrap();
+        .expect("disabled labels workflow should be generated");
 }

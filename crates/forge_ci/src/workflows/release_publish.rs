@@ -21,5 +21,5 @@ pub fn release_publish() {
     Generate::new(workflow)
         .name("release.yml")
         .generate()
-        .unwrap();
+        .expect("disabled release workflow should be generated");
 }

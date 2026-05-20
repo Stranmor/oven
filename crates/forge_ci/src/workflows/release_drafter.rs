@@ -21,5 +21,5 @@ pub fn generate_release_drafter_workflow() {
     Generate::new(workflow)
         .name("release-drafter.yml")
         .generate()
-        .unwrap();
+        .expect("disabled release planning workflow should be generated");
 }

@@ -21,5 +21,5 @@ pub fn generate_bounty_workflow() {
     Generate::new(workflow)
         .name("bounty.yml")
         .generate()
-        .unwrap();
+        .expect("disabled bounty workflow should be generated");
 }

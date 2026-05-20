@@ -21,5 +21,5 @@ pub fn generate_stale_workflow() {
     Generate::new(workflow)
         .name("stale.yml")
         .generate()
-        .unwrap();
+        .expect("disabled stale workflow should be generated");
 }

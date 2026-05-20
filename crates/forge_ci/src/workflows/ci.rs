@@ -48,5 +48,8 @@ pub fn generate_ci_workflow() {
         .add_job("build", build_job)
         .add_job("zsh_rprompt_perf", perf_test_job);
 
-    Generate::new(workflow).name("ci.yml").generate().unwrap();
+    Generate::new(workflow)
+        .name("ci.yml")
+        .generate()
+        .expect("CI workflow should be generated");
 }

@@ -53,5 +53,5 @@ pub fn generate_autofix_workflow() {
     Generate::new(workflow)
         .name("autofix.yml")
         .generate()
-        .unwrap();
+        .expect("autofix workflow should be generated");
 }
