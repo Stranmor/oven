@@ -1065,6 +1065,13 @@ mod tests {
         {
             anyhow::bail!("unused conversation service")
         }
+        async fn try_modify_conversation<FN, T>(&self, _id: &ConversationId, _f: FN) -> Result<T>
+        where
+            FN: FnOnce(&mut Conversation) -> Result<T> + Send,
+            T: Send,
+        {
+            anyhow::bail!("unused conversation service")
+        }
         async fn list_branch_targets(
             &self,
             _conversation_id: &ConversationId,
