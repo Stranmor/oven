@@ -979,7 +979,7 @@ async fn try_finalize_output_tasks_within(
         }
         tokio::time::sleep(std::cmp::min(
             OUTPUT_FINALIZATION_POLL_INTERVAL,
-            deadline.duration_since(Instant::now()),
+            deadline.saturating_duration_since(Instant::now()),
         ))
         .await;
     }
