@@ -22,7 +22,10 @@ use forge_domain::{
     WorkspaceSemanticInjectionReadiness, WorkspaceVectorIndexBuildReport,
 };
 use forge_eventsource::EventSource;
-use forge_project_model::{ProjectContextCommittedQueryResult, ProjectContextEpisodeAppendOutcome};
+use forge_project_model::{
+    ProjectContextCommittedQueryResult, ProjectContextEpisodeAppendOutcome,
+    ProjectContextRetrievalPlanDiagnostic,
+};
 use reqwest::Response;
 use reqwest::header::HeaderMap;
 use url::Url;
@@ -854,6 +857,17 @@ pub trait WorkspaceService: Send + Sync {
     async fn project_context_reranker_diagnostic(
         &self,
     ) -> anyhow::Result<WorkspaceRerankRuntimeDiagnostic>;
+
+    /// Plans a read-only workspace retrieval diagnostic using the same runtime boundaries as live retrieval.
+    async fn plan_workspace_retrieval_diagnostic(
+        &self,
+        _path: PathBuf,
+        _query: String,
+        _limit: usize,
+        _path_filter: Option<String>,
+    ) -> anyhow::Result<ProjectContextRetrievalPlanDiagnostic> {
+        anyhow::bail!("workspace retrieval diagnostic planning is unavailable")
+    }
 
     /// Query the indexed workspace with semantic search and return committed project-model metadata.
     async fn query_workspace_committed(
@@ -2053,6 +2067,18 @@ impl<I: Services> WorkspaceService for I {
     ) -> anyhow::Result<WorkspaceRerankRuntimeDiagnostic> {
         self.workspace_service()
             .project_context_reranker_diagnostic()
+            .await
+    }
+
+    async fn plan_workspace_retrieval_diagnostic(
+        &self,
+        path: PathBuf,
+        query: String,
+        limit: usize,
+        path_filter: Option<String>,
+    ) -> anyhow::Result<ProjectContextRetrievalPlanDiagnostic> {
+        self.workspace_service()
+            .plan_workspace_retrieval_diagnostic(path, query, limit, path_filter)
             .await
     }
 

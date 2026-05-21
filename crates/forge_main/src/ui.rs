@@ -21,7 +21,8 @@ use forge_domain::{
     ActiveGoal, AuthMethod, ChatResponseContent, ConsoleWriter, ContextMessage, GoalBlockerKind,
     GoalStatus, Role, TitleFormat, UserCommand, WorkspaceEvidenceLedgerActivationDiagnostic,
     WorkspaceEvidenceReadinessDiagnostic, WorkspaceEvidenceReplayPreviewDiagnostic,
-    WorkspaceExactFactReadinessDiagnostic, WorkspaceRetrievalPhaseDiagnostics,
+    WorkspaceExactFactReadinessDiagnostic, WorkspaceOfflineRerankApplicability,
+    WorkspaceOfflineRerankApplicabilityMismatch, WorkspaceRetrievalPhaseDiagnostics,
     WorkspaceRetrievalPhaseInvalidReason, WorkspaceRetrievalPhaseSkipReason,
     WorkspaceRetrievalPhaseStatus, WorkspaceRetrievalPhaseUnavailableReason,
     WorkspaceRetrievalPlanDiagnostic, WorkspaceSemanticReadinessDiagnostic,
@@ -438,8 +439,13 @@ fn format_retrieval_plan_diagnostic(diagnostic: &WorkspaceRetrievalPlanDiagnosti
         })
         .collect::<Vec<_>>()
         .join(", ");
+    let offline_rerank_applicability = diagnostic
+        .offline_rerank_applicability
+        .as_ref()
+        .map(format_offline_rerank_applicability)
+        .unwrap_or_else(|| "none".to_string());
     format!(
-        "scope=query_specific_read_only_pre_readback_planner_derived workspace_label={} manifest_label={} planned={} refusal_code={} refusal_detail={} selected_results={} read_requests={} write_decision={} phases=\"{}\" rerank_intent_source={} rerank_intent_fingerprint={} rerank_intent_len={} retrieval_empty={} truncated={} selected=[{}] planned_reads=[{}]",
+        "scope=query_specific_read_only_pre_readback_planner_derived workspace_label={} manifest_label={} planned={} refusal_code={} refusal_detail={} selected_results={} read_requests={} write_decision={} phases=\"{}\" rerank_intent_source={} rerank_intent_fingerprint={} rerank_intent_len={} offline_rerank_applicability=\"{}\" retrieval_empty={} truncated={} selected=[{}] planned_reads=[{}]",
         diagnostic.workspace_root_label,
         diagnostic.manifest_label,
         diagnostic.planned,
@@ -458,11 +464,54 @@ fn format_retrieval_plan_diagnostic(diagnostic: &WorkspaceRetrievalPlanDiagnosti
             .rerank_intent_len
             .map(|len| len.to_string())
             .unwrap_or_else(|| "none".to_string()),
+        offline_rerank_applicability,
         diagnostic.retrieval_empty,
         diagnostic.truncated,
         selected,
         read_requests,
     )
+}
+
+fn format_offline_rerank_applicability(
+    applicability: &WorkspaceOfflineRerankApplicability,
+) -> String {
+    match applicability {
+        WorkspaceOfflineRerankApplicability::ExactMatch => "exact_match".to_string(),
+        WorkspaceOfflineRerankApplicability::Mismatch { reasons } => format!(
+            "mismatch:{}",
+            reasons
+                .iter()
+                .map(format_offline_rerank_mismatch)
+                .collect::<Vec<_>>()
+                .join("+")
+        ),
+    }
+}
+
+fn format_offline_rerank_mismatch(
+    mismatch: &WorkspaceOfflineRerankApplicabilityMismatch,
+) -> &'static str {
+    match mismatch {
+        WorkspaceOfflineRerankApplicabilityMismatch::ManifestHashMismatch => {
+            "manifest_hash_mismatch"
+        }
+        WorkspaceOfflineRerankApplicabilityMismatch::RerankIntentFingerprintMismatch => {
+            "rerank_intent_fingerprint_mismatch"
+        }
+        WorkspaceOfflineRerankApplicabilityMismatch::CandidateIdsOrderMismatch => {
+            "candidate_ids_order_mismatch"
+        }
+        WorkspaceOfflineRerankApplicabilityMismatch::CandidateContentFingerprintMismatch => {
+            "candidate_content_fingerprint_mismatch"
+        }
+        WorkspaceOfflineRerankApplicabilityMismatch::TopKScopeMismatch => "top_k_scope_mismatch",
+        WorkspaceOfflineRerankApplicabilityMismatch::ProducerIdentityPolicyMismatch => {
+            "producer_identity_policy_mismatch"
+        }
+        WorkspaceOfflineRerankApplicabilityMismatch::ScoreArtifactVersionMismatch => {
+            "score_artifact_version_mismatch"
+        }
+    }
 }
 
 impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI<A, F> {
@@ -7339,13 +7388,17 @@ mod tests {
             rerank_intent_source: Some("ExplicitUseCase".to_string()),
             rerank_intent_fingerprint: Some("abc123".to_string()),
             rerank_intent_len: Some(17),
-            offline_rerank_applicability: None,
+            offline_rerank_applicability: Some(WorkspaceOfflineRerankApplicability::Mismatch {
+                reasons: vec![
+                    WorkspaceOfflineRerankApplicabilityMismatch::RerankIntentFingerprintMismatch,
+                ],
+            }),
             rerank_runtime: None,
             retrieval_empty: false,
             truncated: false,
         };
         let actual = format_retrieval_plan_diagnostic(&fixture);
-        let expected = (true, true, true, true, true, false, false);
+        let expected = (true, true, true, true, true, true, false, false);
 
         assert_eq!(
             (
@@ -7354,6 +7407,9 @@ mod tests {
                 actual.contains("planned_reads=[src/lib.rs@src/lib.rs:1-3]"),
                 actual.contains("rerank_intent_source=ExplicitUseCase"),
                 actual.contains("rerank_intent_fingerprint=abc123"),
+                actual.contains(
+                    "offline_rerank_applicability=\"mismatch:rerank_intent_fingerprint_mismatch\"",
+                ),
                 actual.contains("pub fn"),
                 actual.contains("find automatic injection needle"),
             ),

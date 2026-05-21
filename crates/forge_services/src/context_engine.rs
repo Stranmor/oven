@@ -51,16 +51,16 @@ use forge_project_model::{
     ProjectContextPersistedEpisodeAppendOutcome, ProjectContextReadbackOutcome,
     ProjectContextReadbackSummary, ProjectContextRerankerBoundary, ProjectContextRerankerReadiness,
     ProjectContextRerankerUnavailableReason, ProjectContextRetrievalOptions,
-    ProjectContextRetrievalPhaseStatus, ProjectContextRetrievalPlanningOutcome,
-    ProjectContextRetrievalRequest, ProjectContextVectorIndexBoundary,
-    ProjectContextVectorReadiness, ProjectContextVectorUnavailableReason, ProjectIndexer,
-    ProjectManifest, ProjectModelContextRenderBudget, ProjectModelSearchEpisodeInput,
-    ReadRequestsSelected, ReplayActivationCaps, ReplayActivationRequest, RustAnalyzerBounds,
-    RustAnalyzerCapability, RustAnalyzerCapabilityProbe, RustAnalyzerCapabilityStatus,
-    RustAnalyzerProbe, StdRustAnalyzerProcess, VectorIndexArtifact, VectorIndexArtifactId,
-    VectorIndexEntry, VectorQuery, activate_evidence_ledger_replay,
-    derive_native_lsp_reference_request, fingerprint, load_evidence_ledger_activation,
-    local_project_model_dir, local_project_model_manifest,
+    ProjectContextRetrievalPhaseStatus, ProjectContextRetrievalPlanDiagnostic,
+    ProjectContextRetrievalPlanningOutcome, ProjectContextRetrievalRequest,
+    ProjectContextVectorIndexBoundary, ProjectContextVectorReadiness,
+    ProjectContextVectorUnavailableReason, ProjectIndexer, ProjectManifest,
+    ProjectModelContextRenderBudget, ProjectModelSearchEpisodeInput, ReadRequestsSelected,
+    ReplayActivationCaps, ReplayActivationRequest, RustAnalyzerBounds, RustAnalyzerCapability,
+    RustAnalyzerCapabilityProbe, RustAnalyzerCapabilityStatus, RustAnalyzerProbe,
+    StdRustAnalyzerProcess, VectorIndexArtifact, VectorIndexArtifactId, VectorIndexEntry,
+    VectorQuery, activate_evidence_ledger_replay, derive_native_lsp_reference_request, fingerprint,
+    load_evidence_ledger_activation, local_project_model_dir, local_project_model_manifest,
     plan_project_context_retrieval_with_options, read_exact_fact_status,
     redaction_safe_issue_path_label, redaction_safe_provenance_source_label,
     redaction_safe_replay_path_label, render_project_model_context,
@@ -1774,6 +1774,43 @@ impl<
         }
     }
 
+    fn plan_workspace_retrieval_diagnostic_for_runtime(
+        &self,
+        path: PathBuf,
+        query: String,
+        limit: usize,
+        path_filter: Option<String>,
+    ) -> Result<ProjectContextRetrievalPlanDiagnostic> {
+        let root = canonicalize_path(path)?;
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+        let manifest_path = local_project_model_manifest(&root);
+        let manifest = indexer.read_manifest().with_context(|| {
+            format!(
+                "Workspace project model is not indexed at {}. Run project-model indexing first.",
+                manifest_path.display()
+            )
+        })?;
+        let freshness = indexer.evaluate_manifest_freshness(&manifest)?;
+        let request = ProjectContextRetrievalRequest::new(
+            query,
+            limit,
+            ProjectContextPathScope::new(path_filter, Vec::new()),
+            true,
+        );
+        let outcome = plan_project_context_retrieval_with_options(
+            &manifest,
+            &freshness,
+            request,
+            ProjectContextRetrievalOptions {
+                reranker: self.select_project_context_reranker_boundary(),
+                ..ProjectContextRetrievalOptions::default()
+            },
+        );
+        Ok(ProjectContextRetrievalPlanDiagnostic::from_outcome(
+            &outcome,
+        ))
+    }
+
     async fn query_local_workspace_committed(
         &self,
         path: PathBuf,
@@ -3023,6 +3060,16 @@ impl<
         &self,
     ) -> Result<WorkspaceRerankRuntimeDiagnostic> {
         Ok(self.reranker_selector.project_context_reranker_diagnostic())
+    }
+
+    async fn plan_workspace_retrieval_diagnostic(
+        &self,
+        path: PathBuf,
+        query: String,
+        limit: usize,
+        path_filter: Option<String>,
+    ) -> Result<ProjectContextRetrievalPlanDiagnostic> {
+        self.plan_workspace_retrieval_diagnostic_for_runtime(path, query, limit, path_filter)
     }
 
     /// Performs semantic code search on a workspace and returns committed project-model metadata.

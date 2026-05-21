@@ -13,19 +13,18 @@ use forge_project_model::{
     LearningProvenance as ProjectLearningProvenance,
     LearningRedactionStatus as ProjectLearningRedactionStatus,
     LearningReviewState as ProjectLearningReviewState,
-    LearningSourceKind as ProjectLearningSourceKind, ProjectContextPathScope,
-    ProjectContextRetrievalPhaseDiagnostics, ProjectContextRetrievalPhaseInvalidReason,
-    ProjectContextRetrievalPhaseSkipReason, ProjectContextRetrievalPhaseStatus,
-    ProjectContextRetrievalPhaseUnavailableReason, ProjectContextRetrievalPlanDiagnostic,
-    ProjectContextRetrievalReadRequestSummary, ProjectContextRetrievalRequest,
+    LearningSourceKind as ProjectLearningSourceKind, ProjectContextRetrievalPhaseDiagnostics,
+    ProjectContextRetrievalPhaseInvalidReason, ProjectContextRetrievalPhaseSkipReason,
+    ProjectContextRetrievalPhaseStatus, ProjectContextRetrievalPhaseUnavailableReason,
+    ProjectContextRetrievalPlanDiagnostic, ProjectContextRetrievalReadRequestSummary,
     ProjectContextRetrievalSelectedSummary, ProjectContextTarget, ProjectContextWriteDecision,
-    ProjectIndexer, ProjectModelContextEnvelopeInput, ProjectModelContextReadinessMetadata,
+    ProjectModelContextEnvelopeInput, ProjectModelContextReadinessMetadata,
     ProjectModelContextRenderBudget, ProjectModelContextRenderRoot,
     ProjectModelEvidenceLedgerActivationMetadata, ProjectModelEvidenceReadinessMetadata,
     ProjectModelExactFactReadinessMetadata, ProjectModelManifestFreshnessProof,
     ProjectModelSourceNode, ProjectModelVolatileSidecarInput, TargetResolutionBudget,
-    build_project_model_context_envelope, directory_path_filter, local_project_model_dir,
-    local_project_model_manifest, mentioned_paths, plan_project_context_retrieval,
+    build_project_model_context_envelope, directory_path_filter, local_project_model_manifest,
+    mentioned_paths,
 };
 use forge_stream::MpscStream;
 use url::Url;
@@ -589,6 +588,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
                 query.as_deref().unwrap_or_default(),
                 rerank_runtime,
             )
+            .await
         } else {
             Vec::new()
         };
@@ -731,7 +731,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
         }
     }
 
-    fn retrieval_plan_diagnostics(
+    async fn retrieval_plan_diagnostics(
         &self,
         target_specs: &[ProjectContextTargetDiagnostic],
         skipped_manifest_candidates: &[WorkspaceContextManifestDiagnostic],
@@ -739,69 +739,68 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
         rerank_runtime: Option<WorkspaceRerankRuntimeDiagnostic>,
     ) -> Vec<WorkspaceRetrievalPlanDiagnostic> {
         let max_sources = ProjectModelContextRenderBudget::default().max_sources;
-        let mut diagnostics = target_specs
-            .iter()
-            .take(Self::MAX_TARGETS)
-            .filter_map(|target_diagnostic| {
-                Self::retrieval_plan_diagnostic_for_workspace(
+        let mut diagnostics = Vec::new();
+        for target_diagnostic in target_specs.iter().take(Self::MAX_TARGETS) {
+            if let Some(diagnostic) = self
+                .retrieval_plan_diagnostic_for_workspace(
                     &target_diagnostic.target.workspace_root,
                     target_diagnostic.target.path_filter.clone(),
                     query,
                     max_sources,
                     rerank_runtime.clone(),
                 )
-            })
-            .collect::<Vec<_>>();
-        diagnostics.extend(
-            skipped_manifest_candidates
-                .iter()
-                .take(Self::MAX_TARGETS.saturating_sub(diagnostics.len()))
-                .filter(|manifest_diagnostic| manifest_diagnostic.manifest_found)
-                .filter_map(|manifest_diagnostic| {
-                    Self::retrieval_plan_diagnostic_for_workspace(
-                        &manifest_diagnostic.workspace_root,
-                        None,
-                        query,
-                        max_sources,
-                        rerank_runtime.clone(),
-                    )
-                }),
-        );
+                .await
+            {
+                diagnostics.push(diagnostic);
+            }
+        }
+        let remaining = Self::MAX_TARGETS.saturating_sub(diagnostics.len());
+        for manifest_diagnostic in skipped_manifest_candidates
+            .iter()
+            .take(remaining)
+            .filter(|manifest_diagnostic| manifest_diagnostic.manifest_found)
+        {
+            if let Some(diagnostic) = self
+                .retrieval_plan_diagnostic_for_workspace(
+                    &manifest_diagnostic.workspace_root,
+                    None,
+                    query,
+                    max_sources,
+                    rerank_runtime.clone(),
+                )
+                .await
+            {
+                diagnostics.push(diagnostic);
+            }
+        }
         diagnostics
     }
 
-    fn retrieval_plan_diagnostic_for_workspace(
-        workspace_root: &PathBuf,
+    async fn retrieval_plan_diagnostic_for_workspace(
+        &self,
+        workspace_root: &Path,
         path_filter: Option<String>,
         query: &str,
         max_sources: usize,
         rerank_runtime: Option<WorkspaceRerankRuntimeDiagnostic>,
     ) -> Option<WorkspaceRetrievalPlanDiagnostic> {
-        let indexer = ProjectIndexer::new(workspace_root, local_project_model_dir(workspace_root));
-        let manifest = match indexer.read_manifest() {
-            Ok(manifest) => manifest,
+        let outcome = match self
+            .services
+            .plan_workspace_retrieval_diagnostic(
+                workspace_root.to_path_buf(),
+                query.to_string(),
+                max_sources,
+                path_filter,
+            )
+            .await
+        {
+            Ok(diagnostic) => diagnostic,
             Err(error) => {
-                tracing::debug!(error = ?error, path = %workspace_root.display(), "Explain-context retrieval-plan diagnostic could not read manifest");
+                tracing::debug!(error = ?error, path = %workspace_root.display(), "Explain-context retrieval-plan diagnostic could not plan retrieval");
                 return None;
             }
         };
-        let freshness = match indexer.evaluate_manifest_freshness(&manifest) {
-            Ok(freshness) => freshness,
-            Err(error) => {
-                tracing::debug!(error = ?error, path = %workspace_root.display(), "Explain-context retrieval-plan diagnostic could not evaluate freshness");
-                return None;
-            }
-        };
-        let request = ProjectContextRetrievalRequest::new(
-            query.to_string(),
-            max_sources,
-            ProjectContextPathScope::new(path_filter, Vec::new()),
-            true,
-        );
-        let outcome = plan_project_context_retrieval(&manifest, &freshness, request);
-        let mut diagnostic = Self::retrieval_plan_diagnostic_to_domain(
-            ProjectContextRetrievalPlanDiagnostic::from_outcome(&outcome),
-        );
+        let mut diagnostic = Self::retrieval_plan_diagnostic_to_domain(outcome);
         if let Some(rerank_runtime) = rerank_runtime {
             diagnostic.phase_diagnostics.rerank =
                 rerank_runtime.project_phase_status(diagnostic.rerank_intent_len);
@@ -1992,7 +1991,7 @@ mod tests {
         WorkspaceSemanticInjectionReadiness,
     };
     use forge_project_model::{
-        ProjectContextCommittedQueryResult, ProjectContextPackNoWriteReason,
+        ProjectContextCommittedQueryResult, ProjectContextPackNoWriteReason, ProjectIndexer,
     };
     use futures::StreamExt;
     use pretty_assertions::assert_eq;
@@ -3246,6 +3245,8 @@ mod tests {
         embedding_dimension: AtomicUsize,
         rerank_runtime: Mutex<WorkspaceRerankRuntimeDiagnostic>,
         rerank_runtime_diagnostic_calls: AtomicUsize,
+        retrieval_plan_diagnostic: Mutex<Option<ProjectContextRetrievalPlanDiagnostic>>,
+        retrieval_plan_diagnostic_calls: AtomicUsize,
     }
 
     impl ProjectContextHarness {
@@ -3386,6 +3387,8 @@ mod tests {
                 embedding_dimension: AtomicUsize::new(2),
                 rerank_runtime: Mutex::new(WorkspaceRerankRuntimeDiagnostic::missing_config()),
                 rerank_runtime_diagnostic_calls: AtomicUsize::new(0),
+                retrieval_plan_diagnostic: Mutex::new(None),
+                retrieval_plan_diagnostic_calls: AtomicUsize::new(0),
             })
         }
 
@@ -3404,6 +3407,17 @@ mod tests {
 
         async fn set_rerank_runtime(&self, diagnostic: WorkspaceRerankRuntimeDiagnostic) {
             *self.rerank_runtime.lock().await = diagnostic;
+        }
+
+        async fn set_retrieval_plan_diagnostic(
+            &self,
+            diagnostic: ProjectContextRetrievalPlanDiagnostic,
+        ) {
+            *self.retrieval_plan_diagnostic.lock().await = Some(diagnostic);
+        }
+
+        fn retrieval_plan_diagnostic_calls(&self) -> usize {
+            self.retrieval_plan_diagnostic_calls.load(Ordering::SeqCst)
         }
 
         fn rerank_runtime_diagnostic_calls(&self) -> usize {
@@ -3779,6 +3793,37 @@ mod tests {
             self.rerank_runtime_diagnostic_calls
                 .fetch_add(1, Ordering::SeqCst);
             Ok(self.rerank_runtime.lock().await.clone())
+        }
+
+        async fn plan_workspace_retrieval_diagnostic(
+            &self,
+            path: PathBuf,
+            query: String,
+            limit: usize,
+            path_filter: Option<String>,
+        ) -> Result<ProjectContextRetrievalPlanDiagnostic> {
+            self.retrieval_plan_diagnostic_calls
+                .fetch_add(1, Ordering::SeqCst);
+            if let Some(diagnostic) = self.retrieval_plan_diagnostic.lock().await.clone() {
+                return Ok(diagnostic);
+            }
+            let indexer = forge_project_model::ProjectIndexer::new(
+                &path,
+                forge_project_model::local_project_model_dir(&path),
+            );
+            let manifest = indexer.read_manifest()?;
+            let freshness = indexer.evaluate_manifest_freshness(&manifest)?;
+            let request = forge_project_model::ProjectContextRetrievalRequest::new(
+                query,
+                limit,
+                forge_project_model::ProjectContextPathScope::new(path_filter, Vec::new()),
+                true,
+            );
+            let outcome =
+                forge_project_model::plan_project_context_retrieval(&manifest, &freshness, request);
+            Ok(ProjectContextRetrievalPlanDiagnostic::from_outcome(
+                &outcome,
+            ))
         }
 
         async fn query_workspace_committed(
@@ -6116,6 +6161,71 @@ mod tests {
                 serialized.contains("rerank_intent_fingerprint_mismatch"),
                 serialized.contains("raw query secret"),
                 serialized.contains("raw candidate secret"),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_context_surfaces_runtime_offline_rerank_applicability() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root);
+        setup
+            .set_retrieval_plan_diagnostic(ProjectContextRetrievalPlanDiagnostic {
+                planned: true,
+                refusal_code: None,
+                refusal_detail: None,
+                selected_result_count: 1,
+                read_request_count: 0,
+                write_decision: Some(ProjectContextWriteDecision::NoWriteEmptyRetrieval),
+                selected_summaries: Vec::new(),
+                read_request_summaries: Vec::new(),
+                phase_diagnostics: ProjectContextRetrievalPhaseDiagnostics::default(),
+                rerank_intent_source: None,
+                rerank_intent_fingerprint: Some(forge_project_model::fingerprint(
+                    "raw query secret",
+                )),
+                rerank_intent_len: Some(16),
+                offline_rerank_applicability: Some(
+                    forge_project_model::OfflineRerankApplicability::Mismatch {
+                        reasons: vec![
+                            forge_project_model::OfflineRerankApplicabilityMismatch::RerankIntentFingerprintMismatch,
+                        ],
+                    },
+                ),
+                retrieval_empty: false,
+                truncated: false,
+            })
+            .await;
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
+
+        let actual = ProjectContextInjection::new(setup.clone(), agent)
+            .explain(Some("runtime request query".to_string()))
+            .await;
+        let actual_plan = actual
+            .retrieval_plan_diagnostics
+            .first()
+            .expect("explain should include live runtime retrieval diagnostic");
+        let serialized = serde_json::to_string(actual_plan)?;
+        let expected = (
+            1usize,
+            Some(WorkspaceOfflineRerankApplicability::Mismatch {
+                reasons: vec![
+                    WorkspaceOfflineRerankApplicabilityMismatch::RerankIntentFingerprintMismatch,
+                ],
+            }),
+            true,
+            false,
+        );
+
+        assert_eq!(
+            (
+                setup.retrieval_plan_diagnostic_calls(),
+                actual_plan.offline_rerank_applicability.clone(),
+                serialized.contains("rerank_intent_fingerprint_mismatch"),
+                serialized.contains("raw query secret"),
             ),
             expected,
         );
