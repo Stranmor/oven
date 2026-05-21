@@ -104,6 +104,67 @@ impl GoalSlashAction {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ChatTurnOutcome {
+    task_complete: bool,
+    interrupted: bool,
+    stream_error: bool,
+    progress_evidence: bool,
+}
+
+impl ChatTurnOutcome {
+    fn record_response(&mut self, response: &ChatResponse) {
+        match response {
+            ChatResponse::TaskComplete => {
+                self.task_complete = true;
+            }
+            ChatResponse::Interrupt { .. } => {
+                self.interrupted = true;
+            }
+            ChatResponse::TaskMessage { content } => {
+                if !content.as_str().trim().is_empty() {
+                    self.progress_evidence = true;
+                }
+            }
+            ChatResponse::TaskReasoning { content } => {
+                if !content.trim().is_empty() {
+                    self.progress_evidence = true;
+                }
+            }
+            ChatResponse::ToolCallEnd(_) => {
+                self.progress_evidence = true;
+            }
+            ChatResponse::ToolCallStart { .. } | ChatResponse::RetryAttempt { .. } => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoalContinuationDecision {
+    Continue,
+    Stop,
+}
+
+fn decide_goal_continuation(
+    goal: Option<&ActiveGoal>,
+    remaining_budget: u8,
+    outcome: ChatTurnOutcome,
+) -> GoalContinuationDecision {
+    let Some(goal) = goal else {
+        return GoalContinuationDecision::Stop;
+    };
+    if !goal.is_active()
+        || remaining_budget == 0
+        || !outcome.task_complete
+        || outcome.interrupted
+        || outcome.stream_error
+        || !outcome.progress_evidence
+    {
+        return GoalContinuationDecision::Stop;
+    }
+    GoalContinuationDecision::Continue
+}
+
 fn branch_target_select_rows(
     targets: Vec<forge_app::dto::ConversationBranchTarget>,
 ) -> Vec<SelectRow> {
@@ -4645,14 +4706,46 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             return self.on_tui_chat(chat).await;
         }
 
+        let mut chat = chat;
+        let mut remaining_budget = self
+            .active_goal_for_current_conversation()
+            .await?
+            .filter(ActiveGoal::is_active)
+            .map(|goal| goal.continuation.max_turns_per_user_turn)
+            .unwrap_or_default();
+        let final_outcome = loop {
+            let outcome = self.consume_classic_chat_turn(chat).await?;
+            let goal = self.active_goal_for_current_conversation().await?;
+            if decide_goal_continuation(goal.as_ref(), remaining_budget, outcome)
+                != GoalContinuationDecision::Continue
+            {
+                break outcome;
+            }
+            remaining_budget = remaining_budget.saturating_sub(1);
+            chat = self.build_chat_request(None).await?;
+        };
+
+        if final_outcome.task_complete && !final_outcome.interrupted && !final_outcome.stream_error
+        {
+            self.handle_task_complete_side_effects(true).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn consume_classic_chat_turn(&mut self, chat: ChatRequest) -> Result<ChatTurnOutcome> {
         let mut stream = self.api.chat(chat).await?;
 
         // Always use streaming content writer
         let mut writer = StreamingWriter::new(self.spinner.clone(), self.api.clone());
+        let mut outcome = ChatTurnOutcome::default();
 
         while let Some(message) = stream.next().await {
             match message {
-                Ok(message) => self.handle_chat_response(message, &mut writer).await?,
+                Ok(message) => {
+                    outcome.record_response(&message);
+                    self.handle_chat_response(message, &mut writer).await?;
+                }
                 Err(err) => {
                     writer.finish()?;
                     self.spinner.stop(None)?;
@@ -4666,7 +4759,20 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         self.spinner.stop(None)?;
         self.spinner.reset();
 
-        Ok(())
+        Ok(outcome)
+    }
+
+    async fn active_goal_for_current_conversation(&self) -> Result<Option<ActiveGoal>> {
+        let Some(conversation_id) = self.state.conversation_id else {
+            return Ok(None);
+        };
+        let goal = self
+            .api
+            .conversation(&conversation_id)
+            .await?
+            .and_then(|conversation| conversation.context)
+            .and_then(|context| context.active_goal);
+        Ok(goal)
     }
 
     async fn on_tui_chat(&mut self, chat: ChatRequest) -> Result<()> {
@@ -4679,15 +4785,51 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         chat: ChatRequest,
         session: &mut impl forge_tui::TuiRenderer,
     ) -> Result<()> {
+        let mut chat = chat;
+        let mut remaining_budget = self
+            .active_goal_for_current_conversation()
+            .await?
+            .filter(ActiveGoal::is_active)
+            .map(|goal| goal.continuation.max_turns_per_user_turn)
+            .unwrap_or_default();
+        let final_outcome = loop {
+            let outcome = self.consume_tui_chat_turn(chat, session).await?;
+            let goal = self.active_goal_for_current_conversation().await?;
+            if decide_goal_continuation(goal.as_ref(), remaining_budget, outcome)
+                != GoalContinuationDecision::Continue
+            {
+                break outcome;
+            }
+            remaining_budget = remaining_budget.saturating_sub(1);
+            chat = self.build_chat_request(None).await?;
+        };
+
+        if final_outcome.task_complete && !final_outcome.interrupted && !final_outcome.stream_error
+        {
+            self.handle_task_complete_side_effects(false).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn consume_tui_chat_turn(
+        &mut self,
+        chat: ChatRequest,
+        session: &mut impl forge_tui::TuiRenderer,
+    ) -> Result<ChatTurnOutcome> {
         queue_tui_submitted_turn(session, &chat)?;
         self.spinner.stop(None)?;
         self.spinner.reset();
         let mut stream = self.api.chat(chat).await?;
+        let mut outcome = ChatTurnOutcome::default();
         session.queue_and_render(forge_ui_model::running_turn())?;
 
         while let Some(message) = stream.next().await {
             match message {
-                Ok(message) => Box::pin(self.handle_tui_chat_response(message, session)).await?,
+                Ok(message) => {
+                    outcome.record_response(&message);
+                    Box::pin(self.handle_tui_chat_response(message, session)).await?;
+                }
                 Err(err) => {
                     self.spinner.stop(None)?;
                     self.spinner.reset();
@@ -4698,7 +4840,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
 
         self.spinner.stop(None)?;
         self.spinner.reset();
-        Ok(())
+        Ok(outcome)
     }
 
     async fn handle_tui_chat_response(
@@ -4730,9 +4872,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                 };
                 tracker::tool_call(payload);
             }
-            ChatResponse::TaskComplete => {
-                self.handle_task_complete_side_effects(false).await?;
-            }
+            ChatResponse::TaskComplete => {}
             ChatResponse::Interrupt { reason } => {
                 self.handle_tui_interrupt(reason, session).await?;
             }
@@ -4998,7 +5138,6 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             }
             ChatResponse::TaskComplete => {
                 writer.finish()?;
-                self.handle_task_complete_side_effects(true).await?;
             }
         }
         Ok(())
@@ -6582,7 +6721,8 @@ mod tests {
     use std::sync::Arc;
 
     use forge_domain::{
-        CompactionResult, EventValue, ProviderRequestEstimate, ToolCallFull, ToolResult,
+        CompactionResult, EventValue, GoalContinuation, ProviderRequestEstimate, ToolCallFull,
+        ToolResult,
     };
     use forge_ui_model::{UiBlock, UiModel, UiTurnPhase};
     use futures::FutureExt;
@@ -6842,6 +6982,91 @@ mod tests {
             .expect("fixture command event should not render submitted turn");
         let actual = setup.queued_models;
         let expected: Vec<UiModel> = Vec::new();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn goal_continuation_policy_continues_only_for_active_goal_budget_progress_and_task_complete() {
+        let setup = ActiveGoal::new("finish continuation slice")
+            .unwrap()
+            .continuation(GoalContinuation { max_turns_per_user_turn: 1 });
+        let mut outcome = ChatTurnOutcome::default();
+        outcome.record_response(&ChatResponse::TaskMessage {
+            content: ChatResponseContent::Markdown { text: "progress".to_string(), partial: false },
+        });
+        outcome.record_response(&ChatResponse::TaskComplete);
+
+        let actual = decide_goal_continuation(Some(&setup), 1, outcome);
+        let expected = GoalContinuationDecision::Continue;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn goal_continuation_policy_stops_without_active_goal_budget_progress_or_clean_task_complete() {
+        let active_goal = ActiveGoal::new("finish continuation slice").unwrap();
+        let mut paused_goal = active_goal.clone();
+        paused_goal.pause();
+        let mut complete_with_progress = ChatTurnOutcome::default();
+        complete_with_progress.record_response(&ChatResponse::TaskMessage {
+            content: ChatResponseContent::Markdown { text: "progress".to_string(), partial: false },
+        });
+        complete_with_progress.record_response(&ChatResponse::TaskComplete);
+        let mut interrupted = complete_with_progress;
+        interrupted.record_response(&ChatResponse::Interrupt {
+            reason: InterruptionReason::MaxRequestPerTurnLimitReached { limit: 1 },
+        });
+        let stream_error = ChatTurnOutcome { stream_error: true, ..complete_with_progress };
+        let mut no_progress = ChatTurnOutcome::default();
+        no_progress.record_response(&ChatResponse::TaskComplete);
+
+        let actual = vec![
+            decide_goal_continuation(None, 1, complete_with_progress),
+            decide_goal_continuation(Some(&paused_goal), 1, complete_with_progress),
+            decide_goal_continuation(Some(&active_goal), 0, complete_with_progress),
+            decide_goal_continuation(Some(&active_goal), 1, no_progress),
+            decide_goal_continuation(Some(&active_goal), 1, interrupted),
+            decide_goal_continuation(Some(&active_goal), 1, stream_error),
+        ];
+        let expected = vec![
+            GoalContinuationDecision::Stop,
+            GoalContinuationDecision::Stop,
+            GoalContinuationDecision::Stop,
+            GoalContinuationDecision::Stop,
+            GoalContinuationDecision::Stop,
+            GoalContinuationDecision::Stop,
+        ];
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn chat_turn_outcome_tracks_task_complete_interrupt_and_progress_without_goal_mutation() {
+        let goal = ActiveGoal::new("finish continuation slice").unwrap();
+        let mut actual = ChatTurnOutcome::default();
+
+        actual.record_response(&ChatResponse::TaskReasoning { content: "thinking".to_string() });
+        actual.record_response(&ChatResponse::TaskComplete);
+        actual.record_response(&ChatResponse::Interrupt {
+            reason: InterruptionReason::MaxRequestPerTurnLimitReached { limit: 1 },
+        });
+
+        let expected = (true, true, false, true, GoalStatus::Active);
+        assert_eq!(
+            (
+                actual.task_complete,
+                actual.interrupted,
+                actual.stream_error,
+                actual.progress_evidence,
+                goal.status,
+            ),
+            expected,
+        );
+    }
+
+    #[test]
+    fn chat_turn_outcome_marks_stream_error() {
+        let fixture = ChatTurnOutcome { stream_error: true, ..ChatTurnOutcome::default() };
+        let actual = fixture.stream_error;
+        let expected = true;
         assert_eq!(actual, expected);
     }
 

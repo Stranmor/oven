@@ -574,6 +574,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_goal_context_replaces_previous_uncached_goal_without_duplicates() {
+        let agent = fixture_agent_without_user_prompt();
+        let event = Event::new("Second task");
+        let stale_goal = TextMessage::goal_context(
+            Role::User,
+            "<conversation_goal\n  status=\"active\"\n>\n<objective>old</objective>\n</conversation_goal>",
+        )
+        .model(ModelId::new("test-model"));
+        let conversation = fixture_conversation().context(
+            Context::default()
+                .set_active_goal(ActiveGoal::new("finish the slice").unwrap())
+                .add_message(ContextMessage::Text(stale_goal)),
+        );
+        let generator = fixture_generator(agent.clone(), event);
+
+        let actual = generator.add_user_prompt(conversation).await.unwrap();
+
+        let goal_messages = actual
+            .context
+            .unwrap()
+            .messages
+            .into_iter()
+            .filter_map(|message| match message.message {
+                ContextMessage::Text(text) if text.is_goal_context() => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let actual = (
+            goal_messages.len(),
+            goal_messages
+                .first()
+                .map(|message| message.content.contains("finish the slice")),
+            goal_messages.first().map(TextMessage::is_cache_eligible),
+        );
+        let expected = (1, Some(true), Some(false));
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
     async fn test_runtime_context_replaces_previous_request_context() {
         let agent = fixture_agent_without_user_prompt();
         let first_event = Event::new("First task");

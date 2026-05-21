@@ -15,6 +15,7 @@ members = [
     "crates/forge_main",
     "crates/forge_markdown_stream",
     "crates/forge_project_model",
+    "crates/forge_quality_runtime",
     "crates/forge_repo",
     "crates/forge_select",
     "crates/forge_services",
@@ -202,6 +203,7 @@ forge_tui = { path = "crates/forge_tui" }
 forge_ui_model = { path = "crates/forge_ui_model" }
 forge_test_kit = { path = "crates/forge_test_kit" }
 forge_project_model = { path = "crates/forge_project_model" }
+forge_quality_runtime = { path = "crates/forge_quality_runtime" }
 
 forge_markdown_stream = { path = "crates/forge_markdown_stream" }
 forge_config = { path = "crates/forge_config" }

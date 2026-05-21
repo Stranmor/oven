@@ -614,12 +614,15 @@ impl UnsignedTraceEvent {
 
 pub fn compile_quality_profile(artifact: ArtifactReport) -> QualityResult<QualityProfile> {
     let gate_graph = compile_gate_graph(&artifact.artifact_class)?;
+    let compiled_at = DateTime::<Utc>::from_timestamp(0, 0)
+        .expect("unix epoch must be representable for deterministic profiles");
+    let profile_id = stable_profile_id(&artifact, &gate_graph)?;
     Ok(QualityProfile {
         schema_version: SCHEMA_VERSION,
-        profile_id: Uuid::new_v4().to_string(),
+        profile_id,
         artifact,
         gate_graph,
-        compiled_at: Utc::now(),
+        compiled_at,
     })
 }
 
@@ -1057,6 +1060,24 @@ fn evidence_is_stale(evidence: &EvidenceRef, now: DateTime<Utc>) -> bool {
     now.signed_duration_since(evidence.produced_at)
         .num_seconds()
         > MAX_EVIDENCE_AGE_SECONDS
+}
+
+fn stable_profile_id(artifact: &ArtifactReport, gate_graph: &GateGraph) -> QualityResult<String> {
+    #[derive(Serialize)]
+    struct StableProfileIdInput<'a> {
+        schema_version: u32,
+        artifact: &'a ArtifactReport,
+        gate_graph: &'a GateGraph,
+    }
+
+    Ok(format!(
+        "quality_profile:{}",
+        digest_json(&StableProfileIdInput {
+            schema_version: SCHEMA_VERSION,
+            artifact,
+            gate_graph,
+        })?
+    ))
 }
 
 fn stable_class_name(artifact_class: &ArtifactClass) -> &'static str {

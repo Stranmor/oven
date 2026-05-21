@@ -100,6 +100,14 @@ fn first_result_mut(results: &mut [GateResult]) -> &mut GateResult {
 }
 
 #[test]
+fn quality_profile_compilation_is_deterministic() {
+    let report = artifact(ArtifactClass::CodeMcpToolSurface);
+    let first = compile_quality_profile(report.clone()).expect("first profile should compile");
+    let second = compile_quality_profile(report).expect("second profile should compile");
+    assert_eq!(first, second);
+}
+
+#[test]
 fn missing_release_owner_blocks() {
     let mut artifact = artifact(ArtifactClass::CodeMcpToolSurface);
     artifact.owner = None;

@@ -575,13 +575,7 @@ where
         ))
     }
 
-    async fn finalize_and_archive_process(
-        &self,
-        process_id: ProcessId,
-        stdout_task: Option<tokio::task::JoinHandle<()>>,
-        stderr_task: Option<tokio::task::JoinHandle<()>>,
-    ) -> anyhow::Result<()> {
-        finalize_output_tasks(stdout_task, stderr_task).await?;
+    async fn archive_finalized_process(&self, process_id: ProcessId) {
         let process = {
             let mut processes = self.processes.lock().await;
             if let Some(process) = processes.get_mut(&process_id) {
@@ -593,7 +587,51 @@ where
         if let Some(process) = process {
             self.archive_completed_process(process_id, process).await;
         }
+    }
+
+    async fn restore_unfinalized_output_tasks(
+        &self,
+        process_id: &ProcessId,
+        stdout_task: Option<tokio::task::JoinHandle<()>>,
+        stderr_task: Option<tokio::task::JoinHandle<()>>,
+    ) {
+        let mut processes = self.processes.lock().await;
+        if let Some(process) = processes.get_mut(process_id)
+            && !process.output_finalized
+        {
+            process.stdout_task = stdout_task;
+            process.stderr_task = stderr_task;
+            process.output_finalizing = false;
+            process.output_finalized_notify.notify_waiters();
+        }
+    }
+
+    async fn finalize_and_archive_process(
+        &self,
+        process_id: ProcessId,
+        stdout_task: Option<tokio::task::JoinHandle<()>>,
+        stderr_task: Option<tokio::task::JoinHandle<()>>,
+    ) -> anyhow::Result<()> {
+        finalize_output_tasks(stdout_task, stderr_task).await?;
+        self.archive_finalized_process(process_id).await;
         Ok(())
+    }
+
+    async fn try_finalize_and_archive_process_within(
+        &self,
+        process_id: ProcessId,
+        mut stdout_task: Option<tokio::task::JoinHandle<()>>,
+        mut stderr_task: Option<tokio::task::JoinHandle<()>>,
+        timeout: Duration,
+    ) -> anyhow::Result<bool> {
+        if try_finalize_output_tasks_within(&mut stdout_task, &mut stderr_task, timeout).await? {
+            self.archive_finalized_process(process_id).await;
+            Ok(true)
+        } else {
+            self.restore_unfinalized_output_tasks(&process_id, stdout_task, stderr_task)
+                .await;
+            Ok(false)
+        }
     }
 
     async fn execute_command_internal(
@@ -1191,8 +1229,13 @@ where
             let (stdout_task, stderr_task) = process.take_output_tasks();
             break (status, stdout_task, stderr_task);
         };
-        self.finalize_and_archive_process(status.process_id.clone(), stdout_task, stderr_task)
-            .await?;
+        self.try_finalize_and_archive_process_within(
+            status.process_id.clone(),
+            stdout_task,
+            stderr_task,
+            POST_EXIT_OUTPUT_DRAIN_TIMEOUT,
+        )
+        .await?;
         Ok(status)
     }
 }
@@ -2029,9 +2072,7 @@ mod tests {
             fixture.kill_process(process.process_id),
         )
         .await;
-        if actual.is_err()
-            && let Ok(pid) = std::fs::read_to_string(&escaped_pid_path)
-        {
+        if let Ok(pid) = std::fs::read_to_string(&escaped_pid_path) {
             let _ = std::process::Command::new("kill")
                 .arg("-KILL")
                 .arg(pid.trim())
@@ -2041,6 +2082,10 @@ mod tests {
         assert!(
             actual.is_ok(),
             "kill_process should not wait forever for output EOF after the tracked parent has exited"
+        );
+        assert_eq!(
+            actual.unwrap().unwrap().status,
+            ProcessStatusKind::Exited { exit_code: Some(0) }
         );
     }
 

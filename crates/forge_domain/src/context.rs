@@ -511,6 +511,21 @@ impl GoalObjective {
     }
 }
 
+/// Bounded auto-continuation metadata for an active conversation goal.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, Setters)]
+#[setters(into)]
+#[serde(rename_all = "snake_case")]
+pub struct GoalContinuation {
+    /// Maximum empty-event continuation turns allowed after one user turn.
+    pub max_turns_per_user_turn: u8,
+}
+
+impl Default for GoalContinuation {
+    fn default() -> Self {
+        Self { max_turns_per_user_turn: 1 }
+    }
+}
+
 /// One conversation-scoped goal persisted in typed state.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Setters)]
 #[setters(into)]
@@ -519,6 +534,9 @@ pub struct ActiveGoal {
     pub objective: GoalObjective,
     /// Current lifecycle state.
     pub status: GoalStatus,
+    /// Bounded UI-level auto-continuation metadata.
+    #[serde(default)]
+    pub continuation: GoalContinuation,
 }
 
 impl ActiveGoal {
@@ -533,6 +551,7 @@ impl ActiveGoal {
         Ok(Self {
             objective: GoalObjective::new(objective)?,
             status: GoalStatus::Active,
+            continuation: GoalContinuation::default(),
         })
     }
 
@@ -1436,6 +1455,33 @@ mod tests {
         let fixture = ActiveGoal::new("ship <safe> & typed goal").unwrap();
         let actual = fixture.render_prompt_xml();
         let expected = "<conversation_goal\n  status=\"active\"\n>\n<objective>ship &lt;safe&gt; &amp; typed goal</objective>\n</conversation_goal>";
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_active_goal_defaults_continuation_for_legacy_json() {
+        let setup = serde_json::json!({
+            "objective": "finish goal slice",
+            "status": "active"
+        });
+        let actual: ActiveGoal = serde_json::from_value(setup).unwrap();
+        let expected = ActiveGoal::new("finish goal slice").unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_active_goal_serializes_typed_continuation_metadata() {
+        let fixture = ActiveGoal::new("finish goal slice")
+            .unwrap()
+            .continuation(GoalContinuation { max_turns_per_user_turn: 2 });
+        let actual = serde_json::to_value(fixture).unwrap();
+        let expected = serde_json::json!({
+            "objective": "finish goal slice",
+            "status": "active",
+            "continuation": {
+                "max_turns_per_user_turn": 2
+            }
+        });
         assert_eq!(actual, expected);
     }
 
