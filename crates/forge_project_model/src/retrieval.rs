@@ -49,12 +49,42 @@ pub fn plan_retrieval(
         .text
         .as_deref()
         .is_some_and(|text| !text.trim().is_empty());
+    plan_retrieval_with_rerank_intent(
+        query,
+        has_vector_query,
+        has_vector_index,
+        has_reranker,
+        has_text,
+    )
+}
+
+/// Plans retrieval phases from query content, optional integration boundaries,
+/// and typed reranker intent availability.
+///
+/// # Arguments
+///
+/// * `query` - Retrieval query whose exact/text/graph flags drive phases.
+/// * `has_vector_query` - Whether an embedding query is available.
+/// * `has_vector_index` - Whether a vector index boundary is available.
+/// * `has_reranker` - Whether a reranker boundary is available.
+/// * `has_rerank_intent` - Whether a non-empty typed reranker intent is selected.
+pub fn plan_retrieval_with_rerank_intent(
+    query: &RetrievalQuery,
+    has_vector_query: bool,
+    has_vector_index: bool,
+    has_reranker: bool,
+    has_rerank_intent: bool,
+) -> RetrievalScoringPlan {
+    let has_text = query
+        .text
+        .as_deref()
+        .is_some_and(|text| !text.trim().is_empty());
     RetrievalScoringPlan {
         exact: query.path.is_some() || query.symbol.is_some(),
         lexical: has_text,
         vector: has_vector_query && has_vector_index,
         graph: query.include_graph_expansion,
-        rerank: has_text && has_reranker,
+        rerank: has_rerank_intent && has_reranker,
     }
 }
 
@@ -130,11 +160,12 @@ where
         return Vec::new();
     }
     let limit = if query.limit == 0 { 10 } else { query.limit };
-    let plan = plan_retrieval(
+    let plan = plan_retrieval_with_rerank_intent(
         query,
         vector_query.is_some(),
         vector_index.is_some(),
         reranker.is_some(),
+        rerank_intent.is_some(),
     );
     let mut results = if plan.exact {
         exact_results(manifest, query, weights)
@@ -852,6 +883,44 @@ mod tests {
                     .chain(actual_beta.iter())
                     .all(|result| result.score_parts.contains_key("lexical")),
             ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_rerank_intent_reranks_exact_candidates_when_query_text_is_empty() -> Result<()> {
+        let fixture = tempfile::TempDir::new()?;
+        let root = fixture.path().join("project");
+        std::fs::create_dir_all(root.join("src"))?;
+        std::fs::write(root.join("src").join("alpha.rs"), "pub struct Alpha;\n")?;
+        let setup = ProjectIndexer::new(&root, fixture.path().join("model"));
+        let manifest = setup.index()?;
+        let query = RetrievalQuery {
+            text: Some("   ".to_string()),
+            path: Some("src/alpha.rs".to_string()),
+            limit: 1,
+            include_graph_expansion: false,
+            ..RetrievalQuery::default()
+        };
+        let intent = RerankIntent::new("prefer alpha", RerankIntentSource::ExplicitUseCase)
+            .expect("intent should not be empty");
+
+        let actual = retrieve_with_boundaries_and_rerank_intent(
+            &manifest,
+            &query,
+            None,
+            Option::<&DeterministicVectorIndex>::None,
+            Some(&IntentOrderReranker),
+            Some(&intent),
+            &RetrievalScoringWeights::default(),
+        );
+        let expected = true;
+
+        assert_eq!(
+            actual
+                .first()
+                .is_some_and(|result| result.score_parts.contains_key("rerank")),
             expected,
         );
         Ok(())
