@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::env;
+use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -76,6 +77,94 @@ const SEMANTIC_EMBEDDING_TEXT_LIMIT: usize = 4096;
 const QUERY_EMBEDDING_SOURCE_ID: &str = "query";
 const QUERY_EMBEDDING_SOURCE_FINGERPRINT: &str = "query";
 
+/// Configured offline rerank-score artifact path after filesystem trust validation.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TrustedOfflineRerankScoreArtifactPath {
+    path: PathBuf,
+}
+
+impl fmt::Debug for TrustedOfflineRerankScoreArtifactPath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TrustedOfflineRerankScoreArtifactPath")
+            .field("path", &"[REDACTED_TRUSTED_ARTIFACT_PATH]")
+            .finish()
+    }
+}
+
+impl TrustedOfflineRerankScoreArtifactPath {
+    /// Returns the canonical regular artifact path accepted by the trust boundary.
+    pub fn as_path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConfiguredOfflineRerankScoreArtifactSource {
+    path: PathBuf,
+}
+
+impl ConfiguredOfflineRerankScoreArtifactSource {
+    fn from_config(config: &OfflineRerankScoreArtifactConfig) -> Self {
+        Self { path: config.path.clone() }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfiguredArtifactPathState {
+    Rejected,
+    Missing,
+}
+
+fn canonical_configured_artifact_path(
+    root: &Path,
+    model_dir: &Path,
+    path: &Path,
+) -> std::result::Result<PathBuf, ConfiguredArtifactPathState> {
+    let path_text = path.to_string_lossy();
+    if path_text.contains("://")
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(ConfiguredArtifactPathState::Rejected);
+    }
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let metadata = match fs::symlink_metadata(&candidate) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ConfiguredArtifactPathState::Missing);
+        }
+        Err(_error) => return Err(ConfiguredArtifactPathState::Rejected),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ConfiguredArtifactPathState::Rejected);
+    }
+    let canonical_scope = model_dir
+        .canonicalize()
+        .map_err(|_error| ConfiguredArtifactPathState::Rejected)?;
+    let canonical_path = candidate
+        .canonicalize()
+        .map_err(|_error| ConfiguredArtifactPathState::Rejected)?;
+    if !canonical_path.starts_with(canonical_scope) {
+        return Err(ConfiguredArtifactPathState::Rejected);
+    }
+    Ok(canonical_path)
+}
+
+fn trusted_offline_rerank_score_artifact_path(
+    root: &Path,
+    model_dir: &Path,
+    source: &ConfiguredOfflineRerankScoreArtifactSource,
+) -> std::result::Result<TrustedOfflineRerankScoreArtifactPath, ConfiguredArtifactPathState> {
+    canonical_configured_artifact_path(root, model_dir, &source.path)
+        .map(|path| TrustedOfflineRerankScoreArtifactPath { path })
+}
+
 /// Runtime-owned reranker readiness selection supplied to project-context retrieval.
 pub enum ProjectContextRuntimeRerankerSelection<'a> {
     /// No runtime reranker is configured for this service instance.
@@ -121,6 +210,8 @@ pub enum OfflineRerankScoreArtifactReadinessIssue {
     ManifestFreshnessUnknown,
     /// Current project manifest is stale for the configured artifact.
     StaleManifest,
+    /// Configured artifact path failed the artifact source trust boundary.
+    ArtifactPathRejected,
     /// Configured artifact file could not be read.
     ArtifactUnreadable,
     /// Configured artifact JSON could not be parsed or validated.
@@ -140,6 +231,7 @@ impl OfflineRerankScoreArtifactReadinessIssue {
             Self::ManifestUnavailable => "manifest_unavailable",
             Self::ManifestFreshnessUnknown => "manifest_freshness_unknown",
             Self::StaleManifest => "stale_manifest",
+            Self::ArtifactPathRejected => "artifact_path_rejected",
             Self::ArtifactUnreadable => "artifact_unreadable",
             Self::ArtifactCorrupt => "artifact_corrupt",
             Self::UnsupportedArtifact => "unsupported_artifact",
@@ -278,7 +370,24 @@ impl ProductionProjectContextRuntimeRerankerSelector {
                 );
             }
         }
-        match OfflineRerankScoreArtifactReader.read_ready_reranker(&manifest, &config.path) {
+        let source = ConfiguredOfflineRerankScoreArtifactSource::from_config(config);
+        let artifact_path =
+            match trusted_offline_rerank_score_artifact_path(root, indexer.model_dir(), &source) {
+                Ok(path) => path,
+                Err(ConfiguredArtifactPathState::Missing) => {
+                    return Self::configured_not_ready_with_issue(
+                        IDENTITY,
+                        Some(OfflineRerankScoreArtifactReadinessIssue::ArtifactUnreadable),
+                    );
+                }
+                Err(ConfiguredArtifactPathState::Rejected) => {
+                    return Self::configured_not_ready_with_issue(
+                        IDENTITY,
+                        Some(OfflineRerankScoreArtifactReadinessIssue::ArtifactPathRejected),
+                    );
+                }
+            };
+        match OfflineRerankScoreArtifactReader.read_ready_reranker(&manifest, &artifact_path) {
             Ok(reranker) => Self::ready_synchronous(Arc::new(reranker), IDENTITY),
             Err(error) => Self::configured_not_ready_with_issue(
                 IDENTITY,
@@ -381,7 +490,7 @@ impl OfflineRerankScoreArtifactReader {
     /// # Arguments
     ///
     /// * `manifest` - Current project manifest used to reject stale artifacts.
-    /// * `artifact_path` - Explicit local artifact path supplied by configuration or tests.
+    /// * `artifact_path` - Trusted canonical artifact path accepted by the source boundary.
     ///
     /// # Errors
     ///
@@ -389,21 +498,12 @@ impl OfflineRerankScoreArtifactReader {
     pub fn read_ready_reranker(
         &self,
         manifest: &ProjectManifest,
-        artifact_path: &Path,
+        artifact_path: &TrustedOfflineRerankScoreArtifactPath,
     ) -> Result<OfflineRerankScoreArtifactReranker> {
-        let content = fs::read_to_string(artifact_path).with_context(|| {
-            format!(
-                "failed to read offline rerank score artifact at {}",
-                artifact_path.display()
-            )
-        })?;
-        let artifact: OfflineRerankScoreArtifact =
-            serde_json::from_str(&content).with_context(|| {
-                format!(
-                    "failed to parse offline rerank score artifact at {}",
-                    artifact_path.display()
-                )
-            })?;
+        let content = fs::read_to_string(artifact_path.as_path())
+            .context("failed to read offline rerank score artifact")?;
+        let artifact: OfflineRerankScoreArtifact = serde_json::from_str(&content)
+            .context("failed to parse offline rerank score artifact")?;
         OfflineRerankScoreArtifactReranker::new(manifest, artifact)
     }
 }
@@ -430,40 +530,10 @@ fn canonical_configured_vector_index_artifact_path(
     model_dir: &Path,
     source: &ConfiguredVectorIndexArtifactSource,
 ) -> std::result::Result<PathBuf, ConfiguredVectorIndexPathState> {
-    let path_text = source.path.to_string_lossy();
-    if path_text.contains("://")
-        || source
-            .path
-            .components()
-            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
-    {
-        return Err(ConfiguredVectorIndexPathState::Rejected);
-    }
-    let candidate = if source.path.is_absolute() {
-        source.path.clone()
-    } else {
-        root.join(&source.path)
-    };
-    let metadata = match fs::symlink_metadata(&candidate) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ConfiguredVectorIndexPathState::Missing);
-        }
-        Err(_error) => return Err(ConfiguredVectorIndexPathState::Rejected),
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(ConfiguredVectorIndexPathState::Rejected);
-    }
-    let canonical_scope = model_dir
-        .canonicalize()
-        .map_err(|_error| ConfiguredVectorIndexPathState::Rejected)?;
-    let canonical_path = candidate
-        .canonicalize()
-        .map_err(|_error| ConfiguredVectorIndexPathState::Rejected)?;
-    if !canonical_path.starts_with(canonical_scope) {
-        return Err(ConfiguredVectorIndexPathState::Rejected);
-    }
-    Ok(canonical_path)
+    canonical_configured_artifact_path(root, model_dir, &source.path).map_err(|state| match state {
+        ConfiguredArtifactPathState::Rejected => ConfiguredVectorIndexPathState::Rejected,
+        ConfiguredArtifactPathState::Missing => ConfiguredVectorIndexPathState::Missing,
+    })
 }
 
 #[derive(Clone, Debug, Default)]
@@ -5356,6 +5426,15 @@ mod tests {
         )
     }
 
+    fn trusted_fixture_offline_rerank_artifact_path(
+        root: &Path,
+        artifact_path: PathBuf,
+    ) -> Result<TrustedOfflineRerankScoreArtifactPath> {
+        let source = ConfiguredOfflineRerankScoreArtifactSource { path: artifact_path };
+        trusted_offline_rerank_score_artifact_path(root, &local_project_model_dir(root), &source)
+            .map_err(|state| anyhow::anyhow!("offline rerank fixture path rejected: {state:?}"))
+    }
+
     fn local_search_service_with_selector<R>(
         root: &Path,
         selector: R,
@@ -5478,6 +5557,141 @@ mod tests {
     }
 
     #[test]
+    fn production_runtime_reranker_selector_rejected_artifact_paths_fail_closed_without_fallback()
+    -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let manifest =
+            ProjectIndexer::new(&root, local_project_model_dir(&root)).read_manifest()?;
+        let artifact = fixture_offline_rerank_artifact(&manifest)?;
+        let outside_path = root
+            .parent()
+            .expect("fixture workspace should have a parent")
+            .join("outside_offline_rerank.json");
+        fs::write(&outside_path, artifact.to_stable_json()?)?;
+        let in_scope_path = write_fixture_offline_rerank_artifact(&root, &artifact)?;
+        let symlink_path = local_project_model_dir(&root).join("symlink_offline_rerank.json");
+        symlink(&in_scope_path, &symlink_path)?;
+        let attempts = vec![
+            PathBuf::from("https://example.invalid/offline-rerank.json"),
+            PathBuf::from("../outside_offline_rerank.json"),
+            symlink_path,
+            local_project_model_dir(&root),
+            outside_path,
+        ];
+
+        let actual = attempts
+            .into_iter()
+            .map(|path| {
+                let setup = configured_offline_rerank_selector(&root, path);
+                (
+                    matches!(
+                        setup.select_project_context_reranker(),
+                        ProjectContextRuntimeRerankerSelection::Unavailable {
+                            reason: ProjectContextRerankerUnavailableReason::RerankerNotReady,
+                            ..
+                        }
+                    ),
+                    setup.readiness_issue_label(),
+                    setup.is_ready(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = vec![
+            (true, Some("artifact_path_rejected"), false),
+            (true, Some("artifact_path_rejected"), false),
+            (true, Some("artifact_path_rejected"), false),
+            (true, Some("artifact_path_rejected"), false),
+            (true, Some("artifact_path_rejected"), false),
+        ];
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_runtime_reranker_selector_rejects_special_file_artifact_path() -> Result<()> {
+        use std::os::unix::net::UnixListener;
+
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let socket_path = local_project_model_dir(&root).join("offline_rerank.sock");
+        let _listener = UnixListener::bind(&socket_path)?;
+        let setup = configured_offline_rerank_selector(&root, socket_path);
+
+        let actual = (
+            matches!(
+                setup.select_project_context_reranker(),
+                ProjectContextRuntimeRerankerSelection::Unavailable {
+                    reason: ProjectContextRerankerUnavailableReason::RerankerNotReady,
+                    ..
+                }
+            ),
+            setup.readiness_issue_label(),
+            setup.is_ready(),
+        );
+        let expected = (true, Some("artifact_path_rejected"), false);
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn production_runtime_reranker_selector_rejected_path_redacts_malicious_config() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let raw_path = PathBuf::from("https://evil.invalid/secret_path_offline_rerank.json");
+        let setup = configured_offline_rerank_selector(&root, raw_path.clone());
+
+        let actual = format!(
+            "{:?}:{:?}",
+            setup.readiness_issue_label(),
+            match setup.select_project_context_reranker() {
+                ProjectContextRuntimeRerankerSelection::Unavailable { reason, .. } => reason,
+                ProjectContextRuntimeRerankerSelection::Missing => {
+                    ProjectContextRerankerUnavailableReason::MissingReranker
+                }
+                ProjectContextRuntimeRerankerSelection::Ready { .. } => {
+                    ProjectContextRerankerUnavailableReason::MissingReranker
+                }
+            }
+        );
+
+        assert!(!actual.contains(&raw_path.display().to_string()));
+        assert!(!actual.contains("evil.invalid"));
+        assert!(!actual.contains("secret_path_offline_rerank"));
+        Ok(())
+    }
+
+    #[test]
+    fn production_runtime_reranker_selector_missing_artifact_does_not_activate_default_or_stale()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let missing_path = local_project_model_dir(&root).join("missing_offline_rerank.json");
+        let setup = configured_offline_rerank_selector(&root, missing_path);
+
+        let actual = (
+            matches!(
+                setup.select_project_context_reranker(),
+                ProjectContextRuntimeRerankerSelection::Unavailable {
+                    reason: ProjectContextRerankerUnavailableReason::RerankerNotReady,
+                    ..
+                }
+            ),
+            setup.readiness_issue_label(),
+            setup.is_ready(),
+        );
+        let expected = (true, Some("artifact_unreadable"), false);
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
     fn production_runtime_reranker_selector_valid_manifest_compatible_artifact_is_ready()
     -> Result<()> {
         let (_fixture, root) = fixture_workspace()?;
@@ -5541,6 +5755,24 @@ mod tests {
 
         assert!(!actual.contains(&raw_path.display().to_string()));
         assert!(!actual.contains("secret_path_offline_rerank"));
+        Ok(())
+    }
+
+    #[test]
+    fn trusted_offline_rerank_artifact_path_debug_redacts_canonical_path() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let manifest =
+            ProjectIndexer::new(&root, local_project_model_dir(&root)).read_manifest()?;
+        let artifact = fixture_offline_rerank_artifact(&manifest)?;
+        let artifact_path = write_fixture_offline_rerank_artifact(&root, &artifact)?;
+        let setup = trusted_fixture_offline_rerank_artifact_path(&root, artifact_path.clone())?;
+
+        let actual = format!("{setup:?}");
+
+        assert!(!actual.contains(&artifact_path.display().to_string()));
+        assert!(!actual.contains(&root.display().to_string()));
+        assert!(!actual.contains("offline_rerank_scores"));
         Ok(())
     }
 
@@ -5626,8 +5858,10 @@ mod tests {
         let setup = OfflineRerankScoreArtifactReader;
         let candidates = fixture_offline_rerank_candidates();
 
+        let trusted_path = trusted_fixture_offline_rerank_artifact_path(&root, artifact_path)?;
+
         let actual = setup
-            .read_ready_reranker(&manifest, &artifact_path)?
+            .read_ready_reranker(&manifest, &trusted_path)?
             .rerank("runtime reranker proof", &candidates)
             .into_iter()
             .map(|score| (score.id, score.score as i32))
@@ -5657,9 +5891,17 @@ mod tests {
             local_project_model_dir(&root).join("corrupt_offline_rerank_scores.json");
         fs::write(&corrupt_path, "{not-json")?;
 
+        let trusted_stale_path = trusted_fixture_offline_rerank_artifact_path(&root, stale_path)?;
+        let trusted_corrupt_path =
+            trusted_fixture_offline_rerank_artifact_path(&root, corrupt_path)?;
+
         let actual = vec![
-            setup.read_ready_reranker(&manifest, &stale_path).is_err(),
-            setup.read_ready_reranker(&manifest, &corrupt_path).is_err(),
+            setup
+                .read_ready_reranker(&manifest, &trusted_stale_path)
+                .is_err(),
+            setup
+                .read_ready_reranker(&manifest, &trusted_corrupt_path)
+                .is_err(),
         ];
         let expected = vec![true, true];
 
@@ -5676,8 +5918,9 @@ mod tests {
             ProjectIndexer::new(&root, local_project_model_dir(&root)).read_manifest()?;
         let artifact = fixture_offline_rerank_artifact(&manifest)?;
         let artifact_path = write_fixture_offline_rerank_artifact(&root, &artifact)?;
+        let trusted_path = trusted_fixture_offline_rerank_artifact_path(&root, artifact_path)?;
         let setup =
-            OfflineRerankScoreArtifactReader.read_ready_reranker(&manifest, &artifact_path)?;
+            OfflineRerankScoreArtifactReader.read_ready_reranker(&manifest, &trusted_path)?;
         let mut candidates = fixture_offline_rerank_candidates();
         candidates[0].text = "changed candidate text".to_string();
 
