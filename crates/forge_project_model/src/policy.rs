@@ -131,22 +131,14 @@ pub fn mentioned_paths(message: &str, cwd: &Path, home: Option<&Path>) -> Vec<Pa
 fn attachment_tag_paths(message: &str) -> Vec<String> {
     let mut paths = Vec::new();
     let mut rest = message;
-    while let Some(start) = rest.find("@[") {
-        let Some(after_prefix_start) = start.checked_add(2) else {
+    while let Some((_, after_marker)) = rest.split_once("@[") {
+        let Some((path, after_tag)) = after_marker.split_once(']') else {
             break;
         };
-        let after_start = &rest[after_prefix_start..];
-        let Some(end) = after_start.find(']') else {
-            break;
-        };
-        let path = &after_start[..end];
         if !path.is_empty() {
             paths.push(path.to_string());
         }
-        let Some(next_start) = end.checked_add(1) else {
-            break;
-        };
-        rest = &after_start[next_start..];
+        rest = after_tag;
     }
     paths
 }
