@@ -85,8 +85,12 @@ fn parse_error_response_from_text(text: &str) -> Option<ErrorResponse> {
 
 fn json_object_slice(text: &str) -> Option<&str> {
     let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    (start < end).then_some(&text[start..=end])
+    let end = text.rfind('}')?.checked_add(1)?;
+    if start < end {
+        text.get(start..end)
+    } else {
+        None
+    }
 }
 
 fn error_response_has_strict_context_length_exceeded(error: &ErrorResponse) -> bool {
