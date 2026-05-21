@@ -6409,9 +6409,10 @@ mod tests {
             actual <= expected_maximum,
             "path-aware injection should bound index checks for untrusted path-like prompt text; got {actual}, expected at most {expected_maximum}"
         );
+        assert_eq!(setup.workspace_queries.load(Ordering::SeqCst), 0usize);
         let expected_queries = 1usize;
         assert_eq!(
-            setup.workspace_queries.load(Ordering::SeqCst),
+            setup.committed_workspace_queries.load(Ordering::SeqCst),
             expected_queries
         );
         Ok(())
@@ -6614,7 +6615,11 @@ mod tests {
         ];
         assert_eq!(actual_flags, expected_flags);
         assert_eq!(actual.matches("<source").count(), 3usize);
-        assert_eq!(setup.workspace_queries.load(Ordering::SeqCst), 1usize);
+        assert_eq!(setup.workspace_queries.load(Ordering::SeqCst), 0usize);
+        assert_eq!(
+            setup.committed_workspace_queries.load(Ordering::SeqCst),
+            1usize
+        );
         assert!(
             actual.chars().count() <= ProjectModelContextRenderBudget::default().max_rendered_chars,
             "project-model context should stay inside the typed render budget"

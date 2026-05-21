@@ -527,7 +527,11 @@ impl<
         path: PathBuf,
         params: forge_domain::SearchParams<'_>,
     ) -> Result<Vec<forge_domain::Node>> {
-        self.services.query_workspace(path, params).await
+        let (_committed_result, nodes) = self
+            .services
+            .query_workspace_committed(path, params)
+            .await?;
+        Ok(nodes)
     }
 
     async fn list_workspaces(&self) -> Result<Vec<forge_domain::WorkspaceInfo>> {
@@ -620,14 +624,25 @@ impl<
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
     use std::sync::Arc;
+    use std::time::Duration;
 
-    use forge_domain::{
-        CommandExecutionOutput, Environment, ProcessObservationWaitSeconds,
-        ShellHandoffTimeoutSeconds,
-    };
+    use anyhow::{Result, anyhow};
+    use forge_app::dto::ConversationBranchTarget;
+    use forge_app::*;
+    use forge_config::ForgeConfig;
+    use forge_domain::*;
     use forge_infra::{ForgeCommandExecutorService, StdConsoleWriter};
+    use forge_project_model::{
+        ProjectContextCommittedQueryResult, ProjectContextCommittedResultItem,
+        ProjectContextEpisodeAppendFailureReason, ProjectContextPersistedEpisodeAppendOutcome,
+        ProjectContextReadbackSummary,
+    };
     use pretty_assertions::assert_eq;
+    use tokio::sync::Mutex;
+    use url::Url;
 
     use super::*;
 
@@ -649,6 +664,1079 @@ mod tests {
             Arc::new(StdConsoleWriter::default()),
         );
         ForgeAPI::new(Arc::new(()), Arc::new(infra))
+    }
+
+    #[derive(Clone)]
+    struct QueryWorkspaceServices {
+        environment: Environment,
+        config: ForgeConfig,
+        workspace: Arc<QueryWorkspaceService>,
+        noop: Arc<NoopService>,
+    }
+
+    impl QueryWorkspaceServices {
+        fn new(cwd: PathBuf, workspace: Arc<QueryWorkspaceService>) -> Self {
+            Self {
+                environment: fixture_environment(cwd),
+                config: ForgeConfig::default(),
+                workspace,
+                noop: Arc::new(NoopService),
+            }
+        }
+    }
+
+    impl EnvironmentInfra for QueryWorkspaceServices {
+        type Config = ForgeConfig;
+
+        fn get_env_var(&self, _key: &str) -> Option<String> {
+            None
+        }
+
+        fn get_env_vars(&self) -> BTreeMap<String, String> {
+            BTreeMap::new()
+        }
+
+        fn get_environment(&self) -> Environment {
+            self.environment.clone()
+        }
+
+        fn get_config(&self) -> Result<Self::Config> {
+            Ok(self.config.clone())
+        }
+
+        async fn update_environment(&self, _ops: Vec<forge_domain::ConfigOperation>) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Services for QueryWorkspaceServices {
+        type ProviderService = NoopService;
+        type AppConfigService = NoopService;
+        type ConversationService = NoopService;
+        type LearningService = NoopService;
+        type SteerService = NoopService;
+        type TemplateService = NoopService;
+        type AttachmentService = NoopService;
+        type CustomInstructionsService = NoopService;
+        type FileDiscoveryService = NoopService;
+        type McpConfigManager = NoopService;
+        type FsWriteService = NoopService;
+        type PlanCreateService = NoopService;
+        type FsPatchService = NoopService;
+        type FsReadService = NoopService;
+        type ImageReadService = NoopService;
+        type FsRemoveService = NoopService;
+        type FsSearchService = NoopService;
+        type FollowUpService = NoopService;
+        type FsUndoService = NoopService;
+        type NetFetchService = NoopService;
+        type ShellService = NoopService;
+        type McpService = NoopService;
+        type AuthService = NoopService;
+        type AgentRegistry = NoopService;
+        type CommandLoaderService = NoopService;
+        type PolicyService = NoopService;
+        type ProviderAuthService = NoopService;
+        type WorkspaceService = QueryWorkspaceService;
+        type SkillFetchService = NoopService;
+
+        fn provider_service(&self) -> &Self::ProviderService {
+            &self.noop
+        }
+        fn config_service(&self) -> &Self::AppConfigService {
+            &self.noop
+        }
+        fn conversation_service(&self) -> &Self::ConversationService {
+            &self.noop
+        }
+        fn learning_service(&self) -> &Self::LearningService {
+            &self.noop
+        }
+        fn steer_service(&self) -> &Self::SteerService {
+            &self.noop
+        }
+        fn template_service(&self) -> &Self::TemplateService {
+            &self.noop
+        }
+        fn attachment_service(&self) -> &Self::AttachmentService {
+            &self.noop
+        }
+        fn file_discovery_service(&self) -> &Self::FileDiscoveryService {
+            &self.noop
+        }
+        fn mcp_config_manager(&self) -> &Self::McpConfigManager {
+            &self.noop
+        }
+        fn fs_create_service(&self) -> &Self::FsWriteService {
+            &self.noop
+        }
+        fn plan_create_service(&self) -> &Self::PlanCreateService {
+            &self.noop
+        }
+        fn fs_patch_service(&self) -> &Self::FsPatchService {
+            &self.noop
+        }
+        fn fs_read_service(&self) -> &Self::FsReadService {
+            &self.noop
+        }
+        fn image_read_service(&self) -> &Self::ImageReadService {
+            &self.noop
+        }
+        fn fs_remove_service(&self) -> &Self::FsRemoveService {
+            &self.noop
+        }
+        fn fs_search_service(&self) -> &Self::FsSearchService {
+            &self.noop
+        }
+        fn follow_up_service(&self) -> &Self::FollowUpService {
+            &self.noop
+        }
+        fn fs_undo_service(&self) -> &Self::FsUndoService {
+            &self.noop
+        }
+        fn net_fetch_service(&self) -> &Self::NetFetchService {
+            &self.noop
+        }
+        fn shell_service(&self) -> &Self::ShellService {
+            &self.noop
+        }
+        fn mcp_service(&self) -> &Self::McpService {
+            &self.noop
+        }
+        fn custom_instructions_service(&self) -> &Self::CustomInstructionsService {
+            &self.noop
+        }
+        fn auth_service(&self) -> &Self::AuthService {
+            &self.noop
+        }
+        fn agent_registry(&self) -> &Self::AgentRegistry {
+            &self.noop
+        }
+        fn command_loader_service(&self) -> &Self::CommandLoaderService {
+            &self.noop
+        }
+        fn policy_service(&self) -> &Self::PolicyService {
+            &self.noop
+        }
+        fn provider_auth_service(&self) -> &Self::ProviderAuthService {
+            &self.noop
+        }
+        fn workspace_service(&self) -> &Self::WorkspaceService {
+            &self.workspace
+        }
+        fn skill_fetch_service(&self) -> &Self::SkillFetchService {
+            &self.noop
+        }
+    }
+
+    #[derive(Default)]
+    struct QueryWorkspaceService {
+        committed_result: Mutex<Option<QueryWorkspaceOutcome>>,
+        legacy_called: Mutex<bool>,
+    }
+
+    enum QueryWorkspaceOutcome {
+        Ok(ProjectContextCommittedQueryResult, Vec<Node>),
+        Err(String),
+    }
+
+    impl QueryWorkspaceService {
+        async fn set_committed_result(
+            &self,
+            result: ProjectContextCommittedQueryResult,
+            nodes: Vec<Node>,
+        ) {
+            *self.committed_result.lock().await = Some(QueryWorkspaceOutcome::Ok(result, nodes));
+        }
+
+        async fn set_committed_error(&self, error: impl Into<String>) {
+            *self.committed_result.lock().await = Some(QueryWorkspaceOutcome::Err(error.into()));
+        }
+
+        async fn legacy_called(&self) -> bool {
+            *self.legacy_called.lock().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WorkspaceService for QueryWorkspaceService {
+        async fn sync_workspace(&self, _path: PathBuf) -> Result<MpscStream<Result<SyncProgress>>> {
+            anyhow::bail!("unused workspace service")
+        }
+        async fn produce_workspace_exact_fact_reference(
+            &self,
+            _path: PathBuf,
+        ) -> Result<WorkspaceExactFactReferenceReport> {
+            anyhow::bail!("unused workspace service")
+        }
+        async fn workspace_exact_fact_status(
+            &self,
+            _path: PathBuf,
+        ) -> Result<WorkspaceExactFactStatusReport> {
+            anyhow::bail!("unused workspace service")
+        }
+        async fn workspace_evidence_replay_diagnostic(
+            &self,
+            _path: PathBuf,
+        ) -> Result<WorkspaceEvidenceReplayDiagnostic> {
+            anyhow::bail!("unused workspace service")
+        }
+        async fn workspace_evidence_replay_preview_diagnostic(
+            &self,
+            _path: PathBuf,
+        ) -> Result<WorkspaceEvidenceReplayPreviewDiagnostic> {
+            anyhow::bail!("unused workspace service")
+        }
+        async fn build_workspace_vector_index(
+            &self,
+            _path: PathBuf,
+            _embedding_model_id: String,
+        ) -> Result<WorkspaceVectorIndexBuildReport> {
+            anyhow::bail!("unused workspace service")
+        }
+        async fn embed_workspace_query(
+            &self,
+            _query: String,
+            _embedding_model_id: String,
+        ) -> Result<ProjectSemanticEmbeddingOutput> {
+            anyhow::bail!("unused workspace service")
+        }
+        async fn semantic_injection_readiness(
+            &self,
+            _path: PathBuf,
+            _embedding_model_id: Option<String>,
+        ) -> Result<WorkspaceSemanticInjectionReadiness> {
+            anyhow::bail!("unused workspace service")
+        }
+        async fn sem_search_availability(
+            &self,
+            _path: PathBuf,
+            _embedding_model_id: Option<String>,
+        ) -> Result<SemSearchAvailability> {
+            anyhow::bail!("unused workspace service")
+        }
+        async fn sem_search_diagnostic(
+            &self,
+            _path: PathBuf,
+            _embedding_model_id: Option<String>,
+        ) -> Result<SemSearchDiagnosticReport> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn query_workspace_committed(
+            &self,
+            _path: PathBuf,
+            _params: SearchParams<'_>,
+        ) -> Result<(ProjectContextCommittedQueryResult, Vec<Node>)> {
+            match self.committed_result.lock().await.take() {
+                Some(QueryWorkspaceOutcome::Ok(result, nodes)) => Ok((result, nodes)),
+                Some(QueryWorkspaceOutcome::Err(error)) => Err(anyhow!(error)),
+                None => anyhow::bail!("committed query fixture was not configured"),
+            }
+        }
+
+        async fn query_workspace(
+            &self,
+            _path: PathBuf,
+            _params: SearchParams<'_>,
+        ) -> Result<Vec<Node>> {
+            *self.legacy_called.lock().await = true;
+            anyhow::bail!("legacy query_workspace must not be called")
+        }
+
+        async fn list_workspaces(&self) -> Result<Vec<WorkspaceInfo>> {
+            anyhow::bail!("unused workspace service")
+        }
+        async fn get_workspace_info(&self, _path: PathBuf) -> Result<Option<WorkspaceInfo>> {
+            anyhow::bail!("unused workspace service")
+        }
+        async fn is_indexed(&self, _path: &Path) -> Result<bool> {
+            anyhow::bail!("unused workspace service")
+        }
+        async fn delete_workspace(&self, _workspace_id: &WorkspaceId) -> Result<()> {
+            anyhow::bail!("unused workspace service")
+        }
+        async fn delete_workspaces(&self, _workspace_ids: &[WorkspaceId]) -> Result<()> {
+            anyhow::bail!("unused workspace service")
+        }
+        async fn project_model_context_diagnostic(
+            &self,
+            _path: &Path,
+        ) -> Result<WorkspaceContextManifestDiagnostic> {
+            anyhow::bail!("unused workspace service")
+        }
+        async fn get_workspace_status(&self, _path: PathBuf) -> Result<Vec<FileStatus>> {
+            anyhow::bail!("unused workspace service")
+        }
+        async fn is_authenticated(&self) -> Result<bool> {
+            anyhow::bail!("unused workspace service")
+        }
+        async fn init_auth_credentials(&self) -> Result<WorkspaceAuth> {
+            anyhow::bail!("unused workspace service")
+        }
+        async fn init_workspace(&self, _path: PathBuf) -> Result<WorkspaceId> {
+            anyhow::bail!("unused workspace service")
+        }
+    }
+
+    #[derive(Default)]
+    struct NoopService;
+
+    #[async_trait::async_trait]
+    impl ProviderService for NoopService {
+        async fn chat(
+            &self,
+            _model_id: &ModelId,
+            _context: forge_domain::Context,
+            _provider: Provider<Url>,
+        ) -> ResultStream<ChatCompletionMessage, anyhow::Error> {
+            anyhow::bail!("unused provider service")
+        }
+        async fn models(&self, _provider: Provider<Url>) -> Result<Vec<Model>> {
+            anyhow::bail!("unused provider service")
+        }
+        async fn get_provider(&self, _id: ProviderId) -> Result<Provider<Url>> {
+            anyhow::bail!("unused provider service")
+        }
+        async fn get_all_providers(&self) -> Result<Vec<AnyProvider>> {
+            anyhow::bail!("unused provider service")
+        }
+        async fn upsert_credential(&self, _credential: AuthCredential) -> Result<()> {
+            anyhow::bail!("unused provider service")
+        }
+        async fn remove_credential(&self, _id: &ProviderId) -> Result<()> {
+            anyhow::bail!("unused provider service")
+        }
+        async fn migrate_env_credentials(&self) -> Result<Option<MigrationResult>> {
+            anyhow::bail!("unused provider service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AppConfigService for NoopService {
+        async fn get_session_config(&self) -> Option<ModelConfig> {
+            None
+        }
+        async fn get_commit_config(&self) -> Result<Option<ModelConfig>> {
+            Ok(None)
+        }
+        async fn get_suggest_config(&self) -> Result<Option<ModelConfig>> {
+            Ok(None)
+        }
+        async fn get_reasoning_effort(&self) -> Result<Option<Effort>> {
+            Ok(None)
+        }
+        async fn update_config(&self, _ops: Vec<ConfigOperation>) -> Result<()> {
+            anyhow::bail!("unused config service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ConversationService for NoopService {
+        async fn find_conversation(&self, _id: &ConversationId) -> Result<Option<Conversation>> {
+            anyhow::bail!("unused conversation service")
+        }
+        async fn upsert_conversation(&self, _conversation: Conversation) -> Result<()> {
+            anyhow::bail!("unused conversation service")
+        }
+        async fn ensure_delegated_conversation(
+            &self,
+            _id: &ConversationId,
+            _parent_id: Option<ConversationId>,
+        ) -> Result<Conversation> {
+            anyhow::bail!("unused conversation service")
+        }
+        async fn resolve_root_conversation_id(
+            &self,
+            _parent_id: Option<ConversationId>,
+        ) -> Result<Option<ConversationId>> {
+            anyhow::bail!("unused conversation service")
+        }
+        async fn modify_conversation<FN, T>(&self, _id: &ConversationId, _f: FN) -> Result<T>
+        where
+            FN: FnOnce(&mut Conversation) -> T + Send,
+            T: Send,
+        {
+            anyhow::bail!("unused conversation service")
+        }
+        async fn list_branch_targets(
+            &self,
+            _conversation_id: &ConversationId,
+        ) -> Result<Vec<ConversationBranchTarget>> {
+            anyhow::bail!("unused conversation service")
+        }
+        async fn branch_conversation(
+            &self,
+            _conversation_id: &ConversationId,
+            _target_id: MessageId,
+        ) -> Result<Conversation> {
+            anyhow::bail!("unused conversation service")
+        }
+        async fn get_conversation_list_items_by_query(
+            &self,
+            _query: ConversationListQuery,
+        ) -> Result<Vec<ConversationListItem>> {
+            anyhow::bail!("unused conversation service")
+        }
+        async fn get_conversation_list_items_including_agent(
+            &self,
+            _limit: usize,
+        ) -> Result<Vec<ConversationListItem>> {
+            anyhow::bail!("unused conversation service")
+        }
+        async fn get_conversation_list_items_by_visibility(
+            &self,
+            _visibility: ConversationVisibilityFilter,
+            _limit: usize,
+        ) -> Result<Vec<ConversationListItem>> {
+            anyhow::bail!("unused conversation service")
+        }
+        async fn get_conversations(&self) -> Result<Vec<Conversation>> {
+            anyhow::bail!("unused conversation service")
+        }
+        async fn get_conversations_including_agent(&self) -> Result<Vec<Conversation>> {
+            anyhow::bail!("unused conversation service")
+        }
+        async fn get_conversations_by_visibility(
+            &self,
+            _visibility: ConversationVisibilityFilter,
+        ) -> Result<Vec<Conversation>> {
+            anyhow::bail!("unused conversation service")
+        }
+        async fn get_sub_conversations(
+            &self,
+            _parent_id: &ConversationId,
+        ) -> Result<Vec<Conversation>> {
+            anyhow::bail!("unused conversation service")
+        }
+        async fn upsert_subagent_task_session(&self, _session: SubagentTaskSession) -> Result<()> {
+            anyhow::bail!("unused conversation service")
+        }
+        async fn get_subagent_task_session(
+            &self,
+            _task_id: &SubagentTaskId,
+        ) -> Result<Option<SubagentTaskSession>> {
+            anyhow::bail!("unused conversation service")
+        }
+        async fn get_subagent_task_session_by_conversation(
+            &self,
+            _conversation_id: &ConversationId,
+        ) -> Result<Option<SubagentTaskSession>> {
+            anyhow::bail!("unused conversation service")
+        }
+        async fn list_subagent_task_sessions(
+            &self,
+            _filter: SubagentTaskSessionFilter,
+        ) -> Result<Vec<SubagentTaskSession>> {
+            anyhow::bail!("unused conversation service")
+        }
+        async fn last_conversation(&self) -> Result<Option<Conversation>> {
+            anyhow::bail!("unused conversation service")
+        }
+        async fn delete_conversation(&self, _conversation_id: &ConversationId) -> Result<()> {
+            anyhow::bail!("unused conversation service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LearningService for NoopService {
+        async fn capture_candidate_from_conversation(
+            &self,
+            _conversation_id: ConversationId,
+            _source_event_id: String,
+            _summary: String,
+            _metadata: LearningCaptureMetadata,
+        ) -> Result<LearningLedgerAppendOutcome> {
+            anyhow::bail!("unused learning service")
+        }
+        async fn insert_learning_event(
+            &self,
+            _event: LearningLedgerEvent,
+        ) -> Result<LearningLedgerAppendOutcome> {
+            anyhow::bail!("unused learning service")
+        }
+        async fn review_learning_candidate_event(
+            &self,
+            _event: LearningLedgerEvent,
+        ) -> Result<LearningReviewOutcome> {
+            anyhow::bail!("unused learning service")
+        }
+        async fn promote_sensor_lesson(
+            &self,
+            _request: SensorLessonPromotionRequest,
+        ) -> Result<SensorLessonPromotionOutcome> {
+            anyhow::bail!("unused learning service")
+        }
+        async fn get_learning_record(
+            &self,
+            _record_id: LearningRecordId,
+        ) -> Result<Option<LearningRecordProjection>> {
+            anyhow::bail!("unused learning service")
+        }
+        async fn list_learning_records(
+            &self,
+            _review_state: Option<LearningReviewState>,
+            _limit: usize,
+        ) -> Result<Vec<LearningRecordProjection>> {
+            anyhow::bail!("unused learning service")
+        }
+        async fn learning_freshness(
+            &self,
+            _review_state: Option<LearningReviewState>,
+        ) -> Result<LearningLedgerFreshness> {
+            anyhow::bail!("unused learning service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SteerService for NoopService {
+        async fn enqueue_steer(
+            &self,
+            _conversation_id: &ConversationId,
+            _message: SteerMessage,
+        ) -> Result<()> {
+            anyhow::bail!("unused steer service")
+        }
+        async fn clear_steer(&self, _conversation_id: &ConversationId) -> Result<()> {
+            anyhow::bail!("unused steer service")
+        }
+        async fn drain_steer(
+            &self,
+            _conversation_id: &ConversationId,
+        ) -> Result<Vec<SteerMessage>> {
+            anyhow::bail!("unused steer service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TemplateService for NoopService {
+        async fn register_template(&self, _path: PathBuf) -> Result<()> {
+            anyhow::bail!("unused template service")
+        }
+        async fn render_template<V: serde::Serialize + Send + Sync>(
+            &self,
+            _template: Template<V>,
+            _object: &V,
+        ) -> Result<String> {
+            anyhow::bail!("unused template service")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AttachmentService for NoopService {
+        async fn attachments(&self, _url: &str) -> Result<Vec<Attachment>> {
+            anyhow::bail!("unused attachment service")
+        }
+    }
+    #[async_trait::async_trait]
+    impl CustomInstructionsService for NoopService {
+        async fn get_custom_instructions(&self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+    #[async_trait::async_trait]
+    impl FileDiscoveryService for NoopService {
+        async fn collect_files(&self, _config: Walker) -> Result<Vec<File>> {
+            anyhow::bail!("unused file discovery service")
+        }
+        async fn list_current_directory(&self) -> Result<Vec<File>> {
+            anyhow::bail!("unused file discovery service")
+        }
+    }
+    #[async_trait::async_trait]
+    impl McpConfigManager for NoopService {
+        async fn read_mcp_config(&self, _scope: Option<&Scope>) -> Result<McpConfig> {
+            anyhow::bail!("unused mcp config manager")
+        }
+        async fn write_mcp_config(&self, _config: &McpConfig, _scope: &Scope) -> Result<()> {
+            anyhow::bail!("unused mcp config manager")
+        }
+    }
+    #[async_trait::async_trait]
+    impl FsWriteService for NoopService {
+        async fn write(
+            &self,
+            _path: String,
+            _content: String,
+            _overwrite: bool,
+        ) -> Result<FsWriteOutput> {
+            anyhow::bail!("unused write service")
+        }
+    }
+    #[async_trait::async_trait]
+    impl PlanCreateService for NoopService {
+        async fn create_plan(
+            &self,
+            _plan_name: String,
+            _version: String,
+            _content: String,
+        ) -> Result<PlanCreateOutput> {
+            anyhow::bail!("unused plan service")
+        }
+    }
+    #[async_trait::async_trait]
+    impl FsPatchService for NoopService {
+        async fn patch(
+            &self,
+            _path: String,
+            _search: String,
+            _content: String,
+            _replace_all: bool,
+        ) -> Result<PatchOutput> {
+            anyhow::bail!("unused patch service")
+        }
+        async fn multi_patch(&self, _path: String, _edits: Vec<PatchEdit>) -> Result<PatchOutput> {
+            anyhow::bail!("unused patch service")
+        }
+    }
+    #[async_trait::async_trait]
+    impl FsReadService for NoopService {
+        async fn read(
+            &self,
+            _path: String,
+            _start_line: Option<u64>,
+            _end_line: Option<u64>,
+        ) -> Result<ReadOutput> {
+            anyhow::bail!("unused read service")
+        }
+    }
+    #[async_trait::async_trait]
+    impl ImageReadService for NoopService {
+        async fn read_image(&self, _path: String) -> Result<Image> {
+            anyhow::bail!("unused image service")
+        }
+    }
+    #[async_trait::async_trait]
+    impl FsRemoveService for NoopService {
+        async fn remove(&self, _path: String) -> Result<FsRemoveOutput> {
+            anyhow::bail!("unused remove service")
+        }
+    }
+    #[async_trait::async_trait]
+    impl FsSearchService for NoopService {
+        async fn search(&self, _params: FSSearch) -> Result<Option<SearchResult>> {
+            anyhow::bail!("unused search service")
+        }
+    }
+    #[async_trait::async_trait]
+    impl FollowUpService for NoopService {
+        async fn follow_up(
+            &self,
+            _question: String,
+            _options: Vec<String>,
+            _multiple: Option<bool>,
+        ) -> Result<Option<String>> {
+            anyhow::bail!("unused follow up service")
+        }
+    }
+    #[async_trait::async_trait]
+    impl FsUndoService for NoopService {
+        async fn undo(&self, _path: String) -> Result<FsUndoOutput> {
+            anyhow::bail!("unused undo service")
+        }
+    }
+    #[async_trait::async_trait]
+    impl NetFetchService for NoopService {
+        async fn fetch(&self, _url: String, _raw: Option<bool>) -> Result<HttpResponse> {
+            anyhow::bail!("unused fetch service")
+        }
+    }
+    #[async_trait::async_trait]
+    impl ShellService for NoopService {
+        async fn execute(&self, _request: ShellExecuteRequest) -> Result<ShellOutput> {
+            anyhow::bail!("unused shell service")
+        }
+    }
+    #[async_trait::async_trait]
+    impl McpService for NoopService {
+        async fn get_mcp_servers(&self) -> Result<McpServers> {
+            anyhow::bail!("unused mcp service")
+        }
+        async fn execute_mcp(&self, _call: ToolCallFull) -> Result<ToolOutput> {
+            anyhow::bail!("unused mcp service")
+        }
+        async fn reload_mcp(&self) -> Result<()> {
+            anyhow::bail!("unused mcp service")
+        }
+    }
+    #[async_trait::async_trait]
+    impl AuthService for NoopService {
+        async fn user_info(&self, _api_key: &str) -> Result<User> {
+            anyhow::bail!("unused auth service")
+        }
+        async fn user_usage(&self, _api_key: &str) -> Result<UserUsage> {
+            anyhow::bail!("unused auth service")
+        }
+    }
+    #[async_trait::async_trait]
+    impl AgentRegistry for NoopService {
+        async fn get_active_agent_id(&self) -> Result<Option<AgentId>> {
+            Ok(None)
+        }
+        async fn set_active_agent_id(&self, _agent_id: AgentId) -> Result<()> {
+            anyhow::bail!("unused agent registry")
+        }
+        async fn get_agents(&self) -> Result<Vec<Agent>> {
+            Ok(Vec::new())
+        }
+        async fn get_agent_infos(&self) -> Result<Vec<AgentInfo>> {
+            Ok(Vec::new())
+        }
+        async fn get_agent(&self, _agent_id: &AgentId) -> Result<Option<Agent>> {
+            Ok(None)
+        }
+        async fn reload_agents(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+    #[async_trait::async_trait]
+    impl CommandLoaderService for NoopService {
+        async fn get_commands(&self) -> Result<Vec<Command>> {
+            Ok(Vec::new())
+        }
+    }
+    #[async_trait::async_trait]
+    impl PolicyService for NoopService {
+        async fn check_operation_permission(
+            &self,
+            _operation: &PermissionOperation,
+        ) -> Result<PolicyDecision> {
+            anyhow::bail!("unused policy service")
+        }
+    }
+    #[async_trait::async_trait]
+    impl ProviderAuthService for NoopService {
+        async fn init_provider_auth(
+            &self,
+            _provider_id: ProviderId,
+            _method: AuthMethod,
+        ) -> Result<AuthContextRequest> {
+            anyhow::bail!("unused provider auth service")
+        }
+        async fn complete_provider_auth(
+            &self,
+            _provider_id: ProviderId,
+            _context: AuthContextResponse,
+            _timeout: Duration,
+        ) -> Result<()> {
+            anyhow::bail!("unused provider auth service")
+        }
+        async fn refresh_provider_credential(
+            &self,
+            _provider: Provider<Url>,
+        ) -> Result<Provider<Url>> {
+            anyhow::bail!("unused provider auth service")
+        }
+    }
+    #[async_trait::async_trait]
+    impl SkillFetchService for NoopService {
+        async fn fetch_skill(&self, _skill_name: String) -> Result<Skill> {
+            anyhow::bail!("unused skill service")
+        }
+        async fn list_skills(&self) -> Result<Vec<Skill>> {
+            anyhow::bail!("unused skill service")
+        }
+    }
+
+    #[derive(Clone)]
+    struct QueryWorkspaceInfra {
+        environment: Environment,
+        config: ForgeConfig,
+    }
+
+    impl QueryWorkspaceInfra {
+        fn new(cwd: PathBuf) -> Self {
+            Self {
+                environment: fixture_environment(cwd),
+                config: ForgeConfig::default(),
+            }
+        }
+    }
+
+    impl EnvironmentInfra for QueryWorkspaceInfra {
+        type Config = ForgeConfig;
+
+        fn get_env_var(&self, _key: &str) -> Option<String> {
+            None
+        }
+        fn get_env_vars(&self) -> BTreeMap<String, String> {
+            BTreeMap::new()
+        }
+        fn get_environment(&self) -> Environment {
+            self.environment.clone()
+        }
+        fn get_config(&self) -> Result<Self::Config> {
+            Ok(self.config.clone())
+        }
+        async fn update_environment(&self, _ops: Vec<forge_domain::ConfigOperation>) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CommandInfra for QueryWorkspaceInfra {
+        async fn execute_command(
+            &self,
+            _command: String,
+            _working_dir: PathBuf,
+            _silent: bool,
+            _env_vars: Option<Vec<String>>,
+            _handoff_timeout: ShellHandoffTimeoutSeconds,
+        ) -> Result<CommandExecutionOutput> {
+            Err(anyhow!("unused command infra"))
+        }
+        async fn execute_command_raw(
+            &self,
+            _command: &str,
+            _working_dir: PathBuf,
+            _env_vars: Option<Vec<String>>,
+        ) -> Result<std::process::ExitStatus> {
+            Err(anyhow!("unused command infra"))
+        }
+        async fn start_process(
+            &self,
+            _command: String,
+            _working_dir: PathBuf,
+            _env_vars: Option<Vec<String>>,
+        ) -> Result<ProcessStartOutput> {
+            Err(anyhow!("unused command infra"))
+        }
+        async fn process_status(
+            &self,
+            _process_id: forge_domain::ProcessId,
+            _wait: Option<ProcessObservationWaitSeconds>,
+        ) -> Result<ProcessStatus> {
+            Err(anyhow!("unused command infra"))
+        }
+        async fn read_process(
+            &self,
+            _process_id: forge_domain::ProcessId,
+            _cursor: ProcessReadCursor,
+            _wait: Option<ProcessObservationWaitSeconds>,
+        ) -> Result<ProcessReadOutput> {
+            Err(anyhow!("unused command infra"))
+        }
+        async fn list_processes(&self) -> Result<Vec<ProcessStatus>> {
+            Err(anyhow!("unused command infra"))
+        }
+        async fn kill_process(
+            &self,
+            _process_id: forge_domain::ProcessId,
+        ) -> Result<ProcessStatus> {
+            Err(anyhow!("unused command infra"))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SkillRepository for QueryWorkspaceInfra {
+        async fn load_skills(&self) -> Result<Vec<Skill>> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl GrpcInfra for QueryWorkspaceInfra {
+        fn channel(&self) -> Result<tonic::transport::Channel> {
+            Err(anyhow!("unused grpc infra"))
+        }
+        fn hydrate(&self) {}
+    }
+
+    fn fixture_query_workspace_api(
+        cwd: PathBuf,
+        workspace: Arc<QueryWorkspaceService>,
+    ) -> ForgeAPI<QueryWorkspaceServices, QueryWorkspaceInfra> {
+        let services = Arc::new(QueryWorkspaceServices::new(cwd.clone(), workspace));
+        let infra = Arc::new(QueryWorkspaceInfra::new(cwd));
+        ForgeAPI::new(services, infra)
+    }
+
+    fn fixture_node(node_id: &str, file_path: &str, content: &str) -> Node {
+        Node {
+            node_id: NodeId::new(node_id),
+            node: NodeData::FileChunk(FileChunk {
+                file_path: file_path.to_string(),
+                content: content.to_string(),
+                start_line: 1,
+                end_line: 3,
+            }),
+            relevance: Some(0.99),
+            distance: Some(0.01),
+        }
+    }
+
+    fn fixture_committed_episode_append_failed_result() -> Result<ProjectContextCommittedQueryResult>
+    {
+        let read_request =
+            forge_project_model::ProjectContextReadRequest::new("src/api.rs", "api-node", 1, 3)?;
+        let context_pack = forge_project_model::ContextPack {
+            version: 1,
+            manifest_hash: "api-fixture-manifest".to_string(),
+            evidence: vec![forge_project_model::ContextPackEvidence {
+                id: "api-node".to_string(),
+                path: "src/api.rs".to_string(),
+                symbol: None,
+                source: forge_project_model::ContextPackEvidenceSource::RetrievalResult,
+                freshness: forge_project_model::EvidenceFreshness::Fresh,
+                provenance: forge_project_model::Provenance {
+                    path: "src/api.rs".to_string(),
+                    start_line: Some(1),
+                    end_line: Some(3),
+                    source: "fixture".to_string(),
+                    fingerprint: "api-fixture-fingerprint".to_string(),
+                },
+                score: 0.99,
+            }],
+            provenance: vec![forge_project_model::Provenance {
+                path: "src/api.rs".to_string(),
+                start_line: Some(1),
+                end_line: Some(3),
+                source: "fixture".to_string(),
+                fingerprint: "api-fixture-fingerprint".to_string(),
+            }],
+        };
+        let retrieval_plan = forge_project_model::ProjectContextRetrievalPlan {
+            query_diagnostics: forge_project_model::ProjectContextRetrievalQueryDiagnostics {
+                query_text: Some("api boundary".to_string()),
+                path_prefix: None,
+                path_suffixes: Vec::new(),
+                limit: 1,
+                top_k: Some(1),
+                top_k_status: forge_project_model::ProjectContextTopKStatus::Applied {
+                    candidate_count: 1,
+                },
+                use_case: Some("prove committed consumption".to_string()),
+                include_graph_expansion: false,
+                stale_policy: forge_project_model::StaleEvidencePolicy::Reject,
+                freshness_proof_level: forge_project_model::FreshnessProofLevel::FullFilesystem,
+                phase_diagnostics:
+                    forge_project_model::ProjectContextRetrievalPhaseDiagnostics::default(),
+            },
+            selected_results: Vec::new(),
+            context_pack: Some(context_pack),
+            read_requests: vec![read_request.clone()],
+            write_decision:
+                forge_project_model::ProjectContextWriteDecision::WriteContextPackAfterReadback,
+            return_order: Vec::new(),
+        };
+        let replay_activation = forge_project_model::ReplayActivationBoundary {
+            manifest_hash: "api-fixture-manifest".to_string(),
+            active_refs: Vec::new(),
+            issues: Vec::new(),
+            diagnostics: forge_project_model::ReplayActivationDiagnostics::default(),
+        };
+        let commit = forge_project_model::ProjectContextPackCommit::from_retrieval_plan(
+            &retrieval_plan,
+            replay_activation,
+        )?;
+        let commit = match commit.verify_readbacks(vec![
+            forge_project_model::ProjectContextReadbackOutcome::succeeded(&read_request),
+        ])? {
+            forge_project_model::ProjectContextPackReadbackDecision::Write(commit) => commit,
+            forge_project_model::ProjectContextPackReadbackDecision::NoWrite(_) => {
+                anyhow::bail!("fixture committed query should produce persisted proof")
+            }
+        };
+        let tempdir = tempfile::tempdir()?;
+        let indexer = forge_project_model::ProjectIndexer::new(
+            tempdir.path(),
+            tempdir.path().join(".forge_project_model"),
+        );
+        let proof = indexer.persist_verified_context_pack(&commit)?;
+        Ok(ProjectContextCommittedQueryResult::persisted(
+            ProjectContextReadbackSummary::from_outcomes(&[
+                forge_project_model::ProjectContextReadbackOutcome::succeeded(&read_request),
+            ]),
+            proof,
+            ProjectContextPersistedEpisodeAppendOutcome::failed(
+                ProjectContextEpisodeAppendFailureReason::EpisodeAppendFailed,
+            ),
+            vec![ProjectContextCommittedResultItem::new(
+                "api-node",
+                Some(0.99),
+            )],
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_query_workspace_uses_committed_boundary_and_returns_only_nodes() {
+        let setup = tempfile::tempdir().unwrap();
+        let workspace = Arc::new(QueryWorkspaceService::default());
+        let expected = vec![fixture_node(
+            "api-node",
+            "src/api.rs",
+            "pub fn api_boundary() {}",
+        )];
+        workspace
+            .set_committed_result(
+                fixture_committed_episode_append_failed_result().unwrap(),
+                expected.clone(),
+            )
+            .await;
+        let fixture = fixture_query_workspace_api(setup.path().to_path_buf(), workspace.clone());
+
+        let actual = fixture
+            .query_workspace(
+                setup.path().to_path_buf(),
+                SearchParams::new("api boundary", "prove committed consumption"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(actual, expected);
+        assert!(!workspace.legacy_called().await);
+    }
+
+    #[tokio::test]
+    async fn test_query_workspace_serializes_public_nodes_without_committed_metadata_leakage() {
+        let setup = tempfile::tempdir().unwrap();
+        let workspace = Arc::new(QueryWorkspaceService::default());
+        workspace
+            .set_committed_result(
+                fixture_committed_episode_append_failed_result().unwrap(),
+                vec![fixture_node(
+                    "api-node",
+                    "src/api.rs",
+                    "public node content stays visible",
+                )],
+            )
+            .await;
+        let fixture = fixture_query_workspace_api(setup.path().to_path_buf(), workspace);
+        let nodes = fixture
+            .query_workspace(
+                setup.path().to_path_buf(),
+                SearchParams::new("serialization", "prove public api payload"),
+            )
+            .await
+            .unwrap();
+
+        let actual = serde_json::to_string(&nodes).unwrap();
+
+        assert!(!actual.contains("ProjectContextCommittedQueryResult"));
+        assert!(!actual.contains("ProjectContextPersistedEpisodeAppendOutcome"));
+        assert!(!actual.contains("EpisodeAppendFailed"));
+    }
+
+    #[tokio::test]
+    async fn test_query_workspace_propagates_committed_boundary_error() {
+        let setup = tempfile::tempdir().unwrap();
+        let workspace = Arc::new(QueryWorkspaceService::default());
+        workspace
+            .set_committed_error("committed boundary hard failure")
+            .await;
+        let fixture = fixture_query_workspace_api(setup.path().to_path_buf(), workspace.clone());
+
+        let actual = fixture
+            .query_workspace(
+                setup.path().to_path_buf(),
+                SearchParams::new("hard error", "prove propagation"),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        let expected = "committed boundary hard failure";
+
+        assert_eq!(actual, expected);
+        assert!(!workspace.legacy_called().await);
     }
 
     #[tokio::test]
