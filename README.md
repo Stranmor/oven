@@ -7,7 +7,33 @@
   <a href="https://github.com/tailcallhq/forgecode">Upstream ForgeCode</a>
 </p>
 
-> This repository is a maintained fork of upstream [ForgeCode](https://github.com/tailcallhq/forgecode). The fork preserves upstream Apache-2.0 licensing and attribution while carrying Stranmor-specific integration work. Upstream-hosted installers, badges, community links, and release channels are intentionally not advertised here because they do not represent this fork.
+> This repository is a maintained fork of upstream [ForgeCode](https://github.com/tailcallhq/forgecode). It preserves upstream Apache-2.0 licensing and attribution while carrying Stranmor-specific integration work. Upstream-hosted installers, badges, community links, and release channels are intentionally not advertised here because they do not represent this fork.
+
+## Why this fork exists
+
+Stranmor/oven is the integration branch used to keep local ForgeCode development, regression fixes, and agent-operability work together while staying honest about the upstream project it builds on.
+
+### What this fork adds
+
+- **Integrated local fixes first:** regression repairs and workflow fixes can land here before they are upstreamed or replaced by upstream equivalents.
+- **Stranmor-owned runtime assumptions:** documentation and defaults point at this fork's source-build path instead of upstream release/install channels.
+- **Agent-operable development direction:** fork work emphasizes typed project/model context, semantic workspace tooling, Rust-native UI boundaries, and local automation surfaces used by agent workflows.
+- **Upstream-compatible attribution:** this is still a ForgeCode fork, not a renamed independent product; upstream remains the original project and comparison point.
+
+### Choose the right repository
+
+| Use this fork if... | Use upstream ForgeCode if... |
+|---|---|
+| You want to inspect or test Stranmor-specific fixes, local integration work, or fork-only development direction. | You want the official upstream project, community channels, release automation, and installer guidance. |
+| You are building from source and are comfortable validating current fork behavior directly. | You prefer published upstream distribution paths over fork-local source builds. |
+| You need to reproduce behavior from Stranmor/oven commits or local agent workflow changes. | You do not need this fork's patches or project-model/TUI experimentation. |
+
+### Fork status and trust markers
+
+- **Maintenance model:** maintained fork; source builds are the documented path for this repository.
+- **Release posture:** no fork-specific public release channel is advertised here by default.
+- **CI signal:** use this repository's CI link above for fork health; upstream badges do not prove this fork's state.
+- **Attribution:** upstream ForgeCode remains linked and credited; Apache-2.0 licensing is preserved.
 
 ## Build from source
 
@@ -32,7 +58,10 @@ nix run github:Stranmor/oven
 <details>
 <summary><strong>Table&nbsp;of&nbsp;Contents</strong></summary>
 
-- [Fork status](#fork-status)
+- [Why this fork exists](#why-this-fork-exists)
+  - [What this fork adds](#what-this-fork-adds)
+  - [Choose the right repository](#choose-the-right-repository)
+  - [Fork status and trust markers](#fork-status-and-trust-markers)
 - [Build from source](#build-from-source)
 - [Usage Examples](#usage-examples)
 - [Why Forge?](#why-forge)
@@ -69,10 +98,6 @@ nix run github:Stranmor/oven
 </details>
 
 ---
-
-## Fork status
-
-Stranmor/oven is maintained as a fork. Public release automation and upstream package channels are not enabled for this repository by default. Build from source when testing this fork.
 
 ## Usage Examples
 
