@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,6 +16,7 @@ pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_JSON_DEPTH: usize = 24;
 pub const MAX_EVIDENCE_AGE_SECONDS: i64 = 24 * 60 * 60;
 const TRACE_FILE_NAME: &str = "quality-trace.jsonl";
+const TRACE_LOCK_FILE_NAME: &str = "quality-trace.lock";
 pub const SECRET_REDACTION: &str = "[REDACTED]";
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -365,6 +367,7 @@ pub struct TraceStore {
     project_root: PathBuf,
     trace_dir: PathBuf,
     trace_file: PathBuf,
+    lock_file: PathBuf,
 }
 
 impl TraceStore {
@@ -392,6 +395,7 @@ impl TraceStore {
         Ok(Self {
             project_root,
             trace_file: trace_dir.join(TRACE_FILE_NAME),
+            lock_file: trace_dir.join(TRACE_LOCK_FILE_NAME),
             trace_dir,
         })
     }
@@ -426,7 +430,8 @@ impl TraceStore {
         reject_secrets(&request.payload)?;
 
         fs::create_dir_all(&self.trace_dir)?;
-        let existing = self.read_all()?;
+        let lock = self.lock_exclusive()?;
+        let existing = self.read_all_unlocked()?;
         if let Some(prior) = existing
             .iter()
             .find(|event| event.idempotency_key == request.idempotency_key)
@@ -472,15 +477,24 @@ impl TraceStore {
             .append(true)
             .open(&self.trace_file)?;
         writeln!(file, "{line}")?;
+        file.sync_data()?;
         let readback = self
-            .read_all()?
+            .read_all_unlocked()?
             .into_iter()
             .find(|candidate| candidate.event_id == event.event_id)
             .ok_or(QualityError::DigestChainInvalid)?;
+        lock.unlock()?;
         Ok(readback)
     }
 
     pub fn read_all(&self) -> QualityResult<Vec<TraceEvent>> {
+        let lock = self.lock_shared()?;
+        let events = self.read_all_unlocked()?;
+        lock.unlock()?;
+        Ok(events)
+    }
+
+    fn read_all_unlocked(&self) -> QualityResult<Vec<TraceEvent>> {
         if !self.trace_file.exists() {
             return Ok(Vec::new());
         }
@@ -521,6 +535,28 @@ impl TraceStore {
             events = events.split_off(keep_from);
         }
         Ok(events)
+    }
+
+    fn lock_exclusive(&self) -> QualityResult<File> {
+        fs::create_dir_all(&self.trace_dir)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&self.lock_file)?;
+        file.lock_exclusive()?;
+        Ok(file)
+    }
+
+    fn lock_shared(&self) -> QualityResult<File> {
+        fs::create_dir_all(&self.trace_dir)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&self.lock_file)?;
+        file.lock_shared()?;
+        Ok(file)
     }
 
     fn ensure_project_root(&self, requested: &Path) -> QualityResult<()> {

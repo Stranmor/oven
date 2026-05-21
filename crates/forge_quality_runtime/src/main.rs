@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use forge_quality_runtime::{
-    ArtifactReport, GateResult, QualityProfile, QualityProfileCompileRequest,
+    ArtifactReport, GateResult, QualityError, QualityProfile, QualityProfileCompileRequest,
     ReleaseDecisionEvaluateRequest, RuntimeStatus, SCHEMA_VERSION, TraceAppendRequest, TraceQuery,
     TraceStore, TraceStoreConfig, compile_quality_profile, evaluate_release,
 };
@@ -70,7 +70,7 @@ impl QualityRuntimeServer {
     ) -> Result<Json<QualityProfile>, McpError> {
         compile_quality_profile(request.artifact)
             .map(Json)
-            .map_err(internal_error)
+            .map_err(quality_error)
     }
 
     #[tool(description = "Append a bounded redaction-safe event to the append-only trace store")]
@@ -78,7 +78,7 @@ impl QualityRuntimeServer {
         &self,
         Parameters(request): Parameters<TraceAppendRequest>,
     ) -> Result<Json<forge_quality_runtime::TraceEvent>, McpError> {
-        self.store.append(request).map(Json).map_err(internal_error)
+        self.store.append(request).map(Json).map_err(quality_error)
     }
 
     #[tool(description = "Read the append-only trace store with optional bounded tail limit")]
@@ -86,7 +86,7 @@ impl QualityRuntimeServer {
         &self,
         Parameters(query): Parameters<TraceQuery>,
     ) -> Result<Json<Vec<forge_quality_runtime::TraceEvent>>, McpError> {
-        self.store.query(query).map(Json).map_err(internal_error)
+        self.store.query(query).map(Json).map_err(quality_error)
     }
 
     #[tool(
@@ -96,7 +96,7 @@ impl QualityRuntimeServer {
         &self,
         Parameters(query): Parameters<TraceQuery>,
     ) -> Result<Json<Vec<forge_quality_runtime::TraceEvent>>, McpError> {
-        self.store.query(query).map(Json).map_err(internal_error)
+        self.store.query(query).map(Json).map_err(quality_error)
     }
 
     #[tool(description = "Record a gate result as a typed trace event")]
@@ -104,7 +104,8 @@ impl QualityRuntimeServer {
         &self,
         Parameters(request): Parameters<GateRecordRequest>,
     ) -> Result<Json<forge_quality_runtime::TraceEvent>, McpError> {
-        let payload = serde_json::to_value(&request.gate_result).map_err(internal_error)?;
+        let payload = serde_json::to_value(&request.gate_result)
+            .map_err(|_| McpError::internal_error("quality_runtime.schema_serialization_failed", None))?;
         self.store
             .append(TraceAppendRequest {
                 project_root: request.project_root,
@@ -113,7 +114,7 @@ impl QualityRuntimeServer {
                 payload,
             })
             .map(Json)
-            .map_err(internal_error)
+            .map_err(quality_error)
     }
 
     #[tool(
@@ -126,7 +127,7 @@ impl QualityRuntimeServer {
         let now = request.now.unwrap_or_else(chrono::Utc::now);
         evaluate_release(&request.profile, &request.gate_results, now)
             .map(Json)
-            .map_err(internal_error)
+            .map_err(quality_error)
     }
 
     #[tool(
@@ -139,7 +140,7 @@ impl QualityRuntimeServer {
         let now = request.now.unwrap_or_else(chrono::Utc::now);
         evaluate_release(&request.profile, &request.gate_results, now)
             .map(Json)
-            .map_err(internal_error)
+            .map_err(quality_error)
     }
 }
 
@@ -205,6 +206,18 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn internal_error(error: impl std::fmt::Display) -> McpError {
-    McpError::internal_error(error.to_string(), None)
+fn quality_error(error: QualityError) -> McpError {
+    let code = match error {
+        QualityError::UnknownArtifactType => "quality_runtime.unknown_artifact_type",
+        QualityError::ProjectRootRejected => "quality_runtime.project_root_rejected",
+        QualityError::PayloadRejected => "quality_runtime.payload_rejected",
+        QualityError::SecretRejected => "quality_runtime.secret_rejected",
+        QualityError::IdempotencyConflict => "quality_runtime.idempotency_conflict",
+        QualityError::NonMonotonicSequence => "quality_runtime.non_monotonic_sequence",
+        QualityError::DigestChainInvalid => "quality_runtime.digest_chain_invalid",
+        QualityError::MalformedReleaseRequest => "quality_runtime.malformed_release_request",
+        QualityError::Io(_) => "quality_runtime.io_error",
+        QualityError::Json(_) => "quality_runtime.json_error",
+    };
+    McpError::internal_error(code, None)
 }
