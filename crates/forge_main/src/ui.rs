@@ -7339,6 +7339,7 @@ mod tests {
             rerank_intent_source: Some("ExplicitUseCase".to_string()),
             rerank_intent_fingerprint: Some("abc123".to_string()),
             rerank_intent_len: Some(17),
+            offline_rerank_applicability: None,
             rerank_runtime: None,
             retrieval_empty: false,
             truncated: false,

@@ -838,9 +838,58 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
                 .map(|source| format!("{source:?}")),
             rerank_intent_fingerprint: diagnostic.rerank_intent_fingerprint,
             rerank_intent_len: diagnostic.rerank_intent_len,
+            offline_rerank_applicability: diagnostic
+                .offline_rerank_applicability
+                .map(Self::offline_rerank_applicability_to_domain),
             rerank_runtime: None,
             retrieval_empty: diagnostic.retrieval_empty,
             truncated: diagnostic.truncated,
+        }
+    }
+
+    fn offline_rerank_applicability_to_domain(
+        applicability: forge_project_model::OfflineRerankApplicability,
+    ) -> WorkspaceOfflineRerankApplicability {
+        match applicability {
+            forge_project_model::OfflineRerankApplicability::ExactMatch => {
+                WorkspaceOfflineRerankApplicability::ExactMatch
+            }
+            forge_project_model::OfflineRerankApplicability::Mismatch { reasons } => {
+                WorkspaceOfflineRerankApplicability::Mismatch {
+                    reasons: reasons
+                        .into_iter()
+                        .map(Self::offline_rerank_mismatch_to_domain)
+                        .collect(),
+                }
+            }
+        }
+    }
+
+    fn offline_rerank_mismatch_to_domain(
+        mismatch: forge_project_model::OfflineRerankApplicabilityMismatch,
+    ) -> WorkspaceOfflineRerankApplicabilityMismatch {
+        match mismatch {
+            forge_project_model::OfflineRerankApplicabilityMismatch::ManifestHashMismatch => {
+                WorkspaceOfflineRerankApplicabilityMismatch::ManifestHashMismatch
+            }
+            forge_project_model::OfflineRerankApplicabilityMismatch::RerankIntentFingerprintMismatch => {
+                WorkspaceOfflineRerankApplicabilityMismatch::RerankIntentFingerprintMismatch
+            }
+            forge_project_model::OfflineRerankApplicabilityMismatch::CandidateIdsOrderMismatch => {
+                WorkspaceOfflineRerankApplicabilityMismatch::CandidateIdsOrderMismatch
+            }
+            forge_project_model::OfflineRerankApplicabilityMismatch::CandidateContentFingerprintMismatch => {
+                WorkspaceOfflineRerankApplicabilityMismatch::CandidateContentFingerprintMismatch
+            }
+            forge_project_model::OfflineRerankApplicabilityMismatch::TopKScopeMismatch => {
+                WorkspaceOfflineRerankApplicabilityMismatch::TopKScopeMismatch
+            }
+            forge_project_model::OfflineRerankApplicabilityMismatch::ProducerIdentityPolicyMismatch => {
+                WorkspaceOfflineRerankApplicabilityMismatch::ProducerIdentityPolicyMismatch
+            }
+            forge_project_model::OfflineRerankApplicabilityMismatch::ScoreArtifactVersionMismatch => {
+                WorkspaceOfflineRerankApplicabilityMismatch::ScoreArtifactVersionMismatch
+            }
         }
     }
 
@@ -6016,6 +6065,60 @@ mod tests {
             expected,
         );
         assert!(actual_plan.retrieval_empty);
+        Ok(())
+    }
+
+    #[test]
+    fn retrieval_plan_diagnostic_preserves_offline_rerank_applicability() -> Result<()> {
+        let diagnostic = forge_project_model::ProjectContextRetrievalPlanDiagnostic {
+            planned: true,
+            refusal_code: None,
+            refusal_detail: None,
+            selected_result_count: 1,
+            read_request_count: 0,
+            write_decision: Some(forge_project_model::ProjectContextWriteDecision::NoWriteEmptyRetrieval),
+            selected_summaries: Vec::new(),
+            read_request_summaries: Vec::new(),
+            phase_diagnostics: forge_project_model::ProjectContextRetrievalPhaseDiagnostics::default(),
+            rerank_intent_source: None,
+            rerank_intent_fingerprint: Some(forge_project_model::fingerprint("raw query secret")),
+            rerank_intent_len: Some(16),
+            offline_rerank_applicability: Some(
+                forge_project_model::OfflineRerankApplicability::Mismatch {
+                    reasons: vec![
+                        forge_project_model::OfflineRerankApplicabilityMismatch::RerankIntentFingerprintMismatch,
+                    ],
+                },
+            ),
+            retrieval_empty: false,
+            truncated: false,
+        };
+
+        let actual =
+            ProjectContextInjection::<ProjectContextHarness>::retrieval_plan_diagnostic_to_domain(
+                diagnostic,
+            );
+        let serialized = serde_json::to_string(&actual)?;
+        let expected = (
+            Some(forge_domain::WorkspaceOfflineRerankApplicability::Mismatch {
+                reasons: vec![
+                    forge_domain::WorkspaceOfflineRerankApplicabilityMismatch::RerankIntentFingerprintMismatch,
+                ],
+            }),
+            true,
+            false,
+            false,
+        );
+
+        assert_eq!(
+            (
+                actual.offline_rerank_applicability,
+                serialized.contains("rerank_intent_fingerprint_mismatch"),
+                serialized.contains("raw query secret"),
+                serialized.contains("raw candidate secret"),
+            ),
+            expected,
+        );
         Ok(())
     }
 

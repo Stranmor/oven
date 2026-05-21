@@ -1107,6 +1107,9 @@ pub struct WorkspaceRetrievalPlanDiagnostic {
     /// Normalized selected rerank intent length.
     #[serde(default)]
     pub rerank_intent_len: Option<usize>,
+    /// Offline rerank artifact applicability for the current request key, when available.
+    #[serde(default)]
+    pub offline_rerank_applicability: Option<WorkspaceOfflineRerankApplicability>,
     /// Metadata-only runtime rerank availability snapshot.
     #[serde(default)]
     pub rerank_runtime: Option<WorkspaceRerankRuntimeDiagnostic>,
@@ -1114,6 +1117,39 @@ pub struct WorkspaceRetrievalPlanDiagnostic {
     pub retrieval_empty: bool,
     /// Whether selected or read-request summaries were truncated.
     pub truncated: bool,
+}
+
+/// Redaction-safe offline rerank artifact applicability for explain-context diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceOfflineRerankApplicability {
+    /// Offline rerank artifact key exactly matches the current request key.
+    ExactMatch,
+    /// Offline rerank artifact key is not applicable to the current request key.
+    Mismatch {
+        /// Deterministically ordered redaction-safe mismatch reasons.
+        reasons: Vec<WorkspaceOfflineRerankApplicabilityMismatch>,
+    },
+}
+
+/// Redaction-safe reason an offline rerank artifact is not applicable to a request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceOfflineRerankApplicabilityMismatch {
+    /// Artifact was produced for a different project manifest snapshot.
+    ManifestHashMismatch,
+    /// Artifact was produced for a different rerank intent fingerprint.
+    RerankIntentFingerprintMismatch,
+    /// Artifact candidate identifiers or ordering differ from the current request.
+    CandidateIdsOrderMismatch,
+    /// Artifact candidate content fingerprints differ from the current request.
+    CandidateContentFingerprintMismatch,
+    /// Artifact top-k scope differs from the current request.
+    TopKScopeMismatch,
+    /// Artifact producer identity or ordering policy differs from the current request.
+    ProducerIdentityPolicyMismatch,
+    /// Artifact score schema version differs from the current request.
+    ScoreArtifactVersionMismatch,
 }
 
 /// Metadata-only selected-result summary for explain-context planner diagnostics.
