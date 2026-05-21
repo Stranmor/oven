@@ -4085,6 +4085,77 @@ mod tests {
     }
 
     #[test]
+    fn configured_rejected_vector_artifact_paths_fail_closed_without_scan() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        write_fixture_vector_index(&root, "fixture-model", "RuntimeNeedle")?;
+        let artifact = fixture_vector_index_artifact(&root, "fixture-model", "RuntimeNeedle")?;
+        let outside_path = root
+            .parent()
+            .expect("fixture workspace should have a parent")
+            .join("outside_vector.json");
+        fs::write(&outside_path, artifact.to_stable_json()?)?;
+        let symlink_path = local_project_model_dir(&root).join("symlink_vector.json");
+        symlink(&outside_path, &symlink_path)?;
+        let attempts = vec![
+            PathBuf::from("https://example.invalid/vector.json"),
+            PathBuf::from("../outside_vector.json"),
+            outside_path,
+            symlink_path,
+            local_project_model_dir(&root),
+        ];
+
+        let actual = attempts
+            .into_iter()
+            .map(|path| {
+                let selection =
+                    select_fixture_vector_index(&root, Some(path), "fixture-model", vec![1.0, 0.0]);
+                (
+                    selection_readiness(&selection),
+                    selection.boundary().is_some(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = vec![
+            (
+                ProjectContextVectorReadiness::Unavailable(
+                    ProjectContextVectorUnavailableReason::IndexNotReady,
+                ),
+                false,
+            ),
+            (
+                ProjectContextVectorReadiness::Unavailable(
+                    ProjectContextVectorUnavailableReason::IndexNotReady,
+                ),
+                false,
+            ),
+            (
+                ProjectContextVectorReadiness::Unavailable(
+                    ProjectContextVectorUnavailableReason::IndexNotReady,
+                ),
+                false,
+            ),
+            (
+                ProjectContextVectorReadiness::Unavailable(
+                    ProjectContextVectorUnavailableReason::IndexNotReady,
+                ),
+                false,
+            ),
+            (
+                ProjectContextVectorReadiness::Unavailable(
+                    ProjectContextVectorUnavailableReason::IndexNotReady,
+                ),
+                false,
+            ),
+        ];
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
     fn configured_invalid_vector_artifact_ignores_unrelated_valid_scan() -> Result<()> {
         let (_fixture, root) = fixture_workspace()?;
         write_fixture_project_model(&root)?;
