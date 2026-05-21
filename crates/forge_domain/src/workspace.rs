@@ -858,6 +858,8 @@ pub enum WorkspaceRetrievalPhaseSkipReason {
     /// Query text is empty.
     #[default]
     EmptyQueryText,
+    /// Reranker intent text is empty.
+    EmptyRerankIntent,
     /// Graph expansion was not requested.
     GraphExpansionDisabled,
 }
@@ -927,6 +929,15 @@ pub struct WorkspaceRetrievalPlanDiagnostic {
     /// Typed phase diagnostics derived from the read-only planner only.
     #[serde(default)]
     pub phase_diagnostics: WorkspaceRetrievalPhaseDiagnostics,
+    /// Typed redaction-safe selected rerank intent source.
+    #[serde(default)]
+    pub rerank_intent_source: Option<String>,
+    /// Fingerprint of the selected rerank intent text without raw payload duplication.
+    #[serde(default)]
+    pub rerank_intent_fingerprint: Option<String>,
+    /// Normalized selected rerank intent length.
+    #[serde(default)]
+    pub rerank_intent_len: Option<usize>,
     /// Whether retrieval selected no evidence.
     pub retrieval_empty: bool,
     /// Whether selected or read-request summaries were truncated.

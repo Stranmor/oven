@@ -6,11 +6,12 @@ use std::path::{Component, Path};
 use anyhow::{Result, bail};
 
 use crate::context_adapter::{ManifestEvidenceTarget, resolve_manifest_evidence_target};
-use crate::retrieval::retrieve_with_boundaries;
+use crate::retrieval::retrieve_with_boundaries_and_rerank_intent;
 use crate::types::{
     ContextPack, ContextPackEvidence, ContextPackSelection, EdgeConfidence, FreshnessProofLevel,
-    GraphEdge, GraphEdgeKind, ManifestFreshnessEvaluation, ProjectManifest, RetrievalQuery,
-    RetrievalResult, RetrievalScoringWeights, StaleEvidencePolicy, VectorQuery,
+    GraphEdge, GraphEdgeKind, ManifestFreshnessEvaluation, ProjectManifest, RerankIntent,
+    RerankIntentSource, RetrievalQuery, RetrievalResult, RetrievalScoringWeights,
+    StaleEvidencePolicy, VectorQuery,
 };
 use crate::vector::{Reranker, VectorIndex};
 use crate::{ExactFactStatus, ExactFactStatusReport, ReplayActivationBoundary};
@@ -33,6 +34,8 @@ pub struct ProjectContextRetrievalRequest {
     pub include_graph_expansion: bool,
     /// Optional caller use-case preserved as metadata/provenance diagnostics.
     pub use_case: Option<String>,
+    /// Typed caller policy used to select reranker intent.
+    pub rerank_intent_source: ProjectContextRerankIntentSourceSelection,
     /// Optional typed retrieval candidate budget requested by the caller.
     pub top_k: Option<usize>,
 }
@@ -58,6 +61,7 @@ impl ProjectContextRetrievalRequest {
             path_scope,
             include_graph_expansion,
             use_case: None,
+            rerank_intent_source: ProjectContextRerankIntentSourceSelection::Default,
             top_k: None,
         }
     }
@@ -72,6 +76,12 @@ impl ProjectContextRetrievalRequest {
         self
     }
 
+    /// Marks this request as automatic project-model context injection.
+    pub fn automatic_injection(mut self) -> Self {
+        self.rerank_intent_source = ProjectContextRerankIntentSourceSelection::AutomaticInjection;
+        self
+    }
+
     /// Adds an explicit retrieval candidate budget to the request.
     ///
     /// # Arguments
@@ -81,6 +91,16 @@ impl ProjectContextRetrievalRequest {
         self.top_k = Some(top_k);
         self
     }
+}
+
+/// Typed caller policy for selecting reranker intent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProjectContextRerankIntentSourceSelection {
+    /// Normal sem_search behavior: explicit non-empty use-case wins, otherwise query text.
+    #[default]
+    Default,
+    /// Automatic project-model context injection deliberately reranks by actual query text.
+    AutomaticInjection,
 }
 
 /// Full project-model path scope applied before retrieval truncation.
@@ -380,6 +400,8 @@ pub enum ProjectContextRetrievalPhaseSkipReason {
     /// Query text is empty, so lexical/rerank text matching is skipped.
     #[default]
     EmptyQueryText,
+    /// Reranker boundary was ready, but no non-empty intent text was selected.
+    EmptyRerankIntent,
     /// Graph expansion was not requested.
     GraphExpansionDisabled,
 }
@@ -473,6 +495,12 @@ pub struct ProjectContextRetrievalPlanDiagnostic {
     pub read_request_summaries: Vec<ProjectContextRetrievalReadRequestSummary>,
     /// Typed redaction-safe retrieval phase diagnostics.
     pub phase_diagnostics: ProjectContextRetrievalPhaseDiagnostics,
+    /// Typed redaction-safe selected rerank intent source.
+    pub rerank_intent_source: Option<RerankIntentSource>,
+    /// Fingerprint of the selected rerank intent text without raw payload duplication.
+    pub rerank_intent_fingerprint: Option<String>,
+    /// Normalized selected rerank intent length.
+    pub rerank_intent_len: Option<usize>,
     /// Whether retrieval selected no evidence.
     pub retrieval_empty: bool,
     /// Whether selected or read-request summaries were truncated.
@@ -497,6 +525,9 @@ impl ProjectContextRetrievalPlanDiagnostic {
                 selected_summaries: Vec::new(),
                 read_request_summaries: Vec::new(),
                 phase_diagnostics: ProjectContextRetrievalPhaseDiagnostics::default(),
+                rerank_intent_source: None,
+                rerank_intent_fingerprint: None,
+                rerank_intent_len: None,
                 retrieval_empty: false,
                 truncated: false,
             },
@@ -525,6 +556,12 @@ impl ProjectContextRetrievalPlanDiagnostic {
                     selected_summaries,
                     read_request_summaries,
                     phase_diagnostics: plan.query_diagnostics.phase_diagnostics.clone(),
+                    rerank_intent_source: plan.query_diagnostics.rerank_intent_source,
+                    rerank_intent_fingerprint: plan
+                        .query_diagnostics
+                        .rerank_intent_fingerprint
+                        .clone(),
+                    rerank_intent_len: plan.query_diagnostics.rerank_intent_len,
                     retrieval_empty: selected_result_count == 0,
                     truncated: selected_result_count > MAX_DIAGNOSTIC_SUMMARIES
                         || read_request_count > MAX_DIAGNOSTIC_SUMMARIES,
@@ -619,6 +656,12 @@ pub struct ProjectContextRetrievalQueryDiagnostics {
     pub top_k_status: ProjectContextTopKStatus,
     /// Redaction-safe use-case metadata supplied by the caller.
     pub use_case: Option<String>,
+    /// Selected reranker intent source.
+    pub rerank_intent_source: Option<RerankIntentSource>,
+    /// Fingerprint of the normalized reranker intent when selected.
+    pub rerank_intent_fingerprint: Option<String>,
+    /// Character length of the normalized reranker intent when selected.
+    pub rerank_intent_len: Option<usize>,
     /// Whether graph expansion was requested.
     pub include_graph_expansion: bool,
     /// Fixed stale policy used for query path injection.
@@ -782,6 +825,7 @@ pub fn plan_project_context_retrieval_with_options(
         }
         None => ProjectContextTopKStatus::NotRequested,
     };
+    let selected_rerank_intent = select_rerank_intent_for_request(&request);
     let phase_diagnostics = ProjectContextRetrievalPhaseDiagnostics {
         lexical: lexical_phase_status(&request.query_text),
         graph: graph_phase_status(request.include_graph_expansion),
@@ -796,7 +840,14 @@ pub fn plan_project_context_retrieval_with_options(
         limit: effective_limit,
         top_k: request.top_k,
         top_k_status,
-        use_case: request.use_case.clone(),
+        use_case: normalized_use_case(request.use_case.as_deref()),
+        rerank_intent_source: selected_rerank_intent.as_ref().map(|intent| intent.source),
+        rerank_intent_fingerprint: selected_rerank_intent
+            .as_ref()
+            .map(|intent| crate::fingerprint(&intent.text)),
+        rerank_intent_len: selected_rerank_intent
+            .as_ref()
+            .map(|intent| intent.text.chars().count()),
         include_graph_expansion: request.include_graph_expansion,
         stale_policy: StaleEvidencePolicy::Reject,
         freshness_proof_level: freshness.proof_level.clone(),
@@ -822,13 +873,15 @@ pub fn plan_project_context_retrieval_with_options(
         options.vector_index,
         options.vector_unavailable_reason,
     );
-    let reranker_activation = reranker_activation(options.reranker, &request.query_text);
-    let mut selected_results = retrieve_with_boundaries(
+    let reranker_activation =
+        reranker_activation(options.reranker, selected_rerank_intent.as_ref());
+    let mut selected_results = retrieve_with_boundaries_and_rerank_intent(
         manifest,
         &query,
         vector_activation.vector_query,
         vector_activation.vector_index,
         reranker_activation.reranker,
+        selected_rerank_intent.as_ref(),
         &RetrievalScoringWeights::default(),
     );
     let exact_fact_activation =
@@ -1060,6 +1113,36 @@ fn inactive_exact_fact(
     }
 }
 
+fn normalized_use_case(use_case: Option<&str>) -> Option<String> {
+    use_case
+        .map(str::trim)
+        .filter(|use_case| !use_case.is_empty())
+        .map(ToString::to_string)
+}
+
+fn select_rerank_intent_for_request(
+    request: &ProjectContextRetrievalRequest,
+) -> Option<RerankIntent> {
+    match request.rerank_intent_source {
+        ProjectContextRerankIntentSourceSelection::Default => {
+            normalized_use_case(request.use_case.as_deref())
+                .and_then(|use_case| {
+                    RerankIntent::new(use_case, RerankIntentSource::ExplicitUseCase)
+                })
+                .or_else(|| {
+                    RerankIntent::new(
+                        request.query_text.as_str(),
+                        RerankIntentSource::QueryTextFallback,
+                    )
+                })
+        }
+        ProjectContextRerankIntentSourceSelection::AutomaticInjection => RerankIntent::new(
+            request.query_text.as_str(),
+            RerankIntentSource::AutomaticInjectionQueryFallback,
+        ),
+    }
+}
+
 fn lexical_phase_status(query_text: &str) -> ProjectContextRetrievalPhaseStatus {
     if query_text.trim().is_empty() {
         ProjectContextRetrievalPhaseStatus::Skipped(
@@ -1222,11 +1305,11 @@ fn vector_unavailable_phase_reason(
 
 fn reranker_activation<'a>(
     reranker: Option<ProjectContextRerankerBoundary<'a>>,
-    query_text: &str,
+    rerank_intent: Option<&RerankIntent>,
 ) -> ProjectContextRerankerActivation<'a> {
-    if query_text.trim().is_empty() {
+    if rerank_intent.is_none() {
         return ProjectContextRerankerActivation::skipped(
-            ProjectContextRetrievalPhaseSkipReason::EmptyQueryText,
+            ProjectContextRetrievalPhaseSkipReason::EmptyRerankIntent,
         );
     }
     match reranker {
@@ -1421,7 +1504,7 @@ mod tests {
     use crate::types::{
         CargoDependencyDeclaration, CargoDependencyKind, CargoPackageDependency,
         CargoPackageMetadata, CargoTargetDeclaration, CargoTargetKind, CargoTargetMetadata,
-        FreshnessState, Language, Provenance, SourceFile,
+        FreshnessState, Language, Provenance, RerankCandidate, RerankScore, SourceFile,
     };
     use crate::vector::DeterministicVectorIndex;
     use crate::{
@@ -2429,6 +2512,173 @@ mod tests {
     }
 
     #[test]
+    fn planner_selects_explicit_use_case_as_redaction_safe_rerank_intent() -> Result<()> {
+        let (_fixture, _root, manifest) = indexed_fixture()?;
+        let request = ProjectContextRetrievalRequest::new(
+            "Root model",
+            3,
+            ProjectContextPathScope::default(),
+            true,
+        )
+        .with_use_case("  ranked caller proof  ");
+
+        let actual = plan_project_context_retrieval_with_options(
+            &manifest,
+            &freshness(&manifest),
+            request,
+            ProjectContextRetrievalOptions {
+                vector_query: None,
+                vector_index: None,
+                reranker: Some(ready_reranker_boundary(&IntentOrderReranker)),
+                vector_unavailable_reason: None,
+                exact_fact_status: None,
+                replay_activation: None,
+            },
+        );
+        let actual_plan = expect_plan(actual);
+        let expected = (
+            Some("ranked caller proof".to_string()),
+            Some(RerankIntentSource::ExplicitUseCase),
+            Some(fingerprint("ranked caller proof")),
+            Some("ranked caller proof".len()),
+        );
+        assert_eq!(
+            (
+                actual_plan.query_diagnostics.use_case,
+                actual_plan.query_diagnostics.rerank_intent_source,
+                actual_plan.query_diagnostics.rerank_intent_fingerprint,
+                actual_plan.query_diagnostics.rerank_intent_len,
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn whitespace_use_case_falls_back_to_query_text_rerank_intent() -> Result<()> {
+        let (_fixture, _root, manifest) = indexed_fixture()?;
+        let request = ProjectContextRetrievalRequest::new(
+            "Root model",
+            3,
+            ProjectContextPathScope::default(),
+            true,
+        )
+        .with_use_case("   \n\t ");
+
+        let actual = plan_project_context_retrieval_with_options(
+            &manifest,
+            &freshness(&manifest),
+            request,
+            ProjectContextRetrievalOptions {
+                vector_query: None,
+                vector_index: None,
+                reranker: Some(ready_reranker_boundary(&IntentOrderReranker)),
+                vector_unavailable_reason: None,
+                exact_fact_status: None,
+                replay_activation: None,
+            },
+        );
+        let actual_plan = expect_plan(actual);
+        let expected = (
+            None,
+            Some(RerankIntentSource::QueryTextFallback),
+            Some(fingerprint("Root model")),
+            ProjectContextRetrievalPhaseStatus::Active { result_count: 3 },
+        );
+        assert_eq!(
+            (
+                actual_plan.query_diagnostics.use_case,
+                actual_plan.query_diagnostics.rerank_intent_source,
+                actual_plan.query_diagnostics.rerank_intent_fingerprint,
+                actual_plan.query_diagnostics.phase_diagnostics.rerank,
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_query_and_empty_use_case_skip_reranker_with_typed_reason() -> Result<()> {
+        let (_fixture, _root, manifest) = indexed_fixture()?;
+        let request =
+            ProjectContextRetrievalRequest::new("   ", 3, ProjectContextPathScope::default(), true)
+                .with_use_case("   ");
+
+        let actual = plan_project_context_retrieval_with_options(
+            &manifest,
+            &freshness(&manifest),
+            request,
+            ProjectContextRetrievalOptions {
+                vector_query: None,
+                vector_index: None,
+                reranker: Some(ready_reranker_boundary(&IntentOrderReranker)),
+                vector_unavailable_reason: None,
+                exact_fact_status: None,
+                replay_activation: None,
+            },
+        );
+        let actual_plan = expect_plan(actual);
+        let expected = (
+            None,
+            None,
+            ProjectContextRetrievalPhaseStatus::Skipped(
+                ProjectContextRetrievalPhaseSkipReason::EmptyRerankIntent,
+            ),
+        );
+        assert_eq!(
+            (
+                actual_plan.query_diagnostics.use_case,
+                actual_plan.query_diagnostics.rerank_intent_source,
+                actual_plan.query_diagnostics.phase_diagnostics.rerank,
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_injection_use_case_does_not_override_actual_query_intent() -> Result<()> {
+        let (_fixture, _root, manifest) = indexed_fixture()?;
+        let request = ProjectContextRetrievalRequest::new(
+            "Root model",
+            3,
+            ProjectContextPathScope::default(),
+            true,
+        )
+        .with_use_case("automatic project-model context injection")
+        .automatic_injection();
+
+        let actual = plan_project_context_retrieval_with_options(
+            &manifest,
+            &freshness(&manifest),
+            request,
+            ProjectContextRetrievalOptions {
+                vector_query: None,
+                vector_index: None,
+                reranker: Some(ready_reranker_boundary(&IntentOrderReranker)),
+                vector_unavailable_reason: None,
+                exact_fact_status: None,
+                replay_activation: None,
+            },
+        );
+        let actual_plan = expect_plan(actual);
+        let expected = (
+            Some("automatic project-model context injection".to_string()),
+            Some(RerankIntentSource::AutomaticInjectionQueryFallback),
+            Some(fingerprint("Root model")),
+        );
+        assert_eq!(
+            (
+                actual_plan.query_diagnostics.use_case,
+                actual_plan.query_diagnostics.rerank_intent_source,
+                actual_plan.query_diagnostics.rerank_intent_fingerprint,
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
     fn freshness_refusal_still_blocks_semantic_boundaries_before_reads_or_writes() -> Result<()> {
         let (_fixture, _root, manifest) = indexed_fixture()?;
         let vector_query = VectorQuery { embedding: vec![1.0, 0.0] };
@@ -3166,6 +3416,37 @@ mod tests {
                 artifact: "deterministic-vector-index",
             },
             readiness: ProjectContextVectorReadiness::Ready { dimension },
+        }
+    }
+
+    fn ready_reranker_boundary<'a>(
+        reranker: &'a dyn Reranker,
+    ) -> ProjectContextRerankerBoundary<'a> {
+        ProjectContextRerankerBoundary {
+            reranker,
+            identity: ProjectContextIntegrationIdentity {
+                provider: "fixture",
+                artifact: "deterministic-reranker",
+            },
+            readiness: ProjectContextRerankerReadiness::Ready,
+        }
+    }
+
+    struct IntentOrderReranker;
+
+    impl Reranker for IntentOrderReranker {
+        fn rerank(&self, query: &str, candidates: &[RerankCandidate]) -> Vec<RerankScore> {
+            candidates
+                .iter()
+                .map(|candidate| RerankScore {
+                    id: candidate.id.clone(),
+                    score: if candidate.text.contains(query) {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                })
+                .collect()
         }
     }
 

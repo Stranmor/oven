@@ -890,6 +890,7 @@ mod tests {
     struct SemSearchParamSnapshot {
         query: String,
         use_case: String,
+        rerank_intent_source: forge_domain::SearchRerankIntentSource,
         query_embedding: Option<Vec<f32>>,
         embedding_model_id: Option<String>,
     }
@@ -1204,6 +1205,7 @@ mod tests {
                 .push(SemSearchParamSnapshot {
                     query: params.query.to_string(),
                     use_case: params.use_case.clone(),
+                    rerank_intent_source: params.rerank_intent_source,
                     query_embedding: params.query_embedding.clone(),
                     embedding_model_id: params.embedding_model_id.clone(),
                 });
@@ -1244,11 +1246,12 @@ mod tests {
         async fn query_workspace(
             &self,
             _path: PathBuf,
-            _params: SearchParams<'_>,
+            params: SearchParams<'_>,
         ) -> anyhow::Result<Vec<Node>> {
             self.query_calls.lock().await.push(SemSearchParamSnapshot {
                 query: "legacy-query-workspace-called".to_string(),
                 use_case: "legacy-query-workspace-called".to_string(),
+                rerank_intent_source: params.rerank_intent_source,
                 query_embedding: None,
                 embedding_model_id: None,
             });
@@ -2063,6 +2066,9 @@ mod tests {
                     candidate_count: 1,
                 },
                 use_case: Some("committed use case".to_string()),
+                rerank_intent_source: None,
+                rerank_intent_fingerprint: None,
+                rerank_intent_len: None,
                 include_graph_expansion: false,
                 stale_policy: forge_project_model::StaleEvidencePolicy::Reject,
                 freshness_proof_level: forge_project_model::FreshnessProofLevel::FullFilesystem,
@@ -2559,6 +2565,10 @@ mod tests {
             "Find the struct implementation for alpha"
         );
         assert_eq!(actual_queries[0].query_embedding, Some(vec![1.0, 0.0]));
+        assert_eq!(
+            actual_queries[0].rerank_intent_source,
+            forge_domain::SearchRerankIntentSource::Default,
+        );
         assert_eq!(
             actual_queries[0].embedding_model_id,
             Some("fixture-model".to_string())

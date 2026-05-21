@@ -12,14 +12,15 @@ use forge_domain::{
     AuthCredential, AuthDetails, FileChunk, Node, NodeData, NodeId, ProjectSemanticEmbeddingInput,
     ProjectSemanticEmbeddingOutput, ProjectSemanticEmbeddingRequest,
     ProjectSemanticEmbeddingVector, ProviderId, ProviderRepository, SearchParams,
-    SemSearchAvailability, SemSearchDiagnosticReport, SemSearchUnknownReason,
-    SemSearchUnsupportedReason, SyncProgress, UserId, WorkspaceContextFreshness,
-    WorkspaceContextManifestDiagnostic, WorkspaceEvidenceLedgerActivationDiagnostic,
-    WorkspaceEvidenceLedgerActivationSummary, WorkspaceEvidenceLedgerGraphMetadata,
-    WorkspaceEvidenceReadinessDiagnostic, WorkspaceEvidenceReplayBudgetSummary,
-    WorkspaceEvidenceReplayDiagnostic, WorkspaceEvidenceReplayIssueSummary,
-    WorkspaceEvidenceReplayPreviewDiagnostic, WorkspaceEvidenceReplayPreviewStatus,
-    WorkspaceEvidenceReplayReference, WorkspaceEvidenceReplayStatus, WorkspaceExactFactBoundedLoss,
+    SearchRerankIntentSource, SemSearchAvailability, SemSearchDiagnosticReport,
+    SemSearchUnknownReason, SemSearchUnsupportedReason, SyncProgress, UserId,
+    WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
+    WorkspaceEvidenceLedgerActivationDiagnostic, WorkspaceEvidenceLedgerActivationSummary,
+    WorkspaceEvidenceLedgerGraphMetadata, WorkspaceEvidenceReadinessDiagnostic,
+    WorkspaceEvidenceReplayBudgetSummary, WorkspaceEvidenceReplayDiagnostic,
+    WorkspaceEvidenceReplayIssueSummary, WorkspaceEvidenceReplayPreviewDiagnostic,
+    WorkspaceEvidenceReplayPreviewStatus, WorkspaceEvidenceReplayReference,
+    WorkspaceEvidenceReplayStatus, WorkspaceExactFactBoundedLoss,
     WorkspaceExactFactIngestionSummary, WorkspaceExactFactIssue,
     WorkspaceExactFactReadinessDiagnostic, WorkspaceExactFactReferenceReport,
     WorkspaceExactFactReferenceStatus, WorkspaceExactFactStatusReport, WorkspaceId,
@@ -1370,6 +1371,9 @@ impl<
             true,
         )
         .with_use_case(params.use_case.clone());
+        if params.rerank_intent_source == SearchRerankIntentSource::AutomaticInjection {
+            request = request.automatic_injection();
+        }
         if let Some(top_k) = params.top_k {
             request = request.with_top_k(top_k as usize);
         }
@@ -1398,15 +1402,25 @@ impl<
             forge_project_model::EvidenceLedgerReplayRequest::reference_only(&manifest);
         let replay_report =
             select_evidence_ledger_replay(&indexer, &manifest, &replay_report_request);
+        let normalized_use_case = params.use_case.trim();
+        let rerank_intent_identity = match params.rerank_intent_source {
+            SearchRerankIntentSource::AutomaticInjection => fingerprint(params.query.trim()),
+            SearchRerankIntentSource::Default if normalized_use_case.is_empty() => {
+                fingerprint(params.query.trim())
+            }
+            SearchRerankIntentSource::Default => fingerprint(normalized_use_case),
+        };
         let replay_activation_request = ReplayActivationRequest::new(
             &manifest,
             fingerprint(&format!(
-                "{}:{}:{:?}:{:?}:{:?}",
+                "{}:{}:{:?}:{:?}:{:?}:{:?}:{:?}",
                 params.query,
                 params.limit.unwrap_or(10),
                 params.starts_with,
                 params.ends_with,
-                params.top_k
+                params.top_k,
+                params.rerank_intent_source,
+                rerank_intent_identity
             )),
             ReplayActivationCaps::default(),
         );

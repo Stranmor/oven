@@ -252,6 +252,7 @@ fn format_retrieval_phase_status(status: &WorkspaceRetrievalPhaseStatus) -> Stri
 fn format_retrieval_phase_skip_reason(reason: &WorkspaceRetrievalPhaseSkipReason) -> &'static str {
     match reason {
         WorkspaceRetrievalPhaseSkipReason::EmptyQueryText => "missing_query_text",
+        WorkspaceRetrievalPhaseSkipReason::EmptyRerankIntent => "missing_rerank_intent",
         WorkspaceRetrievalPhaseSkipReason::GraphExpansionDisabled => "graph_expansion_disabled",
     }
 }
@@ -341,7 +342,7 @@ fn format_retrieval_plan_diagnostic(diagnostic: &WorkspaceRetrievalPlanDiagnosti
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "scope=query_specific_read_only_pre_readback_planner_derived workspace_label={} manifest_label={} planned={} refusal_code={} refusal_detail={} selected_results={} read_requests={} write_decision={} phases=\"{}\" retrieval_empty={} truncated={} selected=[{}] planned_reads=[{}]",
+        "scope=query_specific_read_only_pre_readback_planner_derived workspace_label={} manifest_label={} planned={} refusal_code={} refusal_detail={} selected_results={} read_requests={} write_decision={} phases=\"{}\" rerank_intent_source={} rerank_intent_fingerprint={} rerank_intent_len={} retrieval_empty={} truncated={} selected=[{}] planned_reads=[{}]",
         diagnostic.workspace_root_label,
         diagnostic.manifest_label,
         diagnostic.planned,
@@ -351,6 +352,15 @@ fn format_retrieval_plan_diagnostic(diagnostic: &WorkspaceRetrievalPlanDiagnosti
         diagnostic.read_request_count,
         diagnostic.write_decision.as_deref().unwrap_or("none"),
         format_retrieval_phase_diagnostics(&diagnostic.phase_diagnostics),
+        diagnostic.rerank_intent_source.as_deref().unwrap_or("none"),
+        diagnostic
+            .rerank_intent_fingerprint
+            .as_deref()
+            .unwrap_or("none"),
+        diagnostic
+            .rerank_intent_len
+            .map(|len| len.to_string())
+            .unwrap_or_else(|| "none".to_string()),
         diagnostic.retrieval_empty,
         diagnostic.truncated,
         selected,
@@ -6958,17 +6968,22 @@ mod tests {
                 end_line: 3,
             }],
             phase_diagnostics: WorkspaceRetrievalPhaseDiagnostics::default(),
+            rerank_intent_source: Some("ExplicitUseCase".to_string()),
+            rerank_intent_fingerprint: Some("abc123".to_string()),
+            rerank_intent_len: Some(17),
             retrieval_empty: false,
             truncated: false,
         };
         let actual = format_retrieval_plan_diagnostic(&fixture);
-        let expected = (true, true, true, false, false);
+        let expected = (true, true, true, true, true, false, false);
 
         assert_eq!(
             (
                 actual.contains("scope=query_specific_read_only_pre_readback_planner_derived"),
                 actual.contains("selected_results=1"),
                 actual.contains("planned_reads=[src/lib.rs@src/lib.rs:1-3]"),
+                actual.contains("rerank_intent_source=ExplicitUseCase"),
+                actual.contains("rerank_intent_fingerprint=abc123"),
                 actual.contains("pub fn"),
                 actual.contains("find automatic injection needle"),
             ),

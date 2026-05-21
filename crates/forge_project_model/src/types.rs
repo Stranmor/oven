@@ -1313,6 +1313,44 @@ pub struct RetrievalQuery {
     pub include_graph_expansion: bool,
 }
 
+/// Typed source used to select the reranker intent text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RerankIntentSource {
+    /// Caller supplied a non-empty explicit use-case.
+    ExplicitUseCase,
+    /// Caller did not supply a usable use-case, so query text is used.
+    #[default]
+    QueryTextFallback,
+    /// Automatic project-model context injection deliberately falls back to the actual query text.
+    AutomaticInjectionQueryFallback,
+}
+
+/// Typed reranker intent selected independently from lexical/vector query text.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RerankIntent {
+    /// Normalized intent text passed to the reranker.
+    pub text: String,
+    /// Typed source that selected this intent text.
+    pub source: RerankIntentSource,
+}
+
+impl RerankIntent {
+    /// Builds a non-empty reranker intent after trimming surrounding whitespace.
+    ///
+    /// # Arguments
+    ///
+    /// * `text` - Candidate reranker intent text.
+    /// * `source` - Typed source that selected the candidate.
+    pub fn new(text: impl Into<String>, source: RerankIntentSource) -> Option<Self> {
+        let text = text.into().trim().to_string();
+        if text.is_empty() {
+            None
+        } else {
+            Some(Self { text, source })
+        }
+    }
+}
+
 /// Retrieval result with fused exact, lexical, and graph scores.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RetrievalResult {

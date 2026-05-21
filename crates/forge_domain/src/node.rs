@@ -137,6 +137,16 @@ impl<T> CodeBase<T> {
     }
 }
 
+/// Caller policy for selecting rerank intent from semantic search inputs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SearchRerankIntentSource {
+    /// Normal sem_search behavior uses explicit use_case before query fallback.
+    #[default]
+    Default,
+    /// Automatic injection reranks by the actual user query text.
+    AutomaticInjection,
+}
+
 #[derive(Debug, Clone, PartialEq, Setters)]
 #[setters(strip_option, into)]
 pub struct SearchParams<'a> {
@@ -144,6 +154,7 @@ pub struct SearchParams<'a> {
     pub limit: Option<usize>,
     pub top_k: Option<u32>,
     pub use_case: String,
+    pub rerank_intent_source: SearchRerankIntentSource,
     pub starts_with: Option<String>,
     pub ends_with: Option<Vec<String>>,
     /// Optional provider-neutral query embedding computed by an external boundary.
@@ -159,11 +170,18 @@ impl<'a> SearchParams<'a> {
             limit: None,
             top_k: None,
             use_case: use_case.to_string(),
+            rerank_intent_source: SearchRerankIntentSource::Default,
             starts_with: None,
             ends_with: None,
             query_embedding: None,
             embedding_model_id: None,
         }
+    }
+
+    /// Marks this search as automatic project-model context injection.
+    pub fn automatic_injection(mut self) -> Self {
+        self.rerank_intent_source = SearchRerankIntentSource::AutomaticInjection;
+        self
     }
 }
 

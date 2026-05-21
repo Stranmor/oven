@@ -274,6 +274,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
         for target_diagnostic in targets {
             let target = target_diagnostic.target;
             let mut params = SearchParams::new(&query, "automatic project-model context injection")
+                .automatic_injection()
                 .limit(max_sources);
             if let Some(path_filter) = target.path_filter.clone() {
                 params = params.starts_with(path_filter);
@@ -816,6 +817,11 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
                 .map(Self::read_request_summary_to_domain)
                 .collect(),
             phase_diagnostics: Self::phase_diagnostics_to_domain(diagnostic.phase_diagnostics),
+            rerank_intent_source: diagnostic
+                .rerank_intent_source
+                .map(|source| format!("{source:?}")),
+            rerank_intent_fingerprint: diagnostic.rerank_intent_fingerprint,
+            rerank_intent_len: diagnostic.rerank_intent_len,
             retrieval_empty: diagnostic.retrieval_empty,
             truncated: diagnostic.truncated,
         }
@@ -863,6 +869,9 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
         match reason {
             ProjectContextRetrievalPhaseSkipReason::EmptyQueryText => {
                 WorkspaceRetrievalPhaseSkipReason::EmptyQueryText
+            }
+            ProjectContextRetrievalPhaseSkipReason::EmptyRerankIntent => {
+                WorkspaceRetrievalPhaseSkipReason::EmptyRerankIntent
             }
             ProjectContextRetrievalPhaseSkipReason::GraphExpansionDisabled => {
                 WorkspaceRetrievalPhaseSkipReason::GraphExpansionDisabled
@@ -3135,6 +3144,7 @@ mod tests {
         queried_workspaces: Mutex<Vec<PathBuf>>,
         query_filters: Mutex<Vec<Option<String>>>,
         query_embeddings: Mutex<Vec<Option<Vec<f32>>>>,
+        query_rerank_sources: Mutex<Vec<forge_domain::SearchRerankIntentSource>>,
         index_checks: AtomicUsize,
         learning_records: Mutex<Vec<LearningRecordProjection>>,
         learning_freshness: LearningLedgerFreshness,
@@ -3268,6 +3278,7 @@ mod tests {
                 queried_workspaces: Mutex::new(Vec::new()),
                 query_filters: Mutex::new(Vec::new()),
                 query_embeddings: Mutex::new(Vec::new()),
+                query_rerank_sources: Mutex::new(Vec::new()),
                 index_checks: AtomicUsize::new(0),
                 learning_records: Mutex::new(Vec::new()),
                 learning_freshness: LearningLedgerFreshness {
@@ -3874,6 +3885,10 @@ mod tests {
                 .lock()
                 .await
                 .push(params.query_embedding.clone());
+            self.query_rerank_sources
+                .lock()
+                .await
+                .push(params.rerank_intent_source);
             if self
                 .error_paths
                 .iter()
@@ -4114,6 +4129,9 @@ mod tests {
                     candidate_count: 1,
                 },
                 use_case: Some("committed use case".to_string()),
+                rerank_intent_source: None,
+                rerank_intent_fingerprint: None,
+                rerank_intent_len: None,
                 include_graph_expansion: false,
                 stale_policy: forge_project_model::StaleEvidencePolicy::Reject,
                 freshness_proof_level: forge_project_model::FreshnessProofLevel::FullFilesystem,
@@ -4967,6 +4985,8 @@ mod tests {
         assert_eq!(*setup.queried_workspaces.lock().await, expected_workspaces);
         let expected_filters = vec![None];
         assert_eq!(*setup.query_filters.lock().await, expected_filters);
+        let expected_sources = vec![forge_domain::SearchRerankIntentSource::AutomaticInjection];
+        assert_eq!(*setup.query_rerank_sources.lock().await, expected_sources);
         Ok(())
     }
 
