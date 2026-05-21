@@ -7042,7 +7042,11 @@ mod tests {
 
     #[test]
     fn test_goal_slash_action_treats_multi_token_lifecycle_keyword_as_objective() {
-        let fixture = vec!["clear".to_string(), "release".to_string(), "blockers".to_string()];
+        let fixture = vec![
+            "clear".to_string(),
+            "release".to_string(),
+            "blockers".to_string(),
+        ];
         let actual = GoalSlashAction::from_args(fixture);
         let expected = GoalSlashAction::Set("clear release blockers".to_string());
         assert_eq!(actual, expected);

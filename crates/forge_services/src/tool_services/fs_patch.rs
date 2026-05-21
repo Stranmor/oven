@@ -619,6 +619,27 @@ fn normalize_apply_patch_target(path: &str, cwd: &Path) -> anyhow::Result<PathBu
     Ok(absolute)
 }
 
+fn apply_patch_conflict_key(section: &ApplyPatchSection, path: &Path) -> anyhow::Result<PathBuf> {
+    match section.operation {
+        ApplyPatchOperation::Update => std::fs::canonicalize(path)
+            .with_context(|| format!("Failed to canonicalize update target: {}", path.display())),
+        ApplyPatchOperation::Add => {
+            let parent = path.parent().ok_or_else(|| {
+                anyhow::anyhow!("Add File target has no parent: {}", path.display())
+            })?;
+            let canonical_parent = std::fs::canonicalize(parent).with_context(|| {
+                format!("Failed to canonicalize add parent: {}", parent.display())
+            })?;
+            Ok(canonical_parent.join(path.file_name().ok_or_else(|| {
+                anyhow::anyhow!("Add File target has no file name: {}", path.display())
+            })?))
+        }
+        ApplyPatchOperation::Delete => {
+            std::fs::canonicalize(path).or_else(|_| Ok(path.to_path_buf()))
+        }
+    }
+}
+
 fn ensure_target_inside_workspace(path: &Path, cwd: &Path, must_exist: bool) -> anyhow::Result<()> {
     let canonical_workspace = std::fs::canonicalize(cwd)
         .with_context(|| format!("Failed to canonicalize workspace root: {}", cwd.display()))?;
@@ -901,6 +922,18 @@ impl<
             let path = normalize_apply_patch_target(&section.path, cwd.as_path())?;
             assert_absolute_path(path.as_path())?;
             paths.push(path);
+        }
+
+        let mut unique_paths = HashSet::new();
+        for (section, path) in sections.iter().zip(paths.iter()) {
+            let conflict_key = apply_patch_conflict_key(section, path.as_path())?;
+            if !unique_paths.insert(conflict_key) {
+                return Ok(rejected_apply_patch_output(
+                    &sections,
+                    &paths,
+                    format!("apply_patch contains duplicate target: {}", path.display()),
+                ));
+            }
         }
 
         if sections
@@ -1391,6 +1424,24 @@ mod tests {
         let actual = lexical_normalized_path_key(fixture);
 
         assert!(actual.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_rejects_same_target_when_absolute_and_relative_alias() {
+        let fixture = tempfile::tempdir().unwrap();
+        let target = fixture.path().join("alias.txt");
+        tokio::fs::write(&target, "old\n").await.unwrap();
+        let service = apply_patch_service(fixture.path().to_path_buf());
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: alias.txt\n- old\n+ first\n*** Update File: {}\n- old\n+ second\n*** End Patch\n",
+            target.display()
+        );
+
+        let actual = service.apply_patch(patch).await.unwrap();
+        let expected = "old\n";
+
+        assert_eq!(actual.files[0].status, ApplyPatchFileStatus::Rejected);
+        assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), expected);
     }
 
     #[tokio::test]
