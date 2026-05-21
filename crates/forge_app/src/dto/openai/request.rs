@@ -106,18 +106,6 @@ impl MessageContent {
             }
         }
     }
-
-    fn sanitized_for_text_token_estimate(&self) -> Self {
-        match self {
-            MessageContent::Text(text) => MessageContent::Text(text.clone()),
-            MessageContent::Parts(parts) => MessageContent::Parts(
-                parts
-                    .iter()
-                    .map(ContentPart::sanitized_for_text_token_estimate)
-                    .collect(),
-            ),
-        }
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -166,18 +154,6 @@ impl ContentPart {
             ContentPart::ImageUrl { image_url, .. } => image_url.media_token_estimate(),
         }
     }
-
-    fn sanitized_for_text_token_estimate(&self) -> Self {
-        match self {
-            ContentPart::Text { text, cache_control } => {
-                ContentPart::Text { text: text.clone(), cache_control: cache_control.clone() }
-            }
-            ContentPart::ImageUrl { image_url, cache_control } => ContentPart::ImageUrl {
-                image_url: image_url.sanitized_for_text_token_estimate(),
-                cache_control: cache_control.clone(),
-            },
-        }
-    }
 }
 
 const IMAGE_MEDIA_TOKEN_ESTIMATE: usize = 2_048;
@@ -185,17 +161,6 @@ const IMAGE_MEDIA_TOKEN_ESTIMATE: usize = 2_048;
 impl ImageUrl {
     fn media_token_estimate(&self) -> usize {
         IMAGE_MEDIA_TOKEN_ESTIMATE
-    }
-
-    fn sanitized_for_text_token_estimate(&self) -> Self {
-        let url = if is_data_url(&self.url) {
-            let mime_type = data_url_mime_type(&self.url).unwrap_or("image/unknown");
-            format!("data:{mime_type};base64,[omitted-from-text-token-estimate]")
-        } else {
-            self.url.clone()
-        };
-
-        Self { url, detail: self.detail.clone() }
     }
 }
 
@@ -635,26 +600,28 @@ impl Request {
     /// * `serialized_request` - Final JSON payload bytes that would be sent to
     ///   the provider.
     pub fn estimated_input_tokens_from_serialized(&self, serialized_request: &[u8]) -> usize {
-        self.estimated_text_tokens_excluding_media_transport(serialized_request)
-            .saturating_add(self.media_token_padding())
+        self.token_estimate_from_serialized(serialized_request)
+            .estimated_input_tokens()
+    }
+
+    fn token_estimate_from_serialized(
+        &self,
+        serialized_request: &[u8],
+    ) -> SerializedRequestTokenEstimate {
+        estimate_serialized_request_excluding_media_transport(serialized_request).unwrap_or_else(
+            || SerializedRequestTokenEstimate {
+                text_tokens_excluding_media_transport: estimate_serialized_text_tokens(
+                    serialized_request,
+                ),
+                media_token_padding: self.media_token_padding(),
+            },
+        )
     }
 
     fn estimated_text_tokens_excluding_media_transport(&self, serialized_request: &[u8]) -> usize {
-        serde_json::to_vec(&self.sanitized_for_text_token_estimate())
-            .map(|sanitized_request| estimate_serialized_text_tokens(&sanitized_request))
-            .unwrap_or_else(|_| estimate_serialized_text_tokens(serialized_request))
-    }
-
-    fn sanitized_for_text_token_estimate(&self) -> Self {
-        let mut request = self.clone();
-        if let Some(messages) = &mut request.messages {
-            for message in messages {
-                if let Some(content) = &message.content {
-                    message.content = Some(content.sanitized_for_text_token_estimate());
-                }
-            }
-        }
-        request
+        estimate_serialized_request_excluding_media_transport(serialized_request)
+            .map(|estimate| estimate.text_tokens_excluding_media_transport)
+            .unwrap_or_else(|| estimate_serialized_text_tokens(serialized_request))
     }
 
     /// Validates that the final serialized provider request fits the known
@@ -695,7 +662,8 @@ impl Request {
                 context_budget.safety_margin()
             )
         })?;
-        let estimated_input = self.estimated_input_tokens_from_serialized(serialized_request);
+        let input_estimate = self.token_estimate_from_serialized(serialized_request);
+        let estimated_input = input_estimate.estimated_input_tokens();
 
         if estimated_input <= input_budget {
             return Ok(());
@@ -712,7 +680,7 @@ impl Request {
             context_budget.safety_margin(),
             input_budget,
             estimated_input,
-            self.media_token_padding(),
+            input_estimate.media_token_padding,
             serialized_request.len()
         )
     }
@@ -846,6 +814,86 @@ impl From<Context> for Request {
             context_window: context.model_context_length,
         }
     }
+}
+
+struct SerializedRequestTokenEstimate {
+    text_tokens_excluding_media_transport: usize,
+    media_token_padding: usize,
+}
+
+impl SerializedRequestTokenEstimate {
+    fn estimated_input_tokens(&self) -> usize {
+        self.text_tokens_excluding_media_transport
+            .saturating_add(self.media_token_padding)
+    }
+}
+
+fn estimate_serialized_request_excluding_media_transport(
+    serialized_request: &[u8],
+) -> Option<SerializedRequestTokenEstimate> {
+    let mut request = serde_json::from_slice::<serde_json::Value>(serialized_request).ok()?;
+    let media_count = sanitize_media_transport_in_json_value(&mut request);
+    let sanitized_request = serde_json::to_vec(&request).ok()?;
+
+    Some(SerializedRequestTokenEstimate {
+        text_tokens_excluding_media_transport: estimate_serialized_text_tokens(&sanitized_request),
+        media_token_padding: media_count.saturating_mul(IMAGE_MEDIA_TOKEN_ESTIMATE),
+    })
+}
+
+fn sanitize_media_transport_in_json_value(value: &mut serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .map(sanitize_media_transport_in_json_value)
+            .sum(),
+        serde_json::Value::Object(object) => {
+            let local_media_count = object
+                .get_mut("image_url")
+                .map(sanitize_image_url_json_value)
+                .unwrap_or_default();
+            let child_media_count: usize = object
+                .iter_mut()
+                .filter(|(key, _)| key.as_str() != "image_url")
+                .map(|(_, value)| sanitize_media_transport_in_json_value(value))
+                .sum();
+
+            local_media_count.saturating_add(child_media_count)
+        }
+        _ => 0,
+    }
+}
+
+fn sanitize_image_url_json_value(value: &mut serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Object(object) => object
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .and_then(sanitized_data_url_placeholder)
+            .map(|sanitized_url| {
+                object.insert("url".to_string(), serde_json::Value::String(sanitized_url));
+                1
+            })
+            .unwrap_or_default(),
+        serde_json::Value::String(url) => sanitized_data_url_placeholder(url)
+            .map(|sanitized_url| {
+                *url = sanitized_url;
+                1
+            })
+            .unwrap_or_default(),
+        _ => 0,
+    }
+}
+
+fn sanitized_data_url_placeholder(url: &str) -> Option<String> {
+    if !is_data_url(url) {
+        return None;
+    }
+
+    let mime_type = data_url_mime_type(url).unwrap_or("image/unknown");
+    Some(format!(
+        "data:{mime_type};base64,[omitted-from-text-token-estimate]"
+    ))
 }
 
 fn estimate_serialized_text_tokens(serialized_request: &[u8]) -> usize {
@@ -1315,6 +1363,38 @@ mod tests {
         let expected = true;
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_context_window_guard_uses_supplied_serialized_request_as_safety_boundary() {
+        let fixture = Request {
+            model: Some(ModelId::new("context-guard-model")),
+            messages: Some(vec![Message {
+                role: super::Role::User,
+                content: Some(MessageContent::Text("short".to_string())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_details: None,
+                reasoning_text: None,
+                reasoning_opaque: None,
+                reasoning_content: None,
+                extra_content: None,
+            }]),
+            context_window: Some(128_000),
+            max_completion_tokens: Some(10_444),
+            ..Default::default()
+        };
+        let mut forged_serialized = serde_json::to_value(&fixture).unwrap();
+        forged_serialized["prompt"] = serde_json::Value::String("x".repeat(1_000_000));
+        let serialized = serde_json::to_vec(&forged_serialized).unwrap();
+
+        let actual = fixture.validate_context_window(&serialized);
+
+        assert!(
+            actual.is_err(),
+            "context-window guard must not ignore the final serialized payload bytes supplied to it"
+        );
     }
 
     #[test]
