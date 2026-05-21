@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/*"]
+exclude = ["crates/forge_quality_runtime"]
 resolver = "2"
 
 
