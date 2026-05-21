@@ -120,6 +120,7 @@ pub enum GateKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GateSpec {
     pub gate_id: String,
     pub kind: GateKind,
@@ -130,6 +131,7 @@ pub struct GateSpec {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GateGraph {
     pub schema_version: u32,
     pub graph_id: String,
@@ -146,6 +148,7 @@ pub enum UnknownPolicy {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactReport {
     pub schema_version: u32,
     pub artifact_id: String,
@@ -171,6 +174,7 @@ pub enum ReleaseClaim {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PublicApprovalBoundary {
     pub approval_required: bool,
     pub approval_present: bool,
@@ -178,6 +182,7 @@ pub struct PublicApprovalBoundary {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EvidenceRef {
     pub evidence_id: String,
     pub kind: EvidenceKind,
@@ -202,6 +207,7 @@ pub enum EvidenceKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EvaluatorRef {
     pub evaluator_id: String,
     pub role: EvaluatorRole,
@@ -229,6 +235,7 @@ pub enum GateStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GateResult {
     pub schema_version: u32,
     pub gate_id: String,
@@ -242,12 +249,14 @@ pub struct GateResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct VectorVerdict {
     pub dimensions: BTreeMap<QualityDimension, GateStatus>,
     pub max_mode: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct QualityProfile {
     pub schema_version: u32,
     pub profile_id: String,
@@ -257,6 +266,7 @@ pub struct QualityProfile {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReleaseDecision {
     pub schema_version: u32,
     pub decision_id: String,
@@ -277,6 +287,7 @@ pub enum ReleaseDecisionStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReleaseBlocker {
     pub code: ReleaseBlockerCode,
     pub message: String,
@@ -298,6 +309,7 @@ pub enum ReleaseBlockerCode {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TraceEvent {
     pub schema_version: u32,
     pub sequence: u64,
@@ -322,6 +334,7 @@ pub enum TraceEventKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TraceAppendRequest {
     pub project_root: PathBuf,
     pub idempotency_key: String,
@@ -330,12 +343,14 @@ pub struct TraceAppendRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TraceQuery {
     pub project_root: PathBuf,
     pub limit: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeStatus {
     pub schema_version: u32,
     pub runtime_id: String,
@@ -345,11 +360,73 @@ pub struct RuntimeStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct McpConfigPreflight {
+    pub schema_version: u32,
+    pub canonical_path: PathBuf,
+    pub canonical_present: bool,
+    pub discovered_local_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct McpConfigPathProbe {
+    pub path: PathBuf,
+    pub present: bool,
+    pub size_bytes: Option<u64>,
+}
+
+pub fn mcp_config_shadowing_preflight(
+    canonical_path: &Path,
+    cwd: &Path,
+) -> QualityResult<McpConfigPreflight> {
+    let canonical_path = canonical_path
+        .parent()
+        .and_then(|parent| {
+            parent
+                .canonicalize()
+                .ok()
+                .map(|parent| parent.join(".mcp.json"))
+        })
+        .unwrap_or_else(|| canonical_path.to_path_buf());
+    let cwd = canonicalize_existing_dir(cwd)?;
+    let mut discovered_local_paths = Vec::new();
+    for ancestor in cwd.ancestors() {
+        let candidate = ancestor.join(".mcp.json");
+        if candidate != canonical_path && candidate.exists() {
+            discovered_local_paths.push(candidate);
+        }
+    }
+    Ok(McpConfigPreflight {
+        schema_version: SCHEMA_VERSION,
+        canonical_present: canonical_path.exists(),
+        canonical_path,
+        discovered_local_paths,
+    })
+}
+
+pub fn probe_mcp_config_path(path: &Path) -> QualityResult<McpConfigPathProbe> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(McpConfigPathProbe {
+            path: path.to_path_buf(),
+            present: true,
+            size_bytes: Some(metadata.len()),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(McpConfigPathProbe { path: path.to_path_buf(), present: false, size_bytes: None })
+        }
+        Err(error) => Err(QualityError::Io(error.to_string())),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct QualityProfileCompileRequest {
     pub artifact: ArtifactReport,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReleaseDecisionEvaluateRequest {
     pub profile: QualityProfile,
     pub gate_results: Vec<GateResult>,
@@ -357,6 +434,7 @@ pub struct ReleaseDecisionEvaluateRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TraceStoreConfig {
     pub project_root: PathBuf,
     pub trace_dir: PathBuf,
@@ -422,6 +500,8 @@ impl TraceStore {
                 "gate_record".to_string(),
                 "release_decision_evaluate".to_string(),
                 "release_decision_get".to_string(),
+                "mcp_config_shadowing_preflight".to_string(),
+                "mcp_config_path_probe".to_string(),
             ],
         }
     }
@@ -991,7 +1071,7 @@ fn redact_secrets_for_key(parent_key: Option<&str>, value: &mut serde_json::Valu
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                redact_secrets_for_key(parent_key, item);
+                redact_secrets_for_key(None, item);
             }
         }
         serde_json::Value::String(text)
@@ -1022,7 +1102,7 @@ fn reject_secrets_for_key(
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                reject_secrets_for_key(parent_key, item)?;
+                reject_secrets_for_key(None, item)?;
             }
         }
         serde_json::Value::String(text)
@@ -1076,6 +1156,10 @@ fn approval_boundary_present(boundary: &Option<PublicApprovalBoundary>) -> bool 
 }
 
 fn evidence_is_stale(evidence: &EvidenceRef, now: DateTime<Utc>) -> bool {
+    if evidence.produced_at > now {
+        return true;
+    }
+
     if let Some(expires_at) = evidence.expires_at
         && expires_at < now
     {
@@ -1176,6 +1260,7 @@ fn is_safe_digest_key(key: &str) -> bool {
     lowered.ends_with("_id")
         || lowered.ends_with("_hash")
         || lowered.ends_with("_digest")
+        || lowered == "id"
         || lowered == "digest"
         || lowered == "hash"
 }

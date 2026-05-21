@@ -7,8 +7,14 @@ use std::thread;
 use chrono::{Duration, Utc};
 use forge_quality_runtime::*;
 use pretty_assertions::assert_eq;
-use serde_json::json;
+use rmcp::{
+    ServiceExt,
+    model::CallToolRequestParam,
+    transport::{ConfigureCommandExt, TokioChildProcess},
+};
+use serde_json::{Value, json};
 use tempfile::TempDir;
+use tokio::process::Command;
 
 fn artifact(class: ArtifactClass) -> ArtifactReport {
     ArtifactReport {
@@ -93,10 +99,416 @@ fn evaluate(profile: &QualityProfile, results: &[GateResult]) -> ReleaseDecision
     evaluate_release(profile, results, Utc::now()).expect("release evaluation should run")
 }
 
+fn gate_record_payload(
+    project_root: &std::path::Path,
+    idempotency_key: &str,
+    gate_result: GateResult,
+) -> Value {
+    json!({
+        "project_root": project_root,
+        "idempotency_key": idempotency_key,
+        "gate_result": gate_result,
+    })
+}
+
+fn call_arguments(value: Value) -> Option<serde_json::Map<String, Value>> {
+    value.as_object().cloned()
+}
+
+fn bin_path() -> PathBuf {
+    let mut path = std::env::current_exe().expect("current test executable path should exist");
+    path.pop();
+    if path.ends_with("deps") {
+        path.pop();
+    }
+    path.push("forge_quality_runtime");
+    if path.exists() {
+        return path;
+    }
+    std::env::var_os("CARGO_BIN_EXE_forge_quality_runtime")
+        .or_else(|| std::env::var_os("CARGO_BIN_EXE_forge-quality-runtime"))
+        .map(PathBuf::from)
+        .expect("Cargo should expose or build forge_quality_runtime binary for MCP stdio tests")
+}
+
+async fn mcp_service(
+    project_root: &std::path::Path,
+    trace_dir: &std::path::Path,
+) -> anyhow::Result<rmcp::service::RunningService<rmcp::RoleClient, ()>> {
+    let transport = TokioChildProcess::new(Command::new(bin_path()).configure(|cmd| {
+        cmd.arg("serve")
+            .arg("--project-root")
+            .arg(project_root)
+            .arg("--trace-dir")
+            .arg(trace_dir);
+    }))?;
+    Ok(().serve(transport).await?)
+}
+
+async fn call_mcp_tool<T>(
+    service: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    name: &str,
+    arguments: Value,
+) -> anyhow::Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let result = service
+        .call_tool(CallToolRequestParam {
+            name: name.to_string().into(),
+            arguments: call_arguments(arguments),
+        })
+        .await?;
+    Ok(result.into_typed()?)
+}
+
+async fn call_mcp_tool_error(
+    service: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    name: &str,
+    arguments: Value,
+) -> String {
+    service
+        .call_tool(CallToolRequestParam {
+            name: name.to_string().into(),
+            arguments: call_arguments(arguments),
+        })
+        .await
+        .expect_err("invalid MCP call must fail")
+        .to_string()
+}
+
 fn first_result_mut(results: &mut [GateResult]) -> &mut GateResult {
     results
         .first_mut()
         .expect("compiled profile should include at least one gate")
+}
+
+#[tokio::test]
+async fn mcp_stdio_boundary_exercises_core_tool_contract() -> anyhow::Result<()> {
+    let temp = TempDir::new().expect("tempdir should be created");
+    let trace_dir = temp.path().join("trace");
+    let service = mcp_service(temp.path(), &trace_dir).await?;
+
+    let listed = service.list_tools(Default::default()).await?;
+    let listed_names = listed
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_ref())
+        .collect::<BTreeSet<_>>();
+    for expected in [
+        "runtime_status",
+        "quality_profile_compile",
+        "trace_append",
+        "trace_get",
+        "trace_query",
+        "gate_record",
+        "release_decision_evaluate",
+        "release_decision_get",
+        "mcp_config_shadowing_preflight",
+        "mcp_config_path_probe",
+    ] {
+        assert!(
+            listed_names.contains(expected),
+            "missing MCP tool {expected}; available tools: {listed_names:?}"
+        );
+    }
+
+    let canonical_dir = temp.path().join("canonical-config");
+    let project_dir = temp.path().join("project-config");
+    fs::create_dir_all(&canonical_dir).expect("canonical fixture dir should be created");
+    fs::create_dir_all(&project_dir).expect("project fixture dir should be created");
+    let canonical_config = canonical_dir.join(".mcp.json");
+    let local_config = project_dir.join(".mcp.json");
+    fs::write(&canonical_config, b"canonical").expect("canonical fixture should be written");
+    fs::write(&local_config, b"local").expect("local fixture should be written");
+    let local_before = fs::read(&local_config).expect("local fixture should be readable");
+    let preflight: McpConfigPreflight = call_mcp_tool(
+        &service,
+        "mcp_config_shadowing_preflight",
+        json!({ "canonical_path": canonical_config, "cwd": project_dir }),
+    )
+    .await?;
+    assert!(preflight.canonical_present);
+    assert_eq!(preflight.discovered_local_paths, vec![local_config.clone()]);
+    let probe: McpConfigPathProbe = call_mcp_tool(
+        &service,
+        "mcp_config_path_probe",
+        json!({ "path": local_config }),
+    )
+    .await?;
+    assert_eq!(probe.size_bytes, Some(5));
+    assert_eq!(
+        fs::read(&local_config).expect("local fixture should remain readable"),
+        local_before
+    );
+
+    let status: RuntimeStatus = call_mcp_tool(&service, "runtime_status", json!({})).await?;
+    assert_eq!(status.status, "ready");
+    assert!(status.tools.contains(&"runtime_status".to_string()));
+
+    let profile: QualityProfile = call_mcp_tool(
+        &service,
+        "quality_profile_compile",
+        json!({ "artifact": artifact(ArtifactClass::CodeMcpToolSurface) }),
+    )
+    .await?;
+    assert_eq!(profile.artifact.artifact_id, "artifact-1");
+
+    let trace_event: TraceEvent = call_mcp_tool(
+        &service,
+        "trace_append",
+        json!({
+            "project_root": temp.path(),
+            "idempotency_key": "mcp-trace-status",
+            "event_kind": "runtime_status",
+            "payload": { "status": "ok" },
+        }),
+    )
+    .await?;
+    assert_eq!(trace_event.sequence, 1);
+
+    let gate_event: TraceEvent = call_mcp_tool(
+        &service,
+        "gate_record",
+        gate_record_payload(
+            temp.path(),
+            "mcp-gate-record",
+            gate_result(
+                &profile,
+                profile
+                    .gate_graph
+                    .required_gates
+                    .first()
+                    .expect("compiled profile should include at least one gate"),
+            ),
+        ),
+    )
+    .await?;
+    assert_eq!(gate_event.event_kind, TraceEventKind::GateRecorded);
+
+    let queried: Vec<TraceEvent> = call_mcp_tool(
+        &service,
+        "trace_query",
+        json!({ "project_root": temp.path(), "limit": 10 }),
+    )
+    .await?;
+    assert_eq!(queried.len(), 2);
+
+    let readback: Vec<TraceEvent> = call_mcp_tool(
+        &service,
+        "trace_get",
+        json!({ "project_root": temp.path(), "limit": 1 }),
+    )
+    .await?;
+    assert_eq!(readback.len(), 1);
+    assert_eq!(
+        readback
+            .first()
+            .expect("limited readback should include one event")
+            .event_id,
+        gate_event.event_id
+    );
+
+    let decision: ReleaseDecision = call_mcp_tool(
+        &service,
+        "release_decision_evaluate",
+        json!({
+            "profile": profile,
+            "gate_results": [],
+            "now": Utc::now(),
+        }),
+    )
+    .await?;
+    assert_eq!(decision.decision, ReleaseDecisionStatus::Blocked);
+    assert!(blocker_codes(&decision).contains(&ReleaseBlockerCode::MissingRequiredGate));
+
+    service.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_stdio_boundary_rejects_adapter_negative_controls() -> anyhow::Result<()> {
+    let temp = TempDir::new().expect("tempdir should be created");
+    let outside = TempDir::new().expect("outside tempdir should be created");
+    let service = mcp_service(temp.path(), &temp.path().join("trace")).await?;
+
+    let unknown_field_error = call_mcp_tool_error(
+        &service,
+        "quality_profile_compile",
+        json!({
+            "artifact": artifact(ArtifactClass::CodeMcpToolSurface),
+            "unexpected": true,
+        }),
+    )
+    .await;
+    assert!(
+        unknown_field_error.contains("failed to deserialize parameters")
+            && unknown_field_error.contains("unknown field"),
+        "unexpected unknown-field adapter error: {unknown_field_error}"
+    );
+
+    let invalid_enum_error = call_mcp_tool_error(
+        &service,
+        "trace_append",
+        json!({
+            "project_root": temp.path(),
+            "idempotency_key": "mcp-invalid-enum",
+            "event_kind": "not_a_real_event",
+            "payload": { "status": "ok" },
+        }),
+    )
+    .await;
+    assert!(
+        invalid_enum_error.contains("failed to deserialize parameters")
+            && invalid_enum_error.contains("unknown variant"),
+        "unexpected invalid-enum adapter error: {invalid_enum_error}"
+    );
+
+    let secret_error = call_mcp_tool_error(
+        &service,
+        "trace_append",
+        json!({
+            "project_root": temp.path(),
+            "idempotency_key": "mcp-secret",
+            "event_kind": "runtime_status",
+            "payload": { "api_token": "sk-secret-value-that-must-not-survive" },
+        }),
+    )
+    .await;
+    assert!(
+        secret_error.contains("quality_runtime.secret_rejected"),
+        "unexpected secret rejection error: {secret_error}"
+    );
+
+    let root_error = call_mcp_tool_error(
+        &service,
+        "trace_append",
+        json!({
+            "project_root": outside.path(),
+            "idempotency_key": "mcp-outside",
+            "event_kind": "runtime_status",
+            "payload": { "status": "ok" },
+        }),
+    )
+    .await;
+    assert!(root_error.contains("quality_runtime.project_root_rejected"));
+
+    let first: TraceEvent = call_mcp_tool(
+        &service,
+        "trace_append",
+        json!({
+            "project_root": temp.path(),
+            "idempotency_key": "mcp-conflict",
+            "event_kind": "runtime_status",
+            "payload": { "status": "one" },
+        }),
+    )
+    .await?;
+    assert_eq!(first.sequence, 1);
+
+    let conflict_error = call_mcp_tool_error(
+        &service,
+        "trace_append",
+        json!({
+            "project_root": temp.path(),
+            "idempotency_key": "mcp-conflict",
+            "event_kind": "runtime_status",
+            "payload": { "status": "two" },
+        }),
+    )
+    .await;
+    assert!(conflict_error.contains("quality_runtime.idempotency_conflict"));
+
+    let mut malformed_artifact = artifact(ArtifactClass::CodeMcpToolSurface);
+    malformed_artifact.artifact_id.clear();
+    let malformed_profile = compile_quality_profile(malformed_artifact)?;
+    let malformed_error = call_mcp_tool_error(
+        &service,
+        "release_decision_evaluate",
+        json!({
+            "profile": malformed_profile,
+            "gate_results": [],
+            "now": Utc::now(),
+        }),
+    )
+    .await;
+    assert!(malformed_error.contains("quality_runtime.malformed_release_request"));
+
+    let profile: QualityProfile = call_mcp_tool(
+        &service,
+        "quality_profile_compile",
+        json!({ "artifact": artifact(ArtifactClass::CodeMcpToolSurface) }),
+    )
+    .await?;
+    let missing_evidence_decision: ReleaseDecision = call_mcp_tool(
+        &service,
+        "release_decision_evaluate",
+        json!({
+            "profile": profile.clone(),
+            "gate_results": passing_results(&profile)
+                .into_iter()
+                .map(|mut result| {
+                    result.evidence.clear();
+                    result
+                })
+                .collect::<Vec<_>>(),
+            "now": Utc::now(),
+        }),
+    )
+    .await?;
+    assert!(
+        blocker_codes(&missing_evidence_decision).contains(&ReleaseBlockerCode::MissingEvidence)
+    );
+
+    service.cancel().await?;
+    Ok(())
+}
+
+#[test]
+fn strict_dto_contract_rejects_unknown_fields_and_invalid_enums() {
+    let report = artifact(ArtifactClass::CodeMcpToolSurface);
+    let mut value = serde_json::to_value(QualityProfileCompileRequest { artifact: report })
+        .expect("request should serialize");
+    value
+        .as_object_mut()
+        .expect("request should be an object")
+        .insert("unexpected".to_string(), json!(true));
+    assert!(serde_json::from_value::<QualityProfileCompileRequest>(value).is_err());
+
+    let invalid_enum = json!({
+        "project_root": "/tmp",
+        "idempotency_key": "bad-enum",
+        "event_kind": "not_a_real_event",
+        "payload": {},
+    });
+    assert!(serde_json::from_value::<TraceAppendRequest>(invalid_enum).is_err());
+}
+
+#[test]
+fn mcp_config_shadowing_preflight_reports_paths_without_mutation() {
+    let temp = TempDir::new().expect("tempdir should be created");
+    let canonical_dir = temp.path().join("canonical");
+    let project_dir = temp.path().join("project");
+    fs::create_dir_all(&canonical_dir).expect("canonical dir should be created");
+    fs::create_dir_all(&project_dir).expect("project dir should be created");
+    let canonical = canonical_dir.join(".mcp.json");
+    let local = project_dir.join(".mcp.json");
+    fs::write(&canonical, b"canonical").expect("canonical probe fixture should be written");
+    fs::write(&local, b"local").expect("local probe fixture should be written");
+    let before = fs::read(&local).expect("local fixture should be readable before preflight");
+
+    let preflight = mcp_config_shadowing_preflight(&canonical, &project_dir)
+        .expect("preflight should inspect fixture paths");
+    assert!(preflight.canonical_present);
+    assert_eq!(preflight.discovered_local_paths, vec![local.clone()]);
+
+    let probe = probe_mcp_config_path(&local).expect("path probe should inspect metadata only");
+    assert!(probe.present);
+    assert_eq!(probe.size_bytes, Some(5));
+    assert_eq!(
+        fs::read(&local).expect("local fixture should be readable after preflight"),
+        before
+    );
 }
 
 #[test]
@@ -420,6 +832,14 @@ fn trace_rejects_truncated_malformed_jsonl() {
 }
 
 #[test]
+fn trace_allows_scalar_secret_like_id_value() {
+    let payload = json!({
+        "id": "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN"
+    });
+    assert_eq!(reject_secrets(&payload), Ok(()));
+}
+
+#[test]
 fn trace_rejects_secret_nested_under_digest_like_key() {
     let payload = json!({
         "evidence_id": {
@@ -429,6 +849,18 @@ fn trace_rejects_secret_nested_under_digest_like_key() {
     assert_eq!(
         reject_secrets(&payload)
             .expect_err("nested secrets under id/digest-like keys must be rejected"),
+        QualityError::SecretRejected
+    );
+}
+
+#[test]
+fn trace_rejects_secret_array_descendant_under_digest_like_key() {
+    let payload = json!({
+        "evidence_id": ["sk-secret-value-that-must-not-survive"]
+    });
+    assert_eq!(
+        reject_secrets(&payload)
+            .expect_err("array descendant secrets under id/digest-like keys must be rejected"),
         QualityError::SecretRejected
     );
 }
@@ -524,6 +956,27 @@ fn stale_evidence_blocks() {
         .checked_sub_signed(Duration::hours(48))
         .expect("test timestamp should be representable");
     let decision = evaluate(&profile, &results);
+    assert!(blocker_codes(&decision).contains(&ReleaseBlockerCode::StaleOrMissingEvidence));
+}
+
+#[test]
+fn future_dated_evidence_blocks() {
+    let now = Utc::now();
+    let profile = compile(ArtifactClass::CodeMcpToolSurface);
+    let mut results = passing_results(&profile);
+    let evidence = first_result_mut(&mut results)
+        .evidence
+        .first_mut()
+        .expect("gate should have evidence");
+    evidence.produced_at = now
+        .checked_add_signed(Duration::hours(48))
+        .expect("test timestamp should be representable");
+    evidence.expires_at = Some(
+        now.checked_add_signed(Duration::hours(72))
+            .expect("test timestamp should be representable"),
+    );
+    let decision =
+        evaluate_release(&profile, &results, now).expect("release evaluation should run");
     assert!(blocker_codes(&decision).contains(&ReleaseBlockerCode::StaleOrMissingEvidence));
 }
 

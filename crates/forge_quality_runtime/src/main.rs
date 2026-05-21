@@ -6,12 +6,13 @@ use forge_quality_runtime::{
     ArtifactReport, GateResult, QualityError, QualityProfile, QualityProfileCompileRequest,
     ReleaseDecisionEvaluateRequest, RuntimeStatus, SCHEMA_VERSION, TraceAppendRequest, TraceQuery,
     TraceStore, TraceStoreConfig, compile_quality_profile, evaluate_release,
+    mcp_config_shadowing_preflight, probe_mcp_config_path,
 };
 use rmcp::{
     ErrorData as McpError, Json, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
-    schemars, tool, tool_router,
+    schemars, tool, tool_handler, tool_router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -143,8 +144,31 @@ impl QualityRuntimeServer {
             .map(Json)
             .map_err(quality_error)
     }
+
+    #[tool(
+        description = "Inspect canonical and local .mcp.json shadowing paths without reading or mutating values"
+    )]
+    fn mcp_config_shadowing_preflight(
+        &self,
+        Parameters(request): Parameters<McpConfigShadowingPreflightRequest>,
+    ) -> Result<Json<forge_quality_runtime::McpConfigPreflight>, McpError> {
+        mcp_config_shadowing_preflight(&request.canonical_path, &request.cwd)
+            .map(Json)
+            .map_err(quality_error)
+    }
+
+    #[tool(description = "Probe one .mcp.json path metadata without reading or mutating values")]
+    fn mcp_config_path_probe(
+        &self,
+        Parameters(request): Parameters<McpConfigPathProbeRequest>,
+    ) -> Result<Json<forge_quality_runtime::McpConfigPathProbe>, McpError> {
+        probe_mcp_config_path(&request.path)
+            .map(Json)
+            .map_err(quality_error)
+    }
 }
 
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for QualityRuntimeServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
@@ -156,10 +180,24 @@ impl ServerHandler for QualityRuntimeServer {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GateRecordRequest {
     project_root: PathBuf,
     idempotency_key: String,
     gate_result: GateResult,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct McpConfigShadowingPreflightRequest {
+    canonical_path: PathBuf,
+    cwd: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct McpConfigPathProbeRequest {
+    path: PathBuf,
 }
 
 #[tokio::main]
@@ -168,7 +206,11 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Serve { project_root, trace_dir } => {
             let server = QualityRuntimeServer::new(project_root, trace_dir)?;
-            server.serve(rmcp::transport::stdio()).await?;
+            server
+                .serve(rmcp::transport::stdio())
+                .await?
+                .waiting()
+                .await?;
         }
         Command::Smoke { project_root, trace_dir } => {
             let server = QualityRuntimeServer::new(project_root.clone(), trace_dir)?;
