@@ -2,6 +2,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fmt;
 use std::fs;
+use std::fs::File;
+use std::io::Read;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -96,6 +100,47 @@ impl TrustedOfflineRerankScoreArtifactPath {
     /// Returns the canonical regular artifact path accepted by the trust boundary.
     pub fn as_path(&self) -> &Path {
         &self.path
+    }
+
+    /// Opens the trusted artifact with symlink refusal and identity revalidation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path no longer resolves to the originally trusted regular file.
+    fn open_for_trusted_read(&self) -> Result<File> {
+        let trusted_metadata = fs::symlink_metadata(&self.path)
+            .context("offline rerank score artifact trust boundary rejected current path state")?;
+        if trusted_metadata.file_type().is_symlink() || !trusted_metadata.is_file() {
+            anyhow::bail!(
+                "offline rerank score artifact trust boundary rejected current path state"
+            );
+        }
+        let trusted_canonical = self
+            .path
+            .canonicalize()
+            .context("offline rerank score artifact trust boundary rejected current path state")?;
+        if trusted_canonical != self.path {
+            anyhow::bail!(
+                "offline rerank score artifact trust boundary rejected current path state"
+            );
+        }
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&self.path)
+            .context("offline rerank score artifact trust boundary rejected current path state")?;
+        let open_metadata = file
+            .metadata()
+            .context("offline rerank score artifact trust boundary rejected current path state")?;
+        if !open_metadata.is_file()
+            || open_metadata.dev() != trusted_metadata.dev()
+            || open_metadata.ino() != trusted_metadata.ino()
+        {
+            anyhow::bail!(
+                "offline rerank score artifact trust boundary rejected current path state"
+            );
+        }
+        Ok(file)
     }
 }
 
@@ -500,7 +545,12 @@ impl OfflineRerankScoreArtifactReader {
         manifest: &ProjectManifest,
         artifact_path: &TrustedOfflineRerankScoreArtifactPath,
     ) -> Result<OfflineRerankScoreArtifactReranker> {
-        let content = fs::read_to_string(artifact_path.as_path())
+        let mut artifact_file = artifact_path
+            .open_for_trusted_read()
+            .context("failed to read offline rerank score artifact")?;
+        let mut content = String::new();
+        artifact_file
+            .read_to_string(&mut content)
             .context("failed to read offline rerank score artifact")?;
         let artifact: OfflineRerankScoreArtifact = serde_json::from_str(&content)
             .context("failed to parse offline rerank score artifact")?;
@@ -5926,6 +5976,54 @@ mod tests {
 
         let actual = setup.rerank("runtime reranker proof", &candidates);
         let expected: Vec<forge_project_model::RerankScore> = Vec::new();
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn offline_rerank_score_artifact_reader_rejects_trusted_path_replaced_by_symlink() -> Result<()>
+    {
+        use std::os::unix::fs::symlink;
+
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let manifest =
+            ProjectIndexer::new(&root, local_project_model_dir(&root)).read_manifest()?;
+        let trusted_artifact = fixture_offline_rerank_artifact_with_candidates(
+            &manifest,
+            "runtime reranker proof",
+            fixture_offline_rerank_candidates(),
+            vec![
+                forge_project_model::RerankScore { id: "candidate-a".to_string(), score: 7.0 },
+                forge_project_model::RerankScore { id: "candidate-b".to_string(), score: 1.0 },
+            ],
+        )?;
+        let trusted_artifact_path =
+            write_fixture_offline_rerank_artifact(&root, &trusted_artifact)?;
+        let trusted_path =
+            trusted_fixture_offline_rerank_artifact_path(&root, trusted_artifact_path.clone())?;
+        let outside_artifact = fixture_offline_rerank_artifact_with_candidates(
+            &manifest,
+            "runtime reranker proof",
+            fixture_offline_rerank_candidates(),
+            vec![
+                forge_project_model::RerankScore { id: "candidate-a".to_string(), score: 1.0 },
+                forge_project_model::RerankScore { id: "candidate-b".to_string(), score: 7.0 },
+            ],
+        )?;
+        let outside_artifact_path = root
+            .parent()
+            .expect("fixture workspace should have a parent")
+            .join("outside_offline_rerank_after_trust.json");
+        fs::write(&outside_artifact_path, outside_artifact.to_stable_json()?)?;
+        fs::remove_file(&trusted_artifact_path)?;
+        symlink(&outside_artifact_path, &trusted_artifact_path)?;
+
+        let actual = OfflineRerankScoreArtifactReader
+            .read_ready_reranker(&manifest, &trusted_path)
+            .is_err();
+        let expected = true;
 
         assert_eq!(actual, expected);
         Ok(())
