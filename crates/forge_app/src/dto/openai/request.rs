@@ -106,6 +106,18 @@ impl MessageContent {
             }
         }
     }
+
+    fn sanitized_for_text_token_estimate(&self) -> Self {
+        match self {
+            MessageContent::Text(text) => MessageContent::Text(text.clone()),
+            MessageContent::Parts(parts) => MessageContent::Parts(
+                parts
+                    .iter()
+                    .map(ContentPart::sanitized_for_text_token_estimate)
+                    .collect(),
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -151,15 +163,56 @@ impl ContentPart {
     fn media_token_padding(&self) -> usize {
         match self {
             ContentPart::Text { .. } => 0,
-            ContentPart::ImageUrl { image_url, .. } => {
-                if image_url.url.trim_start().starts_with("data:") {
-                    image_url.url.len().div_ceil(3)
-                } else {
-                    2_048
-                }
-            }
+            ContentPart::ImageUrl { image_url, .. } => image_url.media_token_estimate(),
         }
     }
+
+    fn sanitized_for_text_token_estimate(&self) -> Self {
+        match self {
+            ContentPart::Text { text, cache_control } => {
+                ContentPart::Text { text: text.clone(), cache_control: cache_control.clone() }
+            }
+            ContentPart::ImageUrl { image_url, cache_control } => ContentPart::ImageUrl {
+                image_url: image_url.sanitized_for_text_token_estimate(),
+                cache_control: cache_control.clone(),
+            },
+        }
+    }
+}
+
+const IMAGE_MEDIA_TOKEN_ESTIMATE: usize = 2_048;
+
+impl ImageUrl {
+    fn media_token_estimate(&self) -> usize {
+        IMAGE_MEDIA_TOKEN_ESTIMATE
+    }
+
+    fn sanitized_for_text_token_estimate(&self) -> Self {
+        let url = if is_data_url(&self.url) {
+            let mime_type = data_url_mime_type(&self.url).unwrap_or("image/unknown");
+            format!("data:{mime_type};base64,[omitted-from-text-token-estimate]")
+        } else {
+            self.url.clone()
+        };
+
+        Self { url, detail: self.detail.clone() }
+    }
+}
+
+fn is_data_url(value: &str) -> bool {
+    value
+        .trim_start()
+        .get(.."data:".len())
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"))
+}
+
+fn data_url_mime_type(value: &str) -> Option<&str> {
+    let trimmed = value.trim_start();
+    let rest = trimmed.get("data:".len()..)?;
+    let (meta, _) = rest.split_once(',')?;
+    meta.split(';')
+        .next()
+        .filter(|mime_type| !mime_type.is_empty())
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -250,7 +303,8 @@ pub struct ProviderRequestEstimate {
     pub estimated_input_tokens: usize,
     /// Final JSON payload byte length before media padding.
     pub serialized_request_bytes: usize,
-    /// Additional token padding for media payloads.
+    /// Additional media/vision token estimate; data URL transport bytes are
+    /// excluded from text-token accounting.
     pub media_token_padding: usize,
     /// Output tokens reserved by the final provider request.
     pub output_token_reservation: usize,
@@ -287,6 +341,31 @@ impl ProviderRequestEstimate {
         let serialized_request_bytes = serialized_request.len();
         Self {
             estimated_input_tokens: estimate_serialized_text_tokens(serialized_request)
+                .saturating_add(media_token_padding),
+            serialized_request_bytes,
+            media_token_padding,
+            output_token_reservation,
+            message_count,
+            tool_count,
+            messages_bytes,
+            tools_bytes,
+        }
+    }
+
+    fn from_openai_request(
+        request: &Request,
+        serialized_request: &[u8],
+        output_token_reservation: usize,
+        message_count: usize,
+        tool_count: usize,
+        messages_bytes: usize,
+        tools_bytes: usize,
+    ) -> Self {
+        let media_token_padding = request.media_token_padding();
+        let serialized_request_bytes = serialized_request.len();
+        Self {
+            estimated_input_tokens: request
+                .estimated_text_tokens_excluding_media_transport(serialized_request)
                 .saturating_add(media_token_padding),
             serialized_request_bytes,
             media_token_padding,
@@ -429,9 +508,9 @@ impl Request {
         let request =
             Self::from_context_for_provider(context, model, provider, merge_system_messages)?;
         let serialized_request = serde_json::to_vec(&request)?;
-        Ok(ProviderRequestEstimate::from_serialized_request(
+        Ok(ProviderRequestEstimate::from_openai_request(
+            &request,
             &serialized_request,
-            request.media_token_padding(),
             request.output_token_reservation(),
             request.message_count(),
             request.tools.as_ref().map(|tools| tools.len()).unwrap_or(0),
@@ -556,8 +635,26 @@ impl Request {
     /// * `serialized_request` - Final JSON payload bytes that would be sent to
     ///   the provider.
     pub fn estimated_input_tokens_from_serialized(&self, serialized_request: &[u8]) -> usize {
-        estimate_serialized_text_tokens(serialized_request)
+        self.estimated_text_tokens_excluding_media_transport(serialized_request)
             .saturating_add(self.media_token_padding())
+    }
+
+    fn estimated_text_tokens_excluding_media_transport(&self, serialized_request: &[u8]) -> usize {
+        serde_json::to_vec(&self.sanitized_for_text_token_estimate())
+            .map(|sanitized_request| estimate_serialized_text_tokens(&sanitized_request))
+            .unwrap_or_else(|_| estimate_serialized_text_tokens(serialized_request))
+    }
+
+    fn sanitized_for_text_token_estimate(&self) -> Self {
+        let mut request = self.clone();
+        if let Some(messages) = &mut request.messages {
+            for message in messages {
+                if let Some(content) = &message.content {
+                    message.content = Some(content.sanitized_for_text_token_estimate());
+                }
+            }
+        }
+        request
     }
 
     /// Validates that the final serialized provider request fits the known
@@ -605,7 +702,7 @@ impl Request {
         }
 
         anyhow::bail!(
-            "OpenAI-compatible context-window guard blocked an oversized request before HTTP dispatch. Model '{}' has context window {} tokens; reserved output is {} tokens; safety margin is {} tokens; effective input budget is {} tokens; final serialized request estimate is {} tokens. Reduce context, lower max_tokens/max_completion_tokens, or select a larger-context model.",
+            "OpenAI-compatible context-window guard blocked an oversized request before HTTP dispatch. Model '{}' has context window {} tokens; reserved output is {} tokens; safety margin is {} tokens; effective input budget is {} tokens; final provider request estimate is {} tokens after excluding image data-url transport bytes from text-token accounting and adding {} media tokens separately; serialized transport size is {} bytes. Reduce context, lower max_tokens/max_completion_tokens, or select a larger-context model.",
             self.model
                 .as_ref()
                 .map(|model| model.as_str())
@@ -614,7 +711,9 @@ impl Request {
             context_budget.output_reservation(),
             context_budget.safety_margin(),
             input_budget,
-            estimated_input
+            estimated_input,
+            self.media_token_padding(),
+            serialized_request.len()
         )
     }
 
@@ -1216,6 +1315,85 @@ mod tests {
         let expected = true;
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_context_window_guard_excludes_image_data_url_transport_from_text_tokens() {
+        let image_payload = "A".repeat(4_000_000);
+        let fixture = Request {
+            model: Some(ModelId::new("gpt-5.5")),
+            messages: Some(vec![Message {
+                role: super::Role::User,
+                content: Some(MessageContent::Parts(vec![ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: format!("data:image/png;base64,{image_payload}"),
+                        detail: None,
+                    },
+                    cache_control: None,
+                }])),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_details: None,
+                reasoning_text: None,
+                reasoning_opaque: None,
+                reasoning_content: None,
+                extra_content: None,
+            }]),
+            context_window: Some(1_048_576),
+            max_completion_tokens: Some(10_444),
+            ..Default::default()
+        };
+        let serialized = serde_json::to_vec(&fixture).unwrap();
+
+        let actual = fixture.estimated_input_tokens_from_serialized(&serialized);
+        let expected_text_only_old_estimate = estimate_serialized_text_tokens(&serialized);
+
+        assert!(serialized.len() > 4_000_000);
+        assert!(expected_text_only_old_estimate > 1_000_000);
+        assert_eq!(fixture.media_token_padding(), IMAGE_MEDIA_TOKEN_ESTIMATE);
+        assert!(
+            actual < 50_000,
+            "image data-url transport bytes must not be counted as ordinary text tokens: actual={actual}"
+        );
+        assert!(
+            actual < expected_text_only_old_estimate / 10,
+            "media-aware estimate must remove the old data-url text-token contribution: actual={actual}, old={expected_text_only_old_estimate}"
+        );
+    }
+
+    #[test]
+    fn test_context_window_guard_allows_large_image_data_url_under_large_context_window() {
+        let image_payload = "A".repeat(4_000_000);
+        let fixture = Request {
+            model: Some(ModelId::new("gpt-5.5")),
+            messages: Some(vec![Message {
+                role: super::Role::User,
+                content: Some(MessageContent::Parts(vec![ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: format!("data:image/png;base64,{image_payload}"),
+                        detail: None,
+                    },
+                    cache_control: None,
+                }])),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_details: None,
+                reasoning_text: None,
+                reasoning_opaque: None,
+                reasoning_content: None,
+                extra_content: None,
+            }]),
+            context_window: Some(1_048_576),
+            max_completion_tokens: Some(10_444),
+            ..Default::default()
+        };
+        let serialized = serde_json::to_vec(&fixture).unwrap();
+
+        let actual = fixture.validate_context_window(&serialized);
+
+        assert!(actual.is_ok());
     }
 
     #[test]
