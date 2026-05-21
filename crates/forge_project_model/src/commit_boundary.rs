@@ -1293,6 +1293,7 @@ mod tests {
             rerank_intent_source: None,
             rerank_intent_fingerprint: None,
             rerank_intent_len: None,
+            offline_rerank_applicability: None,
             include_graph_expansion: false,
             stale_policy: crate::StaleEvidencePolicy::Reject,
             freshness_proof_level: crate::FreshnessProofLevel::FullFilesystem,

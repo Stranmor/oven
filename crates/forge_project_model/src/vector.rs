@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::lexical::tokenize;
+use crate::offline_rerank::OfflineRerankApplicability;
 use crate::types::{RerankCandidate, RerankScore, VectorQuery, VectorSearchHit};
 
 /// Typed vector search boundary implemented by external embedding integrations.
@@ -24,6 +25,20 @@ pub trait Reranker {
     /// * `query` - Free-form query text.
     /// * `candidates` - Candidate identifiers and text surfaces.
     fn rerank(&self, query: &str, candidates: &[RerankCandidate]) -> Vec<RerankScore>;
+
+    /// Projects offline rerank artifact applicability for diagnostic-only integrations.
+    ///
+    /// # Arguments
+    ///
+    /// * `query` - Free-form query text used by the rerank boundary.
+    /// * `candidates` - Candidate identifiers and text surfaces.
+    fn offline_applicability(
+        &self,
+        _query: &str,
+        _candidates: &[RerankCandidate],
+    ) -> Option<OfflineRerankApplicability> {
+        None
+    }
 }
 
 /// Deterministic in-memory vector index for tests and offline evaluation.

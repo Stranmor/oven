@@ -9,6 +9,83 @@ use serde::{Deserialize, Serialize};
 use crate::types::{ProjectManifest, RerankCandidate, RerankScore};
 use crate::util::hash_text;
 
+/// Redaction-safe applicability of one offline rerank artifact key to a live request key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum OfflineRerankApplicability {
+    /// Artifact key exactly matches the current rerank request key.
+    ExactMatch,
+    /// Artifact key is valid but not applicable to this current request key.
+    Mismatch {
+        /// Deterministically ordered redaction-safe mismatch reasons.
+        reasons: Vec<OfflineRerankApplicabilityMismatch>,
+    },
+}
+
+/// Deterministic redaction-safe reason an offline rerank artifact key is not applicable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum OfflineRerankApplicabilityMismatch {
+    /// Artifact was produced for a different project manifest snapshot.
+    ManifestHashMismatch,
+    /// Artifact was produced for a different rerank intent fingerprint.
+    RerankIntentFingerprintMismatch,
+    /// Artifact candidate identifiers or their order differ from the current request.
+    CandidateIdsOrderMismatch,
+    /// Artifact candidate content fingerprints differ from the current request.
+    CandidateContentFingerprintMismatch,
+    /// Artifact top-k scope differs from the current request.
+    TopKScopeMismatch,
+    /// Artifact producer identity or ordering policy differs from the current request.
+    ProducerIdentityPolicyMismatch,
+    /// Artifact score schema version differs from the current request.
+    ScoreArtifactVersionMismatch,
+}
+
+/// Compares a validated artifact key with the current live request key without exposing raw payloads.
+///
+/// # Arguments
+///
+/// * `artifact_key` - Redaction-safe key persisted in the offline rerank artifact.
+/// * `request_key` - Redaction-safe exact key computed for the current runtime request.
+pub fn offline_rerank_applicability(
+    artifact_key: &OfflineRerankScoreKey,
+    request_key: &OfflineRerankScoreKey,
+) -> OfflineRerankApplicability {
+    let mut reasons = Vec::new();
+    if artifact_key.manifest_hash != request_key.manifest_hash {
+        reasons.push(OfflineRerankApplicabilityMismatch::ManifestHashMismatch);
+    }
+    if artifact_key.rerank_intent_fingerprint != request_key.rerank_intent_fingerprint {
+        reasons.push(OfflineRerankApplicabilityMismatch::RerankIntentFingerprintMismatch);
+    }
+    if artifact_key.ordered_candidate_ids != request_key.ordered_candidate_ids {
+        reasons.push(OfflineRerankApplicabilityMismatch::CandidateIdsOrderMismatch);
+    }
+    if artifact_key.ordered_candidate_content_fingerprints
+        != request_key.ordered_candidate_content_fingerprints
+    {
+        reasons.push(OfflineRerankApplicabilityMismatch::CandidateContentFingerprintMismatch);
+    }
+    if artifact_key.top_k_scope != request_key.top_k_scope {
+        reasons.push(OfflineRerankApplicabilityMismatch::TopKScopeMismatch);
+    }
+    if artifact_key.producer_identity != request_key.producer_identity
+        || artifact_key.ordering_policy != request_key.ordering_policy
+    {
+        reasons.push(OfflineRerankApplicabilityMismatch::ProducerIdentityPolicyMismatch);
+    }
+    if artifact_key.score_artifact_version != request_key.score_artifact_version {
+        reasons.push(OfflineRerankApplicabilityMismatch::ScoreArtifactVersionMismatch);
+    }
+
+    if reasons.is_empty() {
+        OfflineRerankApplicability::ExactMatch
+    } else {
+        OfflineRerankApplicability::Mismatch { reasons }
+    }
+}
+
 /// Current offline rerank-score artifact format version.
 pub const OFFLINE_RERANK_SCORE_ARTIFACT_VERSION: u32 = 1;
 
@@ -358,19 +435,45 @@ impl OfflineRerankScoreArtifactReranker {
     pub fn producer_identity(&self) -> &OfflineRerankProducerIdentity {
         &self.producer_identity
     }
-}
+    /// Returns redaction-safe applicability diagnostics for the current request key.
+    ///
+    /// # Arguments
+    ///
+    /// * `query` - Raw rerank intent text used only to compute a fingerprint.
+    /// * `candidates` - Ordered candidates used only for ids and content fingerprints.
+    pub fn applicability_for_request(
+        &self,
+        query: &str,
+        candidates: &[RerankCandidate],
+    ) -> OfflineRerankApplicability {
+        let request_key = self.request_key(query, candidates);
+        offline_rerank_applicability(&self.artifact.key, &request_key)
+    }
 
-impl crate::vector::Reranker for OfflineRerankScoreArtifactReranker {
-    fn rerank(&self, query: &str, candidates: &[RerankCandidate]) -> Vec<RerankScore> {
-        let request_key = OfflineRerankScoreKey::from_manifest_hash(
+    fn request_key(&self, query: &str, candidates: &[RerankCandidate]) -> OfflineRerankScoreKey {
+        OfflineRerankScoreKey::from_manifest_hash(
             &self.manifest_hash,
             query,
             candidates,
             self.producer_identity.clone(),
             self.ordering_policy.clone(),
             self.top_k_scope.clone(),
-        );
+        )
+    }
+}
+
+impl crate::vector::Reranker for OfflineRerankScoreArtifactReranker {
+    fn rerank(&self, query: &str, candidates: &[RerankCandidate]) -> Vec<RerankScore> {
+        let request_key = self.request_key(query, candidates);
         self.artifact.scores_for_exact_key(&request_key)
+    }
+
+    fn offline_applicability(
+        &self,
+        query: &str,
+        candidates: &[RerankCandidate],
+    ) -> Option<OfflineRerankApplicability> {
+        Some(self.applicability_for_request(query, candidates))
     }
 }
 
@@ -423,16 +526,21 @@ mod tests {
         OfflineRerankProducerIdentity::new("offline-fixture", "model-v1")
     }
 
-    fn fixture_artifact(manifest: &ProjectManifest) -> Result<OfflineRerankScoreArtifact> {
+    fn fixture_key(manifest: &ProjectManifest) -> OfflineRerankScoreKey {
         let candidates = fixture_candidates(manifest);
-        let key = OfflineRerankScoreKey::from_request(
+        OfflineRerankScoreKey::from_request(
             manifest,
             "intent text",
             &candidates,
             fixture_identity(),
             OfflineRerankOrderingPolicy::InputOrder,
             OfflineRerankTopKScope::new(Some(candidates.len())),
-        );
+        )
+    }
+
+    fn fixture_artifact(manifest: &ProjectManifest) -> Result<OfflineRerankScoreArtifact> {
+        let candidates = fixture_candidates(manifest);
+        let key = fixture_key(manifest);
         let scores = candidates
             .iter()
             .enumerate()
@@ -442,6 +550,149 @@ mod tests {
             })
             .collect();
         OfflineRerankScoreArtifact::new(key, scores)
+    }
+
+    #[test]
+    fn offline_rerank_applicability_exact_match_returns_exact_match() -> Result<()> {
+        let (_fixture, manifest) = fixture_manifest()?;
+        let setup = fixture_key(&manifest);
+
+        let actual = offline_rerank_applicability(&setup, &setup);
+        let expected = OfflineRerankApplicability::ExactMatch;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn offline_rerank_applicability_returns_each_first_slice_reason_independently() -> Result<()> {
+        let (_fixture, manifest) = fixture_manifest()?;
+        let setup = fixture_key(&manifest);
+        let mut manifest_mismatch = setup.clone();
+        manifest_mismatch.manifest_hash = hash_text("different manifest");
+        let mut intent_mismatch = setup.clone();
+        intent_mismatch.rerank_intent_fingerprint = hash_text("different intent");
+        let mut candidate_ids_mismatch = setup.clone();
+        candidate_ids_mismatch.ordered_candidate_ids.reverse();
+        let mut content_mismatch = setup.clone();
+        content_mismatch.ordered_candidate_content_fingerprints[0] = hash_text("different content");
+        let mut top_k_mismatch = setup.clone();
+        top_k_mismatch.top_k_scope = OfflineRerankTopKScope::new(Some(99));
+        let mut producer_mismatch = setup.clone();
+        producer_mismatch.producer_identity =
+            OfflineRerankProducerIdentity::new("different", "model-v1");
+        let mut version_mismatch = setup.clone();
+        version_mismatch.score_artifact_version = OFFLINE_RERANK_SCORE_ARTIFACT_VERSION + 1;
+
+        let actual = vec![
+            mismatch_reasons(&manifest_mismatch, &setup),
+            mismatch_reasons(&intent_mismatch, &setup),
+            mismatch_reasons(&candidate_ids_mismatch, &setup),
+            mismatch_reasons(&content_mismatch, &setup),
+            mismatch_reasons(&top_k_mismatch, &setup),
+            mismatch_reasons(&producer_mismatch, &setup),
+            mismatch_reasons(&version_mismatch, &setup),
+        ];
+        let expected = vec![
+            vec![OfflineRerankApplicabilityMismatch::ManifestHashMismatch],
+            vec![OfflineRerankApplicabilityMismatch::RerankIntentFingerprintMismatch],
+            vec![OfflineRerankApplicabilityMismatch::CandidateIdsOrderMismatch],
+            vec![OfflineRerankApplicabilityMismatch::CandidateContentFingerprintMismatch],
+            vec![OfflineRerankApplicabilityMismatch::TopKScopeMismatch],
+            vec![OfflineRerankApplicabilityMismatch::ProducerIdentityPolicyMismatch],
+            vec![OfflineRerankApplicabilityMismatch::ScoreArtifactVersionMismatch],
+        ];
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn offline_rerank_applicability_returns_multiple_reasons_in_deterministic_order() -> Result<()>
+    {
+        let (_fixture, manifest) = fixture_manifest()?;
+        let setup = fixture_key(&manifest);
+        let mut mismatch = setup.clone();
+        mismatch.manifest_hash = hash_text("different manifest");
+        mismatch.rerank_intent_fingerprint = hash_text("different intent");
+        mismatch.ordered_candidate_ids.reverse();
+        mismatch.ordered_candidate_content_fingerprints[0] = hash_text("different content");
+        mismatch.top_k_scope = OfflineRerankTopKScope::new(Some(99));
+        mismatch.producer_identity = OfflineRerankProducerIdentity::new("different", "model-v1");
+        mismatch.score_artifact_version = OFFLINE_RERANK_SCORE_ARTIFACT_VERSION + 1;
+
+        let actual = mismatch_reasons(&mismatch, &setup);
+        let expected = vec![
+            OfflineRerankApplicabilityMismatch::ManifestHashMismatch,
+            OfflineRerankApplicabilityMismatch::RerankIntentFingerprintMismatch,
+            OfflineRerankApplicabilityMismatch::CandidateIdsOrderMismatch,
+            OfflineRerankApplicabilityMismatch::CandidateContentFingerprintMismatch,
+            OfflineRerankApplicabilityMismatch::TopKScopeMismatch,
+            OfflineRerankApplicabilityMismatch::ProducerIdentityPolicyMismatch,
+            OfflineRerankApplicabilityMismatch::ScoreArtifactVersionMismatch,
+        ];
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn offline_rerank_applicability_serialization_is_redaction_safe() -> Result<()> {
+        let (_fixture, manifest) = fixture_manifest()?;
+        let artifact_candidates = vec![RerankCandidate {
+            id: "candidate-a".to_string(),
+            text: "raw artifact candidate secret".to_string(),
+        }];
+        let request_candidates = vec![RerankCandidate {
+            id: "candidate-a".to_string(),
+            text: "raw request candidate secret".to_string(),
+        }];
+        let artifact_key = OfflineRerankScoreKey::from_request(
+            &manifest,
+            "raw artifact query secret",
+            &artifact_candidates,
+            fixture_identity(),
+            OfflineRerankOrderingPolicy::InputOrder,
+            OfflineRerankTopKScope::new(Some(1)),
+        );
+        let request_key = OfflineRerankScoreKey::from_request(
+            &manifest,
+            "raw request query secret",
+            &request_candidates,
+            fixture_identity(),
+            OfflineRerankOrderingPolicy::InputOrder,
+            OfflineRerankTopKScope::new(Some(1)),
+        );
+
+        let actual = format!(
+            "{:?} {}",
+            offline_rerank_applicability(&artifact_key, &request_key),
+            serde_json::to_string(&offline_rerank_applicability(&artifact_key, &request_key))?
+        );
+        let expected = vec![false, false, false, false, false, false];
+
+        assert_eq!(
+            vec![
+                actual.contains("raw artifact query secret"),
+                actual.contains("raw request query secret"),
+                actual.contains("raw artifact candidate secret"),
+                actual.contains("raw request candidate secret"),
+                actual.contains("/tmp/offline_rerank_scores.json"),
+                actual.contains("configured/path/offline_rerank_scores.json"),
+            ],
+            expected,
+        );
+        Ok(())
+    }
+
+    fn mismatch_reasons(
+        artifact_key: &OfflineRerankScoreKey,
+        request_key: &OfflineRerankScoreKey,
+    ) -> Vec<OfflineRerankApplicabilityMismatch> {
+        match offline_rerank_applicability(artifact_key, request_key) {
+            OfflineRerankApplicability::ExactMatch => Vec::new(),
+            OfflineRerankApplicability::Mismatch { reasons } => reasons,
+        }
     }
 
     #[test]

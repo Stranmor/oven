@@ -101,9 +101,10 @@ pub use learning::{
 };
 pub use lexical::{LexicalIndex, documents_from_manifest};
 pub use offline_rerank::{
-    OFFLINE_RERANK_SCORE_ARTIFACT_VERSION, OfflineRerankOrderingPolicy,
-    OfflineRerankProducerIdentity, OfflineRerankScoreArtifact, OfflineRerankScoreArtifactReranker,
-    OfflineRerankScoreKey, OfflineRerankTopKScope,
+    OFFLINE_RERANK_SCORE_ARTIFACT_VERSION, OfflineRerankApplicability,
+    OfflineRerankApplicabilityMismatch, OfflineRerankOrderingPolicy, OfflineRerankProducerIdentity,
+    OfflineRerankScoreArtifact, OfflineRerankScoreArtifactReranker, OfflineRerankScoreKey,
+    OfflineRerankTopKScope, offline_rerank_applicability,
 };
 pub use policy::{
     ProjectContextTarget, TargetResolutionBudget, directory_path_filter, local_project_model_dir,

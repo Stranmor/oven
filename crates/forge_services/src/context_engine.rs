@@ -5594,6 +5594,69 @@ mod tests {
     }
 
     #[test]
+    fn configured_offline_rerank_mismatch_surfaces_reason_while_lexical_fallback_remains()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+        let manifest = indexer.read_manifest()?;
+        let artifact = fixture_offline_rerank_artifact_for_query(
+            &manifest,
+            "RuntimeNeedle",
+            "different runtime intent",
+            10,
+        )?;
+        let artifact_path = write_fixture_offline_rerank_artifact(&root, &artifact)?;
+        let selector = configured_offline_rerank_selector(&root, artifact_path);
+        let service = local_search_service_with_selector(&root, selector);
+        let request = ProjectContextRetrievalRequest::new(
+            "RuntimeNeedle".to_string(),
+            10,
+            ProjectContextPathScope::default(),
+            true,
+        )
+        .with_use_case("current runtime intent".to_string());
+
+        let outcome = plan_project_context_retrieval_with_options(
+            &manifest,
+            &indexer.evaluate_manifest_freshness(&manifest)?,
+            request,
+            ProjectContextRetrievalOptions {
+                reranker: service.select_project_context_reranker_boundary(),
+                ..ProjectContextRetrievalOptions::default()
+            },
+        );
+        let actual = match outcome {
+            ProjectContextRetrievalPlanningOutcome::Plan(plan) => (
+                plan.query_diagnostics.offline_rerank_applicability,
+                plan.selected_results.is_empty(),
+                plan.selected_results
+                    .iter()
+                    .any(|result| result.score_parts.contains_key("lexical")),
+                plan.selected_results
+                    .iter()
+                    .any(|result| result.score_parts.contains_key("rerank")),
+            ),
+            ProjectContextRetrievalPlanningOutcome::Refusal(refusal) => {
+                panic!("unexpected refusal: {:?}", refusal)
+            }
+        };
+        let expected = (
+            Some(forge_project_model::OfflineRerankApplicability::Mismatch {
+                reasons: vec![
+                    forge_project_model::OfflineRerankApplicabilityMismatch::RerankIntentFingerprintMismatch,
+                ],
+            }),
+            false,
+            true,
+            false,
+        );
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
     fn production_runtime_reranker_selector_constructs_missing_without_config() -> Result<()> {
         let (_fixture, root) = fixture_workspace()?;
         write_fixture_project_model(&root)?;

@@ -6,7 +6,7 @@ use std::path::{Component, Path};
 use anyhow::{Result, bail};
 
 use crate::context_adapter::{ManifestEvidenceTarget, resolve_manifest_evidence_target};
-use crate::retrieval::retrieve_with_boundaries_and_rerank_intent;
+use crate::retrieval::retrieve_with_boundaries_and_rerank_intent_diagnostics;
 use crate::types::{
     ContextPack, ContextPackEvidence, ContextPackSelection, EdgeConfidence, FreshnessProofLevel,
     GraphEdge, GraphEdgeKind, ManifestFreshnessEvaluation, ProjectManifest, RerankIntent,
@@ -14,7 +14,9 @@ use crate::types::{
     StaleEvidencePolicy, VectorQuery,
 };
 use crate::vector::{Reranker, VectorIndex};
-use crate::{ExactFactStatus, ExactFactStatusReport, ReplayActivationBoundary};
+use crate::{
+    ExactFactStatus, ExactFactStatusReport, OfflineRerankApplicability, ReplayActivationBoundary,
+};
 
 const MAX_DIAGNOSTIC_SUMMARIES: usize = 8;
 const EXACT_FACT_REFERENCE_FANOUT_CAP: usize = 8;
@@ -501,6 +503,8 @@ pub struct ProjectContextRetrievalPlanDiagnostic {
     pub rerank_intent_fingerprint: Option<String>,
     /// Normalized selected rerank intent length.
     pub rerank_intent_len: Option<usize>,
+    /// Redaction-safe offline rerank applicability for this runtime request, if available.
+    pub offline_rerank_applicability: Option<OfflineRerankApplicability>,
     /// Whether retrieval selected no evidence.
     pub retrieval_empty: bool,
     /// Whether selected or read-request summaries were truncated.
@@ -528,6 +532,7 @@ impl ProjectContextRetrievalPlanDiagnostic {
                 rerank_intent_source: None,
                 rerank_intent_fingerprint: None,
                 rerank_intent_len: None,
+                offline_rerank_applicability: None,
                 retrieval_empty: false,
                 truncated: false,
             },
@@ -562,6 +567,10 @@ impl ProjectContextRetrievalPlanDiagnostic {
                         .rerank_intent_fingerprint
                         .clone(),
                     rerank_intent_len: plan.query_diagnostics.rerank_intent_len,
+                    offline_rerank_applicability: plan
+                        .query_diagnostics
+                        .offline_rerank_applicability
+                        .clone(),
                     retrieval_empty: selected_result_count == 0,
                     truncated: selected_result_count > MAX_DIAGNOSTIC_SUMMARIES
                         || read_request_count > MAX_DIAGNOSTIC_SUMMARIES,
@@ -662,6 +671,8 @@ pub struct ProjectContextRetrievalQueryDiagnostics {
     pub rerank_intent_fingerprint: Option<String>,
     /// Character length of the normalized reranker intent when selected.
     pub rerank_intent_len: Option<usize>,
+    /// Redaction-safe offline rerank applicability for this runtime request, if available.
+    pub offline_rerank_applicability: Option<OfflineRerankApplicability>,
     /// Whether graph expansion was requested.
     pub include_graph_expansion: bool,
     /// Fixed stale policy used for query path injection.
@@ -848,6 +859,7 @@ pub fn plan_project_context_retrieval_with_options(
         rerank_intent_len: selected_rerank_intent
             .as_ref()
             .map(|intent| intent.text.chars().count()),
+        offline_rerank_applicability: None,
         include_graph_expansion: request.include_graph_expansion,
         stale_policy: StaleEvidencePolicy::Reject,
         freshness_proof_level: freshness.proof_level.clone(),
@@ -875,7 +887,7 @@ pub fn plan_project_context_retrieval_with_options(
     );
     let reranker_activation =
         reranker_activation(options.reranker, selected_rerank_intent.as_ref());
-    let mut selected_results = retrieve_with_boundaries_and_rerank_intent(
+    let retrieval_execution = retrieve_with_boundaries_and_rerank_intent_diagnostics(
         manifest,
         &query,
         vector_activation.vector_query,
@@ -884,6 +896,7 @@ pub fn plan_project_context_retrieval_with_options(
         selected_rerank_intent.as_ref(),
         &RetrievalScoringWeights::default(),
     );
+    let mut selected_results = retrieval_execution.results;
     let exact_fact_activation =
         exact_fact_activation(manifest, freshness, options.exact_fact_status);
     selected_results.extend(exact_fact_activation.results.iter().cloned());
@@ -906,6 +919,7 @@ pub fn plan_project_context_retrieval_with_options(
     selected_results.truncate(effective_limit);
 
     let mut diagnostics = diagnostics;
+    diagnostics.offline_rerank_applicability = retrieval_execution.offline_rerank_applicability;
     diagnostics.phase_diagnostics.vector = vector_activation.status(&selected_results);
     diagnostics.phase_diagnostics.rerank = reranker_activation.status(&selected_results);
     diagnostics.phase_diagnostics.lexical =
