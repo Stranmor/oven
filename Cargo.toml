@@ -1,6 +1,34 @@
 [workspace]
-members = ["crates/*"]
-exclude = ["crates/forge_quality_runtime"]
+members = [
+    "crates/forge_api",
+    "crates/forge_app",
+    "crates/forge_config",
+    "crates/forge_ci",
+    "crates/forge_display",
+    "crates/forge_domain",
+    "crates/forge_embed",
+    "crates/forge_eventsource",
+    "crates/forge_eventsource_stream",
+    "crates/forge_fs",
+    "crates/forge_infra",
+    "crates/forge_json_repair",
+    "crates/forge_main",
+    "crates/forge_markdown_stream",
+    "crates/forge_project_model",
+    "crates/forge_repo",
+    "crates/forge_select",
+    "crates/forge_services",
+    "crates/forge_snaps",
+    "crates/forge_spinner",
+    "crates/forge_stream",
+    "crates/forge_template",
+    "crates/forge_test_kit",
+    "crates/forge_tool_macros",
+    "crates/forge_tracker",
+    "crates/forge_tui",
+    "crates/forge_ui_model",
+    "crates/forge_walker",
+]
 resolver = "2"
 
 
