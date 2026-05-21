@@ -520,10 +520,13 @@ impl<
                 // Execute all queries in parallel
                 let futures: Vec<_> = params
                     .into_iter()
-                    .map(|param| services.query_workspace(cwd.clone(), param))
+                    .map(|param| services.query_workspace_committed(cwd.clone(), param))
                     .collect();
 
-                let mut results = futures::future::try_join_all(futures).await?;
+                let committed_results = futures::future::try_join_all(futures).await?;
+                let (committed_metadata, mut results): (Vec<_>, Vec<_>) =
+                    committed_results.into_iter().unzip();
+                debug_assert_eq!(committed_metadata.len(), results.len());
 
                 // Deduplicate results across queries
                 crate::search_dedup::deduplicate_results(&mut results);
@@ -852,17 +855,18 @@ mod tests {
 
     use forge_domain::{
         Agent, AgentId, AnyProvider, Attachment, AuthContextRequest, AuthContextResponse,
-        AuthCredential, AuthMethod, ChatCompletionMessage, CodebaseQueryResult, ConfigOperation,
-        Context, Conversation, ConversationId, ConversationListItem, Effort, Environment, File,
-        FileStatus, LearningCaptureMetadata, LearningLedgerAppendOutcome, LearningLedgerEvent,
-        LearningLedgerFreshness, LearningRecordId, LearningRecordProjection, LearningReviewOutcome,
-        LearningReviewState, McpConfig, McpServers, Metrics, Model, ModelConfig, ModelId, Node,
-        NodeData, NodeId, PermissionOperation, ProjectSemanticEmbeddingOutput,
-        ProjectSemanticEmbeddingVector, Provider, ProviderId, ResultStream, Scope, SearchParams,
-        SemSearchAvailability, SemSearchDiagnosticReport, SemSearchDiagnosticStatus,
-        SemSearchUnknownReason, SemSearchUnsupportedReason, Shell, SteerMessage, SubagentTaskId,
-        SubagentTaskSession, SubagentTaskSessionFilter, SyncProgress, ToolCallContext,
-        ToolCallFull, WorkspaceAuth, WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
+        AuthCredential, AuthMethod, ChatCompletionMessage, CodebaseQueryResult,
+        CodebaseSearchResults, ConfigOperation, Context, Conversation, ConversationId,
+        ConversationListItem, Effort, Environment, File, FileStatus, LearningCaptureMetadata,
+        LearningLedgerAppendOutcome, LearningLedgerEvent, LearningLedgerFreshness,
+        LearningRecordId, LearningRecordProjection, LearningReviewOutcome, LearningReviewState,
+        McpConfig, McpServers, Metrics, Model, ModelConfig, ModelId, Node, NodeData, NodeId,
+        PermissionOperation, ProjectSemanticEmbeddingOutput, ProjectSemanticEmbeddingVector,
+        Provider, ProviderId, ResultStream, Scope, SearchParams, SemSearchAvailability,
+        SemSearchDiagnosticReport, SemSearchDiagnosticStatus, SemSearchUnknownReason,
+        SemSearchUnsupportedReason, Shell, SteerMessage, SubagentTaskId, SubagentTaskSession,
+        SubagentTaskSessionFilter, SyncProgress, ToolCallContext, ToolCallFull, WorkspaceAuth,
+        WorkspaceContextFreshness, WorkspaceContextManifestDiagnostic,
         WorkspaceEvidenceReplayDiagnostic, WorkspaceEvidenceReplayPreviewDiagnostic,
         WorkspaceExactFactReferenceContinuationStatus, WorkspaceExactFactReferenceReport,
         WorkspaceExactFactReferenceStatus, WorkspaceExactFactStatusReport, WorkspaceId,
@@ -905,6 +909,7 @@ mod tests {
     struct SemSearchWorkspace {
         embedding_calls: Arc<Mutex<Vec<(String, String)>>>,
         query_calls: Arc<Mutex<Vec<SemSearchParamSnapshot>>>,
+        committed_query_calls: Arc<Mutex<Vec<SemSearchParamSnapshot>>>,
         build_calls: Arc<AtomicUsize>,
         query_error: Option<String>,
         readiness: Arc<StdMutex<SemSearchAvailability>>,
@@ -912,6 +917,8 @@ mod tests {
         exact_fact_statuses: Arc<Mutex<Vec<WorkspaceExactFactStatusReport>>>,
         exact_fact_status_calls: Arc<AtomicUsize>,
         exact_fact_status_error: Arc<StdMutex<Option<String>>>,
+        committed_result:
+            Arc<StdMutex<Option<forge_project_model::ProjectContextCommittedQueryResult>>>,
         exact_fact_producer_calls: Arc<AtomicUsize>,
         exact_fact_producer_error: Arc<StdMutex<Option<String>>>,
         exact_fact_producer_status: Arc<StdMutex<WorkspaceExactFactReferenceStatus>>,
@@ -925,6 +932,7 @@ mod tests {
                 workspace: SemSearchWorkspace {
                     embedding_calls: Arc::new(Mutex::new(Vec::new())),
                     query_calls: Arc::new(Mutex::new(Vec::new())),
+                    committed_query_calls: Arc::new(Mutex::new(Vec::new())),
                     build_calls: Arc::new(AtomicUsize::new(0)),
                     query_error: None,
                     readiness: Arc::new(StdMutex::new(SemSearchAvailability::Ready {
@@ -937,6 +945,7 @@ mod tests {
                     exact_fact_statuses: Arc::new(Mutex::new(Vec::new())),
                     exact_fact_status_calls: Arc::new(AtomicUsize::new(0)),
                     exact_fact_status_error: Arc::new(StdMutex::new(None)),
+                    committed_result: Arc::new(StdMutex::new(None)),
                     exact_fact_producer_calls: Arc::new(AtomicUsize::new(0)),
                     exact_fact_producer_error: Arc::new(StdMutex::new(None)),
                     exact_fact_producer_status: Arc::new(StdMutex::new(
@@ -977,6 +986,14 @@ mod tests {
 
         fn with_exact_fact_status_error(self, error: &str) -> Self {
             *self.workspace.exact_fact_status_error.lock().unwrap() = Some(error.to_string());
+            self
+        }
+
+        fn with_committed_result(
+            self,
+            committed_result: forge_project_model::ProjectContextCommittedQueryResult,
+        ) -> Self {
+            *self.workspace.committed_result.lock().unwrap() = Some(committed_result);
             self
         }
 
@@ -1175,51 +1192,67 @@ mod tests {
 
         async fn query_workspace_committed(
             &self,
-            path: PathBuf,
+            _path: PathBuf,
             params: SearchParams<'_>,
         ) -> anyhow::Result<(
             forge_project_model::ProjectContextCommittedQueryResult,
             Vec<Node>,
         )> {
-            let nodes = self.query_workspace(path, params).await?;
-            Ok((
-                forge_project_model::ProjectContextCommittedQueryResult::no_write(
-                    Default::default(),
-                    forge_project_model::ProjectContextPackNoWriteReason::EmptyEvidence,
-                    Vec::new(),
-                ),
-                nodes,
-            ))
-        }
-
-        async fn query_workspace(
-            &self,
-            _path: PathBuf,
-            params: SearchParams<'_>,
-        ) -> anyhow::Result<Vec<Node>> {
-            self.query_calls.lock().await.push(SemSearchParamSnapshot {
-                query: params.query.to_string(),
-                use_case: params.use_case.clone(),
-                query_embedding: params.query_embedding.clone(),
-                embedding_model_id: params.embedding_model_id.clone(),
-            });
+            self.committed_query_calls
+                .lock()
+                .await
+                .push(SemSearchParamSnapshot {
+                    query: params.query.to_string(),
+                    use_case: params.use_case.clone(),
+                    query_embedding: params.query_embedding.clone(),
+                    embedding_model_id: params.embedding_model_id.clone(),
+                });
             if let Some(error) = &self.query_error {
                 anyhow::bail!(error.clone());
             }
             if params.query_embedding.is_none() || params.embedding_model_id.is_none() {
                 anyhow::bail!("semantic query parameters were not populated")
             }
-            Ok(vec![Node {
-                node_id: NodeId::new("semantic-vector-only-hit"),
-                node: NodeData::FileChunk(forge_domain::FileChunk {
-                    file_path: "src/vector_only.rs".to_string(),
-                    content: "pub struct SemanticVectorOnlyHit;".to_string(),
-                    start_line: 1,
-                    end_line: 1,
-                }),
-                relevance: Some(1.0),
-                distance: None,
-            }])
+            let committed_result = self
+                .committed_result
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| {
+                    forge_project_model::ProjectContextCommittedQueryResult::no_write(
+                        Default::default(),
+                        forge_project_model::ProjectContextPackNoWriteReason::EmptyEvidence,
+                        Vec::new(),
+                    )
+                });
+            Ok((
+                committed_result,
+                vec![Node {
+                    node_id: NodeId::new("semantic-vector-only-hit"),
+                    node: NodeData::FileChunk(forge_domain::FileChunk {
+                        file_path: "src/vector_only.rs".to_string(),
+                        content: "pub struct SemanticVectorOnlyHit;".to_string(),
+                        start_line: 1,
+                        end_line: 1,
+                    }),
+                    relevance: Some(1.0),
+                    distance: None,
+                }],
+            ))
+        }
+
+        async fn query_workspace(
+            &self,
+            _path: PathBuf,
+            _params: SearchParams<'_>,
+        ) -> anyhow::Result<Vec<Node>> {
+            self.query_calls.lock().await.push(SemSearchParamSnapshot {
+                query: "legacy-query-workspace-called".to_string(),
+                use_case: "legacy-query-workspace-called".to_string(),
+                query_embedding: None,
+                embedding_model_id: None,
+            });
+            anyhow::bail!("legacy query_workspace must not be called by sem_search")
         }
 
         async fn list_workspaces(&self) -> anyhow::Result<Vec<WorkspaceInfo>> {
@@ -1938,6 +1971,17 @@ mod tests {
         })
     }
 
+    async fn sem_search_output(
+        executor: &ToolExecutor<SemSearchFixture>,
+        input: ToolCatalog,
+    ) -> anyhow::Result<CodebaseSearchResults> {
+        let actual = executor.call_internal(input, &tool_context()).await?;
+        match actual {
+            ToolOperation::CodebaseSearch { output } => Ok(output),
+            _ => panic!("expected semantic codebase search output"),
+        }
+    }
+
     fn tool_context() -> ToolCallContext {
         ToolCallContext::new(Metrics::default())
     }
@@ -1972,6 +2016,103 @@ mod tests {
         ToolCatalog::WorkspaceExactFactReferenceContinuation(
             forge_domain::WorkspaceExactFactReferenceContinuation { workspace_path },
         )
+    }
+
+    fn committed_persisted_episode_failed_result()
+    -> anyhow::Result<forge_project_model::ProjectContextCommittedQueryResult> {
+        let read_request = forge_project_model::ProjectContextReadRequest::new(
+            "src/committed.rs",
+            "committed-node",
+            1,
+            1,
+        )?;
+        let context_pack = forge_project_model::ContextPack {
+            version: 1,
+            manifest_hash: "fixture-manifest".to_string(),
+            evidence: vec![forge_project_model::ContextPackEvidence {
+                id: "committed-node".to_string(),
+                path: "src/committed.rs".to_string(),
+                symbol: None,
+                source: forge_project_model::ContextPackEvidenceSource::RetrievalResult,
+                freshness: forge_project_model::EvidenceFreshness::Fresh,
+                provenance: forge_project_model::Provenance {
+                    path: "src/committed.rs".to_string(),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                    source: "fixture".to_string(),
+                    fingerprint: "fixture-fingerprint".to_string(),
+                },
+                score: 1.0,
+            }],
+            provenance: vec![forge_project_model::Provenance {
+                path: "src/committed.rs".to_string(),
+                start_line: Some(1),
+                end_line: Some(1),
+                source: "fixture".to_string(),
+                fingerprint: "fixture-fingerprint".to_string(),
+            }],
+        };
+        let retrieval_plan = forge_project_model::ProjectContextRetrievalPlan {
+            query_diagnostics: forge_project_model::ProjectContextRetrievalQueryDiagnostics {
+                query_text: Some("committed query".to_string()),
+                path_prefix: None,
+                path_suffixes: Vec::new(),
+                limit: 1,
+                top_k: Some(1),
+                top_k_status: forge_project_model::ProjectContextTopKStatus::Applied {
+                    candidate_count: 1,
+                },
+                use_case: Some("committed use case".to_string()),
+                include_graph_expansion: false,
+                stale_policy: forge_project_model::StaleEvidencePolicy::Reject,
+                freshness_proof_level: forge_project_model::FreshnessProofLevel::FullFilesystem,
+                phase_diagnostics:
+                    forge_project_model::ProjectContextRetrievalPhaseDiagnostics::default(),
+            },
+            selected_results: Vec::new(),
+            context_pack: Some(context_pack),
+            read_requests: vec![read_request.clone()],
+            write_decision:
+                forge_project_model::ProjectContextWriteDecision::WriteContextPackAfterReadback,
+            return_order: Vec::new(),
+        };
+        let replay_activation = forge_project_model::ReplayActivationBoundary {
+            manifest_hash: "fixture-manifest".to_string(),
+            active_refs: Vec::new(),
+            issues: Vec::new(),
+            diagnostics: forge_project_model::ReplayActivationDiagnostics::default(),
+        };
+        let commit = forge_project_model::ProjectContextPackCommit::from_retrieval_plan(
+            &retrieval_plan,
+            replay_activation,
+        )?;
+        let commit = match commit.verify_readbacks(vec![
+            forge_project_model::ProjectContextReadbackOutcome::succeeded(&read_request),
+        ])? {
+            forge_project_model::ProjectContextPackReadbackDecision::Write(commit) => commit,
+            forge_project_model::ProjectContextPackReadbackDecision::NoWrite(_) => {
+                anyhow::bail!("fixture committed query should produce persisted proof")
+            }
+        };
+        let tempdir = tempfile::tempdir()?;
+        let indexer = forge_project_model::ProjectIndexer::new(
+            tempdir.path(),
+            tempdir.path().join(".forge_project_model"),
+        );
+        let proof = indexer.persist_verified_context_pack(&commit)?;
+        Ok(forge_project_model::ProjectContextCommittedQueryResult::persisted(
+            forge_project_model::ProjectContextReadbackSummary::from_outcomes(&[
+                forge_project_model::ProjectContextReadbackOutcome::succeeded(&read_request),
+            ]),
+            proof,
+            forge_project_model::ProjectContextPersistedEpisodeAppendOutcome::failed(
+                forge_project_model::ProjectContextEpisodeAppendFailureReason::EpisodeAppendFailed,
+            ),
+            vec![forge_project_model::ProjectContextCommittedResultItem::new(
+                "committed-node",
+                Some(1.0),
+            )],
+        ))
     }
 
     async fn exact_fact_output(
@@ -2405,7 +2546,7 @@ mod tests {
             _ => panic!("expected semantic codebase search output"),
         }
         let actual_embeddings = setup.workspace.embedding_calls.lock().await.clone();
-        let actual_queries = setup.workspace.query_calls.lock().await;
+        let actual_queries = setup.workspace.committed_query_calls.lock().await;
         let expected_embeddings = vec![
             ("alpha behavior".to_string(), "fixture-model".to_string()),
             ("beta behavior".to_string(), "fixture-model".to_string()),
@@ -2423,6 +2564,83 @@ mod tests {
             Some("fixture-model".to_string())
         );
         assert_eq!(setup.workspace.build_calls.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sem_search_uses_committed_query_path_and_never_legacy_query_workspace()
+    -> anyhow::Result<()> {
+        let setup = Arc::new(SemSearchFixture::new(sem_search_config(Some(
+            "fixture-model",
+        ))));
+        let executor = ToolExecutor::new(Arc::clone(&setup));
+
+        let actual = sem_search_output(
+            &executor,
+            sem_search_tool("committed path should handle this query"),
+        )
+        .await?;
+
+        let expected = 1;
+        assert_eq!(actual.queries.len(), expected);
+        assert_eq!(setup.workspace.committed_query_calls.lock().await.len(), 1);
+        assert_eq!(setup.workspace.query_calls.lock().await.len(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sem_search_persisted_episode_append_failure_preserves_legacy_output_shape()
+    -> anyhow::Result<()> {
+        let setup = Arc::new(
+            SemSearchFixture::new(sem_search_config(Some("fixture-model")))
+                .with_committed_result(committed_persisted_episode_failed_result()?),
+        );
+        let executor = ToolExecutor::new(Arc::clone(&setup));
+
+        let actual = sem_search_output(
+            &executor,
+            sem_search_tool("committed metadata must stay internal"),
+        )
+        .await?;
+
+        let expected = CodebaseSearchResults {
+            queries: vec![CodebaseQueryResult {
+                query: "committed metadata must stay internal".to_string(),
+                use_case: "Find the struct implementation for semantic vector-only retrieval"
+                    .to_string(),
+                results: vec![Node {
+                    node_id: NodeId::new("semantic-vector-only-hit"),
+                    node: NodeData::FileChunk(forge_domain::FileChunk {
+                        file_path: "src/vector_only.rs".to_string(),
+                        content: "pub struct SemanticVectorOnlyHit;".to_string(),
+                        start_line: 1,
+                        end_line: 1,
+                    }),
+                    relevance: Some(1.0),
+                    distance: None,
+                }],
+            }],
+        };
+        assert_eq!(actual, expected);
+        assert_eq!(setup.workspace.committed_query_calls.lock().await.len(), 1);
+        assert_eq!(setup.workspace.query_calls.lock().await.len(), 0);
+
+        let actual_json = serde_json::to_value(&actual)?;
+        let root = actual_json
+            .as_object()
+            .expect("CodebaseSearchResults should serialize as JSON object");
+        assert_eq!(root.keys().cloned().collect::<Vec<_>>(), vec!["queries"]);
+        let query = root["queries"][0]
+            .as_object()
+            .expect("query result should serialize as JSON object");
+        assert_eq!(
+            query.keys().cloned().collect::<Vec<_>>(),
+            vec!["query", "results", "use_case"]
+        );
+        let serialized = serde_json::to_string(&actual)?;
+        assert!(!serialized.contains("ProjectContextCommittedQueryResult"));
+        assert!(!serialized.contains("ProjectContextPersistedEpisodeAppendOutcome"));
+        assert!(!serialized.contains("EpisodeAppendFailed"));
         Ok(())
     }
 
@@ -2480,7 +2698,7 @@ mod tests {
                 .contains("sem_search unavailable: unsupported: no_model_config")
         );
         assert_eq!(setup.workspace.embedding_calls.lock().await.len(), 0);
-        assert_eq!(setup.workspace.query_calls.lock().await.len(), 0);
+        assert_eq!(setup.workspace.committed_query_calls.lock().await.len(), 0);
         assert_eq!(setup.workspace.build_calls.load(Ordering::SeqCst), 0);
         Ok(())
     }
@@ -2509,7 +2727,7 @@ mod tests {
                 .contains("AmbiguousVectorIndex")
         );
         assert_eq!(setup.workspace.embedding_calls.lock().await.len(), 1);
-        assert_eq!(setup.workspace.query_calls.lock().await.len(), 1);
+        assert_eq!(setup.workspace.committed_query_calls.lock().await.len(), 1);
         assert_eq!(setup.workspace.build_calls.load(Ordering::SeqCst), 0);
         Ok(())
     }
@@ -2536,7 +2754,7 @@ mod tests {
                 .contains("sem_search unavailable: unknown: ambiguous_vector_artifact")
         );
         assert_eq!(setup.workspace.embedding_calls.lock().await.len(), 0);
-        assert_eq!(setup.workspace.query_calls.lock().await.len(), 0);
+        assert_eq!(setup.workspace.committed_query_calls.lock().await.len(), 0);
         assert_eq!(setup.workspace.build_calls.load(Ordering::SeqCst), 0);
         Ok(())
     }
@@ -2570,7 +2788,7 @@ mod tests {
                 .contains("dimension mismatch with ready vector artifact")
         );
         assert_eq!(setup.workspace.embedding_calls.lock().await.len(), 1);
-        assert_eq!(setup.workspace.query_calls.lock().await.len(), 0);
+        assert_eq!(setup.workspace.committed_query_calls.lock().await.len(), 0);
         assert_eq!(setup.workspace.build_calls.load(Ordering::SeqCst), 0);
         Ok(())
     }
