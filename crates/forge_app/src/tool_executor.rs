@@ -436,6 +436,9 @@ impl<
                 let goal = context.active_goal.as_mut().ok_or_else(|| {
                     anyhow!("goal_terminal_action requires an active goal record")
                 })?;
+                if goal.status() != forge_domain::GoalStatus::Active {
+                    anyhow::bail!("goal_terminal_action requires a currently active goal");
+                }
                 match input.status {
                     forge_domain::GoalTerminalActionStatus::Satisfied => {
                         goal.satisfy(input.summary.as_str(), input.evidence.as_str())?;
@@ -2382,6 +2385,79 @@ mod tests {
             readback_verified: true,
         };
         assert_eq!(output, expected);
+    }
+
+    #[tokio::test]
+    async fn goal_terminal_action_refuses_paused_or_terminal_goal_without_mutation() {
+        let paused_conversation_id = ConversationId::generate();
+        let mut paused_goal = forge_domain::ActiveGoal::new("paused goal").unwrap();
+        paused_goal.pause();
+        let paused_conversation = Conversation::new(paused_conversation_id)
+            .context(Context::default().set_active_goal(paused_goal));
+        let paused_setup = SemSearchFixture::new(forge_config::ForgeConfig::default())
+            .with_conversation(paused_conversation)
+            .await;
+        let paused_executor = ToolExecutor::new(Arc::new(paused_setup.clone()));
+        let fixture = goal_terminal_action(
+            forge_domain::GoalTerminalActionStatus::Satisfied,
+            "done",
+            "proof",
+            None,
+        );
+
+        let paused_actual = paused_executor
+            .call_internal(fixture.clone(), &tool_context_for(paused_conversation_id))
+            .await;
+        let paused_persisted = paused_setup
+            .find_conversation(&paused_conversation_id)
+            .await
+            .unwrap()
+            .and_then(|conversation| conversation.context)
+            .and_then(|context| context.active_goal)
+            .unwrap();
+
+        let terminal_conversation_id = ConversationId::generate();
+        let terminal_goal =
+            forge_domain::ActiveGoal::satisfied("terminal goal", "done", "proof").unwrap();
+        let terminal_conversation = Conversation::new(terminal_conversation_id)
+            .context(Context::default().set_active_goal(terminal_goal));
+        let terminal_setup = SemSearchFixture::new(forge_config::ForgeConfig::default())
+            .with_conversation(terminal_conversation)
+            .await;
+        let terminal_executor = ToolExecutor::new(Arc::new(terminal_setup.clone()));
+
+        let terminal_actual = terminal_executor
+            .call_internal(fixture, &tool_context_for(terminal_conversation_id))
+            .await;
+        let terminal_persisted = terminal_setup
+            .find_conversation(&terminal_conversation_id)
+            .await
+            .unwrap()
+            .and_then(|conversation| conversation.context)
+            .and_then(|context| context.active_goal)
+            .unwrap();
+
+        let actual = (
+            paused_actual.is_err(),
+            paused_persisted.status(),
+            terminal_actual.is_err(),
+            terminal_persisted.status(),
+            terminal_persisted
+                .terminal_summary()
+                .map(|summary| summary.as_str()),
+            terminal_persisted
+                .terminal_evidence()
+                .map(|evidence| evidence.as_str()),
+        );
+        let expected = (
+            true,
+            forge_domain::GoalStatus::Paused,
+            true,
+            forge_domain::GoalStatus::Satisfied,
+            Some("done"),
+            Some("proof"),
+        );
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]
