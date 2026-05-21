@@ -44,6 +44,7 @@ jobs/**
 *.js
 *.map
 **/.forge/request.body.json
+**/.forge/quality-runtime-traces/
 node_modules/
 bench/__pycache__
 .ai/
