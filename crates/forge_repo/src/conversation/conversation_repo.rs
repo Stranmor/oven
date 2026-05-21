@@ -2506,6 +2506,7 @@ mod tests {
                     droppable: false,
                     phase: None,
                     cacheable: Some(false),
+                    cache_class: Some(forge_domain::MessageCacheClass::Uncached),
                     kind: None,
                 }),
                 usage: Some(Usage {

@@ -1435,7 +1435,7 @@ mod tests {
     fn test_active_goal_renders_escaped_prompt_xml() {
         let fixture = ActiveGoal::new("ship <safe> & typed goal").unwrap();
         let actual = fixture.render_prompt_xml();
-        let expected = "<conversation_goal status=\"active\"><objective>ship &lt;safe&gt; &amp; typed goal</objective></conversation_goal>";
+        let expected = "<conversation_goal\n  status=\"active\"\n><objective>ship &lt;safe&gt; &amp; typed goal</objective>\n</conversation_goal>";
         assert_eq!(actual, expected);
     }
 

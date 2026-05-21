@@ -1071,13 +1071,20 @@ impl ToolCatalog {
             None => match self {
                 ToolCatalog::ApplyPatch(input) => apply_patch_policy_paths(&input.patch)
                     .into_iter()
-                    .map(|path| crate::policies::PermissionOperation::Write {
-                        message: format!(
-                            "Apply multi-file patch to: `{}`",
-                            format_display_path(path.as_path(), cwd.as_path())
-                        ),
-                        path,
-                        cwd: cwd.clone(),
+                    .map(|path| {
+                        let path = if path.is_absolute() {
+                            path
+                        } else {
+                            cwd.join(path)
+                        };
+                        crate::policies::PermissionOperation::Write {
+                            message: format!(
+                                "Apply multi-file patch to: `{}`",
+                                format_display_path(path.as_path(), cwd.as_path())
+                            ),
+                            path,
+                            cwd: cwd.clone(),
+                        }
                     })
                     .collect(),
                 _ => Vec::new(),
@@ -1445,7 +1452,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use strum::IntoEnumIterator;
 
-    use super::{ProcessRead, ProcessStatusInput, Shell, ShellHandoffTimeoutSeconds};
+    use super::{FSApplyPatch, ProcessRead, ProcessStatusInput, Shell, ShellHandoffTimeoutSeconds};
     use crate::{ToolCatalog, ToolKind, ToolName};
 
     #[test]
@@ -2178,11 +2185,19 @@ mod tests {
 
         let actual = fixture.to_policy_operations(PathBuf::from("/workspace"));
         let expected = vec![
-            PermissionOperation::Write { path: PathBuf::from("/workspace/one.txt") },
-            PermissionOperation::Write { path: PathBuf::from("/workspace/nested/two.txt") },
+            PathBuf::from("/workspace/one.txt"),
+            PathBuf::from("/workspace/nested/two.txt"),
         ];
 
-        assert_eq!(actual, expected);
+        let actual_paths = actual
+            .into_iter()
+            .map(|operation| match operation {
+                PermissionOperation::Write { path, .. } => path,
+                _ => panic!("expected write operation"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual_paths, expected);
     }
 
     #[test]

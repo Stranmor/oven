@@ -478,6 +478,7 @@ mod tests {
             limit: Some(10),
             top_k: Some(20),
             use_case: "find retry logic".to_string(),
+            rerank_intent_source: SearchRerankIntentSource::Default,
             starts_with: None,
             ends_with: Some(vec![".rs".to_string()]),
             query_embedding: None,
@@ -503,6 +504,7 @@ mod tests {
             limit: Some(10),
             top_k: Some(20),
             use_case: "find retry logic".to_string(),
+            rerank_intent_source: SearchRerankIntentSource::Default,
             starts_with: None,
             ends_with: Some(vec![
                 ".rs".to_string(),
@@ -525,6 +527,7 @@ mod tests {
             limit: Some(5),
             top_k: None,
             use_case: "authentication implementation".to_string(),
+            rerank_intent_source: SearchRerankIntentSource::Default,
             starts_with: None,
             ends_with: None,
             query_embedding: None,
