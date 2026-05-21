@@ -187,11 +187,15 @@ async fn main() -> anyhow::Result<()> {
                 publish_approval_boundary: None,
             };
             let profile = compile_quality_profile(artifact).context("compile smoke profile")?;
+            let status_payload = serde_json::to_value(&status)?;
             let event = server.store.append(TraceAppendRequest {
                 project_root,
-                idempotency_key: "smoke-status".to_string(),
+                idempotency_key: format!(
+                    "smoke-status:{}",
+                    forge_quality_runtime::digest_json(&status_payload)?
+                ),
                 event_kind: forge_quality_runtime::TraceEventKind::RuntimeStatus,
-                payload: serde_json::to_value(&status)?,
+                payload: status_payload,
             })?;
             println!(
                 "{}",
