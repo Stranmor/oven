@@ -129,6 +129,9 @@ merge = { version = "0.2", features = ["derive"] }
 hex = "0.4.3"
 rmcp = { version = "0.10.0", features = [
     "client",
+    "server",
+    "macros",
+    "transport-io",
     "transport-sse-client-reqwest",
     "transport-child-process",
     "transport-streamable-http-client-reqwest",

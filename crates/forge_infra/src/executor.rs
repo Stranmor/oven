@@ -22,6 +22,10 @@ use crate::console::StdConsoleWriter;
 const MAX_BACKGROUND_LOG_ENTRIES: usize = 8192;
 const MAX_COMPLETED_PROCESS_ARCHIVE: usize = 128;
 const PROCESS_OBSERVATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
+#[allow(dead_code)]
+const OUTPUT_FINALIZATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
+#[allow(dead_code)]
+const POST_EXIT_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Service for executing shell commands
 pub struct ForgeCommandExecutorService<O = Stdout, E = Stderr> {
@@ -119,6 +123,7 @@ impl ProcessGroupId {
 struct LaunchedProcess {
     process_id: ProcessId,
     child: Child,
+    process_group_id: ProcessGroupId,
     command: String,
     cwd: String,
     logs: Arc<Mutex<VecDeque<ProcessLogEntry>>>,
@@ -221,22 +226,25 @@ impl LaunchedProcess {
     }
 
     fn start_output(&self) -> ProcessStartOutput {
+        self.process_output(ProcessStatusKind::Running)
+    }
+
+    fn process_output(&self, status: ProcessStatusKind) -> ProcessStartOutput {
         ProcessStartOutput {
             process_id: self.process_id.clone(),
-            status: ProcessStatusKind::Running,
+            status,
             command: self.command.clone(),
             cwd: self.cwd.clone(),
         }
     }
 
-    fn into_managed(self) -> anyhow::Result<ManagedProcess> {
-        let process_group_id = ProcessGroupId::from_child(&self.child)?;
-        Ok(ManagedProcess {
+    fn into_managed(self, status: ProcessStatusKind) -> ManagedProcess {
+        ManagedProcess {
             command: self.command,
             cwd: self.cwd,
             child: self.child,
-            process_group_id,
-            status: ProcessStatusKind::Running,
+            process_group_id: self.process_group_id,
+            status,
             logs: self.logs,
             dropped_before_cursor: self.dropped_before_cursor,
             stdout_task: self.stdout_task,
@@ -244,7 +252,7 @@ impl LaunchedProcess {
             output_finalizing: false,
             output_finalized: false,
             output_finalized_notify: Arc::new(Notify::new()),
-        })
+        }
     }
 }
 
@@ -265,6 +273,17 @@ impl ManagedProcess {
         Option<tokio::task::JoinHandle<()>>,
     ) {
         (self.stdout_task.take(), self.stderr_task.take())
+    }
+
+    #[allow(dead_code)]
+    fn output_tasks_finished(&self) -> bool {
+        self.stdout_task
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+            && self
+                .stderr_task
+                .as_ref()
+                .is_none_or(tokio::task::JoinHandle::is_finished)
     }
 
     fn status(&self, process_id: ProcessId) -> ProcessStatus {
@@ -387,6 +406,7 @@ where
         let mut prepared_command = self.prepare_command(&command, working_dir, env_vars);
         prepared_command.stdin(std::process::Stdio::null());
         let mut child = prepared_command.spawn()?;
+        let process_group_id = ProcessGroupId::from_child(&child)?;
         let logs = Arc::new(Mutex::new(VecDeque::new()));
         let next_cursor = Arc::new(AtomicU64::new(1));
         let dropped_before_cursor = Arc::new(AtomicU64::new(0));
@@ -420,6 +440,7 @@ where
         Ok(LaunchedProcess {
             process_id: Self::next_process_id(),
             child,
+            process_group_id,
             command,
             cwd: working_dir.display().to_string(),
             logs,
@@ -489,7 +510,19 @@ where
 
     async fn register_launched_process(&self, launched: LaunchedProcess) -> anyhow::Result<()> {
         let process_id = launched.process_id.clone();
-        let managed = launched.into_managed()?;
+        let managed = launched.into_managed(ProcessStatusKind::Running);
+        self.processes.lock().await.insert(process_id, managed);
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    async fn register_launched_process_with_status(
+        &self,
+        launched: LaunchedProcess,
+        status: ProcessStatusKind,
+    ) -> anyhow::Result<()> {
+        let process_id = launched.process_id.clone();
+        let managed = launched.into_managed(status);
         self.processes.lock().await.insert(process_id, managed);
         Ok(())
     }
@@ -579,15 +612,30 @@ where
             silent,
             LaunchCaptureMode::ForegroundSnapshot,
         )?;
+        let started_at = Instant::now();
         let status = tokio::time::timeout(handoff_timeout.duration(), launched.child.wait()).await;
         match status {
             Ok(status) => {
                 let status = status?;
-                if let Some(stdout_task) = launched.stdout_task.take() {
-                    stdout_task.await?;
-                }
-                if let Some(stderr_task) = launched.stderr_task.take() {
-                    stderr_task.await?;
+                let remaining_window = handoff_timeout
+                    .duration()
+                    .checked_sub(started_at.elapsed())
+                    .unwrap_or_default();
+                let drain_window = std::cmp::min(remaining_window, POST_EXIT_OUTPUT_DRAIN_TIMEOUT);
+                let output_finalized = try_finalize_output_tasks_within(
+                    &mut launched.stdout_task,
+                    &mut launched.stderr_task,
+                    drain_window,
+                )
+                .await?;
+                if !output_finalized {
+                    return self
+                        .handoff_launched_process(
+                            launched,
+                            ProcessStatusKind::Exited { exit_code: status.code() },
+                            handoff_timeout,
+                        )
+                        .await;
                 }
                 let stdout = Self::snapshot_output(&launched.stdout).await;
                 let stderr = Self::snapshot_output(&launched.stderr).await;
@@ -608,24 +656,36 @@ where
                 })
             }
             Err(_) => {
-                launched.disable_output_mirroring();
-                let process = launched.start_output();
-                launched.disable_foreground_capture().await;
-                let stdout = Self::snapshot_output(&launched.stdout).await;
-                let captured_stderr = Self::snapshot_output(&launched.stderr).await;
-                let stderr = format!(
-                    "{captured_stderr}Command exceeded the {handoff_timeout} second synchronous shell window and is running as managed background process {process_id}. Use process_status and process_read with this process_id to observe it.",
-                    process_id = process.process_id
-                );
-                let command = launched.command.clone();
-                self.register_launched_process(launched).await?;
-
-                Ok(CommandExecutionOutput {
-                    output: CommandOutput { stdout, stderr, exit_code: None, command },
-                    process: Some(process),
-                })
+                self.handoff_launched_process(launched, ProcessStatusKind::Running, handoff_timeout)
+                    .await
             }
         }
+    }
+
+    async fn handoff_launched_process(
+        &self,
+        launched: LaunchedProcess,
+        status: ProcessStatusKind,
+        handoff_timeout: ShellHandoffTimeoutSeconds,
+    ) -> anyhow::Result<CommandExecutionOutput> {
+        let launched = launched;
+        launched.disable_output_mirroring();
+        let process = launched.process_output(status.clone());
+        launched.disable_foreground_capture().await;
+        let stdout = Self::snapshot_output(&launched.stdout).await;
+        let captured_stderr = Self::snapshot_output(&launched.stderr).await;
+        let stderr = format!(
+            "{captured_stderr}Command exceeded the {handoff_timeout} second synchronous shell window or its output streams remained open and is tracked as managed background process {process_id}. Use process_status and process_read with this process_id to observe it.",
+            process_id = process.process_id
+        );
+        let command = launched.command.clone();
+        self.register_launched_process_with_status(launched, status)
+            .await?;
+
+        Ok(CommandExecutionOutput {
+            output: CommandOutput { stdout, stderr, exit_code: None, command },
+            process: Some(process),
+        })
     }
 
     async fn process_status_once(&self, process_id: ProcessId) -> anyhow::Result<ProcessStatus> {
@@ -651,6 +711,9 @@ where
                 drop(processes);
                 notified.await;
                 continue;
+            }
+            if !process.output_tasks_finished() {
+                return Ok(process.status(process_id));
             }
             process.output_finalizing = true;
             let tasks = process.take_output_tasks();
@@ -705,6 +768,16 @@ where
                 drop(processes);
                 notified.await;
                 continue;
+            }
+            if !process.output_tasks_finished() {
+                break (
+                    Arc::clone(&process.logs),
+                    dropped_before_cursor,
+                    process.status.clone(),
+                    None,
+                    None,
+                    None,
+                );
             }
             process.output_finalizing = true;
             let tasks = process.take_output_tasks();
@@ -882,6 +955,36 @@ async fn finalize_output_tasks(
     join_output_tasks(stdout_task, stderr_task).await
 }
 
+async fn try_finalize_output_tasks_within(
+    stdout_task: &mut Option<tokio::task::JoinHandle<()>>,
+    stderr_task: &mut Option<tokio::task::JoinHandle<()>>,
+    timeout: Duration,
+) -> anyhow::Result<bool> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
+    loop {
+        if stdout_task
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+            && stderr_task
+                .as_ref()
+                .is_none_or(tokio::task::JoinHandle::is_finished)
+        {
+            join_output_tasks(stdout_task.take(), stderr_task.take()).await?;
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(std::cmp::min(
+            OUTPUT_FINALIZATION_POLL_INTERVAL,
+            deadline.duration_since(Instant::now()),
+        ))
+        .await;
+    }
+}
+
 #[cfg(unix)]
 async fn kill_child_process_group(
     child: &mut Child,
@@ -1038,7 +1141,7 @@ where
                 process.refresh_status_without_output_join().await?;
                 if matches!(process.status, ProcessStatusKind::Running) {
                     statuses.push(process.status(process_id.clone()));
-                } else if !process.output_finalizing {
+                } else if !process.output_finalizing && process.output_tasks_finished() {
                     process.output_finalizing = true;
                     let (stdout_task, stderr_task) = process.take_output_tasks();
                     terminal_processes.push((process_id.clone(), stdout_task, stderr_task));
@@ -2076,6 +2179,60 @@ mod tests {
         let expected = ("immediate".to_string(), None, Vec::new());
 
         assert_eq!((actual.output.stdout, actual.process, processes), expected);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_execute_command_hands_off_when_parent_exits_but_stdout_pipe_remains_open() {
+        let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
+        let started_at = Instant::now();
+
+        let actual = fixture
+            .execute_command(
+                "(sleep 5) & printf parent-done".to_string(),
+                PathBuf::new().join("."),
+                true,
+                None,
+                ShellHandoffTimeoutSeconds::new(1).unwrap(),
+            )
+            .await
+            .unwrap();
+        let process = actual
+            .process
+            .clone()
+            .expect("open descendant stdout pipe should be handed off");
+        let read_output = fixture
+            .read_process(process.process_id.clone(), ProcessReadCursor::new(0), None)
+            .await
+            .unwrap();
+        let kill_status = fixture.kill_process(process.process_id).await.unwrap();
+
+        assert!(
+            started_at.elapsed() < Duration::from_secs(2),
+            "handoff should not wait for descendant-held stdout EOF"
+        );
+        assert_eq!(actual.output.stdout, "parent-done");
+        assert_eq!(actual.output.exit_code, None);
+        assert_eq!(
+            process.status,
+            ProcessStatusKind::Exited { exit_code: Some(0) }
+        );
+        assert!(
+            actual
+                .output
+                .stderr
+                .contains("output streams remained open")
+        );
+        assert!(
+            read_output
+                .entries
+                .iter()
+                .any(|entry| entry.content.contains("parent-done"))
+        );
+        assert_eq!(
+            kill_status.status,
+            ProcessStatusKind::Exited { exit_code: Some(0) }
+        );
     }
 
     #[tokio::test]

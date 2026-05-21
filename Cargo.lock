@@ -2795,6 +2795,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "forge_quality_runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "hex",
+ "pretty_assertions",
+ "rmcp",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "forge_repo"
 version = "0.1.0"
 dependencies = [
