@@ -42,9 +42,9 @@ pub use commit_boundary::{
     ProjectContextEpisodeAppendOutcome, ProjectContextPackCommit, ProjectContextPackCommitError,
     ProjectContextPackNoWrite, ProjectContextPackNoWriteReason, ProjectContextPackPersistedProof,
     ProjectContextPackReadbackDecision, ProjectContextPackWriteInstruction,
-    ProjectContextReadbackEvidence, ProjectContextReadbackOutcome, ProjectContextReadbackStatus,
-    ProjectContextReadbackSummary, ProjectModelSearchEpisodeInput, ReadRequestsSelected,
-    ReadbackVerified,
+    ProjectContextPersistedEpisodeAppendOutcome, ProjectContextReadbackEvidence,
+    ProjectContextReadbackOutcome, ProjectContextReadbackStatus, ProjectContextReadbackSummary,
+    ProjectModelSearchEpisodeInput, ReadRequestsSelected, ReadbackVerified,
 };
 pub use context_adapter::{
     EvidenceReplayPreviewError, ManifestEvidenceTarget, ProjectModelContextRenderRoot,

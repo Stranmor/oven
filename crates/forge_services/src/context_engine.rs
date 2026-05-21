@@ -33,9 +33,9 @@ use forge_project_model::{
     ExternalFactProductionReport, ExternalFactProductionRequest, ExternalFactProductionStatus,
     NativeLspReferenceProducer, NativeLspReferenceRequest, NativeLspReferenceRequestDerivation,
     ProjectContextCommittedQueryResult, ProjectContextCommittedResultItem,
-    ProjectContextEpisodeAppendFailureReason, ProjectContextEpisodeAppendOutcome,
-    ProjectContextIntegrationIdentity, ProjectContextPackCommit,
-    ProjectContextPackReadbackDecision, ProjectContextPathScope, ProjectContextReadbackOutcome,
+    ProjectContextEpisodeAppendFailureReason, ProjectContextIntegrationIdentity,
+    ProjectContextPackCommit, ProjectContextPackReadbackDecision, ProjectContextPathScope,
+    ProjectContextPersistedEpisodeAppendOutcome, ProjectContextReadbackOutcome,
     ProjectContextReadbackSummary, ProjectContextRerankerBoundary, ProjectContextRerankerReadiness,
     ProjectContextRerankerUnavailableReason, ProjectContextRetrievalOptions,
     ProjectContextRetrievalPhaseStatus, ProjectContextRetrievalPlanningOutcome,
@@ -1463,21 +1463,17 @@ impl<
                 let episode_fingerprint =
                     episode_instruction.episode().provenance.fingerprint.clone();
                 let episode_append = match indexer.append_episode(episode_instruction.episode()) {
-                    Ok(_) => ProjectContextEpisodeAppendOutcome::Appended { episode_fingerprint },
-                    Err(error) => {
-                        let committed = ProjectContextCommittedQueryResult::persisted(
-                            readback_summary,
-                            proof,
-                            ProjectContextEpisodeAppendOutcome::Failed {
-                                reason_code:
-                                    ProjectContextEpisodeAppendFailureReason::EpisodeAppendFailed,
-                            },
-                            result_order,
+                    Ok(_) => {
+                        ProjectContextPersistedEpisodeAppendOutcome::appended(episode_fingerprint)
+                    }
+                    Err(_error) => {
+                        info!(
+                            reason = ?ProjectContextEpisodeAppendFailureReason::EpisodeAppendFailed,
+                            "project-model search episode append failed after context-pack persistence"
                         );
-                        return Err(error.context(format!(
-                            "append project-model search episode; project-model committed query episode append outcome: {:?}",
-                            committed.episode_append()
-                        )));
+                        ProjectContextPersistedEpisodeAppendOutcome::failed(
+                            ProjectContextEpisodeAppendFailureReason::EpisodeAppendFailed,
+                        )
                     }
                 };
                 ProjectContextCommittedQueryResult::persisted(
@@ -1503,7 +1499,15 @@ impl<
         path: PathBuf,
         params: SearchParams<'_>,
     ) -> Result<Vec<Node>> {
-        let (_committed_result, nodes) = self.query_local_workspace_committed(path, params).await?;
+        let (committed_result, nodes) = self.query_local_workspace_committed(path, params).await?;
+        if let forge_project_model::ProjectContextEpisodeAppendOutcome::Failed { reason_code } =
+            committed_result.episode_append()
+        {
+            anyhow::bail!(
+                "append project-model search episode; project-model committed query episode append outcome: {:?}",
+                reason_code
+            );
+        }
         Ok(nodes)
     }
 }
@@ -5306,6 +5310,42 @@ mod tests {
         assert!(actual_error.contains(expected));
         assert!(actual_error.contains(expected_state));
         assert!(!actual_error.contains(forbidden_state));
+        assert_eq!(indexer.list_context_pack_artifacts()?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_workspace_committed_exposes_typed_episode_append_failure_after_pack_write()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        fs::create_dir(local_project_model_dir(&root).join("tool_episodes.jsonl"))?;
+        let setup = ForgeWorkspaceService::new(
+            Arc::new(LocalSearchInfra {
+                cwd: root.clone(),
+                credential: None,
+                workspaces: Vec::new(),
+                remote_search_called: Arc::new(AtomicBool::new(false)),
+                range_read_called: Arc::new(AtomicBool::new(false)),
+                range_read_fails: false,
+            }),
+            Arc::new(NoopDiscovery),
+        );
+        let params = SearchParams::new("build runtime needle", "runtime integration proof")
+            .limit(5usize)
+            .ends_with(vec![".rs".to_string()]);
+
+        let (actual, nodes) = setup
+            .query_local_workspace_committed(root.clone(), params)
+            .await?;
+        let expected = forge_project_model::ProjectContextEpisodeAppendOutcome::Failed {
+            reason_code:
+                forge_project_model::ProjectContextEpisodeAppendFailureReason::EpisodeAppendFailed,
+        };
+        let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
+
+        assert!(!nodes.is_empty());
+        assert_eq!(actual.episode_append(), &expected);
         assert_eq!(indexer.list_context_pack_artifacts()?.len(), 1);
         Ok(())
     }

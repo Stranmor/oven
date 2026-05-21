@@ -52,18 +52,18 @@ impl ProjectContextCommittedQueryResult {
     ///
     /// * `readback` - Redaction-safe summary of executed readback requests.
     /// * `proof` - Persisted proof produced by verified context-pack persistence.
-    /// * `episode_append` - Typed episode append outcome.
+    /// * `episode_append` - Typed persisted-pack episode append outcome.
     /// * `result_order` - Redaction-safe legacy result order metadata.
     pub fn persisted(
         readback: ProjectContextReadbackSummary,
         proof: ProjectContextPackPersistedProof,
-        episode_append: ProjectContextEpisodeAppendOutcome,
+        episode_append: ProjectContextPersistedEpisodeAppendOutcome,
         result_order: Vec<ProjectContextCommittedResultItem>,
     ) -> Self {
         Self {
             readback,
             commit: ProjectContextCommitOutcome::Persisted(proof),
-            episode_append,
+            episode_append: episode_append.into(),
             result_order,
         }
     }
@@ -116,6 +116,54 @@ pub enum ProjectContextEpisodeAppendOutcome {
         /// Stable redaction-safe failure classification.
         reason_code: ProjectContextEpisodeAppendFailureReason,
     },
+}
+
+/// Episode append status that is valid only after a context pack was persisted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProjectContextPersistedEpisodeAppendOutcome {
+    /// Episode append completed successfully.
+    Appended {
+        /// Stable redaction-safe episode fingerprint.
+        episode_fingerprint: String,
+    },
+    /// Episode append failed after the context pack was already persisted.
+    Failed {
+        /// Stable redaction-safe failure classification.
+        reason_code: ProjectContextEpisodeAppendFailureReason,
+    },
+}
+
+impl ProjectContextPersistedEpisodeAppendOutcome {
+    /// Builds a persisted-pack append success outcome.
+    ///
+    /// # Arguments
+    ///
+    /// * `episode_fingerprint` - Stable redaction-safe episode fingerprint.
+    pub fn appended(episode_fingerprint: impl Into<String>) -> Self {
+        Self::Appended { episode_fingerprint: episode_fingerprint.into() }
+    }
+
+    /// Builds a persisted-pack append failure outcome.
+    ///
+    /// # Arguments
+    ///
+    /// * `reason_code` - Stable redaction-safe failure classification.
+    pub fn failed(reason_code: ProjectContextEpisodeAppendFailureReason) -> Self {
+        Self::Failed { reason_code }
+    }
+}
+
+impl From<ProjectContextPersistedEpisodeAppendOutcome> for ProjectContextEpisodeAppendOutcome {
+    fn from(outcome: ProjectContextPersistedEpisodeAppendOutcome) -> Self {
+        match outcome {
+            ProjectContextPersistedEpisodeAppendOutcome::Appended { episode_fingerprint } => {
+                Self::Appended { episode_fingerprint }
+            }
+            ProjectContextPersistedEpisodeAppendOutcome::Failed { reason_code } => {
+                Self::Failed { reason_code }
+            }
+        }
+    }
 }
 
 /// Typed reason that episode append was not attempted.
@@ -1178,14 +1226,35 @@ mod tests {
                 ProjectContextReadbackOutcome::succeeded(&request("main", "src/main.rs")),
             ]),
             setup_proof.clone(),
-            ProjectContextEpisodeAppendOutcome::Appended {
-                episode_fingerprint: "episode-fingerprint".to_string(),
-            },
+            ProjectContextPersistedEpisodeAppendOutcome::appended("episode-fingerprint"),
             vec![ProjectContextCommittedResultItem::new("main", Some(1.0))],
         );
         let expected = ProjectContextCommitOutcome::Persisted(setup_proof);
 
         assert_eq!(actual.commit(), &expected);
+    }
+    #[test]
+    fn committed_persisted_result_requires_persisted_episode_append_outcome() {
+        let setup_pack = pack(vec![evidence("main", "src/main.rs")]);
+        let setup_proof = verified_commit(&setup_pack).persisted_proof(
+            crate::ContextPackArtifactId::new("c".repeat(64)).unwrap(),
+            "context_packs/proof.json",
+        );
+        let actual = ProjectContextCommittedQueryResult::persisted(
+            ProjectContextReadbackSummary::from_outcomes(&[
+                ProjectContextReadbackOutcome::succeeded(&request("main", "src/main.rs")),
+            ]),
+            setup_proof,
+            ProjectContextPersistedEpisodeAppendOutcome::failed(
+                ProjectContextEpisodeAppendFailureReason::EpisodeAppendFailed,
+            ),
+            vec![ProjectContextCommittedResultItem::new("main", Some(1.0))],
+        );
+        let expected = ProjectContextEpisodeAppendOutcome::Failed {
+            reason_code: ProjectContextEpisodeAppendFailureReason::EpisodeAppendFailed,
+        };
+
+        assert_eq!(actual.episode_append(), &expected);
     }
 
     fn no_write_reason(
