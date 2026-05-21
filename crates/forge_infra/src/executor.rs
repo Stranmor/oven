@@ -1999,6 +1999,51 @@ mod tests {
         assert!(!marker_path.exists());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_process_kill_after_parent_exit_does_not_block_on_escaped_stdout_holder() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let escaped_pid_path = temp_dir.path().join("escaped-pid");
+        let command = format!(
+            "(setsid sh -c 'printf $$ > \"{}\"; sleep 5') & printf parent-done",
+            escaped_pid_path.display()
+        );
+        let fixture = ForgeCommandExecutorService::new(test_env(), test_printer());
+        let executed = fixture
+            .execute_command(
+                command,
+                temp_dir.path().to_path_buf(),
+                true,
+                None,
+                ShellHandoffTimeoutSeconds::new(1).unwrap(),
+            )
+            .await
+            .unwrap();
+        let process = executed
+            .process
+            .clone()
+            .expect("escaped stdout holder should keep output task open");
+
+        let actual = tokio::time::timeout(
+            Duration::from_millis(500),
+            fixture.kill_process(process.process_id),
+        )
+        .await;
+        if actual.is_err()
+            && let Ok(pid) = std::fs::read_to_string(&escaped_pid_path)
+        {
+            let _ = std::process::Command::new("kill")
+                .arg("-KILL")
+                .arg(pid.trim())
+                .status();
+        }
+
+        assert!(
+            actual.is_ok(),
+            "kill_process should not wait forever for output EOF after the tracked parent has exited"
+        );
+    }
+
     #[tokio::test]
     async fn test_execute_command_timeout_handoff_preserves_single_process_side_effects() {
         let temp_dir = tempfile::tempdir().unwrap();
