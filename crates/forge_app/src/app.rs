@@ -802,7 +802,11 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
         let mut diagnostic = Self::retrieval_plan_diagnostic_to_domain(
             ProjectContextRetrievalPlanDiagnostic::from_outcome(&outcome),
         );
-        diagnostic.rerank_runtime = rerank_runtime;
+        if let Some(rerank_runtime) = rerank_runtime {
+            diagnostic.phase_diagnostics.rerank =
+                rerank_runtime.project_phase_status(diagnostic.rerank_intent_len);
+            diagnostic.rerank_runtime = Some(rerank_runtime);
+        }
         Some(diagnostic)
     }
 
@@ -5771,24 +5775,66 @@ mod tests {
         let actual = actual
             .retrieval_plan_diagnostics
             .first()
-            .and_then(|diagnostic| diagnostic.rerank_runtime.clone())
+            .expect("retrieval plan diagnostic should be present");
+        let actual_runtime = actual
+            .rerank_runtime
+            .clone()
             .expect("rerank runtime diagnostic should be present");
         let expected = (
             WorkspaceRerankRuntimeState::ConfiguredReady,
             true,
+            WorkspaceRetrievalPhaseStatus::Active { result_count: 0 },
+            false,
             0usize,
             1usize,
         );
 
         assert_eq!(
             (
-                actual.state,
-                actual.rerank_available,
+                actual_runtime.state,
+                actual_runtime.rerank_available,
+                actual.phase_diagnostics.rerank.clone(),
+                matches!(
+                    actual.phase_diagnostics.rerank,
+                    WorkspaceRetrievalPhaseStatus::Unavailable {
+                        reason: WorkspaceRetrievalPhaseUnavailableReason::MissingReranker
+                    }
+                ),
                 fake_reranker_calls.load(Ordering::SeqCst),
                 setup.rerank_runtime_diagnostic_calls(),
             ),
             expected,
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_context_reranker_runtime_configured_not_ready_projects_phase_not_ready()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root);
+        setup
+            .set_rerank_runtime(WorkspaceRerankRuntimeDiagnostic::configured_not_ready(
+                "project-context-offline-rerank",
+                "offline-rerank-score-artifact",
+                OfflineRerankScoreArtifactReadinessIssue::ArtifactUnreadable,
+            ))
+            .await;
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
+
+        let actual = ProjectContextInjection::new(setup, agent)
+            .explain(Some("find automatic injection needle".to_string()))
+            .await;
+        let actual = actual
+            .retrieval_plan_diagnostics
+            .first()
+            .expect("retrieval plan diagnostic should be present");
+        let expected = WorkspaceRetrievalPhaseStatus::Unavailable {
+            reason: WorkspaceRetrievalPhaseUnavailableReason::RerankerNotReady,
+        };
+
+        assert_eq!(actual.phase_diagnostics.rerank, expected);
         Ok(())
     }
 
@@ -5805,11 +5851,27 @@ mod tests {
         let actual = actual
             .retrieval_plan_diagnostics
             .first()
-            .and_then(|diagnostic| diagnostic.rerank_runtime.clone())
+            .expect("retrieval plan diagnostic should be present");
+        let actual_runtime = actual
+            .rerank_runtime
+            .clone()
             .expect("rerank runtime diagnostic should be present");
-        let expected = (WorkspaceRerankRuntimeState::MissingConfig, false);
+        let expected = (
+            WorkspaceRerankRuntimeState::MissingConfig,
+            false,
+            WorkspaceRetrievalPhaseStatus::Unavailable {
+                reason: WorkspaceRetrievalPhaseUnavailableReason::MissingReranker,
+            },
+        );
 
-        assert_eq!((actual.state, actual.rerank_available), expected);
+        assert_eq!(
+            (
+                actual_runtime.state,
+                actual_runtime.rerank_available,
+                actual.phase_diagnostics.rerank.clone(),
+            ),
+            expected,
+        );
         Ok(())
     }
 

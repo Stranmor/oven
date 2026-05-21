@@ -491,6 +491,38 @@ impl WorkspaceRerankRuntimeDiagnostic {
         }
     }
 
+    /// Projects runtime selector metadata into a read-only rerank phase status.
+    ///
+    /// # Arguments
+    ///
+    /// * `rerank_intent_len` - Normalized selected rerank intent length from the pure planner.
+    pub fn project_phase_status(
+        &self,
+        rerank_intent_len: Option<usize>,
+    ) -> WorkspaceRetrievalPhaseStatus {
+        if rerank_intent_len.is_none_or(|len| len == 0) {
+            return WorkspaceRetrievalPhaseStatus::Skipped {
+                reason: WorkspaceRetrievalPhaseSkipReason::EmptyRerankIntent,
+            };
+        }
+
+        match self.state {
+            WorkspaceRerankRuntimeState::MissingConfig => {
+                WorkspaceRetrievalPhaseStatus::Unavailable {
+                    reason: WorkspaceRetrievalPhaseUnavailableReason::MissingReranker,
+                }
+            }
+            WorkspaceRerankRuntimeState::ConfiguredNotReady { .. } => {
+                WorkspaceRetrievalPhaseStatus::Unavailable {
+                    reason: WorkspaceRetrievalPhaseUnavailableReason::RerankerNotReady,
+                }
+            }
+            WorkspaceRerankRuntimeState::ConfiguredReady => {
+                WorkspaceRetrievalPhaseStatus::Active { result_count: 0 }
+            }
+        }
+    }
+
     /// Creates the missing-config diagnostic state.
     pub fn missing_config() -> Self {
         Self {
@@ -1152,7 +1184,28 @@ pub struct WorkspaceContextExplanation {
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
+
     use super::*;
+
+    #[test]
+    fn workspace_rerank_runtime_phase_projection_skips_empty_intent() {
+        let fixture = WorkspaceRerankRuntimeDiagnostic::configured_ready(
+            "project-context-offline-rerank",
+            "offline-rerank-score-artifact",
+        );
+
+        let actual = (
+            fixture.project_phase_status(None),
+            fixture.project_phase_status(Some(0)),
+        );
+        let expected_status = WorkspaceRetrievalPhaseStatus::Skipped {
+            reason: WorkspaceRetrievalPhaseSkipReason::EmptyRerankIntent,
+        };
+        let expected = (expected_status.clone(), expected_status);
+
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn workspace_context_explanation_deserializes_legacy_payload_without_replay_preview() {
