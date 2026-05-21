@@ -975,22 +975,28 @@ pub fn digest_json<T: Serialize>(value: &T) -> QualityResult<String> {
 }
 
 pub fn redact_secrets(value: &mut serde_json::Value) {
+    redact_secrets_for_key(None, value);
+}
+
+fn redact_secrets_for_key(parent_key: Option<&str>, value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
             for (key, child) in map.iter_mut() {
                 if is_secret_key(key) || is_secret_value_for_key(key, child) {
                     *child = serde_json::Value::String(SECRET_REDACTION.to_string());
                 } else {
-                    redact_secrets(child);
+                    redact_secrets_for_key(Some(key), child);
                 }
             }
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                redact_secrets(item);
+                redact_secrets_for_key(parent_key, item);
             }
         }
-        serde_json::Value::String(text) if looks_like_secret(text) => {
+        serde_json::Value::String(text)
+            if !parent_key.is_some_and(is_safe_digest_key) && looks_like_secret(text) =>
+        {
             *value = serde_json::Value::String(SECRET_REDACTION.to_string());
         }
         _ => {}
@@ -998,21 +1004,30 @@ pub fn redact_secrets(value: &mut serde_json::Value) {
 }
 
 pub fn reject_secrets(value: &serde_json::Value) -> QualityResult<()> {
+    reject_secrets_for_key(None, value)
+}
+
+fn reject_secrets_for_key(
+    parent_key: Option<&str>,
+    value: &serde_json::Value,
+) -> QualityResult<()> {
     match value {
         serde_json::Value::Object(map) => {
             for (key, child) in map {
                 if is_secret_key(key) || is_secret_value_for_key(key, child) {
                     return Err(QualityError::SecretRejected);
                 }
-                reject_secrets(child)?;
+                reject_secrets_for_key(Some(key), child)?;
             }
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                reject_secrets(item)?;
+                reject_secrets_for_key(parent_key, item)?;
             }
         }
-        serde_json::Value::String(text) if looks_like_secret(text) => {
+        serde_json::Value::String(text)
+            if !parent_key.is_some_and(is_safe_digest_key) && looks_like_secret(text) =>
+        {
             return Err(QualityError::SecretRejected);
         }
         _ => {}
@@ -1139,11 +1154,21 @@ fn is_secret_key(key: &str) -> bool {
 }
 
 fn is_secret_value_for_key(key: &str, value: &serde_json::Value) -> bool {
-    if is_safe_digest_key(key) {
+    if is_safe_digest_key(key) && is_scalar_digest_like_value(value) {
         false
     } else {
         matches!(value, serde_json::Value::String(text) if looks_like_secret(text))
     }
+}
+
+fn is_scalar_digest_like_value(value: &serde_json::Value) -> bool {
+    matches!(
+        value,
+        serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_)
+    )
 }
 
 fn is_safe_digest_key(key: &str) -> bool {

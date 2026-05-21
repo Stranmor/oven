@@ -390,6 +390,36 @@ fn trace_detects_digest_tampering() {
 }
 
 #[test]
+fn trace_rejects_truncated_malformed_jsonl() {
+    let temp = TempDir::new().expect("tempdir should be created");
+    let trace_dir = temp.path().join("trace");
+    let store = TraceStore::new(TraceStoreConfig {
+        project_root: temp.path().to_path_buf(),
+        trace_dir: trace_dir.clone(),
+    })
+    .expect("trace store should initialize");
+    store
+        .append(TraceAppendRequest {
+            project_root: temp.path().to_path_buf(),
+            idempotency_key: "malformed".to_string(),
+            event_kind: TraceEventKind::RuntimeStatus,
+            payload: json!({"status":"ok"}),
+        })
+        .expect("append should work");
+    fs::write(
+        trace_dir.join("quality-trace.jsonl"),
+        "{\"schema_version\":1",
+    )
+    .expect("malformed trace write should work");
+    assert!(matches!(
+        store
+            .read_all()
+            .expect_err("malformed trace record must fail closed"),
+        QualityError::Json(_)
+    ));
+}
+
+#[test]
 fn trace_rejects_secret_nested_under_digest_like_key() {
     let payload = json!({
         "evidence_id": {
