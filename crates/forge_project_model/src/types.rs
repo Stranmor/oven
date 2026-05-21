@@ -1535,6 +1535,7 @@ pub struct RerankCandidate {
 
 /// Reranked candidate score returned by a typed reranker implementation.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RerankScore {
     /// Candidate identifier.
     pub id: String,

@@ -33,6 +33,7 @@ use forge_project_model::{
     EvidenceReplayScoreKind, ExternalFactArtifactIngestionReport, ExternalFactIngestionIssue,
     ExternalFactProductionReport, ExternalFactProductionRequest, ExternalFactProductionStatus,
     NativeLspReferenceProducer, NativeLspReferenceRequest, NativeLspReferenceRequestDerivation,
+    OfflineRerankScoreArtifact, OfflineRerankScoreArtifactReranker,
     ProjectContextCommittedQueryResult, ProjectContextCommittedResultItem,
     ProjectContextEpisodeAppendFailureReason, ProjectContextIntegrationIdentity,
     ProjectContextPackCommit, ProjectContextPackReadbackDecision, ProjectContextPathScope,
@@ -42,12 +43,13 @@ use forge_project_model::{
     ProjectContextRetrievalPhaseStatus, ProjectContextRetrievalPlanningOutcome,
     ProjectContextRetrievalRequest, ProjectContextVectorIndexBoundary,
     ProjectContextVectorReadiness, ProjectContextVectorUnavailableReason, ProjectIndexer,
-    ProjectModelContextRenderBudget, ProjectModelSearchEpisodeInput, ReadRequestsSelected,
-    ReplayActivationCaps, ReplayActivationRequest, RustAnalyzerBounds, RustAnalyzerCapability,
-    RustAnalyzerCapabilityProbe, RustAnalyzerCapabilityStatus, RustAnalyzerProbe,
-    StdRustAnalyzerProcess, VectorIndexArtifact, VectorIndexArtifactId, VectorIndexEntry,
-    VectorQuery, activate_evidence_ledger_replay, derive_native_lsp_reference_request, fingerprint,
-    load_evidence_ledger_activation, local_project_model_dir, local_project_model_manifest,
+    ProjectManifest, ProjectModelContextRenderBudget, ProjectModelSearchEpisodeInput,
+    ReadRequestsSelected, ReplayActivationCaps, ReplayActivationRequest, RustAnalyzerBounds,
+    RustAnalyzerCapability, RustAnalyzerCapabilityProbe, RustAnalyzerCapabilityStatus,
+    RustAnalyzerProbe, StdRustAnalyzerProcess, VectorIndexArtifact, VectorIndexArtifactId,
+    VectorIndexEntry, VectorQuery, activate_evidence_ledger_replay,
+    derive_native_lsp_reference_request, fingerprint, load_evidence_ledger_activation,
+    local_project_model_dir, local_project_model_manifest,
     plan_project_context_retrieval_with_options, read_exact_fact_status,
     redaction_safe_issue_path_label, redaction_safe_provenance_source_label,
     redaction_safe_replay_path_label, render_project_model_context,
@@ -189,6 +191,43 @@ impl ProjectContextRuntimeRerankerSelector for ProductionProjectContextRuntimeRe
                 }
             }
         }
+    }
+}
+
+/// Service-side reader for an explicitly configured local offline rerank-score artifact.
+#[derive(Clone, Debug, Default)]
+pub struct OfflineRerankScoreArtifactReader;
+
+impl OfflineRerankScoreArtifactReader {
+    /// Reads a validated local offline rerank-score artifact into a synchronous reranker adapter.
+    ///
+    /// # Arguments
+    ///
+    /// * `manifest` - Current project manifest used to reject stale artifacts.
+    /// * `artifact_path` - Explicit local artifact path supplied by configuration or tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the artifact cannot be read, parsed, or validated for the manifest.
+    pub fn read_ready_reranker(
+        &self,
+        manifest: &ProjectManifest,
+        artifact_path: &Path,
+    ) -> Result<OfflineRerankScoreArtifactReranker> {
+        let content = fs::read_to_string(artifact_path).with_context(|| {
+            format!(
+                "failed to read offline rerank score artifact at {}",
+                artifact_path.display()
+            )
+        })?;
+        let artifact: OfflineRerankScoreArtifact =
+            serde_json::from_str(&content).with_context(|| {
+                format!(
+                    "failed to parse offline rerank score artifact at {}",
+                    artifact_path.display()
+                )
+            })?;
+        OfflineRerankScoreArtifactReranker::new(manifest, artifact)
     }
 }
 
@@ -2606,7 +2645,7 @@ mod tests {
         ExactFactArtifactStoreState, ExactFactStatus, ExactFactStatusReport, ExternalFactBatch,
         ExternalFactBatchMetadata, ExternalFactIngestionIssueCode, ExternalFactProductionReport,
         ExternalFactProductionStatus, ExternalFactSource, FreshnessState, GraphEdgeKind,
-        NativeLspReferenceRequest, Provenance, RetrievalQuery, RustAnalyzerCapability,
+        NativeLspReferenceRequest, Provenance, Reranker, RetrievalQuery, RustAnalyzerCapability,
         RustAnalyzerCapabilityStatus, RustAnalyzerProbe, StaleEvidencePolicy, SymbolKind,
         ToolEpisode, TypedExternalFacts, TypedExternalReferenceFact, TypedExternalSymbolFact,
         VectorIndexArtifact, external_fact_artifact_fingerprint, external_fact_batch_fingerprint,
@@ -3208,6 +3247,52 @@ mod tests {
         let setup = ProjectIndexer::new(root, local_project_model_dir(root));
         let manifest = setup.index()?;
         setup.write_manifest(&manifest)
+    }
+
+    fn fixture_offline_rerank_candidates() -> Vec<forge_project_model::RerankCandidate> {
+        vec![
+            forge_project_model::RerankCandidate {
+                id: "candidate-a".to_string(),
+                text: "runtime needle candidate".to_string(),
+            },
+            forge_project_model::RerankCandidate {
+                id: "candidate-b".to_string(),
+                text: "other candidate".to_string(),
+            },
+        ]
+    }
+
+    fn fixture_offline_rerank_artifact(
+        manifest: &ProjectManifest,
+    ) -> Result<OfflineRerankScoreArtifact> {
+        let candidates = fixture_offline_rerank_candidates();
+        let key = forge_project_model::OfflineRerankScoreKey::from_request(
+            manifest,
+            "runtime reranker proof",
+            &candidates,
+            forge_project_model::OfflineRerankProducerIdentity::new(
+                "offline-cache-fixture",
+                "model-v1",
+            ),
+            forge_project_model::OfflineRerankOrderingPolicy::InputOrder,
+            forge_project_model::OfflineRerankTopKScope::new(Some(candidates.len())),
+        );
+        OfflineRerankScoreArtifact::new(
+            key,
+            vec![
+                forge_project_model::RerankScore { id: "candidate-a".to_string(), score: 7.0 },
+                forge_project_model::RerankScore { id: "candidate-b".to_string(), score: 1.0 },
+            ],
+        )
+    }
+
+    fn write_fixture_offline_rerank_artifact(
+        root: &Path,
+        artifact: &OfflineRerankScoreArtifact,
+    ) -> Result<PathBuf> {
+        let artifact_path = local_project_model_dir(root).join("offline_rerank_scores.json");
+        fs::write(&artifact_path, artifact.to_stable_json()?)?;
+        Ok(artifact_path)
     }
 
     fn write_fixture_vector_index(
@@ -4443,6 +4528,80 @@ mod tests {
         let expected = ("test-runtime-reranker", "ready-sync-cache", 0usize);
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn offline_rerank_score_artifact_reader_returns_ready_adapter_for_exact_artifact() -> Result<()>
+    {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let manifest =
+            ProjectIndexer::new(&root, local_project_model_dir(&root)).read_manifest()?;
+        let artifact = fixture_offline_rerank_artifact(&manifest)?;
+        let artifact_path = write_fixture_offline_rerank_artifact(&root, &artifact)?;
+        let setup = OfflineRerankScoreArtifactReader;
+        let candidates = fixture_offline_rerank_candidates();
+
+        let actual = setup
+            .read_ready_reranker(&manifest, &artifact_path)?
+            .rerank("runtime reranker proof", &candidates)
+            .into_iter()
+            .map(|score| (score.id, score.score as i32))
+            .collect::<Vec<_>>();
+        let expected = vec![
+            ("candidate-a".to_string(), 7i32),
+            ("candidate-b".to_string(), 1i32),
+        ];
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn offline_rerank_score_artifact_reader_rejects_stale_and_corrupt_artifacts() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let manifest =
+            ProjectIndexer::new(&root, local_project_model_dir(&root)).read_manifest()?;
+        let setup = OfflineRerankScoreArtifactReader;
+        let artifact = fixture_offline_rerank_artifact(&manifest)?;
+        let mut stale_key = artifact.key.clone();
+        stale_key.manifest_hash = forge_project_model::fingerprint("stale-manifest");
+        let stale = OfflineRerankScoreArtifact::new(stale_key, artifact.scores.clone())?;
+        let stale_path = write_fixture_offline_rerank_artifact(&root, &stale)?;
+        let corrupt_path =
+            local_project_model_dir(&root).join("corrupt_offline_rerank_scores.json");
+        fs::write(&corrupt_path, "{not-json")?;
+
+        let actual = vec![
+            setup.read_ready_reranker(&manifest, &stale_path).is_err(),
+            setup.read_ready_reranker(&manifest, &corrupt_path).is_err(),
+        ];
+        let expected = vec![true, true];
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn offline_rerank_score_artifact_adapter_returns_no_scores_for_candidate_mismatch() -> Result<()>
+    {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let manifest =
+            ProjectIndexer::new(&root, local_project_model_dir(&root)).read_manifest()?;
+        let artifact = fixture_offline_rerank_artifact(&manifest)?;
+        let artifact_path = write_fixture_offline_rerank_artifact(&root, &artifact)?;
+        let setup =
+            OfflineRerankScoreArtifactReader.read_ready_reranker(&manifest, &artifact_path)?;
+        let mut candidates = fixture_offline_rerank_candidates();
+        candidates[0].text = "changed candidate text".to_string();
+
+        let actual = setup.rerank("runtime reranker proof", &candidates);
+        let expected: Vec<forge_project_model::RerankScore> = Vec::new();
+
+        assert_eq!(actual, expected);
+        Ok(())
     }
 
     #[tokio::test]

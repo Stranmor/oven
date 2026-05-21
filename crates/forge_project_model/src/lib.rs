@@ -12,6 +12,7 @@ mod indexer;
 mod ingestion;
 mod learning;
 mod lexical;
+mod offline_rerank;
 mod policy;
 mod producer;
 mod render;
@@ -99,6 +100,11 @@ pub use learning::{
     LearningReviewState, LearningSourceKind, learning_records_to_graph,
 };
 pub use lexical::{LexicalIndex, documents_from_manifest};
+pub use offline_rerank::{
+    OFFLINE_RERANK_SCORE_ARTIFACT_VERSION, OfflineRerankOrderingPolicy,
+    OfflineRerankProducerIdentity, OfflineRerankScoreArtifact, OfflineRerankScoreArtifactReranker,
+    OfflineRerankScoreKey, OfflineRerankTopKScope,
+};
 pub use policy::{
     ProjectContextTarget, TargetResolutionBudget, directory_path_filter, local_project_model_dir,
     local_project_model_external_fact_report, local_project_model_manifest, mentioned_paths,
