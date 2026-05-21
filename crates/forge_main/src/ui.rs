@@ -90,8 +90,11 @@ enum GoalSlashAction {
 
 impl GoalSlashAction {
     fn from_args(args: Vec<String>) -> Self {
-        let first = args.first().map(String::as_str);
-        match first {
+        if !args.is_empty() && args.len() != 1 {
+            return Self::Set(args.join(" ").trim().to_string());
+        }
+
+        match args.first().map(String::as_str) {
             None | Some("") | Some("view") => Self::View,
             Some("pause") => Self::Pause,
             Some("resume") => Self::Resume,
@@ -7034,6 +7037,14 @@ mod tests {
             notifier.notified().now_or_never().is_some(),
         );
         let expected = (true, 1, 1, 0, false, false);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_goal_slash_action_treats_multi_token_lifecycle_keyword_as_objective() {
+        let fixture = vec!["clear".to_string(), "release".to_string(), "blockers".to_string()];
+        let actual = GoalSlashAction::from_args(fixture);
+        let expected = GoalSlashAction::Set("clear release blockers".to_string());
         assert_eq!(actual, expected);
     }
 
