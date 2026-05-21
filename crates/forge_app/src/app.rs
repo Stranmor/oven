@@ -5875,7 +5875,7 @@ mod tests {
         ProjectContextInjection::new(setup.clone(), agent)
             .inject(conversation)
             .await;
-        let actual = setup.workspace_queries.load(Ordering::SeqCst);
+        let actual = setup.committed_workspace_queries.load(Ordering::SeqCst);
         let expected = 1usize;
 
         assert_eq!(actual, expected);
