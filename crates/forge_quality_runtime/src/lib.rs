@@ -859,7 +859,9 @@ pub fn evaluate_release(
 
         if result.evidence.is_empty()
             || result.evidence.iter().any(|evidence| {
-                evidence_is_stale(evidence, now) || evidence.digest.trim().is_empty()
+                evidence_is_stale(evidence, now)
+                    || evidence.digest.trim().is_empty()
+                    || evidence.artifact_hash != profile.artifact.artifact_hash
             })
         {
             blockers.push(blocker(
@@ -884,6 +886,15 @@ pub fn evaluate_release(
         }
 
         for dimension in &required_gate.dimensions {
+            if result.dimensions_not_checked.contains(dimension)
+                || !result.checked_dimensions.contains(dimension)
+            {
+                blockers.push(blocker(
+                    ReleaseBlockerCode::UntestedRequiredDimension,
+                    format!("dimension '{dimension:?}' was declared not checked"),
+                ));
+                continue;
+            }
             match verdict.dimensions.get(dimension) {
                 Some(GateStatus::Pass) => {
                     passed_dimensions.insert(dimension.clone());
@@ -969,7 +980,7 @@ pub fn redact_secrets(value: &mut serde_json::Value) {
             for (key, child) in map.iter_mut() {
                 if is_secret_key(key) || is_secret_value_for_key(key, child) {
                     *child = serde_json::Value::String(SECRET_REDACTION.to_string());
-                } else if !is_safe_digest_key(key) {
+                } else {
                     redact_secrets(child);
                 }
             }
@@ -993,9 +1004,7 @@ pub fn reject_secrets(value: &serde_json::Value) -> QualityResult<()> {
                 if is_secret_key(key) || is_secret_value_for_key(key, child) {
                     return Err(QualityError::SecretRejected);
                 }
-                if !is_safe_digest_key(key) {
-                    reject_secrets(child)?;
-                }
+                reject_secrets(child)?;
             }
         }
         serde_json::Value::Array(items) => {

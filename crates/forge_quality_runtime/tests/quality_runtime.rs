@@ -390,6 +390,50 @@ fn trace_detects_digest_tampering() {
 }
 
 #[test]
+fn trace_rejects_secret_nested_under_digest_like_key() {
+    let payload = json!({
+        "evidence_id": {
+            "api_token": "sk-secret-value-that-must-not-survive"
+        }
+    });
+    assert_eq!(
+        reject_secrets(&payload)
+            .expect_err("nested secrets under id/digest-like keys must be rejected"),
+        QualityError::SecretRejected
+    );
+}
+
+#[test]
+fn release_blocks_required_dimension_declared_not_checked_by_gate_result() {
+    let profile = compile(ArtifactClass::CodeMcpToolSurface);
+    let mut results = passing_results(&profile);
+    let first = first_result_mut(&mut results);
+    let dimension = first
+        .checked_dimensions
+        .iter()
+        .next()
+        .expect("gate should have a checked dimension")
+        .clone();
+    first.checked_dimensions.remove(&dimension);
+    first.dimensions_not_checked.insert(dimension);
+    let decision = evaluate(&profile, &results);
+    assert!(blocker_codes(&decision).contains(&ReleaseBlockerCode::UntestedRequiredDimension));
+}
+
+#[test]
+fn release_blocks_evidence_for_different_artifact_hash() {
+    let profile = compile(ArtifactClass::CodeMcpToolSurface);
+    let mut results = passing_results(&profile);
+    first_result_mut(&mut results)
+        .evidence
+        .first_mut()
+        .expect("gate should have evidence")
+        .artifact_hash = digest_text("different-artifact");
+    let decision = evaluate(&profile, &results);
+    assert!(blocker_codes(&decision).contains(&ReleaseBlockerCode::StaleOrMissingEvidence));
+}
+
+#[test]
 fn trace_rejects_excessive_payload_size() {
     let oversized = "x".repeat(MAX_PAYLOAD_BYTES.saturating_add(1));
     assert_eq!(
