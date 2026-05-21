@@ -547,7 +547,7 @@ mod tests {
             })
             .expect("goal context should be injected");
         let actual = goal_message.content().unwrap();
-        let expected = "<conversation_goal\n  status=\"active\"\n><objective>finish the slice</objective>\n</conversation_goal>";
+        let expected = "<conversation_goal\n  status=\"active\"\n>\n<objective>finish the slice</objective>\n</conversation_goal>";
         assert_eq!(actual, expected);
     }
 
