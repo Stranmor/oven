@@ -8,7 +8,7 @@ fn repo_root() -> PathBuf {
 }
 
 fn workflow_text(path: &str) -> String {
-    fs::read_to_string(repo_root().join(path)).unwrap()
+    fs::read_to_string(repo_root().join(path)).expect("workflow file should be readable")
 }
 
 fn assert_workflow_is_read_only_dispatch(path: &str) {

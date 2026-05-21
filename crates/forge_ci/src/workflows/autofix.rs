@@ -23,11 +23,15 @@ pub fn generate_autofix_workflow() {
         .add_step(
             Step::new("Cargo Clippy String Safety").run(jobs::clippy_string_safety_cmd(false)),
         )
-        .add_step(Step::new("Autofix").uses(
-            "autofix-ci",
-            "action",
-            "7a166d7532b277f34e16238930461bf77f9d7ed8",
-        ));
+        .add_step(
+            Step::new("Autofix")
+                .uses(
+                    "autofix-ci",
+                    "action",
+                    "7a166d7532b277f34e16238930461bf77f9d7ed8",
+                )
+                .continue_on_error(true),
+        );
 
     let events = Event::default()
         .push(Push::default().add_branch("main"))

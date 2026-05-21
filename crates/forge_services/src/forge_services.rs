@@ -98,9 +98,16 @@ pub struct ForgeServices<
     infra: Arc<F>,
 }
 
-fn production_project_context_runtime_reranker_selector()
--> Arc<ProductionProjectContextRuntimeRerankerSelector> {
-    Arc::new(ProductionProjectContextRuntimeRerankerSelector::default())
+fn production_project_context_runtime_reranker_selector(
+    root: &std::path::Path,
+    config: Option<&forge_config::ForgeConfig>,
+) -> Arc<ProductionProjectContextRuntimeRerankerSelector> {
+    Arc::new(match config {
+        Some(config) => {
+            ProductionProjectContextRuntimeRerankerSelector::from_forge_config(root, config)
+        }
+        None => ProductionProjectContextRuntimeRerankerSelector::default(),
+    })
 }
 
 impl<
@@ -157,10 +164,15 @@ impl<
         let policy_service = ForgePolicyService::new(infra.clone());
         let provider_auth_service = ForgeProviderAuthService::new(infra.clone());
         let discovery = Arc::new(FdDefault::new(infra.clone()));
+        let environment = infra.get_environment();
+        let config = infra.get_config().ok();
         let workspace_service = Arc::new(
             crate::context_engine::ForgeWorkspaceService::new(infra.clone(), discovery)
                 .with_project_context_reranker_selector(
-                    production_project_context_runtime_reranker_selector(),
+                    production_project_context_runtime_reranker_selector(
+                        &environment.cwd,
+                        config.as_ref(),
+                    ),
                 ),
         );
         let skill_service = Arc::new(ForgeSkillFetch::new(infra.clone()));
@@ -436,7 +448,8 @@ mod tests {
 
     #[test]
     fn production_workspace_reranker_selector_wiring_defaults_to_missing() {
-        let setup = production_project_context_runtime_reranker_selector();
+        let setup =
+            production_project_context_runtime_reranker_selector(std::path::Path::new("."), None);
         let actual = matches!(
             setup.select_project_context_reranker(),
             ProjectContextRuntimeRerankerSelection::Missing

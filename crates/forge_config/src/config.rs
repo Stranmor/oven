@@ -162,6 +162,36 @@ pub struct ProviderEntry {
     pub auth_methods: Vec<ProviderAuthMethod>,
 }
 
+/// Local project-context runtime integration configuration.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize, Setters, JsonSchema, Dummy)]
+#[serde(rename_all = "snake_case")]
+#[setters(strip_option)]
+pub struct ProjectContextConfig {
+    /// Optional local offline rerank-score artifact source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline_rerank_score_artifact: Option<OfflineRerankScoreArtifactConfig>,
+}
+
+/// Local offline rerank-score artifact source configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Setters, JsonSchema, Dummy)]
+#[serde(rename_all = "snake_case")]
+#[setters(strip_option)]
+pub struct OfflineRerankScoreArtifactConfig {
+    /// Local filesystem path to the offline rerank-score artifact JSON.
+    pub path: PathBuf,
+}
+
+impl OfflineRerankScoreArtifactConfig {
+    /// Creates an offline rerank-score artifact source config.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Local filesystem path to the artifact JSON.
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
 /// Top-level Forge configuration merged from all sources (defaults, file,
 /// environment).
 #[derive(Default, Debug, Setters, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Dummy)]
@@ -242,6 +272,9 @@ pub struct ForgeConfig {
     /// Default embedding model identity used by agent-facing semantic search.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_embedding_model_id: Option<String>,
+    /// Project-context runtime integration configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_context: Option<ProjectContextConfig>,
     /// Base URL of the Forge services API used for semantic search and
     /// indexing.
     #[serde(default)]
@@ -441,6 +474,26 @@ mod tests {
         EnvVarName, TelegramChatId, TelegramCompletionNotification,
         TelegramCompletionNotificationBackend,
     };
+
+    #[test]
+    fn test_project_context_offline_rerank_artifact_config_deserializes() {
+        let fixture = r#"
+[project_context.offline_rerank_score_artifact]
+path = "/tmp/offline-rerank.json"
+"#;
+
+        let actual = ConfigReader::default()
+            .read_toml(fixture)
+            .build()
+            .expect("config fixture should build");
+        let expected = Some(ProjectContextConfig {
+            offline_rerank_score_artifact: Some(OfflineRerankScoreArtifactConfig::new(
+                "/tmp/offline-rerank.json",
+            )),
+        });
+
+        assert_eq!(actual.project_context, expected);
+    }
 
     #[test]
     fn test_f32_temperature_round_trip() {
