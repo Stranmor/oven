@@ -170,6 +170,9 @@ pub struct ProjectContextConfig {
     /// Optional local offline rerank-score artifact source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offline_rerank_score_artifact: Option<OfflineRerankScoreArtifactConfig>,
+    /// Optional authoritative local durable vector-index artifact source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_index_artifact: Option<VectorIndexArtifactConfig>,
 }
 
 /// Local offline rerank-score artifact source configuration.
@@ -183,6 +186,26 @@ pub struct OfflineRerankScoreArtifactConfig {
 
 impl OfflineRerankScoreArtifactConfig {
     /// Creates an offline rerank-score artifact source config.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Local filesystem path to the artifact JSON.
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+/// Local durable vector-index artifact source configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Setters, JsonSchema, Dummy)]
+#[serde(rename_all = "snake_case")]
+#[setters(strip_option)]
+pub struct VectorIndexArtifactConfig {
+    /// Local filesystem path to the durable vector-index artifact JSON.
+    pub path: PathBuf,
+}
+
+impl VectorIndexArtifactConfig {
+    /// Creates a durable vector-index artifact source config.
     ///
     /// # Arguments
     ///
@@ -480,6 +503,9 @@ mod tests {
         let fixture = r#"
 [project_context.offline_rerank_score_artifact]
 path = "/tmp/offline-rerank.json"
+
+[project_context.vector_index_artifact]
+path = "/tmp/vector-index.json"
 "#;
 
         let actual = ConfigReader::default()
@@ -490,6 +516,7 @@ path = "/tmp/offline-rerank.json"
             offline_rerank_score_artifact: Some(OfflineRerankScoreArtifactConfig::new(
                 "/tmp/offline-rerank.json",
             )),
+            vector_index_artifact: Some(VectorIndexArtifactConfig::new("/tmp/vector-index.json")),
         });
 
         assert_eq!(actual.project_context, expected);

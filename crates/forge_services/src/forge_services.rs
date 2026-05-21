@@ -173,6 +173,11 @@ impl<
                         &environment.cwd,
                         config.as_ref(),
                     ),
+                )
+                .with_project_context_vector_index_artifact_config(
+                    config
+                        .as_ref()
+                        .and_then(|config| config.project_context.as_ref()),
                 ),
         );
         let skill_service = Arc::new(ForgeSkillFetch::new(infra.clone()));

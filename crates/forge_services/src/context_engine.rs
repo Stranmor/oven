@@ -1,14 +1,16 @@
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use forge_app::{CommandInfra, EnvironmentInfra, FileReaderInfra, WalkerInfra, WorkspaceService};
-use forge_config::{ForgeConfig, OfflineRerankScoreArtifactConfig, ProjectContextConfig};
+use forge_config::{
+    ForgeConfig, OfflineRerankScoreArtifactConfig, ProjectContextConfig, VectorIndexArtifactConfig,
+};
 use forge_domain::{
     AuthCredential, AuthDetails, FileChunk, Node, NodeData, NodeId, ProjectSemanticEmbeddingInput,
     ProjectSemanticEmbeddingOutput, ProjectSemanticEmbeddingRequest,
@@ -33,11 +35,12 @@ use forge_project_model::{
     EvidenceReplayContentPolicy, EvidenceReplayFreshnessPolicy, EvidenceReplayIssueCode,
     EvidenceReplayScoreKind, ExternalFactArtifactIngestionReport, ExternalFactIngestionIssue,
     ExternalFactProductionReport, ExternalFactProductionRequest, ExternalFactProductionStatus,
-    NativeLspReferenceProducer, NativeLspReferenceRequest, NativeLspReferenceRequestDerivation,
-    OfflineRerankScoreArtifact, OfflineRerankScoreArtifactReranker,
-    ProjectContextCommittedQueryResult, ProjectContextCommittedResultItem,
-    ProjectContextEpisodeAppendFailureReason, ProjectContextIntegrationIdentity,
-    ProjectContextPackCommit, ProjectContextPackReadbackDecision, ProjectContextPathScope,
+    ManifestFreshnessEvaluation, NativeLspReferenceProducer, NativeLspReferenceRequest,
+    NativeLspReferenceRequestDerivation, OfflineRerankScoreArtifact,
+    OfflineRerankScoreArtifactReranker, ProjectContextCommittedQueryResult,
+    ProjectContextCommittedResultItem, ProjectContextEpisodeAppendFailureReason,
+    ProjectContextIntegrationIdentity, ProjectContextPackCommit,
+    ProjectContextPackReadbackDecision, ProjectContextPathScope,
     ProjectContextPersistedEpisodeAppendOutcome, ProjectContextReadbackOutcome,
     ProjectContextReadbackSummary, ProjectContextRerankerBoundary, ProjectContextRerankerReadiness,
     ProjectContextRerankerUnavailableReason, ProjectContextRetrievalOptions,
@@ -403,6 +406,64 @@ impl OfflineRerankScoreArtifactReader {
             })?;
         OfflineRerankScoreArtifactReranker::new(manifest, artifact)
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConfiguredVectorIndexArtifactSource {
+    path: PathBuf,
+}
+
+impl ConfiguredVectorIndexArtifactSource {
+    fn from_config(config: &VectorIndexArtifactConfig) -> Self {
+        Self { path: config.path.clone() }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfiguredVectorIndexPathState {
+    Rejected,
+    Missing,
+}
+
+fn canonical_configured_vector_index_artifact_path(
+    root: &Path,
+    model_dir: &Path,
+    source: &ConfiguredVectorIndexArtifactSource,
+) -> std::result::Result<PathBuf, ConfiguredVectorIndexPathState> {
+    let path_text = source.path.to_string_lossy();
+    if path_text.contains("://")
+        || source
+            .path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(ConfiguredVectorIndexPathState::Rejected);
+    }
+    let candidate = if source.path.is_absolute() {
+        source.path.clone()
+    } else {
+        root.join(&source.path)
+    };
+    let metadata = match fs::symlink_metadata(&candidate) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ConfiguredVectorIndexPathState::Missing);
+        }
+        Err(_error) => return Err(ConfiguredVectorIndexPathState::Rejected),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ConfiguredVectorIndexPathState::Rejected);
+    }
+    let canonical_scope = model_dir
+        .canonicalize()
+        .map_err(|_error| ConfiguredVectorIndexPathState::Rejected)?;
+    let canonical_path = candidate
+        .canonicalize()
+        .map_err(|_error| ConfiguredVectorIndexPathState::Rejected)?;
+    if !canonical_path.starts_with(canonical_scope) {
+        return Err(ConfiguredVectorIndexPathState::Rejected);
+    }
+    Ok(canonical_path)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1052,6 +1113,7 @@ pub struct ForgeWorkspaceService<F, D, R = MissingProjectContextRuntimeReranker>
     infra: Arc<F>,
     discovery: Arc<D>,
     reranker_selector: Arc<R>,
+    vector_index_artifact_source: Option<ConfiguredVectorIndexArtifactSource>,
     unavailable_reranker: NotReadyProjectContextReranker,
 }
 
@@ -1061,6 +1123,7 @@ impl<F, D, R> Clone for ForgeWorkspaceService<F, D, R> {
             infra: Arc::clone(&self.infra),
             discovery: Arc::clone(&self.discovery),
             reranker_selector: Arc::clone(&self.reranker_selector),
+            vector_index_artifact_source: self.vector_index_artifact_source.clone(),
             unavailable_reranker: self.unavailable_reranker.clone(),
         }
     }
@@ -1074,6 +1137,7 @@ impl<F, D> ForgeWorkspaceService<F, D, MissingProjectContextRuntimeReranker> {
             infra,
             discovery,
             reranker_selector: Arc::new(MissingProjectContextRuntimeReranker),
+            vector_index_artifact_source: None,
             unavailable_reranker: NotReadyProjectContextReranker::default(),
         }
     }
@@ -1093,8 +1157,24 @@ impl<F, D, R> ForgeWorkspaceService<F, D, R> {
             infra: self.infra,
             discovery: self.discovery,
             reranker_selector,
+            vector_index_artifact_source: self.vector_index_artifact_source,
             unavailable_reranker: self.unavailable_reranker,
         }
+    }
+
+    /// Rebuilds the service with the authoritative configured vector-index artifact source.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Optional project-context integration configuration.
+    pub fn with_project_context_vector_index_artifact_config(
+        mut self,
+        config: Option<&ProjectContextConfig>,
+    ) -> Self {
+        self.vector_index_artifact_source = config
+            .and_then(|config| config.vector_index_artifact.as_ref())
+            .map(ConfiguredVectorIndexArtifactSource::from_config);
+        self
     }
 }
 
@@ -1409,6 +1489,14 @@ impl<
         let root = canonicalize_path(path)?;
         let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
         let manifest = indexer.read_manifest()?;
+        if let Some(source) = self.vector_index_artifact_source.as_ref() {
+            return Ok(semantic_injection_readiness_from_configured_source(
+                &indexer,
+                &manifest,
+                embedding_model_id,
+                source,
+            ));
+        }
         Ok(Self::semantic_injection_readiness_from_indexer(
             &indexer,
             &manifest,
@@ -1495,17 +1583,26 @@ impl<
                 });
             }
         };
-        let freshness = match indexer.evaluate_manifest_freshness(&manifest) {
-            Ok(evaluation) if evaluation.can_inject() => WorkspaceContextFreshness::Fresh,
-            Ok(evaluation) if evaluation.state.fresh => WorkspaceContextFreshness::Unknown {
+        let freshness_evaluation = match indexer.evaluate_manifest_freshness(&manifest) {
+            Ok(evaluation) => evaluation,
+            Err(_error) => {
+                return Ok(SemSearchAvailability::Unknown {
+                    reason: SemSearchUnknownReason::ManifestFreshnessUnknown,
+                });
+            }
+        };
+        let freshness = if freshness_evaluation.can_inject() {
+            WorkspaceContextFreshness::Fresh
+        } else if freshness_evaluation.state.fresh {
+            WorkspaceContextFreshness::Unknown {
                 reason: "project-model freshness checked only indexed files; added-file discovery not proven".to_string(),
-            },
-            Ok(evaluation) => WorkspaceContextFreshness::Stale {
-                changed: evaluation.state.changed,
-                deleted: evaluation.state.deleted,
-                added: evaluation.state.added,
-            },
-            Err(error) => WorkspaceContextFreshness::Unknown { reason: error.to_string() },
+            }
+        } else {
+            WorkspaceContextFreshness::Stale {
+                changed: freshness_evaluation.state.changed.clone(),
+                deleted: freshness_evaluation.state.deleted.clone(),
+                added: freshness_evaluation.state.added.clone(),
+            }
         };
         match freshness {
             WorkspaceContextFreshness::Fresh => {}
@@ -1520,7 +1617,15 @@ impl<
                 });
             }
         }
-        sem_search_availability_from_indexer(&indexer, &manifest, embedding_model_id)
+        match self.vector_index_artifact_source.as_ref() {
+            Some(source) => sem_search_availability_from_configured_source(
+                &indexer,
+                &manifest,
+                embedding_model_id,
+                source,
+            ),
+            None => sem_search_availability_from_indexer(&indexer, &manifest, embedding_model_id),
+        }
     }
 
     fn sem_search_diagnostic_for_model(
@@ -1597,8 +1702,10 @@ impl<
         let durable_vector_selection = select_durable_vector_index(
             &indexer,
             &manifest,
+            &freshness,
             semantic_query.as_ref(),
             params.embedding_model_id.as_deref(),
+            self.vector_index_artifact_source.as_ref(),
         );
         if semantic_query.is_some()
             && let Some(reason) = durable_vector_selection.unavailable_reason()
@@ -2073,11 +2180,107 @@ fn sem_search_availability_from_indexer(
     }
 }
 
+fn semantic_injection_readiness_from_configured_source(
+    indexer: &ProjectIndexer,
+    manifest: &forge_project_model::ProjectManifest,
+    embedding_model_id: &str,
+    source: &ConfiguredVectorIndexArtifactSource,
+) -> WorkspaceSemanticInjectionReadiness {
+    let artifact_path = match canonical_configured_vector_index_artifact_path(
+        indexer.root(),
+        indexer.model_dir(),
+        source,
+    ) {
+        Ok(path) => path,
+        Err(ConfiguredVectorIndexPathState::Missing | ConfiguredVectorIndexPathState::Rejected) => {
+            return WorkspaceSemanticInjectionReadiness::VectorIndexCorruptOrNotReady;
+        }
+    };
+    let artifact = match fs::read_to_string(&artifact_path)
+        .ok()
+        .and_then(|json| serde_json::from_str::<VectorIndexArtifact>(&json).ok())
+    {
+        Some(artifact) => artifact,
+        None => return WorkspaceSemanticInjectionReadiness::VectorIndexCorruptOrNotReady,
+    };
+    if artifact.validate(manifest).is_err() {
+        return WorkspaceSemanticInjectionReadiness::VectorIndexCorruptOrNotReady;
+    }
+    if artifact.embedding_model_id != embedding_model_id {
+        return WorkspaceSemanticInjectionReadiness::VectorIndexAbsentOrNoMatch;
+    }
+    match indexer.evaluate_manifest_freshness(manifest) {
+        Ok(freshness) if freshness.can_inject() => {}
+        Ok(_) | Err(_) => {
+            return WorkspaceSemanticInjectionReadiness::VectorIndexCorruptOrNotReady;
+        }
+    }
+    let dimension = artifact.dimension;
+    match forge_project_model::DurableVectorIndex::new(manifest, artifact) {
+        Ok(_index) => WorkspaceSemanticInjectionReadiness::VectorIndexReady { dimension },
+        Err(_error) => WorkspaceSemanticInjectionReadiness::VectorIndexCorruptOrNotReady,
+    }
+}
+
+fn sem_search_availability_from_configured_source(
+    indexer: &ProjectIndexer,
+    manifest: &forge_project_model::ProjectManifest,
+    embedding_model_id: &str,
+    source: &ConfiguredVectorIndexArtifactSource,
+) -> Result<SemSearchAvailability> {
+    let artifact_path = match canonical_configured_vector_index_artifact_path(
+        indexer.root(),
+        indexer.model_dir(),
+        source,
+    ) {
+        Ok(path) => path,
+        Err(ConfiguredVectorIndexPathState::Missing | ConfiguredVectorIndexPathState::Rejected) => {
+            return Ok(SemSearchAvailability::Unknown {
+                reason: SemSearchUnknownReason::VectorArtifactCorruptOrNotReady,
+            });
+        }
+    };
+    let artifact = match fs::read_to_string(&artifact_path)
+        .ok()
+        .and_then(|json| serde_json::from_str::<VectorIndexArtifact>(&json).ok())
+    {
+        Some(artifact) => artifact,
+        None => {
+            return Ok(SemSearchAvailability::Unknown {
+                reason: SemSearchUnknownReason::VectorArtifactCorruptOrNotReady,
+            });
+        }
+    };
+    if artifact.validate(manifest).is_err() {
+        return Ok(SemSearchAvailability::Unknown {
+            reason: SemSearchUnknownReason::VectorArtifactCorruptOrNotReady,
+        });
+    }
+    if artifact.embedding_model_id != embedding_model_id {
+        return Ok(SemSearchAvailability::Unsupported {
+            reason: SemSearchUnsupportedReason::VectorArtifactAbsentOrNoMatch,
+        });
+    }
+    if forge_project_model::DurableVectorIndex::new(manifest, artifact.clone()).is_err() {
+        return Ok(SemSearchAvailability::Unknown {
+            reason: SemSearchUnknownReason::VectorArtifactCorruptOrNotReady,
+        });
+    }
+    Ok(SemSearchAvailability::Ready {
+        workspace_root: indexer.root().to_path_buf(),
+        manifest_hash: manifest.manifest_hash.clone(),
+        vector_artifact_id: artifact.artifact_id()?.to_string(),
+        dimension: artifact.dimension,
+    })
+}
+
 fn select_durable_vector_index(
     indexer: &ProjectIndexer,
     manifest: &forge_project_model::ProjectManifest,
+    freshness: &ManifestFreshnessEvaluation,
     query: Option<&VectorQuery>,
     embedding_model_id: Option<&str>,
+    configured_source: Option<&ConfiguredVectorIndexArtifactSource>,
 ) -> DurableVectorSelection {
     let Some(query) = query else {
         return DurableVectorSelection::unavailable(
@@ -2094,6 +2297,80 @@ fn select_durable_vector_index(
             ProjectContextVectorUnavailableReason::MissingVectorIndex,
         );
     };
+    if let Some(source) = configured_source {
+        return select_configured_durable_vector_index(
+            indexer,
+            manifest,
+            freshness,
+            embedding_model_id,
+            source,
+        );
+    }
+    select_scanned_durable_vector_index(indexer, manifest, embedding_model_id)
+}
+
+fn select_configured_durable_vector_index(
+    indexer: &ProjectIndexer,
+    manifest: &forge_project_model::ProjectManifest,
+    freshness: &ManifestFreshnessEvaluation,
+    embedding_model_id: &str,
+    source: &ConfiguredVectorIndexArtifactSource,
+) -> DurableVectorSelection {
+    let artifact_path = match canonical_configured_vector_index_artifact_path(
+        indexer.root(),
+        indexer.model_dir(),
+        source,
+    ) {
+        Ok(path) => path,
+        Err(ConfiguredVectorIndexPathState::Missing | ConfiguredVectorIndexPathState::Rejected) => {
+            return DurableVectorSelection::unavailable(
+                ProjectContextVectorUnavailableReason::IndexNotReady,
+            );
+        }
+    };
+    let artifact = match fs::read_to_string(&artifact_path)
+        .ok()
+        .and_then(|json| serde_json::from_str::<VectorIndexArtifact>(&json).ok())
+    {
+        Some(artifact) => artifact,
+        None => {
+            return DurableVectorSelection::unavailable(
+                ProjectContextVectorUnavailableReason::IndexNotReady,
+            );
+        }
+    };
+    if artifact.validate(manifest).is_err() {
+        return DurableVectorSelection::unavailable(
+            ProjectContextVectorUnavailableReason::IndexNotReady,
+        );
+    }
+    if artifact.embedding_model_id != embedding_model_id {
+        return DurableVectorSelection::unavailable(
+            ProjectContextVectorUnavailableReason::NoMatchingVectorIndex,
+        );
+    }
+    if !freshness.can_inject() {
+        return DurableVectorSelection::unavailable(
+            ProjectContextVectorUnavailableReason::IndexNotReady,
+        );
+    }
+    let dimension = artifact.dimension;
+    match forge_project_model::DurableVectorIndex::new(manifest, artifact) {
+        Ok(index) => DurableVectorSelection {
+            index: Some(index),
+            readiness: ProjectContextVectorReadiness::Ready { dimension },
+        },
+        Err(_error) => DurableVectorSelection::unavailable(
+            ProjectContextVectorUnavailableReason::IndexNotReady,
+        ),
+    }
+}
+
+fn select_scanned_durable_vector_index(
+    indexer: &ProjectIndexer,
+    manifest: &forge_project_model::ProjectManifest,
+    embedding_model_id: &str,
+) -> DurableVectorSelection {
     let Ok(ids) = indexer.list_vector_indexes() else {
         return DurableVectorSelection::unavailable(
             ProjectContextVectorUnavailableReason::IndexNotReady,
@@ -3535,11 +3812,11 @@ mod tests {
         Ok(artifact_path)
     }
 
-    fn write_fixture_vector_index(
+    fn fixture_vector_index_artifact(
         root: &Path,
         model_id: &str,
         target_symbol: &str,
-    ) -> Result<VectorIndexArtifactId> {
+    ) -> Result<VectorIndexArtifact> {
         let indexer = ProjectIndexer::new(root, local_project_model_dir(root));
         let manifest = indexer.read_manifest()?;
         let symbol = manifest
@@ -3551,10 +3828,302 @@ mod tests {
             &manifest,
             BTreeMap::from([(symbol.id.clone(), vec![1.0, 0.0])]),
         )?;
-        let artifact = VectorIndexArtifact::new(&manifest, model_id, 2, entries)?;
+        VectorIndexArtifact::new(&manifest, model_id, 2, entries)
+    }
+
+    fn write_configured_vector_index_artifact(
+        root: &Path,
+        file_name: &str,
+        artifact: &VectorIndexArtifact,
+    ) -> Result<PathBuf> {
+        let artifact_path = local_project_model_dir(root).join(file_name);
+        fs::write(&artifact_path, artifact.to_stable_json()?)?;
+        Ok(artifact_path)
+    }
+
+    fn write_fixture_vector_index(
+        root: &Path,
+        model_id: &str,
+        target_symbol: &str,
+    ) -> Result<VectorIndexArtifactId> {
+        let indexer = ProjectIndexer::new(root, local_project_model_dir(root));
+        let manifest = indexer.read_manifest()?;
+        let artifact = fixture_vector_index_artifact(root, model_id, target_symbol)?;
         let id = indexer.vector_index_artifact_id(&artifact)?;
         indexer.write_vector_index(&manifest, &artifact)?;
         Ok(id)
+    }
+
+    fn select_fixture_vector_index(
+        root: &Path,
+        artifact_path: Option<PathBuf>,
+        model_id: &str,
+        query_embedding: Vec<f32>,
+    ) -> DurableVectorSelection {
+        let indexer = ProjectIndexer::new(root, local_project_model_dir(root));
+        let manifest = indexer.read_manifest().unwrap();
+        let freshness = indexer.evaluate_manifest_freshness(&manifest).unwrap();
+        let source = artifact_path.map(|path| ConfiguredVectorIndexArtifactSource { path });
+        let query = VectorQuery { embedding: query_embedding };
+        select_durable_vector_index(
+            &indexer,
+            &manifest,
+            &freshness,
+            Some(&query),
+            Some(model_id),
+            source.as_ref(),
+        )
+    }
+
+    fn selection_readiness(selection: &DurableVectorSelection) -> ProjectContextVectorReadiness {
+        selection.readiness
+    }
+
+    #[test]
+    fn configured_vector_artifact_activates_and_bypasses_scan() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let artifact = fixture_vector_index_artifact(&root, "fixture-model", "RuntimeNeedle")?;
+        let artifact_path = write_configured_vector_index_artifact(
+            &root,
+            "configured_vector_index.json",
+            &artifact,
+        )?;
+        let vector_dir = local_project_model_dir(&root).join("vector_indexes");
+        fs::create_dir_all(&vector_dir)?;
+        fs::write(vector_dir.join(format!("{}.json", "0".repeat(64))), "{")?;
+
+        let actual = select_fixture_vector_index(
+            &root,
+            Some(artifact_path),
+            "fixture-model",
+            vec![1.0, 0.0],
+        );
+        let expected = ProjectContextVectorReadiness::Ready { dimension: 2 };
+
+        assert_eq!(selection_readiness(&actual), expected);
+        assert!(actual.boundary().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn configured_missing_vector_artifact_fails_closed_without_scan() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        write_fixture_vector_index(&root, "fixture-model", "RuntimeNeedle")?;
+        let missing_path = local_project_model_dir(&root).join("missing_configured_vector.json");
+
+        let actual =
+            select_fixture_vector_index(&root, Some(missing_path), "fixture-model", vec![1.0, 0.0]);
+        let expected = ProjectContextVectorReadiness::Unavailable(
+            ProjectContextVectorUnavailableReason::IndexNotReady,
+        );
+
+        assert_eq!(selection_readiness(&actual), expected);
+        assert!(actual.boundary().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn configured_stale_vector_artifact_fails_closed_without_scan() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        write_fixture_vector_index(&root, "fixture-model", "RuntimeNeedle")?;
+        let mut artifact = fixture_vector_index_artifact(&root, "fixture-model", "RuntimeNeedle")?;
+        artifact.manifest_hash = forge_project_model::fingerprint("stale-manifest");
+        let artifact_path = write_configured_vector_index_artifact(
+            &root,
+            "stale_configured_vector.json",
+            &artifact,
+        )?;
+
+        let actual = select_fixture_vector_index(
+            &root,
+            Some(artifact_path),
+            "fixture-model",
+            vec![1.0, 0.0],
+        );
+        let expected = ProjectContextVectorReadiness::Unavailable(
+            ProjectContextVectorUnavailableReason::IndexNotReady,
+        );
+
+        assert_eq!(selection_readiness(&actual), expected);
+        assert!(actual.boundary().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn configured_model_mismatch_vector_artifact_fails_closed_without_scan() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        write_fixture_vector_index(&root, "fixture-model", "RuntimeNeedle")?;
+        let artifact = fixture_vector_index_artifact(&root, "other-model", "RuntimeNeedle")?;
+        let artifact_path =
+            write_configured_vector_index_artifact(&root, "model_mismatch_vector.json", &artifact)?;
+
+        let actual = select_fixture_vector_index(
+            &root,
+            Some(artifact_path),
+            "fixture-model",
+            vec![1.0, 0.0],
+        );
+        let expected = ProjectContextVectorReadiness::Unavailable(
+            ProjectContextVectorUnavailableReason::NoMatchingVectorIndex,
+        );
+
+        assert_eq!(selection_readiness(&actual), expected);
+        assert!(actual.boundary().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn configured_dimension_mismatch_vector_artifact_fails_closed() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let mut artifact = fixture_vector_index_artifact(&root, "fixture-model", "RuntimeNeedle")?;
+        artifact.dimension = 3;
+        let artifact_path = write_configured_vector_index_artifact(
+            &root,
+            "dimension_mismatch_vector.json",
+            &artifact,
+        )?;
+
+        let actual = select_fixture_vector_index(
+            &root,
+            Some(artifact_path),
+            "fixture-model",
+            vec![1.0, 0.0],
+        );
+        let expected = ProjectContextVectorReadiness::Unavailable(
+            ProjectContextVectorUnavailableReason::IndexNotReady,
+        );
+
+        assert_eq!(selection_readiness(&actual), expected);
+        assert!(actual.boundary().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn configured_zero_dimension_empty_entries_and_non_finite_vector_fail_closed() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let mut zero_dimension =
+            fixture_vector_index_artifact(&root, "fixture-model", "RuntimeNeedle")?;
+        zero_dimension.dimension = 0;
+        let zero_dimension_path = write_configured_vector_index_artifact(
+            &root,
+            "zero_dimension_vector.json",
+            &zero_dimension,
+        )?;
+        let mut empty_entries =
+            fixture_vector_index_artifact(&root, "fixture-model", "RuntimeNeedle")?;
+        empty_entries.entries.clear();
+        let empty_entries_path = write_configured_vector_index_artifact(
+            &root,
+            "empty_entries_vector.json",
+            &empty_entries,
+        )?;
+        let non_finite = fixture_vector_index_artifact(&root, "fixture-model", "RuntimeNeedle")?;
+        let finite_json = non_finite.to_stable_json()?;
+        assert!(finite_json.contains("1.0"));
+        let non_finite_path = local_project_model_dir(&root).join("non_finite_vector.json");
+        fs::write(&non_finite_path, finite_json.replacen("1.0", "1e999", 1))?;
+
+        let actual = vec![
+            selection_readiness(&select_fixture_vector_index(
+                &root,
+                Some(zero_dimension_path),
+                "fixture-model",
+                vec![1.0, 0.0],
+            )),
+            selection_readiness(&select_fixture_vector_index(
+                &root,
+                Some(empty_entries_path),
+                "fixture-model",
+                vec![1.0, 0.0],
+            )),
+            selection_readiness(&select_fixture_vector_index(
+                &root,
+                Some(non_finite_path),
+                "fixture-model",
+                vec![1.0, 0.0],
+            )),
+        ];
+        let expected = vec![
+            ProjectContextVectorReadiness::Unavailable(
+                ProjectContextVectorUnavailableReason::IndexNotReady,
+            ),
+            ProjectContextVectorReadiness::Unavailable(
+                ProjectContextVectorUnavailableReason::IndexNotReady,
+            ),
+            ProjectContextVectorReadiness::Unavailable(
+                ProjectContextVectorUnavailableReason::IndexNotReady,
+            ),
+        ];
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn configured_corrupt_vector_artifact_fails_closed_without_scan() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        write_fixture_vector_index(&root, "fixture-model", "RuntimeNeedle")?;
+        let corrupt_path = local_project_model_dir(&root).join("corrupt_configured_vector.json");
+        fs::write(&corrupt_path, "{")?;
+
+        let actual =
+            select_fixture_vector_index(&root, Some(corrupt_path), "fixture-model", vec![1.0, 0.0]);
+        let expected = ProjectContextVectorReadiness::Unavailable(
+            ProjectContextVectorUnavailableReason::IndexNotReady,
+        );
+
+        assert_eq!(selection_readiness(&actual), expected);
+        assert!(actual.boundary().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn configured_invalid_vector_artifact_ignores_unrelated_valid_scan() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        write_fixture_vector_index(&root, "fixture-model", "RuntimeNeedle")?;
+        let mut artifact = fixture_vector_index_artifact(&root, "fixture-model", "RuntimeNeedle")?;
+        artifact.entries.clear();
+        let artifact_path = write_configured_vector_index_artifact(
+            &root,
+            "invalid_configured_vector.json",
+            &artifact,
+        )?;
+
+        let actual = select_fixture_vector_index(
+            &root,
+            Some(artifact_path),
+            "fixture-model",
+            vec![1.0, 0.0],
+        );
+        let expected = ProjectContextVectorReadiness::Unavailable(
+            ProjectContextVectorUnavailableReason::IndexNotReady,
+        );
+
+        assert_eq!(selection_readiness(&actual), expected);
+        assert!(actual.boundary().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn vector_config_absent_preserves_existing_scan_behavior() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        write_fixture_vector_index(&root, "fixture-model", "RuntimeNeedle")?;
+
+        let actual = select_fixture_vector_index(&root, None, "fixture-model", vec![1.0, 0.0]);
+        let expected = ProjectContextVectorReadiness::Ready { dimension: 2 };
+
+        assert_eq!(selection_readiness(&actual), expected);
+        assert!(actual.boundary().is_some());
+        Ok(())
     }
 
     #[test]
@@ -4708,6 +5277,7 @@ mod tests {
             offline_rerank_score_artifact: Some(
                 forge_config::OfflineRerankScoreArtifactConfig::new(artifact_path),
             ),
+            vector_index_artifact: None,
         };
         ProductionProjectContextRuntimeRerankerSelector::from_project_context_config(
             root,
@@ -5401,6 +5971,51 @@ mod tests {
         assert!(chunk.0.contains("src/lib.rs"));
         assert!(!remote_search_called.load(Ordering::SeqCst));
         assert!(range_read_called.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_injection_readiness_configured_invalid_vector_ignores_valid_scan() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        write_fixture_vector_index(&root, "fixture-model", "RuntimeNeedle")?;
+        let corrupt_path = local_project_model_dir(&root).join("configured_readiness_corrupt.json");
+        fs::write(&corrupt_path, "{")?;
+        let config = forge_config::ProjectContextConfig {
+            offline_rerank_score_artifact: None,
+            vector_index_artifact: Some(forge_config::VectorIndexArtifactConfig::new(corrupt_path)),
+        };
+        let setup = fixture_sync_service(&root)
+            .with_project_context_vector_index_artifact_config(Some(&config));
+
+        let actual = setup.semantic_injection_readiness_for_model(root, Some("fixture-model"))?;
+        let expected = WorkspaceSemanticInjectionReadiness::VectorIndexCorruptOrNotReady;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn sem_search_availability_configured_invalid_vector_ignores_valid_scan() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        write_fixture_vector_index(&root, "fixture-model", "RuntimeNeedle")?;
+        let corrupt_path =
+            local_project_model_dir(&root).join("configured_availability_corrupt.json");
+        fs::write(&corrupt_path, "{")?;
+        let config = forge_config::ProjectContextConfig {
+            offline_rerank_score_artifact: None,
+            vector_index_artifact: Some(forge_config::VectorIndexArtifactConfig::new(corrupt_path)),
+        };
+        let setup = fixture_sync_service(&root)
+            .with_project_context_vector_index_artifact_config(Some(&config));
+
+        let actual = setup.sem_search_availability_for_model(root, Some("fixture-model"))?;
+        let expected = SemSearchAvailability::Unknown {
+            reason: SemSearchUnknownReason::VectorArtifactCorruptOrNotReady,
+        };
+
+        assert_eq!(actual, expected);
         Ok(())
     }
 
