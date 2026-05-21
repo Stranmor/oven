@@ -291,12 +291,12 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
                 .await;
             let nodes = match self
                 .services
-                .query_workspace(target.workspace_root.clone(), params)
+                .query_workspace_committed(target.workspace_root.clone(), params)
                 .await
             {
-                Ok(nodes) => nodes,
+                Ok((_committed_result, nodes)) => nodes,
                 Err(error) => {
-                    tracing::debug!(error = ?error, path = %target.workspace_root.display(), "Skipping project-model context target because local retrieval failed");
+                    tracing::debug!(error = ?error, path = %target.workspace_root.display(), "Skipping project-model context target because committed local retrieval failed");
                     continue;
                 }
             };
@@ -3130,6 +3130,8 @@ mod tests {
         replay_preview_empty_paths: Vec<PathBuf>,
         captured_context: Mutex<Option<Context>>,
         workspace_queries: AtomicUsize,
+        committed_workspace_queries: AtomicUsize,
+        committed_result: Mutex<Option<ProjectContextCommittedQueryResult>>,
         queried_workspaces: Mutex<Vec<PathBuf>>,
         query_filters: Mutex<Vec<Option<String>>>,
         query_embeddings: Mutex<Vec<Option<Vec<f32>>>>,
@@ -3261,6 +3263,8 @@ mod tests {
                 replay_preview_empty_paths,
                 captured_context: Mutex::new(None),
                 workspace_queries: AtomicUsize::new(0),
+                committed_workspace_queries: AtomicUsize::new(0),
+                committed_result: Mutex::new(None),
                 queried_workspaces: Mutex::new(Vec::new()),
                 query_filters: Mutex::new(Vec::new()),
                 query_embeddings: Mutex::new(Vec::new()),
@@ -3309,6 +3313,10 @@ mod tests {
 
         fn set_embedding_dimension(&self, dimension: usize) {
             self.embedding_dimension.store(dimension, Ordering::SeqCst);
+        }
+
+        async fn set_committed_result(&self, result: ProjectContextCommittedQueryResult) {
+            *self.committed_result.lock().await = Some(result);
         }
     }
 
@@ -3659,15 +3667,22 @@ mod tests {
             path: PathBuf,
             params: SearchParams<'_>,
         ) -> Result<(ProjectContextCommittedQueryResult, Vec<Node>)> {
-            let nodes = self.query_workspace(path, params).await?;
-            Ok((
-                ProjectContextCommittedQueryResult::no_write(
-                    Default::default(),
-                    ProjectContextPackNoWriteReason::EmptyEvidence,
-                    Vec::new(),
-                ),
-                nodes,
-            ))
+            self.committed_workspace_queries
+                .fetch_add(1, Ordering::SeqCst);
+            let nodes = self.fixture_query_workspace_nodes(path, params).await?;
+            let result = self
+                .committed_result
+                .lock()
+                .await
+                .clone()
+                .unwrap_or_else(|| {
+                    ProjectContextCommittedQueryResult::no_write(
+                        Default::default(),
+                        ProjectContextPackNoWriteReason::EmptyEvidence,
+                        Vec::new(),
+                    )
+                });
+            Ok((result, nodes))
         }
 
         async fn query_workspace(
@@ -3676,94 +3691,7 @@ mod tests {
             params: SearchParams<'_>,
         ) -> Result<Vec<Node>> {
             self.workspace_queries.fetch_add(1, Ordering::SeqCst);
-            assert!(params.query.contains("automatic injection needle"));
-            assert_eq!(params.limit, Some(3));
-            self.queried_workspaces.lock().await.push(path.clone());
-            self.query_filters
-                .lock()
-                .await
-                .push(params.starts_with.clone());
-            self.query_embeddings
-                .lock()
-                .await
-                .push(params.query_embedding.clone());
-            if self
-                .error_paths
-                .iter()
-                .any(|error_path| error_path == &path)
-            {
-                anyhow::bail!("fixture query failure for {}", path.display());
-            }
-            if self
-                .empty_paths
-                .iter()
-                .any(|empty_path| empty_path == &path)
-            {
-                return Ok(Vec::new());
-            }
-            if params.query_embedding.is_some() {
-                return Ok(vec![Node {
-                    node_id: NodeId::new("symbol:src/vector_only.rs:SemanticVectorOnlyHit"),
-                    node: NodeData::FileChunk(FileChunk {
-                        file_path: "src/vector_only.rs".to_string(),
-                        content: "pub struct SemanticVectorOnlyHit;".to_string(),
-                        start_line: 7,
-                        end_line: 7,
-                    }),
-                    relevance: Some(0.99),
-                    distance: None,
-                }]);
-            }
-            let file_path = params.starts_with.as_deref().unwrap_or("src/lib.rs");
-            let long_content = (0..40)
-                .map(|index| format!("pub fn long_{index}() -> usize {{ {index} }}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            Ok(vec![
-                Node {
-                    node_id: NodeId::new("symbol:src/lib.rs:automatic_injection_needle"),
-                    node: NodeData::FileChunk(FileChunk {
-                        file_path: file_path.to_string(),
-                        content: "pub fn automatic_injection_needle() -> usize { 42 }".to_string(),
-                        start_line: 3,
-                        end_line: 3,
-                    }),
-                    relevance: Some(0.875),
-                    distance: None,
-                },
-                Node {
-                    node_id: NodeId::new("symbol:src/long.rs:long_block"),
-                    node: NodeData::FileChunk(FileChunk {
-                        file_path: "src/long.rs".to_string(),
-                        content: long_content,
-                        start_line: 10,
-                        end_line: 80,
-                    }),
-                    relevance: Some(0.75),
-                    distance: None,
-                },
-                Node {
-                    node_id: NodeId::new("file:src/full.rs"),
-                    node: NodeData::File(forge_domain::FileNode {
-                        file_path: "src/full.rs".to_string(),
-                        content: "pub fn full_file_should_not_render() {}".repeat(100),
-                        hash: "full-file-hash".to_string(),
-                    }),
-                    relevance: Some(0.5),
-                    distance: None,
-                },
-                Node {
-                    node_id: NodeId::new("symbol:src/extra.rs:extra"),
-                    node: NodeData::FileChunk(FileChunk {
-                        file_path: "src/extra.rs".to_string(),
-                        content: "pub fn extra_should_not_render() {}".to_string(),
-                        start_line: 1,
-                        end_line: 1,
-                    }),
-                    relevance: Some(0.25),
-                    distance: None,
-                },
-            ])
+            self.fixture_query_workspace_nodes(path, params).await
         }
 
         async fn list_workspaces(&self) -> Result<Vec<WorkspaceInfo>> {
@@ -3929,6 +3857,103 @@ mod tests {
         }
     }
 
+    impl ProjectContextHarness {
+        async fn fixture_query_workspace_nodes(
+            &self,
+            path: PathBuf,
+            params: SearchParams<'_>,
+        ) -> Result<Vec<Node>> {
+            assert!(params.query.contains("automatic injection needle"));
+            assert_eq!(params.limit, Some(3));
+            self.queried_workspaces.lock().await.push(path.clone());
+            self.query_filters
+                .lock()
+                .await
+                .push(params.starts_with.clone());
+            self.query_embeddings
+                .lock()
+                .await
+                .push(params.query_embedding.clone());
+            if self
+                .error_paths
+                .iter()
+                .any(|error_path| error_path == &path)
+            {
+                anyhow::bail!("fixture query failure for {}", path.display());
+            }
+            if self
+                .empty_paths
+                .iter()
+                .any(|empty_path| empty_path == &path)
+            {
+                return Ok(Vec::new());
+            }
+            if params.query_embedding.is_some() {
+                return Ok(vec![Node {
+                    node_id: NodeId::new("symbol:src/vector_only.rs:SemanticVectorOnlyHit"),
+                    node: NodeData::FileChunk(FileChunk {
+                        file_path: "src/vector_only.rs".to_string(),
+                        content: "pub struct SemanticVectorOnlyHit;".to_string(),
+                        start_line: 7,
+                        end_line: 7,
+                    }),
+                    relevance: Some(0.99),
+                    distance: None,
+                }]);
+            }
+            let file_path = params.starts_with.as_deref().unwrap_or("src/lib.rs");
+            let long_content = (0..40)
+                .map(|index| format!("pub fn long_{index}() -> usize {{ {index} }}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(vec![
+                Node {
+                    node_id: NodeId::new("symbol:src/lib.rs:automatic_injection_needle"),
+                    node: NodeData::FileChunk(FileChunk {
+                        file_path: file_path.to_string(),
+                        content: "pub fn automatic_injection_needle() -> usize { 42 }".to_string(),
+                        start_line: 3,
+                        end_line: 3,
+                    }),
+                    relevance: Some(0.875),
+                    distance: None,
+                },
+                Node {
+                    node_id: NodeId::new("symbol:src/long.rs:long_block"),
+                    node: NodeData::FileChunk(FileChunk {
+                        file_path: "src/long.rs".to_string(),
+                        content: long_content,
+                        start_line: 10,
+                        end_line: 80,
+                    }),
+                    relevance: Some(0.75),
+                    distance: None,
+                },
+                Node {
+                    node_id: NodeId::new("file:src/full.rs"),
+                    node: NodeData::File(forge_domain::FileNode {
+                        file_path: "src/full.rs".to_string(),
+                        content: "pub fn full_file_should_not_render() {}".repeat(100),
+                        hash: "full-file-hash".to_string(),
+                    }),
+                    relevance: Some(0.5),
+                    distance: None,
+                },
+                Node {
+                    node_id: NodeId::new("symbol:src/extra.rs:extra"),
+                    node: NodeData::FileChunk(FileChunk {
+                        file_path: "src/extra.rs".to_string(),
+                        content: "pub fn extra_should_not_render() {}".to_string(),
+                        start_line: 1,
+                        end_line: 1,
+                    }),
+                    relevance: Some(0.25),
+                    distance: None,
+                },
+            ])
+        }
+    }
+
     #[async_trait::async_trait]
     impl LearningService for ProjectContextHarness {
         async fn capture_candidate_from_conversation(
@@ -4043,6 +4068,102 @@ mod tests {
         let manifest = indexer.index()?;
         indexer.write_manifest(&manifest)?;
         Ok(())
+    }
+
+    fn committed_persisted_episode_failed_result() -> Result<ProjectContextCommittedQueryResult> {
+        let read_request = forge_project_model::ProjectContextReadRequest::new(
+            "src/committed.rs",
+            "committed-node",
+            1,
+            1,
+        )?;
+        let context_pack = forge_project_model::ContextPack {
+            version: 1,
+            manifest_hash: "fixture-manifest".to_string(),
+            evidence: vec![forge_project_model::ContextPackEvidence {
+                id: "committed-node".to_string(),
+                path: "src/committed.rs".to_string(),
+                symbol: None,
+                source: forge_project_model::ContextPackEvidenceSource::RetrievalResult,
+                freshness: forge_project_model::EvidenceFreshness::Fresh,
+                provenance: forge_project_model::Provenance {
+                    path: "src/committed.rs".to_string(),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                    source: "fixture".to_string(),
+                    fingerprint: "fixture-fingerprint".to_string(),
+                },
+                score: 1.0,
+            }],
+            provenance: vec![forge_project_model::Provenance {
+                path: "src/committed.rs".to_string(),
+                start_line: Some(1),
+                end_line: Some(1),
+                source: "fixture".to_string(),
+                fingerprint: "fixture-fingerprint".to_string(),
+            }],
+        };
+        let retrieval_plan = forge_project_model::ProjectContextRetrievalPlan {
+            query_diagnostics: forge_project_model::ProjectContextRetrievalQueryDiagnostics {
+                query_text: Some("committed query".to_string()),
+                path_prefix: None,
+                path_suffixes: Vec::new(),
+                limit: 1,
+                top_k: Some(1),
+                top_k_status: forge_project_model::ProjectContextTopKStatus::Applied {
+                    candidate_count: 1,
+                },
+                use_case: Some("committed use case".to_string()),
+                include_graph_expansion: false,
+                stale_policy: forge_project_model::StaleEvidencePolicy::Reject,
+                freshness_proof_level: forge_project_model::FreshnessProofLevel::FullFilesystem,
+                phase_diagnostics:
+                    forge_project_model::ProjectContextRetrievalPhaseDiagnostics::default(),
+            },
+            selected_results: Vec::new(),
+            context_pack: Some(context_pack),
+            read_requests: vec![read_request.clone()],
+            write_decision:
+                forge_project_model::ProjectContextWriteDecision::WriteContextPackAfterReadback,
+            return_order: Vec::new(),
+        };
+        let replay_activation = forge_project_model::ReplayActivationBoundary {
+            manifest_hash: "fixture-manifest".to_string(),
+            active_refs: Vec::new(),
+            issues: Vec::new(),
+            diagnostics: forge_project_model::ReplayActivationDiagnostics::default(),
+        };
+        let commit = forge_project_model::ProjectContextPackCommit::from_retrieval_plan(
+            &retrieval_plan,
+            replay_activation,
+        )?;
+        let commit = match commit.verify_readbacks(vec![
+            forge_project_model::ProjectContextReadbackOutcome::succeeded(&read_request),
+        ])? {
+            forge_project_model::ProjectContextPackReadbackDecision::Write(commit) => commit,
+            forge_project_model::ProjectContextPackReadbackDecision::NoWrite(_) => {
+                anyhow::bail!("fixture committed query should produce persisted proof")
+            }
+        };
+        let tempdir = tempfile::tempdir()?;
+        let indexer = forge_project_model::ProjectIndexer::new(
+            tempdir.path(),
+            tempdir.path().join(".forge_project_model"),
+        );
+        let proof = indexer.persist_verified_context_pack(&commit)?;
+        Ok(ProjectContextCommittedQueryResult::persisted(
+            forge_project_model::ProjectContextReadbackSummary::from_outcomes(&[
+                forge_project_model::ProjectContextReadbackOutcome::succeeded(&read_request),
+            ]),
+            proof,
+            forge_project_model::ProjectContextPersistedEpisodeAppendOutcome::failed(
+                forge_project_model::ProjectContextEpisodeAppendFailureReason::EpisodeAppendFailed,
+            ),
+            vec![forge_project_model::ProjectContextCommittedResultItem::new(
+                "committed-node",
+                Some(1.0),
+            )],
+        ))
     }
 
     fn fixture_learning_projection(
@@ -4816,7 +4937,11 @@ mod tests {
             .await;
         let expected_workspaces = vec![cwd];
         assert_eq!(*setup.queried_workspaces.lock().await, expected_workspaces);
-        assert_eq!(setup.workspace_queries.load(Ordering::SeqCst), 1usize);
+        assert_eq!(setup.workspace_queries.load(Ordering::SeqCst), 0usize);
+        assert_eq!(
+            setup.committed_workspace_queries.load(Ordering::SeqCst),
+            1usize
+        );
         assert!(actual.context.unwrap().messages.iter().any(|message| {
             message
                 .content()
@@ -4958,6 +5083,45 @@ mod tests {
                 setup.embedding_calls.load(Ordering::SeqCst),
                 setup.query_embeddings.lock().await.clone(),
                 content.contains("automatic_injection_needle"),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_model_context_committed_episode_append_failure_with_nodes_still_injects()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root);
+        setup
+            .set_committed_result(committed_persisted_episode_failed_result()?)
+            .await;
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id.clone());
+        let conversation = Conversation::generate().context(Context::default().add_message(
+            ContextMessage::user("find automatic injection needle", Some(model_id)),
+        ));
+
+        let actual = ProjectContextInjection::new(setup.clone(), agent)
+            .inject(conversation)
+            .await;
+        let content = actual
+            .context
+            .unwrap()
+            .messages
+            .iter()
+            .filter_map(|message| message.content())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let expected = (1usize, 0usize, true, false);
+
+        assert_eq!(
+            (
+                setup.committed_workspace_queries.load(Ordering::SeqCst),
+                setup.workspace_queries.load(Ordering::SeqCst),
+                content.contains("automatic_injection_needle"),
+                content.contains("EpisodeAppendFailed"),
             ),
             expected,
         );
@@ -5284,7 +5448,7 @@ mod tests {
         let actual = ProjectContextInjection::new(setup.clone(), agent)
             .explain(Some("find automatic injection needle".to_string()))
             .await;
-        let expected = (root, true, 1usize, 1usize, None::<String>, 0usize);
+        let expected = (root, true, 1usize, 1usize, None::<String>, 0usize, 0usize);
 
         assert_eq!(
             (
@@ -5294,6 +5458,7 @@ mod tests {
                 actual.selected_targets.len(),
                 actual.skip_reason,
                 setup.workspace_queries.load(Ordering::SeqCst),
+                setup.committed_workspace_queries.load(Ordering::SeqCst),
             ),
             expected
         );
@@ -5314,11 +5479,20 @@ mod tests {
             .retrieval_plan_diagnostics
             .first()
             .expect("explain should include query-specific retrieval plan diagnostic");
-        let expected = (0usize, Vec::<PathBuf>::new(), true, 1usize, true, false);
+        let expected = (
+            0usize,
+            0usize,
+            Vec::<PathBuf>::new(),
+            true,
+            1usize,
+            true,
+            false,
+        );
 
         assert_eq!(
             (
                 setup.workspace_queries.load(Ordering::SeqCst),
+                setup.committed_workspace_queries.load(Ordering::SeqCst),
                 actual.retrieval_empty_targets,
                 actual.would_inject,
                 actual.replay_preview_diagnostics.len(),
@@ -5545,11 +5719,12 @@ mod tests {
         let actual = ProjectContextInjection::new(setup.clone(), agent)
             .explain(Some("find automatic injection needle".to_string()))
             .await;
-        let expected = (0usize, 0usize, true, true);
+        let expected = (0usize, 0usize, 0usize, true, true);
 
         assert_eq!(
             (
                 setup.workspace_queries.load(Ordering::SeqCst),
+                setup.committed_workspace_queries.load(Ordering::SeqCst),
                 setup.learning_records.lock().await.len(),
                 actual
                     .retrieval_plan_diagnostics
