@@ -361,6 +361,60 @@ expression: actual.tools
   },
   {
     "type": "function",
+    "name": "goal_terminal_action",
+    "parameters": {
+      "additionalProperties": false,
+      "description": "Input for terminalizing the current conversation goal from a model-side tool call.",
+      "properties": {
+        "blocker_kind": {
+          "anyOf": [
+            {
+              "enum": [
+                "missing_credential",
+                "requires_human_approval",
+                "external_dependency_unavailable",
+                "safety_boundary",
+                "impossible",
+                "user_intent_ambiguity"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Required only when status is blocked; forbidden when status is satisfied."
+        },
+        "evidence": {
+          "description": "Non-empty bounded terminal evidence proving the terminal state.",
+          "type": "string"
+        },
+        "status": {
+          "description": "Terminal status to apply to the current conversation goal.",
+          "enum": [
+            "satisfied",
+            "blocked"
+          ],
+          "type": "string"
+        },
+        "summary": {
+          "description": "Non-empty bounded terminal summary.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "blocker_kind",
+        "evidence",
+        "status",
+        "summary"
+      ],
+      "type": "object"
+    },
+    "strict": true,
+    "description": "Terminalizes the current conversation goal as satisfied or blocked using the active ToolCallContext conversation_id.\n\nUse when the model has proven the conversation goal is complete or has reached a closed blocker. The schema intentionally has no conversation_id argument; the runtime conversation context is authoritative. Satisfied requires summary and evidence and forbids blocker_kind. Blocked requires summary, evidence, and blocker_kind. Unknown arguments are rejected."
+  },
+  {
+    "type": "function",
     "name": "remove",
     "parameters": {
       "additionalProperties": false,

@@ -12,14 +12,15 @@ use derive_more::From;
 use eserde::Deserialize;
 use forge_tool_macros::ToolDescription;
 use schemars::{JsonSchema, Schema};
-use serde::Serialize;
+use serde::{Deserialize as SerdeDeserialize, Serialize};
 use serde_json::Map;
 use strum::IntoEnumIterator;
 use strum_macros::{AsRefStr, Display, EnumDiscriminants, EnumIter};
 
 use crate::{
-    ConversationId, ProcessObservationWaitSeconds, ShellHandoffTimeoutSeconds, ToolCallArguments,
-    ToolCallFull, ToolDefinition, ToolDescription, ToolName,
+    ConversationId, GoalBlockerKind, GoalTerminalEvidence, GoalTerminalSummary,
+    ProcessObservationWaitSeconds, ShellHandoffTimeoutSeconds, ToolCallArguments, ToolCallFull,
+    ToolDefinition, ToolDescription, ToolName,
 };
 
 /// Enum representing all possible tool input types.
@@ -53,6 +54,7 @@ pub enum ToolCatalog {
     SemSearch(SemanticSearch),
     WorkspaceVectorIndexBuildContinuation(WorkspaceVectorIndexBuildContinuation),
     WorkspaceExactFactReferenceContinuation(WorkspaceExactFactReferenceContinuation),
+    GoalTerminalAction(#[eserde(compat)] GoalTerminalAction),
     Remove(FSRemove),
     Patch(FSPatch),
     MultiPatch(FSMultiPatch),
@@ -486,6 +488,115 @@ pub struct WorkspaceExactFactReferenceContinuation {
     pub workspace_path: PathBuf,
 }
 
+/// Terminal status requested by the model for the active conversation goal.
+#[derive(
+    Default, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Display, AsRefStr, EnumIter,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum GoalTerminalActionStatus {
+    /// The active goal is complete and the evidence proves completion.
+    #[default]
+    Satisfied,
+    /// The active goal is blocked by a closed blocker kind.
+    Blocked,
+}
+
+/// Input for terminalizing the current conversation goal from a model-side tool call.
+#[derive(Debug, Clone, Serialize, JsonSchema, ToolDescription, PartialEq)]
+#[tool_description_file = "crates/forge_domain/src/tools/descriptions/goal_terminal_action.md"]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct GoalTerminalAction {
+    /// Terminal status to apply to the current conversation goal.
+    pub status: GoalTerminalActionStatus,
+    /// Non-empty bounded terminal summary.
+    pub summary: GoalTerminalSummary,
+    /// Non-empty bounded terminal evidence proving the terminal state.
+    pub evidence: GoalTerminalEvidence,
+    /// Required only when status is blocked; forbidden when status is satisfied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocker_kind: Option<GoalBlockerKind>,
+}
+
+impl Default for GoalTerminalAction {
+    fn default() -> Self {
+        Self {
+            status: GoalTerminalActionStatus::Satisfied,
+            summary: GoalTerminalSummary::new("goal satisfied")
+                .expect("default goal terminal summary must be valid"),
+            evidence: GoalTerminalEvidence::new("default goal terminal evidence")
+                .expect("default goal terminal evidence must be valid"),
+            blocker_kind: None,
+        }
+    }
+}
+
+impl GoalTerminalAction {
+    /// Validates cross-field terminal payload invariants.
+    ///
+    /// # Errors
+    /// Returns an error when status and blocker kind do not form a valid terminal state.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        match (self.status, self.blocker_kind) {
+            (GoalTerminalActionStatus::Satisfied, Some(_)) => {
+                anyhow::bail!("satisfied goal terminal action forbids blocker_kind")
+            }
+            (GoalTerminalActionStatus::Blocked, None) => {
+                anyhow::bail!("blocked goal terminal action requires blocker_kind")
+            }
+            (GoalTerminalActionStatus::Satisfied, None)
+            | (GoalTerminalActionStatus::Blocked, Some(_)) => Ok(()),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for GoalTerminalAction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(SerdeDeserialize)]
+        #[serde(deny_unknown_fields)]
+        struct GoalTerminalActionWire {
+            status: GoalTerminalActionStatus,
+            summary: GoalTerminalSummary,
+            evidence: GoalTerminalEvidence,
+            #[serde(default)]
+            blocker_kind: Option<GoalBlockerKind>,
+        }
+
+        let wire = <GoalTerminalActionWire as serde::Deserialize>::deserialize(deserializer)?;
+        let action = GoalTerminalAction {
+            status: wire.status,
+            summary: wire.summary,
+            evidence: wire.evidence,
+            blocker_kind: wire.blocker_kind,
+        };
+        action.validate().map_err(serde::de::Error::custom)?;
+        Ok(action)
+    }
+}
+
+/// Readback-proven result of a model-side goal terminalization action.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GoalTerminalActionReport {
+    /// Persisted terminal status.
+    pub status: GoalTerminalActionStatus,
+    /// Persisted objective text.
+    pub objective: String,
+    /// Persisted terminal summary.
+    pub summary: String,
+    /// Persisted terminal evidence.
+    pub evidence: String,
+    /// Persisted blocker kind for blocked terminal goals.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[eserde(compat)]
+    pub blocker_kind: Option<GoalBlockerKind>,
+    /// True only when post-write readback proves the final active_goal state.
+    pub readback_verified: bool,
+}
+
 #[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema, ToolDescription, PartialEq)]
 #[tool_description_file = "crates/forge_domain/src/tools/descriptions/fs_remove.md"]
 pub struct FSRemove {
@@ -552,6 +663,64 @@ trait SimpleEnumSchema: AsRef<str> + IntoEnumIterator {
 // Blanket implementation for all types that implement AsRef<str> and
 // IntoEnumIterator
 impl<T> SimpleEnumSchema for T where T: AsRef<str> + IntoEnumIterator {}
+
+impl JsonSchema for GoalTerminalSummary {
+    fn schema_name() -> Cow<'static, str> {
+        "GoalTerminalSummary".into()
+    }
+
+    fn json_schema(_gen: &mut schemars::generate::SchemaGenerator) -> Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": GoalTerminalSummary::MAX_CHARS
+        })
+    }
+}
+
+impl JsonSchema for GoalTerminalEvidence {
+    fn schema_name() -> Cow<'static, str> {
+        "GoalTerminalEvidence".into()
+    }
+
+    fn json_schema(_gen: &mut schemars::generate::SchemaGenerator) -> Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": GoalTerminalEvidence::MAX_CHARS
+        })
+    }
+}
+
+impl JsonSchema for GoalTerminalActionStatus {
+    fn schema_name() -> Cow<'static, str> {
+        <Self as SimpleEnumSchema>::simple_enum_schema_name()
+    }
+
+    fn json_schema(r#gen: &mut schemars::generate::SchemaGenerator) -> Schema {
+        <Self as SimpleEnumSchema>::simple_enum_schema(r#gen)
+    }
+}
+
+impl JsonSchema for GoalBlockerKind {
+    fn schema_name() -> Cow<'static, str> {
+        "GoalBlockerKind".into()
+    }
+
+    fn json_schema(_gen: &mut schemars::generate::SchemaGenerator) -> Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "enum": [
+                "missing_credential",
+                "requires_human_approval",
+                "external_dependency_unavailable",
+                "safety_boundary",
+                "impossible",
+                "user_intent_ambiguity"
+            ]
+        })
+    }
+}
 
 impl JsonSchema for PatchOperation {
     fn schema_name() -> Cow<'static, str> {
@@ -924,6 +1093,7 @@ impl ToolDescription for ToolCatalog {
             ToolCatalog::SemSearch(v) => v.description(),
             ToolCatalog::WorkspaceVectorIndexBuildContinuation(v) => v.description(),
             ToolCatalog::WorkspaceExactFactReferenceContinuation(v) => v.description(),
+            ToolCatalog::GoalTerminalAction(v) => v.description(),
             ToolCatalog::Read(v) => v.description(),
             ToolCatalog::Remove(v) => v.description(),
             ToolCatalog::Undo(v) => v.description(),
@@ -1018,6 +1188,9 @@ impl ToolCatalog {
             }
             ToolCatalog::WorkspaceExactFactReferenceContinuation(_) => {
                 r#gen.into_root_schema_for::<WorkspaceExactFactReferenceContinuation>()
+            }
+            ToolCatalog::GoalTerminalAction(_) => {
+                r#gen.into_root_schema_for::<GoalTerminalAction>()
             }
             ToolCatalog::Read(_) => r#gen.into_root_schema_for::<FSRead>(),
             ToolCatalog::Remove(_) => r#gen.into_root_schema_for::<FSRemove>(),
@@ -1202,6 +1375,7 @@ impl ToolCatalog {
             }),
             // Operations that don't require permission checks
             ToolCatalog::SemSearch(_)
+            | ToolCatalog::GoalTerminalAction(_)
             | ToolCatalog::Undo(_)
             | ToolCatalog::ProcessStatus(_)
             | ToolCatalog::ProcessRead(_)
@@ -1496,6 +1670,62 @@ mod tests {
         let actual = ToolCatalog::try_from(fixture);
 
         assert!(actual.is_err());
+    }
+
+    #[test]
+    fn test_goal_terminal_action_rejects_unknown_arguments_and_forged_conversation_id() {
+        use crate::{ToolCallArguments, ToolCallFull};
+
+        let fixture = ToolCallFull {
+            name: ToolKind::GoalTerminalAction.name(),
+            call_id: None,
+            arguments: ToolCallArguments::from_json(
+                r#"{"status":"satisfied","summary":"done","evidence":"proof","conversation_id":"00000000-0000-4000-8000-000000000001"}"#,
+            ),
+            thought_signature: None,
+        };
+
+        let actual = ToolCatalog::try_from(fixture);
+
+        assert!(actual.is_err());
+    }
+
+    #[test]
+    fn test_goal_terminal_action_rejects_invalid_terminal_payloads() {
+        use crate::{ToolCallArguments, ToolCallFull};
+
+        let satisfied_with_blocker = ToolCallFull {
+            name: ToolKind::GoalTerminalAction.name(),
+            call_id: None,
+            arguments: ToolCallArguments::from_json(
+                r#"{"status":"satisfied","summary":"done","evidence":"proof","blocker_kind":"safety_boundary"}"#,
+            ),
+            thought_signature: None,
+        };
+        let blocked_without_kind = ToolCallFull {
+            name: ToolKind::GoalTerminalAction.name(),
+            call_id: None,
+            arguments: ToolCallArguments::from_json(
+                r#"{"status":"blocked","summary":"blocked","evidence":"proof"}"#,
+            ),
+            thought_signature: None,
+        };
+        let invalid_status = ToolCallFull {
+            name: ToolKind::GoalTerminalAction.name(),
+            call_id: None,
+            arguments: ToolCallArguments::from_json(
+                r#"{"status":"complete","summary":"done","evidence":"proof"}"#,
+            ),
+            thought_signature: None,
+        };
+
+        let actual = vec![
+            ToolCatalog::try_from(satisfied_with_blocker).is_err(),
+            ToolCatalog::try_from(blocked_without_kind).is_err(),
+            ToolCatalog::try_from(invalid_status).is_err(),
+        ];
+        let expected = vec![true, true, true];
+        assert_eq!(actual, expected);
     }
 
     #[test]

@@ -1282,8 +1282,14 @@ mod tests {
     }
 
     #[test]
-    fn test_context_record_preserves_active_goal_without_messages() {
-        let goal = forge_domain::ActiveGoal::new("ship goal persistence").unwrap();
+    fn test_context_record_preserves_terminal_active_goal_without_messages() {
+        let goal = forge_domain::ActiveGoal::blocked(
+            "ship goal persistence",
+            "blocked",
+            "approval required",
+            forge_domain::GoalBlockerKind::RequiresHumanApproval,
+        )
+        .unwrap();
         let setup = Context::default().set_active_goal(goal.clone());
 
         let actual: Context = serde_json::from_str::<ContextRecord>(

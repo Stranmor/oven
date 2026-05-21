@@ -71,6 +71,37 @@ fn canonicalize_workspace_exact_fact_path(
     )
 }
 
+fn goal_terminal_action_report(
+    goal: &forge_domain::ActiveGoal,
+    expected_status: forge_domain::GoalTerminalActionStatus,
+    readback_verified: bool,
+) -> anyhow::Result<forge_domain::GoalTerminalActionReport> {
+    let actual_status = match goal.status() {
+        forge_domain::GoalStatus::Satisfied => forge_domain::GoalTerminalActionStatus::Satisfied,
+        forge_domain::GoalStatus::Blocked => forge_domain::GoalTerminalActionStatus::Blocked,
+        forge_domain::GoalStatus::Active | forge_domain::GoalStatus::Paused => {
+            anyhow::bail!("goal_terminal_action did not produce a terminal goal")
+        }
+    };
+    if actual_status != expected_status {
+        anyhow::bail!("goal_terminal_action readback status mismatch");
+    }
+    let summary = goal
+        .terminal_summary()
+        .ok_or_else(|| anyhow!("goal_terminal_action terminal summary missing"))?;
+    let evidence = goal
+        .terminal_evidence()
+        .ok_or_else(|| anyhow!("goal_terminal_action terminal evidence missing"))?;
+    Ok(forge_domain::GoalTerminalActionReport {
+        status: actual_status,
+        objective: goal.objective().as_str().to_string(),
+        summary: summary.as_str().to_string(),
+        evidence: evidence.as_str().to_string(),
+        blocker_kind: goal.blocker_kind(),
+        readback_verified,
+    })
+}
+
 pub struct ToolExecutor<S> {
     services: Arc<S>,
 }
@@ -386,6 +417,63 @@ impl<
         }
     }
 
+    async fn goal_terminal_action(
+        &self,
+        input: forge_domain::GoalTerminalAction,
+        context: &ToolCallContext,
+    ) -> anyhow::Result<forge_domain::GoalTerminalActionReport> {
+        input.validate()?;
+        let conversation_id = context.conversation_id.ok_or_else(|| {
+            anyhow!("goal_terminal_action requires ToolCallContext conversation_id")
+        })?;
+        let expected_status = input.status;
+        let mutation_report = self
+            .services
+            .modify_conversation(&conversation_id, move |conversation| {
+                let context = conversation.context.as_mut().ok_or_else(|| {
+                    anyhow!("goal_terminal_action requires persisted conversation context")
+                })?;
+                let goal = context.active_goal.as_mut().ok_or_else(|| {
+                    anyhow!("goal_terminal_action requires an active goal record")
+                })?;
+                match input.status {
+                    forge_domain::GoalTerminalActionStatus::Satisfied => {
+                        goal.satisfy(input.summary.as_str(), input.evidence.as_str())?;
+                    }
+                    forge_domain::GoalTerminalActionStatus::Blocked => {
+                        let blocker_kind = input.blocker_kind.ok_or_else(|| {
+                            anyhow!("blocked goal terminal action requires blocker_kind")
+                        })?;
+                        goal.block(
+                            input.summary.as_str(),
+                            input.evidence.as_str(),
+                            blocker_kind,
+                        )?;
+                    }
+                }
+                goal_terminal_action_report(goal, expected_status, false)
+            })
+            .await??;
+
+        let readback_goal = self
+            .services
+            .find_conversation(&conversation_id)
+            .await?
+            .and_then(|conversation| conversation.context)
+            .and_then(|context| context.active_goal)
+            .ok_or_else(|| anyhow!("goal_terminal_action readback did not find active_goal"))?;
+        let readback_report = goal_terminal_action_report(&readback_goal, expected_status, true)?;
+        if readback_report.status != mutation_report.status
+            || readback_report.objective != mutation_report.objective
+            || readback_report.summary != mutation_report.summary
+            || readback_report.evidence != mutation_report.evidence
+            || readback_report.blocker_kind != mutation_report.blocker_kind
+        {
+            anyhow::bail!("goal_terminal_action readback state did not match persisted mutation");
+        }
+        Ok(readback_report)
+    }
+
     async fn call_internal(
         &self,
         input: ToolCatalog,
@@ -674,6 +762,10 @@ impl<
                     .await;
                 ToolOperation::WorkspaceExactFactReferenceContinuation { output: Box::new(output) }
             }
+            ToolCatalog::GoalTerminalAction(input) => {
+                let output = self.goal_terminal_action(input, context).await?;
+                ToolOperation::GoalTerminalAction { output }
+            }
             ToolCatalog::Remove(input) => {
                 let normalized_path = self.normalize_path(input.path.clone());
                 let output = self.services.remove(normalized_path).await?;
@@ -942,6 +1034,7 @@ mod tests {
         exact_fact_producer_calls: Arc<AtomicUsize>,
         exact_fact_producer_error: Arc<StdMutex<Option<String>>>,
         exact_fact_producer_status: Arc<StdMutex<WorkspaceExactFactReferenceStatus>>,
+        conversation: Arc<Mutex<Option<Conversation>>>,
     }
 
     impl SemSearchFixture {
@@ -971,6 +1064,7 @@ mod tests {
                     exact_fact_producer_status: Arc::new(StdMutex::new(
                         WorkspaceExactFactReferenceStatus::ArtifactWritten,
                     )),
+                    conversation: Arc::new(Mutex::new(None)),
                 },
                 unused: SemSearchUnusedService,
             }
@@ -1001,6 +1095,11 @@ mod tests {
             statuses: Vec<WorkspaceExactFactStatusReport>,
         ) -> Self {
             *self.workspace.exact_fact_statuses.lock().await = statuses;
+            self
+        }
+
+        async fn with_conversation(self, conversation: Conversation) -> Self {
+            *self.workspace.conversation.lock().await = Some(conversation);
             self
         }
 
@@ -1867,10 +1966,156 @@ mod tests {
 
     impl_sem_search_unused_services!(SemSearchUnusedService);
 
+    #[async_trait::async_trait]
+    impl ConversationService for SemSearchWorkspace {
+        async fn find_conversation(
+            &self,
+            id: &ConversationId,
+        ) -> anyhow::Result<Option<Conversation>> {
+            Ok(self
+                .conversation
+                .lock()
+                .await
+                .clone()
+                .filter(|conversation| conversation.id == *id))
+        }
+
+        async fn upsert_conversation(&self, conversation: Conversation) -> anyhow::Result<()> {
+            *self.conversation.lock().await = Some(conversation);
+            Ok(())
+        }
+
+        async fn ensure_delegated_conversation(
+            &self,
+            _id: &ConversationId,
+            _parent_id: Option<ConversationId>,
+        ) -> anyhow::Result<Conversation> {
+            anyhow::bail!("unused delegated conversation")
+        }
+
+        async fn resolve_root_conversation_id(
+            &self,
+            _parent_id: Option<ConversationId>,
+        ) -> anyhow::Result<Option<ConversationId>> {
+            Ok(None)
+        }
+
+        async fn modify_conversation<F, T>(&self, id: &ConversationId, f: F) -> anyhow::Result<T>
+        where
+            F: FnOnce(&mut Conversation) -> T + Send,
+            T: Send,
+        {
+            let mut guard = self.conversation.lock().await;
+            let conversation = guard
+                .as_mut()
+                .filter(|conversation| conversation.id == *id)
+                .ok_or_else(|| anyhow!("fixture conversation not found"))?;
+            Ok(f(conversation))
+        }
+
+        async fn list_branch_targets(
+            &self,
+            _conversation_id: &ConversationId,
+        ) -> anyhow::Result<Vec<crate::dto::ConversationBranchTarget>> {
+            Ok(Vec::new())
+        }
+
+        async fn branch_conversation(
+            &self,
+            _conversation_id: &ConversationId,
+            _target_id: forge_domain::MessageId,
+        ) -> anyhow::Result<Conversation> {
+            anyhow::bail!("unused branch conversation")
+        }
+
+        async fn get_conversation_list_items_by_query(
+            &self,
+            _query: forge_domain::ConversationListQuery,
+        ) -> anyhow::Result<Vec<ConversationListItem>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_conversation_list_items_including_agent(
+            &self,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<ConversationListItem>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_conversation_list_items_by_visibility(
+            &self,
+            _visibility: forge_domain::ConversationVisibilityFilter,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<ConversationListItem>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_conversations(&self) -> anyhow::Result<Vec<Conversation>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_conversations_including_agent(&self) -> anyhow::Result<Vec<Conversation>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_conversations_by_visibility(
+            &self,
+            _visibility: forge_domain::ConversationVisibilityFilter,
+        ) -> anyhow::Result<Vec<Conversation>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_sub_conversations(
+            &self,
+            _parent_id: &ConversationId,
+        ) -> anyhow::Result<Vec<Conversation>> {
+            Ok(Vec::new())
+        }
+
+        async fn upsert_subagent_task_session(
+            &self,
+            _session: SubagentTaskSession,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn get_subagent_task_session(
+            &self,
+            _task_id: &SubagentTaskId,
+        ) -> anyhow::Result<Option<SubagentTaskSession>> {
+            Ok(None)
+        }
+
+        async fn get_subagent_task_session_by_conversation(
+            &self,
+            _conversation_id: &ConversationId,
+        ) -> anyhow::Result<Option<SubagentTaskSession>> {
+            Ok(None)
+        }
+
+        async fn list_subagent_task_sessions(
+            &self,
+            _filter: SubagentTaskSessionFilter,
+        ) -> anyhow::Result<Vec<SubagentTaskSession>> {
+            Ok(Vec::new())
+        }
+
+        async fn last_conversation(&self) -> anyhow::Result<Option<Conversation>> {
+            Ok(None)
+        }
+
+        async fn delete_conversation(
+            &self,
+            _conversation_id: &ConversationId,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     impl Services for SemSearchFixture {
         type ProviderService = SemSearchUnusedService;
         type AppConfigService = SemSearchUnusedService;
-        type ConversationService = SemSearchUnusedService;
+        type ConversationService = SemSearchWorkspace;
         type LearningService = SemSearchUnusedService;
         type SteerService = SemSearchUnusedService;
         type TemplateService = SemSearchUnusedService;
@@ -1905,7 +2150,7 @@ mod tests {
             &self.unused
         }
         fn conversation_service(&self) -> &Self::ConversationService {
-            &self.unused
+            &self.workspace
         }
         fn learning_service(&self) -> &Self::LearningService {
             &self.unused
@@ -2018,6 +2263,125 @@ mod tests {
 
     fn tool_context() -> ToolCallContext {
         ToolCallContext::new(Metrics::default())
+    }
+
+    fn tool_context_for(conversation_id: ConversationId) -> ToolCallContext {
+        ToolCallContext::new(Metrics::default()).conversation_id(Some(conversation_id))
+    }
+
+    fn goal_terminal_action(
+        status: forge_domain::GoalTerminalActionStatus,
+        summary: &str,
+        evidence: &str,
+        blocker_kind: Option<forge_domain::GoalBlockerKind>,
+    ) -> ToolCatalog {
+        ToolCatalog::GoalTerminalAction(forge_domain::GoalTerminalAction {
+            status,
+            summary: forge_domain::GoalTerminalSummary::new(summary).unwrap(),
+            evidence: forge_domain::GoalTerminalEvidence::new(evidence).unwrap(),
+            blocker_kind,
+        })
+    }
+
+    #[tokio::test]
+    async fn goal_terminal_action_refuses_missing_conversation_id_without_mutation() {
+        let conversation_id = ConversationId::generate();
+        let conversation = Conversation::new(conversation_id).context(
+            Context::default().set_active_goal(forge_domain::ActiveGoal::new("ship goal").unwrap()),
+        );
+        let setup = SemSearchFixture::new(forge_config::ForgeConfig::default())
+            .with_conversation(conversation)
+            .await;
+        let executor = ToolExecutor::new(Arc::new(setup.clone()));
+        let fixture = goal_terminal_action(
+            forge_domain::GoalTerminalActionStatus::Satisfied,
+            "done",
+            "proof",
+            None,
+        );
+
+        let actual = executor.call_internal(fixture, &tool_context()).await;
+        let persisted = setup
+            .find_conversation(&conversation_id)
+            .await
+            .unwrap()
+            .and_then(|conversation| conversation.context)
+            .and_then(|context| context.active_goal)
+            .unwrap();
+        let expected = forge_domain::GoalStatus::Active;
+
+        assert!(actual.is_err());
+        assert_eq!(persisted.status(), expected);
+    }
+
+    #[tokio::test]
+    async fn goal_terminal_action_persists_satisfied_with_readback() {
+        let conversation_id = ConversationId::generate();
+        let conversation = Conversation::new(conversation_id).context(
+            Context::default().set_active_goal(forge_domain::ActiveGoal::new("ship goal").unwrap()),
+        );
+        let setup = SemSearchFixture::new(forge_config::ForgeConfig::default())
+            .with_conversation(conversation)
+            .await;
+        let executor = ToolExecutor::new(Arc::new(setup));
+        let fixture = goal_terminal_action(
+            forge_domain::GoalTerminalActionStatus::Satisfied,
+            "done",
+            "proof",
+            None,
+        );
+
+        let actual = executor
+            .call_internal(fixture, &tool_context_for(conversation_id))
+            .await
+            .unwrap();
+        let ToolOperation::GoalTerminalAction { output } = actual else {
+            panic!("expected goal terminal action output")
+        };
+        let expected = forge_domain::GoalTerminalActionReport {
+            status: forge_domain::GoalTerminalActionStatus::Satisfied,
+            objective: "ship goal".to_string(),
+            summary: "done".to_string(),
+            evidence: "proof".to_string(),
+            blocker_kind: None,
+            readback_verified: true,
+        };
+        assert_eq!(output, expected);
+    }
+
+    #[tokio::test]
+    async fn goal_terminal_action_persists_blocked_with_readback() {
+        let conversation_id = ConversationId::generate();
+        let conversation = Conversation::new(conversation_id).context(
+            Context::default().set_active_goal(forge_domain::ActiveGoal::new("ship goal").unwrap()),
+        );
+        let setup = SemSearchFixture::new(forge_config::ForgeConfig::default())
+            .with_conversation(conversation)
+            .await;
+        let executor = ToolExecutor::new(Arc::new(setup));
+        let fixture = goal_terminal_action(
+            forge_domain::GoalTerminalActionStatus::Blocked,
+            "blocked",
+            "approval needed",
+            Some(forge_domain::GoalBlockerKind::RequiresHumanApproval),
+        );
+
+        let actual = executor
+            .call_internal(fixture, &tool_context_for(conversation_id))
+            .await
+            .unwrap();
+        let ToolOperation::GoalTerminalAction { output } = actual else {
+            panic!("expected goal terminal action output")
+        };
+        let expected = forge_domain::GoalTerminalActionReport {
+            status: forge_domain::GoalTerminalActionStatus::Blocked,
+            objective: "ship goal".to_string(),
+            summary: "blocked".to_string(),
+            evidence: "approval needed".to_string(),
+            blocker_kind: Some(forge_domain::GoalBlockerKind::RequiresHumanApproval),
+            readback_verified: true,
+        };
+        assert_eq!(output, expected);
     }
 
     #[tokio::test]

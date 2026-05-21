@@ -574,6 +574,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_terminal_goal_is_persisted_but_not_injected() {
+        let agent = fixture_agent_without_user_prompt();
+        let event = Event::new("First task");
+        let goal = ActiveGoal::satisfied("finish the slice", "done", "proof").unwrap();
+        let conversation = fixture_conversation().context(Context::default().set_active_goal(goal));
+        let generator = fixture_generator(agent.clone(), event);
+
+        let actual = generator.add_user_prompt(conversation).await.unwrap();
+
+        let context = actual.context.unwrap();
+        let actual = (
+            context.active_goal.as_ref().map(ActiveGoal::status),
+            context.messages.iter().any(|message| {
+                matches!(&message.message, ContextMessage::Text(text) if text.is_goal_context())
+            }),
+        );
+        let expected = (Some(GoalStatus::Satisfied), false);
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
     async fn test_goal_context_replaces_previous_uncached_goal_without_duplicates() {
         let agent = fixture_agent_without_user_prompt();
         let event = Event::new("Second task");

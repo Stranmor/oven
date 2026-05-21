@@ -123,6 +123,11 @@ impl FormatContent for ToolCatalog {
                     ))
                     .into(),
             ),
+            ToolCatalog::GoalTerminalAction(input) => Some(
+                TitleFormat::debug("Goal Terminal Action")
+                    .sub_title(input.status.to_string())
+                    .into(),
+            ),
             ToolCatalog::Remove(input) => {
                 let display_path = display_path_for(&input.path);
                 Some(TitleFormat::debug("Remove").sub_title(display_path).into())

@@ -18,8 +18,8 @@ use forge_app::{CommitResult, ToolResolver};
 use forge_config::ForgeConfig;
 use forge_display::MarkdownFormat;
 use forge_domain::{
-    ActiveGoal, AuthMethod, ChatResponseContent, ConsoleWriter, ContextMessage, GoalStatus, Role,
-    TitleFormat, UserCommand, WorkspaceEvidenceLedgerActivationDiagnostic,
+    ActiveGoal, AuthMethod, ChatResponseContent, ConsoleWriter, ContextMessage, GoalBlockerKind,
+    GoalStatus, Role, TitleFormat, UserCommand, WorkspaceEvidenceLedgerActivationDiagnostic,
     WorkspaceEvidenceReadinessDiagnostic, WorkspaceEvidenceReplayPreviewDiagnostic,
     WorkspaceExactFactReadinessDiagnostic, WorkspaceRetrievalPhaseDiagnostics,
     WorkspaceRetrievalPhaseInvalidReason, WorkspaceRetrievalPhaseSkipReason,
@@ -163,6 +163,17 @@ fn decide_goal_continuation(
         return GoalContinuationDecision::Stop;
     }
     GoalContinuationDecision::Continue
+}
+
+fn format_goal_blocker_kind(kind: GoalBlockerKind) -> &'static str {
+    match kind {
+        GoalBlockerKind::MissingCredential => "missing_credential",
+        GoalBlockerKind::RequiresHumanApproval => "requires_human_approval",
+        GoalBlockerKind::ExternalDependencyUnavailable => "external_dependency_unavailable",
+        GoalBlockerKind::SafetyBoundary => "safety_boundary",
+        GoalBlockerKind::Impossible => "impossible",
+        GoalBlockerKind::UserIntentAmbiguity => "user_intent_ambiguity",
+    }
 }
 
 fn branch_target_select_rows(
@@ -3043,14 +3054,26 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
     fn write_goal_status(&mut self, goal: Option<&ActiveGoal>) -> anyhow::Result<()> {
         match goal {
             Some(goal) => {
-                let status = match goal.status {
+                let status = match goal.status() {
                     GoalStatus::Active => "active",
                     GoalStatus::Paused => "paused",
+                    GoalStatus::Satisfied => "satisfied",
+                    GoalStatus::Blocked => "blocked",
                 };
-                self.writeln_title(TitleFormat::info(format!(
-                    "Goal ({status}): {}",
-                    goal.objective.as_str().bold()
-                )))?;
+                let mut message = format!("Goal ({status}): {}", goal.objective().as_str().bold());
+                if let Some(summary) = goal.terminal_summary() {
+                    message.push_str(&format!("\nSummary: {}", summary.as_str()));
+                }
+                if let Some(blocker_kind) = goal.blocker_kind() {
+                    message.push_str(&format!(
+                        "\nBlocker kind: {}",
+                        format_goal_blocker_kind(blocker_kind)
+                    ));
+                }
+                if let Some(evidence) = goal.terminal_evidence() {
+                    message.push_str(&format!("\nEvidence: {}", evidence.as_str()));
+                }
+                self.writeln_title(TitleFormat::info(message))?;
             }
             None => {
                 self.writeln_title(TitleFormat::info(
@@ -4711,7 +4734,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             .active_goal_for_current_conversation()
             .await?
             .filter(ActiveGoal::is_active)
-            .map(|goal| goal.continuation.max_turns_per_user_turn)
+            .map(|goal| goal.continuation_config().max_turns_per_user_turn)
             .unwrap_or_default();
         let final_outcome = loop {
             let outcome = self.consume_classic_chat_turn(chat).await?;
@@ -4790,7 +4813,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             .active_goal_for_current_conversation()
             .await?
             .filter(ActiveGoal::is_active)
-            .map(|goal| goal.continuation.max_turns_per_user_turn)
+            .map(|goal| goal.continuation_config().max_turns_per_user_turn)
             .unwrap_or_default();
         let final_outcome = loop {
             let outcome = self.consume_tui_chat_turn(chat, session).await?;
@@ -7006,6 +7029,8 @@ mod tests {
         let active_goal = ActiveGoal::new("finish continuation slice").unwrap();
         let mut paused_goal = active_goal.clone();
         paused_goal.pause();
+        let terminal_goal =
+            ActiveGoal::satisfied("finish continuation slice", "done", "proof").unwrap();
         let mut complete_with_progress = ChatTurnOutcome::default();
         complete_with_progress.record_response(&ChatResponse::TaskMessage {
             content: ChatResponseContent::Markdown { text: "progress".to_string(), partial: false },
@@ -7022,6 +7047,7 @@ mod tests {
         let actual = vec![
             decide_goal_continuation(None, 1, complete_with_progress),
             decide_goal_continuation(Some(&paused_goal), 1, complete_with_progress),
+            decide_goal_continuation(Some(&terminal_goal), 1, complete_with_progress),
             decide_goal_continuation(Some(&active_goal), 0, complete_with_progress),
             decide_goal_continuation(Some(&active_goal), 1, no_progress),
             decide_goal_continuation(Some(&active_goal), 1, interrupted),
@@ -7034,7 +7060,15 @@ mod tests {
             GoalContinuationDecision::Stop,
             GoalContinuationDecision::Stop,
             GoalContinuationDecision::Stop,
+            GoalContinuationDecision::Stop,
         ];
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn goal_blocker_kind_format_uses_stable_snake_case() {
+        let actual = format_goal_blocker_kind(GoalBlockerKind::RequiresHumanApproval);
+        let expected = "requires_human_approval";
         assert_eq!(actual, expected);
     }
 
@@ -7056,7 +7090,7 @@ mod tests {
                 actual.interrupted,
                 actual.stream_error,
                 actual.progress_evidence,
-                goal.status,
+                goal.status(),
             ),
             expected,
         );
@@ -7305,6 +7339,7 @@ mod tests {
             rerank_intent_source: Some("ExplicitUseCase".to_string()),
             rerank_intent_fingerprint: Some("abc123".to_string()),
             rerank_intent_len: Some(17),
+            rerank_runtime: None,
             retrieval_empty: false,
             truncated: false,
         };

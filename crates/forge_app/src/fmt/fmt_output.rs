@@ -63,6 +63,7 @@ impl FormatContent for ToolOperation {
             | ToolOperation::CodebaseSearch { output: _ }
             | ToolOperation::WorkspaceVectorIndexBuildContinuation { output: _ }
             | ToolOperation::WorkspaceExactFactReferenceContinuation { output: _ }
+            | ToolOperation::GoalTerminalAction { output: _ }
             | ToolOperation::FsUndo { input: _, output: _ }
             | ToolOperation::NetFetch { input: _, output: _ }
             | ToolOperation::Shell { output: _ }

@@ -8,8 +8,9 @@ use forge_config::ForgeConfig;
 use forge_display::DiffFormat;
 use forge_domain::{
     CodebaseSearchResults, Environment, FSApplyPatch, FSMultiPatch, FSPatch, FSRead, FSRemove,
-    FSSearch, FSUndo, FSWrite, FileOperation, LineNumbers, Metrics, NetFetch, PlanCreate, ToolKind,
-    WorkspaceExactFactReferenceContinuationReport, WorkspaceVectorIndexBuildContinuationReport,
+    FSSearch, FSUndo, FSWrite, FileOperation, GoalTerminalActionReport, LineNumbers, Metrics,
+    NetFetch, PlanCreate, ToolKind, WorkspaceExactFactReferenceContinuationReport,
+    WorkspaceVectorIndexBuildContinuationReport,
 };
 use forge_template::Element;
 
@@ -58,6 +59,9 @@ pub enum ToolOperation {
     },
     WorkspaceExactFactReferenceContinuation {
         output: Box<WorkspaceExactFactReferenceContinuationReport>,
+    },
+    GoalTerminalAction {
+        output: GoalTerminalActionReport,
     },
     FsPatch {
         input: FSPatch,
@@ -500,6 +504,19 @@ impl ToolOperation {
                     .expect("workspace exact-fact reference continuation report should serialize");
                 let elm = Element::new("workspace_exact_fact_reference_continuation")
                     .attr("final_status", format!("{:?}", output.final_status))
+                    .cdata(body);
+                forge_domain::ToolOutput::text(elm)
+            }
+            ToolOperation::GoalTerminalAction { output } => {
+                let body = serde_json::to_string(&output)
+                    .expect("goal terminal action report should serialize");
+                let elm = Element::new("goal_terminal_action")
+                    .attr("status", output.status.to_string())
+                    .attr("readback_verified", output.readback_verified)
+                    .attr_if_some(
+                        "blocker_kind",
+                        output.blocker_kind.map(|kind| format!("{kind:?}")),
+                    )
                     .cdata(body);
                 forge_domain::ToolOutput::text(elm)
             }

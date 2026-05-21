@@ -376,6 +376,9 @@ fn extract_tool_info(call: &ToolCallFull, current_todos: &[Todo]) -> Option<Summ
             ToolCatalog::WorkspaceExactFactReferenceContinuation(_) => Some(SummaryTool::Mcp {
                 name: "workspace_exact_fact_reference_continuation".to_string(),
             }),
+            ToolCatalog::GoalTerminalAction(_) => {
+                Some(SummaryTool::Mcp { name: "goal_terminal_action".to_string() })
+            }
             ToolCatalog::Undo(input) => Some(SummaryTool::Undo { path: input.path }),
             ToolCatalog::Fetch(input) => Some(SummaryTool::Fetch { url: input.url }),
             ToolCatalog::Followup(input) => {

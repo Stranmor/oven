@@ -216,6 +216,53 @@ expression: tools
   ]
 }
 {
+  "title": "GoalTerminalAction",
+  "description": "Input for terminalizing the current conversation goal from a model-side tool call.",
+  "type": "object",
+  "properties": {
+    "blocker_kind": {
+      "description": "Required only when status is blocked; forbidden when status is satisfied.",
+      "type": "string",
+      "enum": [
+        "missing_credential",
+        "requires_human_approval",
+        "external_dependency_unavailable",
+        "safety_boundary",
+        "impossible",
+        "user_intent_ambiguity",
+        null
+      ],
+      "nullable": true
+    },
+    "evidence": {
+      "description": "Non-empty bounded terminal evidence proving the terminal state.",
+      "type": "string",
+      "maxLength": 8000,
+      "minLength": 1
+    },
+    "status": {
+      "description": "Terminal status to apply to the current conversation goal.",
+      "type": "string",
+      "enum": [
+        "satisfied",
+        "blocked"
+      ]
+    },
+    "summary": {
+      "description": "Non-empty bounded terminal summary.",
+      "type": "string",
+      "maxLength": 2000,
+      "minLength": 1
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "summary",
+    "evidence"
+  ]
+}
+{
   "title": "FSRemove",
   "type": "object",
   "properties": {

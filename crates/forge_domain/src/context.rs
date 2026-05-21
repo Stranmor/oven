@@ -482,6 +482,155 @@ pub enum GoalStatus {
     Active,
     /// Goal is retained for the thread but not injected into the next model turn.
     Paused,
+    /// Goal reached its requested terminal success state.
+    Satisfied,
+    /// Goal reached a closed terminal blocker state.
+    Blocked,
+}
+
+/// Closed blocker taxonomy for terminal blocked goals.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Eq,
+    PartialEq,
+    Serialize,
+    strum_macros::AsRefStr,
+    strum_macros::EnumIter,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalBlockerKind {
+    /// The workflow cannot continue without credentials or permissions.
+    MissingCredential,
+    /// The workflow cannot continue without explicit current-session approval.
+    RequiresHumanApproval,
+    /// A third-party dependency is unavailable beyond the safe circuit breaker.
+    ExternalDependencyUnavailable,
+    /// Continuing would cross a safety or data-integrity boundary.
+    SafetyBoundary,
+    /// The requested outcome is physically or structurally impossible.
+    Impossible,
+    /// The workflow is blocked by irreducible user-intent ambiguity.
+    UserIntentAmbiguity,
+}
+
+/// Validated non-empty bounded terminal goal summary text.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct GoalTerminalSummary(String);
+
+impl GoalTerminalSummary {
+    /// Maximum terminal summary length in Unicode scalar values.
+    pub const MAX_CHARS: usize = 2_000;
+
+    /// Creates a non-empty bounded terminal summary.
+    ///
+    /// # Arguments
+    /// * `summary` - Terminal completion or blocker summary.
+    ///
+    /// # Errors
+    /// Returns an error when the summary is empty or exceeds the character bound.
+    pub fn new(summary: impl Into<String>) -> anyhow::Result<Self> {
+        let summary = summary.into().trim().to_string();
+        validate_non_empty_bounded_goal_text(&summary, Self::MAX_CHARS, "goal terminal summary")?;
+        Ok(Self(summary))
+    }
+
+    /// Returns the terminal summary text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for GoalTerminalSummary {
+    fn default() -> Self {
+        Self("default".to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for GoalTerminalSummary {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Validated non-empty bounded terminal goal evidence text.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct GoalTerminalEvidence(String);
+
+impl GoalTerminalEvidence {
+    /// Maximum terminal evidence length in Unicode scalar values.
+    pub const MAX_CHARS: usize = 8_000;
+
+    /// Creates non-empty bounded terminal evidence.
+    ///
+    /// # Arguments
+    /// * `evidence` - Terminal completion or blocker evidence.
+    ///
+    /// # Errors
+    /// Returns an error when the evidence is empty or exceeds the character bound.
+    pub fn new(evidence: impl Into<String>) -> anyhow::Result<Self> {
+        let evidence = evidence.into().trim().to_string();
+        validate_non_empty_bounded_goal_text(&evidence, Self::MAX_CHARS, "goal terminal evidence")?;
+        Ok(Self(evidence))
+    }
+
+    /// Returns the terminal evidence text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for GoalTerminalEvidence {
+    fn default() -> Self {
+        Self("default".to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for GoalTerminalEvidence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+fn validate_non_empty_bounded_goal_text(
+    text: &str,
+    max_chars: usize,
+    label: &str,
+) -> anyhow::Result<()> {
+    if text.trim().is_empty() {
+        anyhow::bail!("{label} cannot be empty");
+    }
+    let actual_chars = text.chars().count();
+    if actual_chars > max_chars {
+        anyhow::bail!("{label} exceeds maximum length of {max_chars} characters");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum ActiveGoalState {
+    Active,
+    Paused,
+    Satisfied {
+        summary: GoalTerminalSummary,
+        evidence: GoalTerminalEvidence,
+    },
+    Blocked {
+        summary: GoalTerminalSummary,
+        evidence: GoalTerminalEvidence,
+        blocker_kind: GoalBlockerKind,
+    },
 }
 
 /// Validated objective text for a conversation-scoped goal.
@@ -527,16 +676,11 @@ impl Default for GoalContinuation {
 }
 
 /// One conversation-scoped goal persisted in typed state.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Setters)]
-#[setters(into)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActiveGoal {
-    /// Objective the model should keep in mind for this conversation.
-    pub objective: GoalObjective,
-    /// Current lifecycle state.
-    pub status: GoalStatus,
-    /// Bounded UI-level auto-continuation metadata.
-    #[serde(default)]
-    pub continuation: GoalContinuation,
+    objective: GoalObjective,
+    state: ActiveGoalState,
+    continuation: GoalContinuation,
 }
 
 impl ActiveGoal {
@@ -550,24 +694,187 @@ impl ActiveGoal {
     pub fn new(objective: impl Into<String>) -> anyhow::Result<Self> {
         Ok(Self {
             objective: GoalObjective::new(objective)?,
-            status: GoalStatus::Active,
+            state: ActiveGoalState::Active,
             continuation: GoalContinuation::default(),
         })
     }
 
+    /// Creates a terminal satisfied goal with validated summary and evidence.
+    ///
+    /// # Arguments
+    /// * `objective` - Goal objective text.
+    /// * `summary` - Non-empty bounded terminal success summary.
+    /// * `evidence` - Non-empty bounded terminal success evidence.
+    ///
+    /// # Errors
+    /// Returns an error when any goal terminal payload validation fails.
+    pub fn satisfied(
+        objective: impl Into<String>,
+        summary: impl Into<String>,
+        evidence: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            objective: GoalObjective::new(objective)?,
+            state: ActiveGoalState::Satisfied {
+                summary: GoalTerminalSummary::new(summary)?,
+                evidence: GoalTerminalEvidence::new(evidence)?,
+            },
+            continuation: GoalContinuation::default(),
+        })
+    }
+
+    /// Creates a terminal blocked goal with validated summary, evidence, and blocker kind.
+    ///
+    /// # Arguments
+    /// * `objective` - Goal objective text.
+    /// * `summary` - Non-empty bounded blocker summary.
+    /// * `evidence` - Non-empty bounded blocker evidence.
+    /// * `blocker_kind` - Closed blocker taxonomy value.
+    ///
+    /// # Errors
+    /// Returns an error when any goal terminal payload validation fails.
+    pub fn blocked(
+        objective: impl Into<String>,
+        summary: impl Into<String>,
+        evidence: impl Into<String>,
+        blocker_kind: GoalBlockerKind,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            objective: GoalObjective::new(objective)?,
+            state: ActiveGoalState::Blocked {
+                summary: GoalTerminalSummary::new(summary)?,
+                evidence: GoalTerminalEvidence::new(evidence)?,
+                blocker_kind,
+            },
+            continuation: GoalContinuation::default(),
+        })
+    }
+
+    /// Returns a copy with updated continuation metadata.
+    ///
+    /// # Arguments
+    /// * `continuation` - Bounded UI-level auto-continuation metadata.
+    pub fn continuation(mut self, continuation: GoalContinuation) -> Self {
+        self.continuation = continuation;
+        self
+    }
+
+    /// Returns the goal objective.
+    pub fn objective(&self) -> &GoalObjective {
+        &self.objective
+    }
+
+    /// Returns the current lifecycle status.
+    pub fn status(&self) -> GoalStatus {
+        match self.state {
+            ActiveGoalState::Active => GoalStatus::Active,
+            ActiveGoalState::Paused => GoalStatus::Paused,
+            ActiveGoalState::Satisfied { .. } => GoalStatus::Satisfied,
+            ActiveGoalState::Blocked { .. } => GoalStatus::Blocked,
+        }
+    }
+
+    /// Returns bounded continuation metadata.
+    pub fn continuation_config(&self) -> GoalContinuation {
+        self.continuation
+    }
+
+    /// Returns terminal summary text when the goal is terminal.
+    pub fn terminal_summary(&self) -> Option<&GoalTerminalSummary> {
+        match &self.state {
+            ActiveGoalState::Satisfied { summary, .. }
+            | ActiveGoalState::Blocked { summary, .. } => Some(summary),
+            ActiveGoalState::Active | ActiveGoalState::Paused => None,
+        }
+    }
+
+    /// Returns terminal evidence text when the goal is terminal.
+    pub fn terminal_evidence(&self) -> Option<&GoalTerminalEvidence> {
+        match &self.state {
+            ActiveGoalState::Satisfied { evidence, .. }
+            | ActiveGoalState::Blocked { evidence, .. } => Some(evidence),
+            ActiveGoalState::Active | ActiveGoalState::Paused => None,
+        }
+    }
+
+    /// Returns terminal blocker kind for blocked goals.
+    pub fn blocker_kind(&self) -> Option<GoalBlockerKind> {
+        match &self.state {
+            ActiveGoalState::Blocked { blocker_kind, .. } => Some(*blocker_kind),
+            ActiveGoalState::Active
+            | ActiveGoalState::Paused
+            | ActiveGoalState::Satisfied { .. } => None,
+        }
+    }
+
+    /// Returns true when the goal is terminal and must not be resumed.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.state,
+            ActiveGoalState::Satisfied { .. } | ActiveGoalState::Blocked { .. }
+        )
+    }
+
+    /// Marks this goal satisfied with validated terminal summary and evidence.
+    ///
+    /// # Arguments
+    /// * `summary` - Non-empty bounded terminal success summary.
+    /// * `evidence` - Non-empty bounded terminal success evidence.
+    ///
+    /// # Errors
+    /// Returns an error when terminal payload validation fails.
+    pub fn satisfy(
+        &mut self,
+        summary: impl Into<String>,
+        evidence: impl Into<String>,
+    ) -> anyhow::Result<()> {
+        self.state = ActiveGoalState::Satisfied {
+            summary: GoalTerminalSummary::new(summary)?,
+            evidence: GoalTerminalEvidence::new(evidence)?,
+        };
+        Ok(())
+    }
+
+    /// Marks this goal blocked with validated terminal summary, evidence, and blocker kind.
+    ///
+    /// # Arguments
+    /// * `summary` - Non-empty bounded blocker summary.
+    /// * `evidence` - Non-empty bounded blocker evidence.
+    /// * `blocker_kind` - Closed blocker taxonomy value.
+    ///
+    /// # Errors
+    /// Returns an error when terminal payload validation fails.
+    pub fn block(
+        &mut self,
+        summary: impl Into<String>,
+        evidence: impl Into<String>,
+        blocker_kind: GoalBlockerKind,
+    ) -> anyhow::Result<()> {
+        self.state = ActiveGoalState::Blocked {
+            summary: GoalTerminalSummary::new(summary)?,
+            evidence: GoalTerminalEvidence::new(evidence)?,
+            blocker_kind,
+        };
+        Ok(())
+    }
+
     /// Returns true when the goal should be injected into the next model request.
     pub fn is_active(&self) -> bool {
-        self.status == GoalStatus::Active
+        self.status() == GoalStatus::Active
     }
 
     /// Pauses the goal while retaining it in conversation state.
     pub fn pause(&mut self) {
-        self.status = GoalStatus::Paused;
+        if !self.is_terminal() {
+            self.state = ActiveGoalState::Paused;
+        }
     }
 
     /// Resumes the goal for model-context injection.
     pub fn resume(&mut self) {
-        self.status = GoalStatus::Active;
+        if !self.is_terminal() {
+            self.state = ActiveGoalState::Active;
+        }
     }
 
     /// Renders this goal as an uncached internal context payload.
@@ -575,13 +882,122 @@ impl ActiveGoal {
         Element::new("conversation_goal")
             .attr(
                 "status",
-                match self.status {
+                match self.status() {
                     GoalStatus::Active => "active",
                     GoalStatus::Paused => "paused",
+                    GoalStatus::Satisfied => "satisfied",
+                    GoalStatus::Blocked => "blocked",
                 },
             )
             .append(Element::new("objective").text(self.objective.as_str()))
             .render()
+    }
+}
+
+impl Serialize for ActiveGoal {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let field_count = match &self.state {
+            ActiveGoalState::Active | ActiveGoalState::Paused => 3,
+            ActiveGoalState::Satisfied { .. } => 5,
+            ActiveGoalState::Blocked { .. } => 6,
+        };
+        let mut state = serializer.serialize_struct("ActiveGoal", field_count)?;
+        state.serialize_field("objective", &self.objective)?;
+        state.serialize_field("status", &self.status())?;
+        state.serialize_field("continuation", &self.continuation)?;
+        match &self.state {
+            ActiveGoalState::Active | ActiveGoalState::Paused => {}
+            ActiveGoalState::Satisfied { summary, evidence } => {
+                state.serialize_field("summary", summary)?;
+                state.serialize_field("evidence", evidence)?;
+            }
+            ActiveGoalState::Blocked { summary, evidence, blocker_kind } => {
+                state.serialize_field("summary", summary)?;
+                state.serialize_field("evidence", evidence)?;
+                state.serialize_field("blocker_kind", blocker_kind)?;
+            }
+        }
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ActiveGoal {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ActiveGoalWire {
+            objective: GoalObjective,
+            status: GoalStatus,
+            #[serde(default)]
+            continuation: GoalContinuation,
+            #[serde(default)]
+            summary: Option<GoalTerminalSummary>,
+            #[serde(default)]
+            evidence: Option<GoalTerminalEvidence>,
+            #[serde(default)]
+            blocker_kind: Option<GoalBlockerKind>,
+        }
+
+        let wire = ActiveGoalWire::deserialize(deserializer)?;
+        let state = match wire.status {
+            GoalStatus::Active => {
+                if wire.summary.is_some() || wire.evidence.is_some() || wire.blocker_kind.is_some()
+                {
+                    return Err(serde::de::Error::custom(
+                        "active goal forbids terminal summary, evidence, and blocker_kind",
+                    ));
+                }
+                ActiveGoalState::Active
+            }
+            GoalStatus::Paused => {
+                if wire.summary.is_some() || wire.evidence.is_some() || wire.blocker_kind.is_some()
+                {
+                    return Err(serde::de::Error::custom(
+                        "paused goal forbids terminal summary, evidence, and blocker_kind",
+                    ));
+                }
+                ActiveGoalState::Paused
+            }
+            GoalStatus::Satisfied => {
+                if wire.blocker_kind.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "satisfied goal forbids blocker_kind",
+                    ));
+                }
+                ActiveGoalState::Satisfied {
+                    summary: wire
+                        .summary
+                        .ok_or_else(|| serde::de::Error::missing_field("summary"))?,
+                    evidence: wire
+                        .evidence
+                        .ok_or_else(|| serde::de::Error::missing_field("evidence"))?,
+                }
+            }
+            GoalStatus::Blocked => ActiveGoalState::Blocked {
+                summary: wire
+                    .summary
+                    .ok_or_else(|| serde::de::Error::missing_field("summary"))?,
+                evidence: wire
+                    .evidence
+                    .ok_or_else(|| serde::de::Error::missing_field("evidence"))?,
+                blocker_kind: wire
+                    .blocker_kind
+                    .ok_or_else(|| serde::de::Error::missing_field("blocker_kind"))?,
+            },
+        };
+        Ok(Self {
+            objective: wire.objective,
+            state,
+            continuation: wire.continuation,
+        })
     }
 }
 
@@ -1441,6 +1857,137 @@ mod tests {
 
     fn assistant_message(content: impl Into<String>) -> MessageEntry {
         ContextMessage::assistant(content.into(), None, None, None).into()
+    }
+
+    #[test]
+    fn test_active_goal_terminal_satisfied_is_validated_and_inactive() {
+        let setup = ActiveGoal::satisfied(
+            "finish goal slice",
+            "Goal completed",
+            "Tests and readback passed",
+        )
+        .unwrap();
+        let actual = (
+            setup.status(),
+            setup.is_active(),
+            setup.is_terminal(),
+            setup.terminal_summary().map(GoalTerminalSummary::as_str),
+            setup.terminal_evidence().map(GoalTerminalEvidence::as_str),
+            setup.blocker_kind(),
+        );
+        let expected = (
+            GoalStatus::Satisfied,
+            false,
+            true,
+            Some("Goal completed"),
+            Some("Tests and readback passed"),
+            None,
+        );
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_active_goal_terminal_blocked_requires_closed_blocker_kind() {
+        let setup = ActiveGoal::blocked(
+            "finish goal slice",
+            "Blocked safely",
+            "Current-session approval is required",
+            GoalBlockerKind::RequiresHumanApproval,
+        )
+        .unwrap();
+        let actual = (
+            setup.status(),
+            setup.is_active(),
+            setup.is_terminal(),
+            setup.blocker_kind(),
+        );
+        let expected = (
+            GoalStatus::Blocked,
+            false,
+            true,
+            Some(GoalBlockerKind::RequiresHumanApproval),
+        );
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_active_goal_terminal_payload_rejects_empty_and_oversized_values() {
+        let actual = vec![
+            ActiveGoal::satisfied("goal", " ", "evidence").is_err(),
+            ActiveGoal::satisfied("goal", "summary", " ").is_err(),
+            ActiveGoal::satisfied(
+                "goal",
+                "x".repeat(GoalTerminalSummary::MAX_CHARS + 1),
+                "evidence",
+            )
+            .is_err(),
+            ActiveGoal::blocked(
+                "goal",
+                "summary",
+                "x".repeat(GoalTerminalEvidence::MAX_CHARS + 1),
+                GoalBlockerKind::SafetyBoundary,
+            )
+            .is_err(),
+        ];
+        let expected = vec![true, true, true, true];
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_active_goal_terminal_serde_rejects_invalid_state_shapes() {
+        let valid_satisfied = serde_json::json!({
+            "objective": "finish goal slice",
+            "status": "satisfied",
+            "summary": "done",
+            "evidence": "proof"
+        });
+        let valid_blocked = serde_json::json!({
+            "objective": "finish goal slice",
+            "status": "blocked",
+            "summary": "blocked",
+            "evidence": "approval needed",
+            "blocker_kind": "requires_human_approval"
+        });
+        let invalid_satisfied = serde_json::json!({
+            "objective": "finish goal slice",
+            "status": "satisfied",
+            "summary": "done",
+            "evidence": "proof",
+            "blocker_kind": "safety_boundary"
+        });
+        let invalid_blocked = serde_json::json!({
+            "objective": "finish goal slice",
+            "status": "blocked",
+            "summary": "blocked",
+            "evidence": "approval needed"
+        });
+        let actual = vec![
+            serde_json::from_value::<ActiveGoal>(valid_satisfied).is_ok(),
+            serde_json::from_value::<ActiveGoal>(valid_blocked).is_ok(),
+            serde_json::from_value::<ActiveGoal>(invalid_satisfied).is_err(),
+            serde_json::from_value::<ActiveGoal>(invalid_blocked).is_err(),
+        ];
+        let expected = vec![true, true, true, true];
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_active_goal_pause_resume_do_not_reactivate_terminal_goals() {
+        let mut satisfied = ActiveGoal::satisfied("goal", "done", "proof").unwrap();
+        let mut blocked = ActiveGoal::blocked(
+            "goal",
+            "blocked",
+            "proof",
+            GoalBlockerKind::ExternalDependencyUnavailable,
+        )
+        .unwrap();
+        satisfied.pause();
+        satisfied.resume();
+        blocked.pause();
+        blocked.resume();
+        let actual = (satisfied.status(), blocked.status());
+        let expected = (GoalStatus::Satisfied, GoalStatus::Blocked);
+        assert_eq!(actual, expected);
     }
 
     #[test]
