@@ -47,6 +47,24 @@ impl<S: ConversationRepository> ConversationService for ForgeConversationService
         Ok(out)
     }
 
+    async fn try_modify_conversation<F, T>(&self, id: &ConversationId, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut Conversation) -> Result<T> + Send,
+        T: Send,
+    {
+        let mut conversation = self
+            .conversation_repository
+            .get_conversation(id)
+            .await?
+            .ok_or_else(|| forge_app::domain::Error::ConversationNotFound(*id))?;
+        let out = f(&mut conversation)?;
+        let _ = self
+            .conversation_repository
+            .upsert_conversation(conversation)
+            .await?;
+        Ok(out)
+    }
+
     async fn find_conversation(&self, id: &ConversationId) -> Result<Option<Conversation>> {
         self.conversation_repository.get_conversation(id).await
     }

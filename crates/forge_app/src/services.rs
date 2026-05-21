@@ -373,6 +373,21 @@ pub trait ConversationService: Send + Sync {
         F: FnOnce(&mut Conversation) -> T + Send,
         T: Send;
 
+    /// Attempts to modify a conversation and persists it only when the mutation
+    /// closure succeeds.
+    ///
+    /// # Arguments
+    /// * `id` - The conversation ID to modify.
+    /// * `f` - The fallible mutation closure executed before persistence.
+    ///
+    /// # Errors
+    /// Returns an error if the conversation is missing, the mutation fails, or
+    /// persistence fails.
+    async fn try_modify_conversation<F, T>(&self, id: &ConversationId, f: F) -> anyhow::Result<T>
+    where
+        F: FnOnce(&mut Conversation) -> anyhow::Result<T> + Send,
+        T: Send;
+
     /// Lists branch targets for a conversation using the domain selectable-target filter.
     ///
     /// # Arguments
@@ -1284,6 +1299,16 @@ impl<I: Services> ConversationService for I {
         T: Send,
     {
         self.conversation_service().modify_conversation(id, f).await
+    }
+
+    async fn try_modify_conversation<F, T>(&self, id: &ConversationId, f: F) -> anyhow::Result<T>
+    where
+        F: FnOnce(&mut Conversation) -> anyhow::Result<T> + Send,
+        T: Send,
+    {
+        self.conversation_service()
+            .try_modify_conversation(id, f)
+            .await
     }
 
     async fn list_branch_targets(
@@ -2215,6 +2240,22 @@ mod tests {
                 .get_mut(id)
                 .ok_or_else(|| forge_domain::Error::ConversationNotFound(*id))?;
             Ok(f(conversation))
+        }
+
+        async fn try_modify_conversation<F, T>(
+            &self,
+            id: &ConversationId,
+            f: F,
+        ) -> anyhow::Result<T>
+        where
+            F: FnOnce(&mut Conversation) -> anyhow::Result<T> + Send,
+            T: Send,
+        {
+            let mut conversations = self.conversations.lock().await;
+            let conversation = conversations
+                .get_mut(id)
+                .ok_or_else(|| forge_domain::Error::ConversationNotFound(*id))?;
+            f(conversation)
         }
 
         async fn branch_conversation(

@@ -2205,6 +2205,18 @@ mod tests {
             Ok(f(conversation))
         }
 
+        async fn try_modify_conversation<F, T>(&self, id: &ConversationId, f: F) -> Result<T>
+        where
+            F: FnOnce(&mut Conversation) -> Result<T> + Send,
+            T: Send,
+        {
+            let mut conversations = self.conversations.lock().await;
+            let conversation = conversations
+                .get_mut(id)
+                .ok_or_else(|| forge_domain::Error::ConversationNotFound(*id))?;
+            f(conversation)
+        }
+
         async fn branch_conversation(
             &self,
             _conversation_id: &ConversationId,

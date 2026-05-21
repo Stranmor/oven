@@ -429,7 +429,7 @@ impl<
         let expected_status = input.status;
         let mutation_report = self
             .services
-            .modify_conversation(&conversation_id, move |conversation| {
+            .try_modify_conversation(&conversation_id, move |conversation| {
                 let context = conversation.context.as_mut().ok_or_else(|| {
                     anyhow!("goal_terminal_action requires persisted conversation context")
                 })?;
@@ -456,7 +456,7 @@ impl<
                 }
                 goal_terminal_action_report(goal, expected_status, false)
             })
-            .await??;
+            .await?;
 
         let readback_goal = self
             .services
@@ -1038,6 +1038,7 @@ mod tests {
         exact_fact_producer_error: Arc<StdMutex<Option<String>>>,
         exact_fact_producer_status: Arc<StdMutex<WorkspaceExactFactReferenceStatus>>,
         conversation: Arc<Mutex<Option<Conversation>>>,
+        conversation_upserts: Arc<AtomicUsize>,
     }
 
     impl SemSearchFixture {
@@ -1068,6 +1069,7 @@ mod tests {
                         WorkspaceExactFactReferenceStatus::ArtifactWritten,
                     )),
                     conversation: Arc::new(Mutex::new(None)),
+                    conversation_upserts: Arc::new(AtomicUsize::new(0)),
                 },
                 unused: SemSearchUnusedService,
             }
@@ -1104,6 +1106,10 @@ mod tests {
         async fn with_conversation(self, conversation: Conversation) -> Self {
             *self.workspace.conversation.lock().await = Some(conversation);
             self
+        }
+
+        fn conversation_upserts(&self) -> usize {
+            self.workspace.conversation_upserts.load(Ordering::SeqCst)
         }
 
         fn with_exact_fact_status_error(self, error: &str) -> Self {
@@ -1534,6 +1540,17 @@ mod tests {
                     T: Send,
                 {
                     anyhow::bail!("unused conversation modify")
+                }
+                async fn try_modify_conversation<F, T>(
+                    &self,
+                    _id: &ConversationId,
+                    _f: F,
+                ) -> anyhow::Result<T>
+                where
+                    F: FnOnce(&mut Conversation) -> anyhow::Result<T> + Send,
+                    T: Send,
+                {
+                    anyhow::bail!("unused fallible conversation modify")
                 }
                 async fn list_branch_targets(
                     &self,
@@ -1984,6 +2001,7 @@ mod tests {
         }
 
         async fn upsert_conversation(&self, conversation: Conversation) -> anyhow::Result<()> {
+            self.conversation_upserts.fetch_add(1, Ordering::SeqCst);
             *self.conversation.lock().await = Some(conversation);
             Ok(())
         }
@@ -2014,6 +2032,23 @@ mod tests {
                 .filter(|conversation| conversation.id == *id)
                 .ok_or_else(|| anyhow!("fixture conversation not found"))?;
             Ok(f(conversation))
+        }
+
+        async fn try_modify_conversation<F, T>(
+            &self,
+            id: &ConversationId,
+            f: F,
+        ) -> anyhow::Result<T>
+        where
+            F: FnOnce(&mut Conversation) -> anyhow::Result<T> + Send,
+            T: Send,
+        {
+            let mut guard = self.conversation.lock().await;
+            let conversation = guard
+                .as_mut()
+                .filter(|conversation| conversation.id == *id)
+                .ok_or_else(|| anyhow!("fixture conversation not found"))?;
+            f(conversation)
         }
 
         async fn list_branch_targets(
@@ -2439,8 +2474,10 @@ mod tests {
 
         let actual = (
             paused_actual.is_err(),
+            paused_setup.conversation_upserts(),
             paused_persisted.status(),
             terminal_actual.is_err(),
+            terminal_setup.conversation_upserts(),
             terminal_persisted.status(),
             terminal_persisted
                 .terminal_summary()
@@ -2451,8 +2488,10 @@ mod tests {
         );
         let expected = (
             true,
+            0,
             forge_domain::GoalStatus::Paused,
             true,
+            0,
             forge_domain::GoalStatus::Satisfied,
             Some("done"),
             Some("proof"),
