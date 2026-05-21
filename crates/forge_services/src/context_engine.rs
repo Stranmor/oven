@@ -17,7 +17,8 @@ use forge_config::{
     ForgeConfig, OfflineRerankScoreArtifactConfig, ProjectContextConfig, VectorIndexArtifactConfig,
 };
 use forge_domain::{
-    AuthCredential, AuthDetails, FileChunk, Node, NodeData, NodeId, ProjectSemanticEmbeddingInput,
+    AuthCredential, AuthDetails, FileChunk, Node, NodeData, NodeId,
+    OfflineRerankScoreArtifactReadinessIssue, ProjectSemanticEmbeddingInput,
     ProjectSemanticEmbeddingOutput, ProjectSemanticEmbeddingRequest,
     ProjectSemanticEmbeddingVector, ProviderId, ProviderRepository, SearchParams,
     SearchRerankIntentSource, SemSearchAvailability, SemSearchDiagnosticReport,
@@ -32,7 +33,8 @@ use forge_domain::{
     WorkspaceExactFactIngestionSummary, WorkspaceExactFactIssue,
     WorkspaceExactFactReadinessDiagnostic, WorkspaceExactFactReferenceReport,
     WorkspaceExactFactReferenceStatus, WorkspaceExactFactStatusReport, WorkspaceId,
-    WorkspaceIndexRepository, WorkspaceSemanticInjectionReadiness, WorkspaceVectorIndexBuildReport,
+    WorkspaceIndexRepository, WorkspaceRerankRuntimeDiagnostic,
+    WorkspaceSemanticInjectionReadiness, WorkspaceVectorIndexBuildReport,
     WorkspaceVectorIndexBuildStatus,
 };
 use forge_project_model::{
@@ -234,6 +236,9 @@ pub enum ProjectContextRuntimeRerankerSelection<'a> {
 pub trait ProjectContextRuntimeRerankerSelector: Send + Sync {
     /// Selects the currently configured runtime reranker without reading external data.
     fn select_project_context_reranker(&self) -> ProjectContextRuntimeRerankerSelection<'_>;
+
+    /// Projects metadata-only construction-time runtime rerank availability.
+    fn project_context_reranker_diagnostic(&self) -> WorkspaceRerankRuntimeDiagnostic;
 }
 
 /// Production default selector: no runtime reranker is configured yet.
@@ -244,45 +249,9 @@ impl ProjectContextRuntimeRerankerSelector for MissingProjectContextRuntimeReran
     fn select_project_context_reranker(&self) -> ProjectContextRuntimeRerankerSelection<'_> {
         ProjectContextRuntimeRerankerSelection::Missing
     }
-}
 
-/// Redaction-safe construction-time issue for configured offline rerank-score artifacts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OfflineRerankScoreArtifactReadinessIssue {
-    /// Current project manifest could not be read at construction time.
-    ManifestUnavailable,
-    /// Current project manifest freshness could not be proven at construction time.
-    ManifestFreshnessUnknown,
-    /// Current project manifest is stale for the configured artifact.
-    StaleManifest,
-    /// Configured artifact path failed the artifact source trust boundary.
-    ArtifactPathRejected,
-    /// Configured artifact file could not be read.
-    ArtifactUnreadable,
-    /// Configured artifact JSON could not be parsed or validated.
-    ArtifactCorrupt,
-    /// Configured artifact format version is unsupported.
-    UnsupportedArtifact,
-    /// Configured artifact fingerprint did not validate.
-    FingerprintInvalid,
-    /// Configured artifact was produced for a different manifest hash.
-    ManifestHashMismatch,
-}
-
-impl OfflineRerankScoreArtifactReadinessIssue {
-    /// Returns a stable redaction-safe reason label for diagnostics and tests.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::ManifestUnavailable => "manifest_unavailable",
-            Self::ManifestFreshnessUnknown => "manifest_freshness_unknown",
-            Self::StaleManifest => "stale_manifest",
-            Self::ArtifactPathRejected => "artifact_path_rejected",
-            Self::ArtifactUnreadable => "artifact_unreadable",
-            Self::ArtifactCorrupt => "artifact_corrupt",
-            Self::UnsupportedArtifact => "unsupported_artifact",
-            Self::FingerprintInvalid => "fingerprint_invalid",
-            Self::ManifestHashMismatch => "manifest_hash_mismatch",
-        }
+    fn project_context_reranker_diagnostic(&self) -> WorkspaceRerankRuntimeDiagnostic {
+        WorkspaceRerankRuntimeDiagnostic::missing_config()
     }
 }
 
@@ -291,7 +260,7 @@ enum ProductionProjectContextRuntimeRerankerState {
     Missing,
     ConfiguredNotReady {
         identity: ProjectContextIntegrationIdentity,
-        readiness_issue: Option<OfflineRerankScoreArtifactReadinessIssue>,
+        readiness_issue: OfflineRerankScoreArtifactReadinessIssue,
     },
     Ready {
         reranker: Arc<dyn forge_project_model::Reranker + Send + Sync>,
@@ -329,7 +298,10 @@ impl ProductionProjectContextRuntimeRerankerSelector {
     ///
     /// * `identity` - Redaction-safe runtime reranker identity.
     pub fn configured_not_ready(identity: ProjectContextIntegrationIdentity) -> Self {
-        Self::configured_not_ready_with_issue(identity, None)
+        Self::configured_not_ready_with_issue(
+            identity,
+            OfflineRerankScoreArtifactReadinessIssue::ArtifactUnreadable,
+        )
     }
 
     /// Creates a selector for a configured runtime reranker that failed closed
@@ -341,7 +313,7 @@ impl ProductionProjectContextRuntimeRerankerSelector {
     /// * `readiness_issue` - Redaction-safe construction-time issue label.
     pub fn configured_not_ready_with_issue(
         identity: ProjectContextIntegrationIdentity,
-        readiness_issue: Option<OfflineRerankScoreArtifactReadinessIssue>,
+        readiness_issue: OfflineRerankScoreArtifactReadinessIssue,
     ) -> Self {
         Self {
             state: ProductionProjectContextRuntimeRerankerState::ConfiguredNotReady {
@@ -396,7 +368,7 @@ impl ProductionProjectContextRuntimeRerankerSelector {
             Err(_error) => {
                 return Self::configured_not_ready_with_issue(
                     IDENTITY,
-                    Some(OfflineRerankScoreArtifactReadinessIssue::ManifestUnavailable),
+                    OfflineRerankScoreArtifactReadinessIssue::ManifestUnavailable,
                 );
             }
         };
@@ -405,13 +377,13 @@ impl ProductionProjectContextRuntimeRerankerSelector {
             Ok(_freshness) => {
                 return Self::configured_not_ready_with_issue(
                     IDENTITY,
-                    Some(OfflineRerankScoreArtifactReadinessIssue::StaleManifest),
+                    OfflineRerankScoreArtifactReadinessIssue::StaleManifest,
                 );
             }
             Err(_error) => {
                 return Self::configured_not_ready_with_issue(
                     IDENTITY,
-                    Some(OfflineRerankScoreArtifactReadinessIssue::ManifestFreshnessUnknown),
+                    OfflineRerankScoreArtifactReadinessIssue::ManifestFreshnessUnknown,
                 );
             }
         }
@@ -422,13 +394,13 @@ impl ProductionProjectContextRuntimeRerankerSelector {
                 Err(ConfiguredArtifactPathState::Missing) => {
                     return Self::configured_not_ready_with_issue(
                         IDENTITY,
-                        Some(OfflineRerankScoreArtifactReadinessIssue::ArtifactUnreadable),
+                        OfflineRerankScoreArtifactReadinessIssue::ArtifactUnreadable,
                     );
                 }
                 Err(ConfiguredArtifactPathState::Rejected) => {
                     return Self::configured_not_ready_with_issue(
                         IDENTITY,
-                        Some(OfflineRerankScoreArtifactReadinessIssue::ArtifactPathRejected),
+                        OfflineRerankScoreArtifactReadinessIssue::ArtifactPathRejected,
                     );
                 }
             };
@@ -436,7 +408,7 @@ impl ProductionProjectContextRuntimeRerankerSelector {
             Ok(reranker) => Self::ready_synchronous(Arc::new(reranker), IDENTITY),
             Err(error) => Self::configured_not_ready_with_issue(
                 IDENTITY,
-                Some(offline_rerank_readiness_issue_from_error(&error)),
+                offline_rerank_readiness_issue_from_error(&error),
             ),
         }
     }
@@ -445,14 +417,10 @@ impl ProductionProjectContextRuntimeRerankerSelector {
     pub fn readiness_issue_label(&self) -> Option<&'static str> {
         match &self.state {
             ProductionProjectContextRuntimeRerankerState::ConfiguredNotReady {
-                readiness_issue: Some(issue),
+                readiness_issue,
                 ..
-            } => Some(issue.label()),
+            } => Some(readiness_issue.label()),
             ProductionProjectContextRuntimeRerankerState::Missing
-            | ProductionProjectContextRuntimeRerankerState::ConfiguredNotReady {
-                readiness_issue: None,
-                ..
-            }
             | ProductionProjectContextRuntimeRerankerState::Ready { .. } => None,
         }
     }
@@ -499,6 +467,28 @@ impl ProjectContextRuntimeRerankerSelector for ProductionProjectContextRuntimeRe
                     reranker: reranker.as_ref(),
                     identity: *identity,
                 }
+            }
+        }
+    }
+
+    fn project_context_reranker_diagnostic(&self) -> WorkspaceRerankRuntimeDiagnostic {
+        match &self.state {
+            ProductionProjectContextRuntimeRerankerState::Missing => {
+                WorkspaceRerankRuntimeDiagnostic::missing_config()
+            }
+            ProductionProjectContextRuntimeRerankerState::ConfiguredNotReady {
+                identity,
+                readiness_issue,
+            } => WorkspaceRerankRuntimeDiagnostic::configured_not_ready(
+                identity.provider,
+                identity.artifact,
+                *readiness_issue,
+            ),
+            ProductionProjectContextRuntimeRerankerState::Ready { identity, .. } => {
+                WorkspaceRerankRuntimeDiagnostic::configured_ready(
+                    identity.provider,
+                    identity.artifact,
+                )
             }
         }
     }
@@ -3029,6 +3019,12 @@ impl<
         self.sem_search_diagnostic_for_model(path, embedding_model_id.as_deref())
     }
 
+    async fn project_context_reranker_diagnostic(
+        &self,
+    ) -> Result<WorkspaceRerankRuntimeDiagnostic> {
+        Ok(self.reranker_selector.project_context_reranker_diagnostic())
+    }
+
     /// Performs semantic code search on a workspace and returns committed project-model metadata.
     async fn query_workspace_committed(
         &self,
@@ -3208,6 +3204,7 @@ mod tests {
         ConfigOperation, Environment, FileHash, ProcessId, ProcessReadCursor, ProcessReadOutput,
         ProcessStartOutput, ProcessStatus, ProviderTemplate, SemSearchDiagnosticStatus,
         SemSearchSuggestedAction, ShellHandoffTimeoutSeconds, WorkspaceFiles, WorkspaceInfo,
+        WorkspaceRerankRuntimeState,
     };
     use forge_project_model::{
         ContextPack, ContextPackSelection, EvidenceLedgerReplayReport, EvidenceReplayBudget,
@@ -3341,6 +3338,31 @@ mod tests {
                         identity,
                         reason: ProjectContextRerankerUnavailableReason::RerankerNotReady,
                     }
+                }
+            }
+        }
+
+        fn project_context_reranker_diagnostic(&self) -> WorkspaceRerankRuntimeDiagnostic {
+            let identity = ProjectContextIntegrationIdentity {
+                provider: "test-runtime-reranker",
+                artifact: "explicit-mock-runtime",
+            };
+            match &self.state {
+                FakeRuntimeRerankerSelectorState::Missing => {
+                    WorkspaceRerankRuntimeDiagnostic::missing_config()
+                }
+                FakeRuntimeRerankerSelectorState::Ready(_reranker) => {
+                    WorkspaceRerankRuntimeDiagnostic::configured_ready(
+                        identity.provider,
+                        identity.artifact,
+                    )
+                }
+                FakeRuntimeRerankerSelectorState::Unavailable => {
+                    WorkspaceRerankRuntimeDiagnostic::configured_not_ready(
+                        identity.provider,
+                        identity.artifact,
+                        OfflineRerankScoreArtifactReadinessIssue::ArtifactUnreadable,
+                    )
                 }
             }
         }
@@ -5504,6 +5526,71 @@ mod tests {
             Arc::new(NoopDiscovery),
         )
         .with_project_context_reranker_selector(Arc::new(selector))
+    }
+
+    #[test]
+    fn production_runtime_reranker_diagnostic_projects_typed_construction_snapshot() -> Result<()> {
+        let (_ready_fixture, ready_root) = fixture_workspace()?;
+        write_fixture_project_model(&ready_root)?;
+        let ready_manifest = ProjectIndexer::new(&ready_root, local_project_model_dir(&ready_root))
+            .read_manifest()?;
+        let ready_artifact = fixture_offline_rerank_artifact(&ready_manifest)?;
+        let ready_artifact_path =
+            write_fixture_offline_rerank_artifact(&ready_root, &ready_artifact)?;
+        let ready = configured_offline_rerank_selector(&ready_root, ready_artifact_path)
+            .project_context_reranker_diagnostic();
+
+        let (_corrupt_fixture, corrupt_root) = fixture_workspace()?;
+        write_fixture_project_model(&corrupt_root)?;
+        let corrupt_path =
+            local_project_model_dir(&corrupt_root).join("corrupt_offline_rerank.json");
+        fs::write(&corrupt_path, "{not-json")?;
+        let corrupt = configured_offline_rerank_selector(&corrupt_root, corrupt_path)
+            .project_context_reranker_diagnostic();
+
+        let (_stale_fixture, stale_root) = fixture_workspace()?;
+        write_fixture_project_model(&stale_root)?;
+        let stale_manifest = ProjectIndexer::new(&stale_root, local_project_model_dir(&stale_root))
+            .read_manifest()?;
+        let stale_artifact = fixture_offline_rerank_artifact(&stale_manifest)?;
+        let mut stale_key = stale_artifact.key.clone();
+        stale_key.manifest_hash = forge_project_model::fingerprint("stale-manifest");
+        let stale_artifact = OfflineRerankScoreArtifact::new(stale_key, stale_artifact.scores)?;
+        let stale_path = write_fixture_offline_rerank_artifact(&stale_root, &stale_artifact)?;
+        let stale = configured_offline_rerank_selector(&stale_root, stale_path)
+            .project_context_reranker_diagnostic();
+
+        let missing = ProductionProjectContextRuntimeRerankerSelector::missing()
+            .project_context_reranker_diagnostic();
+        let expected = (
+            WorkspaceRerankRuntimeState::ConfiguredReady,
+            true,
+            WorkspaceRerankRuntimeState::ConfiguredNotReady {
+                issue: OfflineRerankScoreArtifactReadinessIssue::ArtifactCorrupt,
+            },
+            Some("artifact_corrupt".to_string()),
+            WorkspaceRerankRuntimeState::ConfiguredNotReady {
+                issue: OfflineRerankScoreArtifactReadinessIssue::ManifestHashMismatch,
+            },
+            Some("manifest_hash_mismatch".to_string()),
+            WorkspaceRerankRuntimeState::MissingConfig,
+            false,
+        );
+
+        assert_eq!(
+            (
+                ready.state,
+                ready.rerank_available,
+                corrupt.state.clone(),
+                corrupt.issue_label().map(str::to_string),
+                stale.state.clone(),
+                stale.issue_label().map(str::to_string),
+                missing.state,
+                missing.rerank_available,
+            ),
+            expected,
+        );
+        Ok(())
     }
 
     #[test]

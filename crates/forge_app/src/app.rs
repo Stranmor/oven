@@ -577,11 +577,17 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
             .await;
         let retrieval_empty_targets = Vec::new();
         let has_query = query.as_deref().is_some_and(|query| !query.is_empty());
+        let rerank_runtime = self
+            .services
+            .project_context_reranker_diagnostic()
+            .await
+            .ok();
         let retrieval_plan_diagnostics = if has_query {
             self.retrieval_plan_diagnostics(
                 &target_specs,
                 &nearest_skipped_manifest_candidates,
                 query.as_deref().unwrap_or_default(),
+                rerank_runtime,
             )
         } else {
             Vec::new()
@@ -730,6 +736,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
         target_specs: &[ProjectContextTargetDiagnostic],
         skipped_manifest_candidates: &[WorkspaceContextManifestDiagnostic],
         query: &str,
+        rerank_runtime: Option<WorkspaceRerankRuntimeDiagnostic>,
     ) -> Vec<WorkspaceRetrievalPlanDiagnostic> {
         let max_sources = ProjectModelContextRenderBudget::default().max_sources;
         let mut diagnostics = target_specs
@@ -741,6 +748,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
                     target_diagnostic.target.path_filter.clone(),
                     query,
                     max_sources,
+                    rerank_runtime.clone(),
                 )
             })
             .collect::<Vec<_>>();
@@ -755,6 +763,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
                         None,
                         query,
                         max_sources,
+                        rerank_runtime.clone(),
                     )
                 }),
         );
@@ -766,6 +775,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
         path_filter: Option<String>,
         query: &str,
         max_sources: usize,
+        rerank_runtime: Option<WorkspaceRerankRuntimeDiagnostic>,
     ) -> Option<WorkspaceRetrievalPlanDiagnostic> {
         let indexer = ProjectIndexer::new(workspace_root, local_project_model_dir(workspace_root));
         let manifest = match indexer.read_manifest() {
@@ -789,9 +799,11 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
             true,
         );
         let outcome = plan_project_context_retrieval(&manifest, &freshness, request);
-        Some(Self::retrieval_plan_diagnostic_to_domain(
+        let mut diagnostic = Self::retrieval_plan_diagnostic_to_domain(
             ProjectContextRetrievalPlanDiagnostic::from_outcome(&outcome),
-        ))
+        );
+        diagnostic.rerank_runtime = rerank_runtime;
+        Some(diagnostic)
     }
 
     fn retrieval_plan_diagnostic_to_domain(
@@ -822,6 +834,7 @@ impl<S: EnvironmentInfra<Config = forge_config::ForgeConfig> + WorkspaceService>
                 .map(|source| format!("{source:?}")),
             rerank_intent_fingerprint: diagnostic.rerank_intent_fingerprint,
             rerank_intent_len: diagnostic.rerank_intent_len,
+            rerank_runtime: None,
             retrieval_empty: diagnostic.retrieval_empty,
             truncated: diagnostic.truncated,
         }
@@ -2694,6 +2707,12 @@ mod tests {
             ))
         }
 
+        async fn project_context_reranker_diagnostic(
+            &self,
+        ) -> Result<WorkspaceRerankRuntimeDiagnostic> {
+            Ok(WorkspaceRerankRuntimeDiagnostic::missing_config())
+        }
+
         async fn query_workspace_committed(
             &self,
             _path: PathBuf,
@@ -3160,6 +3179,8 @@ mod tests {
         embedding_failure: AtomicBool,
         embedding_pending: AtomicBool,
         embedding_dimension: AtomicUsize,
+        rerank_runtime: Mutex<WorkspaceRerankRuntimeDiagnostic>,
+        rerank_runtime_diagnostic_calls: AtomicUsize,
     }
 
     impl ProjectContextHarness {
@@ -3298,6 +3319,8 @@ mod tests {
                 embedding_failure: AtomicBool::new(false),
                 embedding_pending: AtomicBool::new(false),
                 embedding_dimension: AtomicUsize::new(2),
+                rerank_runtime: Mutex::new(WorkspaceRerankRuntimeDiagnostic::missing_config()),
+                rerank_runtime_diagnostic_calls: AtomicUsize::new(0),
             })
         }
 
@@ -3312,6 +3335,14 @@ mod tests {
         ) {
             let path = fs::canonicalize(&path).unwrap_or(path);
             self.semantic_readiness.lock().await.insert(path, readiness);
+        }
+
+        async fn set_rerank_runtime(&self, diagnostic: WorkspaceRerankRuntimeDiagnostic) {
+            *self.rerank_runtime.lock().await = diagnostic;
+        }
+
+        fn rerank_runtime_diagnostic_calls(&self) -> usize {
+            self.rerank_runtime_diagnostic_calls.load(Ordering::SeqCst)
         }
 
         fn disable_semantic_embedding_model(&self) {
@@ -3675,6 +3706,14 @@ mod tests {
                 embedding_model_id.as_deref(),
                 &path,
             ))
+        }
+
+        async fn project_context_reranker_diagnostic(
+            &self,
+        ) -> Result<WorkspaceRerankRuntimeDiagnostic> {
+            self.rerank_runtime_diagnostic_calls
+                .fetch_add(1, Ordering::SeqCst);
+            Ok(self.rerank_runtime.lock().await.clone())
         }
 
         async fn query_workspace_committed(
@@ -5696,6 +5735,119 @@ mod tests {
         };
 
         assert_eq!(actual.phase_diagnostics.rerank, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_context_reranker_runtime_reports_configured_ready_without_activation()
+    -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root);
+        let fake_reranker_calls = AtomicUsize::new(0);
+        setup
+            .set_rerank_runtime(WorkspaceRerankRuntimeDiagnostic::configured_ready(
+                "project-context-offline-rerank",
+                "offline-rerank-score-artifact",
+            ))
+            .await;
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
+
+        let actual = ProjectContextInjection::new(setup.clone(), agent)
+            .explain(Some("find automatic injection needle".to_string()))
+            .await;
+        let actual = actual
+            .retrieval_plan_diagnostics
+            .first()
+            .and_then(|diagnostic| diagnostic.rerank_runtime.clone())
+            .expect("rerank runtime diagnostic should be present");
+        let expected = (
+            WorkspaceRerankRuntimeState::ConfiguredReady,
+            true,
+            0usize,
+            1usize,
+        );
+
+        assert_eq!(
+            (
+                actual.state,
+                actual.rerank_available,
+                fake_reranker_calls.load(Ordering::SeqCst),
+                setup.rerank_runtime_diagnostic_calls(),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_context_reranker_runtime_reports_missing_config() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root);
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
+
+        let actual = ProjectContextInjection::new(setup, agent)
+            .explain(Some("find automatic injection needle".to_string()))
+            .await;
+        let actual = actual
+            .retrieval_plan_diagnostics
+            .first()
+            .and_then(|diagnostic| diagnostic.rerank_runtime.clone())
+            .expect("rerank runtime diagnostic should be present");
+        let expected = (WorkspaceRerankRuntimeState::MissingConfig, false);
+
+        assert_eq!((actual.state, actual.rerank_available), expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_context_reranker_runtime_redacts_rejected_malicious_artifact() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        let setup = ProjectContextHarness::new(root);
+        setup
+            .set_rerank_runtime(WorkspaceRerankRuntimeDiagnostic::configured_not_ready(
+                "project-context-offline-rerank",
+                "offline-rerank-score-artifact",
+                OfflineRerankScoreArtifactReadinessIssue::ArtifactPathRejected,
+            ))
+            .await;
+        let model_id = ModelId::new("test-model");
+        let agent = Agent::new(AgentId::new("forge"), ProviderId::OPENAI, model_id);
+
+        let actual = ProjectContextInjection::new(setup, agent)
+            .explain(Some(
+                "https://evil.invalid/raw-query candidate secret artifact content".to_string(),
+            ))
+            .await;
+        let diagnostic = actual
+            .retrieval_plan_diagnostics
+            .first()
+            .and_then(|diagnostic| diagnostic.rerank_runtime.clone())
+            .expect("rerank runtime diagnostic should be present");
+        let diagnostic_json = serde_json::to_string(&diagnostic)?;
+        let expected = (
+            WorkspaceRerankRuntimeState::ConfiguredNotReady {
+                issue: OfflineRerankScoreArtifactReadinessIssue::ArtifactPathRejected,
+            },
+            Some("artifact_path_rejected".to_string()),
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert_eq!(
+            (
+                diagnostic.state.clone(),
+                diagnostic.issue_label().map(str::to_string),
+                diagnostic_json.contains("evil.invalid"),
+                diagnostic_json.contains("candidate secret"),
+                diagnostic_json.contains("artifact content"),
+                diagnostic_json.contains("/secret/"),
+            ),
+            expected,
+        );
         Ok(())
     }
 

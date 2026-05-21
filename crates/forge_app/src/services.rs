@@ -18,7 +18,7 @@ use forge_domain::{
     SubagentTaskSessionFilter, SyncProgress, SyntaxError, Template, ToolCallFull, ToolOutput,
     WorkspaceAuth, WorkspaceContextManifestDiagnostic, WorkspaceEvidenceReplayDiagnostic,
     WorkspaceEvidenceReplayPreviewDiagnostic, WorkspaceExactFactReferenceReport,
-    WorkspaceExactFactStatusReport, WorkspaceId, WorkspaceInfo,
+    WorkspaceExactFactStatusReport, WorkspaceId, WorkspaceInfo, WorkspaceRerankRuntimeDiagnostic,
     WorkspaceSemanticInjectionReadiness, WorkspaceVectorIndexBuildReport,
 };
 use forge_eventsource::EventSource;
@@ -834,6 +834,11 @@ pub trait WorkspaceService: Send + Sync {
         path: PathBuf,
         embedding_model_id: Option<String>,
     ) -> anyhow::Result<SemSearchDiagnosticReport>;
+
+    /// Produces a metadata-only runtime rerank availability snapshot without selecting a reranker.
+    async fn project_context_reranker_diagnostic(
+        &self,
+    ) -> anyhow::Result<WorkspaceRerankRuntimeDiagnostic>;
 
     /// Query the indexed workspace with semantic search and return committed project-model metadata.
     async fn query_workspace_committed(
@@ -2018,6 +2023,14 @@ impl<I: Services> WorkspaceService for I {
             .await
     }
 
+    async fn project_context_reranker_diagnostic(
+        &self,
+    ) -> anyhow::Result<WorkspaceRerankRuntimeDiagnostic> {
+        self.workspace_service()
+            .project_context_reranker_diagnostic()
+            .await
+    }
+
     async fn query_workspace_committed(
         &self,
         path: PathBuf,
@@ -2882,6 +2895,12 @@ mod tests {
             anyhow::bail!("unused workspace service")
         }
 
+        async fn project_context_reranker_diagnostic(
+            &self,
+        ) -> anyhow::Result<WorkspaceRerankRuntimeDiagnostic> {
+            anyhow::bail!("unused workspace service")
+        }
+
         async fn query_workspace_committed(
             &self,
             _path: PathBuf,
@@ -3053,6 +3072,12 @@ mod tests {
             _path: PathBuf,
             _embedding_model_id: Option<String>,
         ) -> anyhow::Result<SemSearchDiagnosticReport> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn project_context_reranker_diagnostic(
+            &self,
+        ) -> anyhow::Result<WorkspaceRerankRuntimeDiagnostic> {
             anyhow::bail!("unused workspace service")
         }
 

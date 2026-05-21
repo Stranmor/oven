@@ -889,7 +889,7 @@ mod tests {
         WorkspaceEvidenceReplayDiagnostic, WorkspaceEvidenceReplayPreviewDiagnostic,
         WorkspaceExactFactReferenceContinuationStatus, WorkspaceExactFactReferenceReport,
         WorkspaceExactFactReferenceStatus, WorkspaceExactFactStatusReport, WorkspaceId,
-        WorkspaceInfo, WorkspaceSemanticInjectionReadiness,
+        WorkspaceInfo, WorkspaceRerankRuntimeDiagnostic, WorkspaceSemanticInjectionReadiness,
         WorkspaceVectorIndexBuildContinuationStatus, WorkspaceVectorIndexBuildReport,
         WorkspaceVectorIndexBuildStatus,
     };
@@ -1208,6 +1208,12 @@ mod tests {
                 embedding_model_id.as_deref(),
                 &path,
             ))
+        }
+
+        async fn project_context_reranker_diagnostic(
+            &self,
+        ) -> anyhow::Result<WorkspaceRerankRuntimeDiagnostic> {
+            Ok(WorkspaceRerankRuntimeDiagnostic::missing_config())
         }
 
         async fn query_workspace_committed(

@@ -407,6 +407,143 @@ fn shell_quote_display(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// Redaction-safe construction-time issue for configured offline rerank-score artifacts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OfflineRerankScoreArtifactReadinessIssue {
+    /// Current project manifest could not be read at construction time.
+    ManifestUnavailable,
+    /// Current project manifest freshness could not be proven at construction time.
+    ManifestFreshnessUnknown,
+    /// Current project manifest is stale for the configured artifact.
+    StaleManifest,
+    /// Configured artifact path failed the artifact source trust boundary.
+    ArtifactPathRejected,
+    /// Configured artifact file could not be read.
+    ArtifactUnreadable,
+    /// Configured artifact JSON could not be parsed or validated.
+    ArtifactCorrupt,
+    /// Configured artifact format version is unsupported.
+    UnsupportedArtifact,
+    /// Configured artifact fingerprint did not validate.
+    FingerprintInvalid,
+    /// Configured artifact was produced for a different manifest hash.
+    ManifestHashMismatch,
+}
+
+impl OfflineRerankScoreArtifactReadinessIssue {
+    /// Returns a stable redaction-safe reason label for diagnostics and tests.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ManifestUnavailable => "manifest_unavailable",
+            Self::ManifestFreshnessUnknown => "manifest_freshness_unknown",
+            Self::StaleManifest => "stale_manifest",
+            Self::ArtifactPathRejected => "artifact_path_rejected",
+            Self::ArtifactUnreadable => "artifact_unreadable",
+            Self::ArtifactCorrupt => "artifact_corrupt",
+            Self::UnsupportedArtifact => "unsupported_artifact",
+            Self::FingerprintInvalid => "fingerprint_invalid",
+            Self::ManifestHashMismatch => "manifest_hash_mismatch",
+        }
+    }
+}
+
+/// Metadata-only runtime rerank availability snapshot for read-only diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct WorkspaceRerankRuntimeDiagnostic {
+    /// Redaction-safe runtime status captured from selector construction state.
+    pub state: WorkspaceRerankRuntimeState,
+    /// Stable provider label when a reranker source was configured.
+    pub provider_label: Option<String>,
+    /// Stable artifact label when a reranker source was configured.
+    pub artifact_label: Option<String>,
+    /// Whether read-only diagnostics may report rerank availability without activation.
+    pub rerank_available: bool,
+    /// Clarifies that the diagnostic is a construction-time activation snapshot.
+    pub snapshot_kind: String,
+}
+
+impl Serialize for WorkspaceRerankRuntimeDiagnostic {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("WorkspaceRerankRuntimeDiagnostic", 6)?;
+        state.serialize_field("state", &self.state)?;
+        state.serialize_field("provider_label", &self.provider_label)?;
+        state.serialize_field("artifact_label", &self.artifact_label)?;
+        state.serialize_field("issue_label", &self.issue_label())?;
+        state.serialize_field("rerank_available", &self.rerank_available)?;
+        state.serialize_field("snapshot_kind", &self.snapshot_kind)?;
+        state.end()
+    }
+}
+
+impl WorkspaceRerankRuntimeDiagnostic {
+    /// Returns the stable redaction-safe issue label derived from the typed state.
+    pub fn issue_label(&self) -> Option<&'static str> {
+        match self.state {
+            WorkspaceRerankRuntimeState::MissingConfig
+            | WorkspaceRerankRuntimeState::ConfiguredReady => None,
+            WorkspaceRerankRuntimeState::ConfiguredNotReady { issue } => Some(issue.label()),
+        }
+    }
+
+    /// Creates the missing-config diagnostic state.
+    pub fn missing_config() -> Self {
+        Self {
+            state: WorkspaceRerankRuntimeState::MissingConfig,
+            provider_label: None,
+            artifact_label: None,
+            rerank_available: false,
+            snapshot_kind: "runtime_selector_construction_snapshot".to_string(),
+        }
+    }
+
+    /// Creates the configured-ready diagnostic state.
+    pub fn configured_ready(provider: &'static str, artifact: &'static str) -> Self {
+        Self {
+            state: WorkspaceRerankRuntimeState::ConfiguredReady,
+            provider_label: Some(provider.to_string()),
+            artifact_label: Some(artifact.to_string()),
+            rerank_available: true,
+            snapshot_kind: "runtime_selector_construction_snapshot".to_string(),
+        }
+    }
+
+    /// Creates the configured-not-ready diagnostic state.
+    pub fn configured_not_ready(
+        provider: &'static str,
+        artifact: &'static str,
+        issue: OfflineRerankScoreArtifactReadinessIssue,
+    ) -> Self {
+        Self {
+            state: WorkspaceRerankRuntimeState::ConfiguredNotReady { issue },
+            provider_label: Some(provider.to_string()),
+            artifact_label: Some(artifact.to_string()),
+            rerank_available: false,
+            snapshot_kind: "runtime_selector_construction_snapshot".to_string(),
+        }
+    }
+}
+
+/// Typed runtime rerank diagnostic state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceRerankRuntimeState {
+    /// No rerank runtime configuration exists.
+    MissingConfig,
+    /// Rerank runtime was configured and activated at selector construction time.
+    ConfiguredReady,
+    /// Rerank runtime was configured but failed closed at selector construction time.
+    ConfiguredNotReady {
+        /// Redaction-safe typed issue from the shared offline artifact source of truth.
+        issue: OfflineRerankScoreArtifactReadinessIssue,
+    },
+}
+
 /// Typed readiness classification for automatic semantic project-context injection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkspaceSemanticInjectionReadiness {
@@ -938,6 +1075,9 @@ pub struct WorkspaceRetrievalPlanDiagnostic {
     /// Normalized selected rerank intent length.
     #[serde(default)]
     pub rerank_intent_len: Option<usize>,
+    /// Metadata-only runtime rerank availability snapshot.
+    #[serde(default)]
+    pub rerank_runtime: Option<WorkspaceRerankRuntimeDiagnostic>,
     /// Whether retrieval selected no evidence.
     pub retrieval_empty: bool,
     /// Whether selected or read-request summaries were truncated.

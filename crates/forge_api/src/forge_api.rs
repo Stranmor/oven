@@ -923,6 +923,12 @@ mod tests {
             anyhow::bail!("unused workspace service")
         }
 
+        async fn project_context_reranker_diagnostic(
+            &self,
+        ) -> Result<WorkspaceRerankRuntimeDiagnostic> {
+            anyhow::bail!("unused workspace service")
+        }
+
         async fn query_workspace_committed(
             &self,
             _path: PathBuf,
