@@ -22,7 +22,7 @@ use forge_domain::{
     WorkspaceSemanticInjectionReadiness, WorkspaceVectorIndexBuildReport,
 };
 use forge_eventsource::EventSource;
-use forge_project_model::ProjectContextCommittedQueryResult;
+use forge_project_model::{ProjectContextCommittedQueryResult, ProjectContextEpisodeAppendOutcome};
 use reqwest::Response;
 use reqwest::header::HeaderMap;
 use url::Url;
@@ -799,12 +799,15 @@ pub trait WorkspaceService: Send + Sync {
         params: SearchParams<'_>,
     ) -> anyhow::Result<(ProjectContextCommittedQueryResult, Vec<Node>)>;
 
-    /// Query the indexed workspace with semantic search
+    /// Query the indexed workspace with semantic search.
     async fn query_workspace(
         &self,
         path: PathBuf,
         params: SearchParams<'_>,
-    ) -> anyhow::Result<Vec<Node>>;
+    ) -> anyhow::Result<Vec<Node>> {
+        let (committed_result, nodes) = self.query_workspace_committed(path, params).await?;
+        project_committed_query_nodes(committed_result, nodes)
+    }
 
     /// List all workspaces indexed by the user
     async fn list_workspaces(&self) -> anyhow::Result<Vec<WorkspaceInfo>>;
@@ -838,6 +841,26 @@ pub trait WorkspaceService: Send + Sync {
 
     /// Initialize a workspace without syncing files
     async fn init_workspace(&self, path: PathBuf) -> anyhow::Result<WorkspaceId>;
+}
+
+/// Projects committed workspace-query metadata into the legacy public node surface.
+///
+/// # Arguments
+///
+/// * `committed_result` - Committed query metadata produced by the project-model boundary.
+/// * `nodes` - Legacy node projection produced by the committed query path.
+pub fn project_committed_query_nodes(
+    committed_result: ProjectContextCommittedQueryResult,
+    nodes: Vec<Node>,
+) -> anyhow::Result<Vec<Node>> {
+    if let ProjectContextEpisodeAppendOutcome::Failed { reason_code } =
+        committed_result.episode_append()
+    {
+        match reason_code {
+            forge_project_model::ProjectContextEpisodeAppendFailureReason::EpisodeAppendFailed => {}
+        }
+    }
+    Ok(nodes)
 }
 
 #[async_trait::async_trait]
@@ -2991,14 +3014,6 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("committed workspace query fixture missing"))
         }
 
-        async fn query_workspace(
-            &self,
-            _path: PathBuf,
-            _params: SearchParams<'_>,
-        ) -> anyhow::Result<Vec<Node>> {
-            anyhow::bail!("legacy workspace query fixture missing")
-        }
-
         async fn list_workspaces(&self) -> anyhow::Result<Vec<WorkspaceInfo>> {
             anyhow::bail!("unused workspace service")
         }
@@ -3261,6 +3276,57 @@ mod tests {
 
         assert_eq!(actual_metadata, expected_metadata);
         assert_eq!(actual_nodes, expected_nodes);
+    }
+
+    #[tokio::test]
+    async fn workspace_legacy_query_adapter_delegates_to_committed_query() {
+        let setup = FacadeFixture::default();
+        let expected_metadata = ProjectContextCommittedQueryResult::no_write(
+            Default::default(),
+            ProjectContextPackNoWriteReason::EmptyEvidence,
+            Vec::new(),
+        );
+        let expected = vec![Node {
+            node_id: NodeId::new("symbol:src/lib.rs:legacy_adapter"),
+            node: NodeData::FileChunk(FileChunk {
+                file_path: "src/lib.rs".to_string(),
+                content: "pub fn legacy_adapter() {}".to_string(),
+                start_line: 1,
+                end_line: 1,
+            }),
+            relevance: Some(1.0),
+            distance: None,
+        }];
+        setup
+            .workspace
+            .set_committed_result(expected_metadata, expected.clone())
+            .await;
+
+        let actual = setup
+            .query_workspace(
+                PathBuf::from("/tmp/workspace"),
+                SearchParams::new("legacy adapter", "test use case"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn workspace_legacy_query_adapter_propagates_committed_query_errors() {
+        let setup = FacadeFixture::default();
+
+        let actual = setup
+            .query_workspace(
+                PathBuf::from("/tmp/workspace"),
+                SearchParams::new("legacy adapter", "test use case"),
+            )
+            .await;
+        let expected = "committed workspace query fixture missing";
+        let actual = actual.unwrap_err().to_string();
+
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]

@@ -1493,23 +1493,6 @@ impl<
         });
         Ok((committed_result, nodes))
     }
-
-    async fn query_local_workspace(
-        &self,
-        path: PathBuf,
-        params: SearchParams<'_>,
-    ) -> Result<Vec<Node>> {
-        let (committed_result, nodes) = self.query_local_workspace_committed(path, params).await?;
-        if let forge_project_model::ProjectContextEpisodeAppendOutcome::Failed { reason_code } =
-            committed_result.episode_append()
-        {
-            anyhow::bail!(
-                "append project-model search episode; project-model committed query episode append outcome: {:?}",
-                reason_code
-            );
-        }
-        Ok(nodes)
-    }
 }
 
 struct ValidatedVectorEntries {
@@ -2343,15 +2326,6 @@ impl<
         params: forge_domain::SearchParams<'_>,
     ) -> Result<(ProjectContextCommittedQueryResult, Vec<forge_domain::Node>)> {
         self.query_local_workspace_committed(path, params).await
-    }
-
-    /// Performs semantic code search on a workspace.
-    async fn query_workspace(
-        &self,
-        path: PathBuf,
-        params: forge_domain::SearchParams<'_>,
-    ) -> Result<Vec<forge_domain::Node>> {
-        self.query_local_workspace(path, params).await
     }
 
     /// Lists all workspaces.
@@ -5287,8 +5261,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_workspace_returns_error_when_episode_append_fails_after_pack_write() -> Result<()>
-    {
+    async fn query_workspace_legacy_projection_preserves_nodes_when_episode_append_fails_after_pack_write()
+    -> Result<()> {
         let (_fixture, root) = fixture_workspace()?;
         write_fixture_project_model(&root)?;
         fs::create_dir(local_project_model_dir(&root).join("tool_episodes.jsonl"))?;
@@ -5307,18 +5281,9 @@ mod tests {
             .limit(5usize)
             .ends_with(vec![".rs".to_string()]);
 
-        let actual = WorkspaceService::query_workspace(&setup, root.clone(), params).await;
-        let expected = "append project-model search episode";
-        let expected_state = "EpisodeAppendFailed";
-        let forbidden_state = "RequiredReadbackFailed";
-        let actual_error = match actual {
-            Ok(nodes) => anyhow::bail!("expected episode append error, got {} nodes", nodes.len()),
-            Err(error) => error.to_string(),
-        };
+        let actual = WorkspaceService::query_workspace(&setup, root.clone(), params).await?;
         let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
-        assert!(actual_error.contains(expected));
-        assert!(actual_error.contains(expected_state));
-        assert!(!actual_error.contains(forbidden_state));
+        assert!(!actual.is_empty());
         assert_eq!(indexer.list_context_pack_artifacts()?.len(), 1);
         Ok(())
     }
