@@ -74,7 +74,32 @@ IMPORTANT: Only searches within /home/user/project and subdirectories. For paths
 - Keep queries targeted - too many broad queries can cause timeouts
 - **Match your intent**: If seeking documentation, use doc-focused keywords ("setup guide", "configuration README"); if seeking code, use implementation terms ("token refresh logic", "error handling implementation")
 
-Returns the topK most relevant file:line locations with code context. Each query is ranked independently, then reranked by relevance to your stated intent.
+Returns the topK most relevant file:line locations with code context. Each query is embedded with the configured semantic embedding model and matched against an existing durable workspace vector index plus project-model retrieval signals. Production reranker runtime is not active yet (`reranker: None`), so do not assume cross-encoder reranking is applied.
+
+---
+
+### workspace_vector_index_build_continuation
+
+Agent-invoked vector index build continuation for semantic search readiness repair. Explicit only: this tool is never called by `sem_search`, diagnostics, automatic context injection, or tool-description rendering. Use only when a prior diagnostic indicates that the current workspace has a fresh manifest and a vector build is the safe next action.
+
+Execution is typed and service-owned: canonicalizes and validates the workspace root, runs a preflight diagnostic, builds only for `vector_build_suggested` with `safe_to_suggest_build=true`, calls the workspace vector-index build service directly, runs a post-build diagnostic, and returns a closed typed status. It never executes diagnostic display command text, never shells out, and never deletes, truncates, or cleans corrupt/ambiguous vector artifacts.
+
+---
+
+### workspace_exact_fact_reference_continuation
+
+Actuator tool that continues exact-fact reference production only for the current workspace root.
+
+Use this when the workspace exact-fact status is inactive and production is safe. The executor first validates that `workspace_path` canonicalizes to the current workspace root, then performs a read-only status preflight. It never accepts alternate modes and never exposes raw producer/status errors, source text, JSON-RPC, stdout, or stderr.
+
+Input:
+- `workspace_path`: workspace root path. Relative paths are resolved against the current working directory. The canonical requested path must equal the current workspace root.
+
+Behavior:
+- Already-active exact facts return a typed no-op status.
+- Missing, stale, corrupt, or unreadable status states return typed non-produced statuses.
+- Production is attempted at most once and only through the workspace service boundary.
+- Postflight status is always attempted after a producer attempt, and active success is reported only when postflight proves exact facts are active.
 
 ---
 
@@ -140,6 +165,45 @@ If you want to create a new file, use:
 - A new file path, including dir name if needed
 - First edit: empty oldString and the new file's contents as newString
 - Subsequent edits: normal edit operations on the created content
+
+---
+
+### apply_patch
+
+Use this tool for coordinated multi-file text patches when one logical change must touch more than one file with a shared all-or-none preflight.
+
+Input:
+- `patch`: a V4A-style patch string. The first non-empty line must be `*** Begin Patch` and the last non-empty line must be `*** End Patch`.
+
+Supported first-slice operations:
+- `*** Update File: <path>` with strict hunks using lines prefixed by `-` for removed text and `+` for replacement text. Blank hunk lines must still be prefixed. Matching is exact and deterministic; there is no fuzzy fallback.
+- `*** Add File: <path>` with new file lines prefixed by `+`. The file must not already exist and the parent directory must already exist.
+- `*** Delete File: <path>` is parsed but currently rejected fail-closed. Rename/move operations are not supported.
+
+Use `multi_patch` instead when you need multiple exact replacements in one existing file. Use `apply_patch` only when the patch coordinates multiple file-level operations or when the V4A patch format is the natural source format.
+
+Safety model:
+- Every target path is normalized relative to the current working directory and must remain inside the workspace.
+- Duplicate/conflicting targets are rejected before mutation.
+- Every `Update File` target must have been read earlier in the conversation.
+- Permissions are checked for every touched path before execution.
+- All update hunks and add-file checks are validated before any write.
+- Existing touched files are snapshotted before writing.
+- This is not a full filesystem transaction. It provides strict all-or-none preflight plus snapshot/checkpoint semantics; it does not claim rollback if the operating system fails mid-write.
+
+Example:
+
+```text
+*** Begin Patch
+*** Update File: src/lib.rs
+- old line
++ new line
+*** Add File: src/new_module.rs
++ pub fn value() -> u8 {
++     1
++ }
+*** End Patch
+```
 
 ---
 

@@ -566,11 +566,17 @@ fn exact_identifier_token_byte_start(line_text: &str, identifier: &str) -> Optio
 }
 
 fn is_identifier_boundary(line_text: &str, start: usize, end: usize) -> bool {
-    let before = line_text[..start]
+    let Some(before_text) = line_text.get(..start) else {
+        return false;
+    };
+    let Some(after_text) = line_text.get(end..) else {
+        return false;
+    };
+    let before = before_text
         .chars()
         .next_back()
         .is_none_or(|value| !is_rust_identifier_continue(value));
-    let after = line_text[end..]
+    let after = after_text
         .chars()
         .next()
         .is_none_or(|value| !is_rust_identifier_continue(value));
@@ -591,10 +597,8 @@ fn is_rust_identifier_continue(value: char) -> bool {
 }
 
 fn utf16_character_offset(line_text: &str, byte_start: usize) -> Option<u32> {
-    if !line_text.is_char_boundary(byte_start) {
-        return None;
-    }
-    u32::try_from(line_text[..byte_start].encode_utf16().count()).ok()
+    let before_text = line_text.get(..byte_start)?;
+    u32::try_from(before_text.encode_utf16().count()).ok()
 }
 
 /// Bounded rust-analyzer reference production request.
