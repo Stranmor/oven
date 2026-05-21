@@ -359,6 +359,7 @@ pub struct RuntimeStatus {
     pub tools: Vec<String>,
 }
 
+/// Metadata-only report for effective MCP configuration shadowing checks.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct McpConfigPreflight {
@@ -368,6 +369,7 @@ pub struct McpConfigPreflight {
     pub discovered_local_paths: Vec<PathBuf>,
 }
 
+/// Metadata-only probe result for one MCP configuration path.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct McpConfigPathProbe {
@@ -376,6 +378,14 @@ pub struct McpConfigPathProbe {
     pub size_bytes: Option<u64>,
 }
 
+/// Inspects canonical and local `.mcp.json` paths that can shadow MCP configuration.
+///
+/// # Arguments
+/// * `canonical_path` - Canonical MCP configuration path expected by the runtime.
+/// * `cwd` - Current working directory whose ancestor chain should be inspected.
+///
+/// # Errors
+/// Returns an error when `cwd` cannot be canonicalized as an existing directory.
 pub fn mcp_config_shadowing_preflight(
     canonical_path: &Path,
     cwd: &Path,
@@ -405,6 +415,13 @@ pub fn mcp_config_shadowing_preflight(
     })
 }
 
+/// Probes one MCP configuration path without reading file contents.
+///
+/// # Arguments
+/// * `path` - MCP configuration path whose metadata should be inspected.
+///
+/// # Errors
+/// Returns an error when metadata lookup fails for reasons other than a missing file.
 pub fn probe_mcp_config_path(path: &Path) -> QualityResult<McpConfigPathProbe> {
     match fs::metadata(path) {
         Ok(metadata) => Ok(McpConfigPathProbe {
