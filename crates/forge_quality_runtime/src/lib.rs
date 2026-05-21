@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use fs2::FileExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -418,8 +418,10 @@ impl TraceStore {
                 "quality_profile_compile".to_string(),
                 "trace_append".to_string(),
                 "trace_get".to_string(),
+                "trace_query".to_string(),
                 "gate_record".to_string(),
                 "release_decision_evaluate".to_string(),
+                "release_decision_get".to_string(),
             ],
         }
     }
@@ -430,7 +432,7 @@ impl TraceStore {
         reject_secrets(&request.payload)?;
 
         fs::create_dir_all(&self.trace_dir)?;
-        let lock = self.lock_exclusive()?;
+        let _lock = self.lock_exclusive()?;
         let existing = self.read_all_unlocked()?;
         if let Some(prior) = existing
             .iter()
@@ -483,14 +485,12 @@ impl TraceStore {
             .into_iter()
             .find(|candidate| candidate.event_id == event.event_id)
             .ok_or(QualityError::DigestChainInvalid)?;
-        lock.unlock()?;
         Ok(readback)
     }
 
     pub fn read_all(&self) -> QualityResult<Vec<TraceEvent>> {
-        let lock = self.lock_shared()?;
+        let _lock = self.lock_shared()?;
         let events = self.read_all_unlocked()?;
-        lock.unlock()?;
         Ok(events)
     }
 
@@ -537,26 +537,29 @@ impl TraceStore {
         Ok(events)
     }
 
-    fn lock_exclusive(&self) -> QualityResult<File> {
-        fs::create_dir_all(&self.trace_dir)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&self.lock_file)?;
-        file.lock_exclusive()?;
-        Ok(file)
+    fn lock_exclusive(&self) -> QualityResult<FileLock> {
+        self.lock(libc::LOCK_EX)
     }
 
-    fn lock_shared(&self) -> QualityResult<File> {
+    fn lock_shared(&self) -> QualityResult<FileLock> {
+        self.lock(libc::LOCK_SH)
+    }
+
+    fn lock(&self, operation: libc::c_int) -> QualityResult<FileLock> {
         fs::create_dir_all(&self.trace_dir)?;
         let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .open(&self.lock_file)?;
-        file.lock_shared()?;
-        Ok(file)
+        let rc = unsafe { libc::flock(file.as_raw_fd(), operation) };
+        if rc == 0 {
+            Ok(FileLock { file })
+        } else {
+            Err(QualityError::Io(
+                std::io::Error::last_os_error().to_string(),
+            ))
+        }
     }
 
     fn ensure_project_root(&self, requested: &Path) -> QualityResult<()> {
@@ -566,6 +569,16 @@ impl TraceStore {
         } else {
             Err(QualityError::ProjectRootRejected)
         }
+    }
+}
+
+struct FileLock {
+    file: File,
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 

@@ -104,8 +104,9 @@ impl QualityRuntimeServer {
         &self,
         Parameters(request): Parameters<GateRecordRequest>,
     ) -> Result<Json<forge_quality_runtime::TraceEvent>, McpError> {
-        let payload = serde_json::to_value(&request.gate_result)
-            .map_err(|_| McpError::internal_error("quality_runtime.schema_serialization_failed", None))?;
+        let payload = serde_json::to_value(&request.gate_result).map_err(|_| {
+            McpError::internal_error("quality_runtime.schema_serialization_failed", None)
+        })?;
         self.store
             .append(TraceAppendRequest {
                 project_root: request.project_root,

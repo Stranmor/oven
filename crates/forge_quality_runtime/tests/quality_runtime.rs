@@ -319,3 +319,142 @@ fn trace_rejects_excessive_payload_depth() {
         QualityError::PayloadRejected
     );
 }
+
+#[test]
+fn trace_idempotency_conflict_blocks() {
+    let temp = TempDir::new().expect("tempdir should be created");
+    let store = TraceStore::new(TraceStoreConfig {
+        project_root: temp.path().to_path_buf(),
+        trace_dir: temp.path().join("trace"),
+    })
+    .expect("trace store should initialize");
+    let first = TraceAppendRequest {
+        project_root: temp.path().to_path_buf(),
+        idempotency_key: "conflict-key".to_string(),
+        event_kind: TraceEventKind::RuntimeStatus,
+        payload: json!({"status":"one"}),
+    };
+    let second = TraceAppendRequest {
+        project_root: temp.path().to_path_buf(),
+        idempotency_key: "conflict-key".to_string(),
+        event_kind: TraceEventKind::RuntimeStatus,
+        payload: json!({"status":"two"}),
+    };
+    store.append(first).expect("first append should work");
+    assert_eq!(
+        store
+            .append(second)
+            .expect_err("conflicting idempotency key must be rejected"),
+        QualityError::IdempotencyConflict
+    );
+}
+
+#[test]
+fn trace_detects_digest_tampering() {
+    let temp = TempDir::new().expect("tempdir should be created");
+    let trace_dir = temp.path().join("trace");
+    let store = TraceStore::new(TraceStoreConfig {
+        project_root: temp.path().to_path_buf(),
+        trace_dir: trace_dir.clone(),
+    })
+    .expect("trace store should initialize");
+    store
+        .append(TraceAppendRequest {
+            project_root: temp.path().to_path_buf(),
+            idempotency_key: "tamper".to_string(),
+            event_kind: TraceEventKind::RuntimeStatus,
+            payload: json!({"status":"ok"}),
+        })
+        .expect("append should work");
+    let trace_file = trace_dir.join("quality-trace.jsonl");
+    let content = fs::read_to_string(&trace_file).expect("trace file should be readable");
+    fs::write(
+        trace_file,
+        content.replace("\"status\":\"ok\"", "\"status\":\"bad\""),
+    )
+    .expect("tamper write should work");
+    assert_eq!(
+        store
+            .read_all()
+            .expect_err("tampered digest chain must be rejected"),
+        QualityError::DigestChainInvalid
+    );
+}
+
+#[test]
+fn trace_rejects_excessive_payload_size() {
+    let oversized = "x".repeat(MAX_PAYLOAD_BYTES.saturating_add(1));
+    assert_eq!(
+        validate_payload(&json!({"large": oversized}))
+            .expect_err("oversized payload must be rejected"),
+        QualityError::PayloadRejected
+    );
+}
+
+#[test]
+fn concurrent_appends_preserve_monotonic_sequence() {
+    let temp = TempDir::new().expect("tempdir should be created");
+    let store = Arc::new(
+        TraceStore::new(TraceStoreConfig {
+            project_root: temp.path().to_path_buf(),
+            trace_dir: temp.path().join("trace"),
+        })
+        .expect("trace store should initialize"),
+    );
+    let mut handles = Vec::new();
+    for index in 0_u8..8 {
+        let store = Arc::clone(&store);
+        let project_root = temp.path().to_path_buf();
+        handles.push(thread::spawn(move || {
+            store
+                .append(TraceAppendRequest {
+                    project_root,
+                    idempotency_key: format!("concurrent-{index}"),
+                    event_kind: TraceEventKind::RuntimeStatus,
+                    payload: json!({"index": index}),
+                })
+                .expect("concurrent append should work");
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("append thread should not panic");
+    }
+    let events = store.read_all().expect("trace readback should work");
+    assert_eq!(events.len(), 8);
+    for (offset, event) in events.iter().enumerate() {
+        let expected = u64::try_from(offset)
+            .expect("test offset should fit u64")
+            .checked_add(1)
+            .expect("test sequence should not overflow");
+        assert_eq!(event.sequence, expected);
+    }
+}
+
+#[test]
+fn stale_evidence_blocks() {
+    let profile = compile(ArtifactClass::CodeMcpToolSurface);
+    let mut results = passing_results(&profile);
+    first_result_mut(&mut results)
+        .evidence
+        .first_mut()
+        .expect("gate should have evidence")
+        .produced_at = Utc::now()
+        .checked_sub_signed(Duration::hours(48))
+        .expect("test timestamp should be representable");
+    let decision = evaluate(&profile, &results);
+    assert!(blocker_codes(&decision).contains(&ReleaseBlockerCode::StaleOrMissingEvidence));
+}
+
+#[test]
+fn public_artifact_with_approval_boundary_can_pass() {
+    let mut report = artifact(ArtifactClass::PublicClientFacing);
+    report.claim = ReleaseClaim::PublishAdjacent;
+    report.publish_approval_boundary = Some(PublicApprovalBoundary {
+        approval_required: true,
+        approval_present: true,
+        approval_reference: Some("current-session-private-approval-boundary".to_string()),
+    });
+    let profile = compile_quality_profile(report).expect("profile should compile");
+    let decision = evaluate(&profile, &passing_results(&profile));
+    assert_eq!(decision.decision, ReleaseDecisionStatus::Pass);
+}
