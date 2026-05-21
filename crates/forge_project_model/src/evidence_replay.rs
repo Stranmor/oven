@@ -717,9 +717,10 @@ pub fn apply_replay_readback_results(
             verified.readback_status = ReplayEvidenceReadbackStatus::Verified;
             active_refs.push(verified);
         } else {
-            *excluded_by_reason
+            let count = excluded_by_reason
                 .entry(EvidenceReplayIssueCode::ReadbackFailed)
-                .or_default() += 1;
+                .or_default();
+            *count = count.saturating_add(1);
             issues.push(ReplayActivationIssue {
                 code: EvidenceReplayIssueCode::ReadbackFailed,
                 artifact_id: Some(reference.artifact_id.clone()),
@@ -910,7 +911,8 @@ impl<'a> ActivationBuilder<'a> {
         path: Option<&str>,
         target_id: Option<&str>,
     ) {
-        *self.excluded_by_reason.entry(code.clone()).or_default() += 1;
+        let count = self.excluded_by_reason.entry(code.clone()).or_default();
+        *count = count.saturating_add(1);
         self.issues.push(ReplayActivationIssue {
             code,
             artifact_id: artifact_id.map(ToString::to_string),

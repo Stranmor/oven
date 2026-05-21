@@ -14,6 +14,253 @@ use crate::retrieval_plan::{
 use crate::types::{ContextPack, ContextPackArtifactId, Provenance, ToolEpisode};
 use crate::util::fingerprint;
 
+/// Redaction-safe committed query boundary returned by project-model-owned search.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectContextCommittedQueryResult {
+    readback: ProjectContextReadbackSummary,
+    commit: ProjectContextCommitOutcome,
+    episode_append: ProjectContextEpisodeAppendOutcome,
+    result_order: Vec<ProjectContextCommittedResultItem>,
+}
+
+impl ProjectContextCommittedQueryResult {
+    /// Builds a committed query result for a no-write commit outcome.
+    ///
+    /// # Arguments
+    ///
+    /// * `readback` - Redaction-safe summary of executed readback requests.
+    /// * `reason` - Typed reason that the context pack was not written.
+    /// * `result_order` - Redaction-safe legacy result order metadata.
+    pub fn no_write(
+        readback: ProjectContextReadbackSummary,
+        reason: ProjectContextPackNoWriteReason,
+        result_order: Vec<ProjectContextCommittedResultItem>,
+    ) -> Self {
+        Self {
+            readback,
+            commit: ProjectContextCommitOutcome::NoWrite(reason),
+            episode_append: ProjectContextEpisodeAppendOutcome::NotAttempted {
+                reason: ProjectContextEpisodeAppendNotAttemptedReason::NoPersistedContextPack,
+            },
+            result_order,
+        }
+    }
+
+    /// Builds a committed query result for a persisted context-pack outcome.
+    ///
+    /// # Arguments
+    ///
+    /// * `readback` - Redaction-safe summary of executed readback requests.
+    /// * `proof` - Persisted proof produced by verified context-pack persistence.
+    /// * `episode_append` - Typed episode append outcome.
+    /// * `result_order` - Redaction-safe legacy result order metadata.
+    pub fn persisted(
+        readback: ProjectContextReadbackSummary,
+        proof: ProjectContextPackPersistedProof,
+        episode_append: ProjectContextEpisodeAppendOutcome,
+        result_order: Vec<ProjectContextCommittedResultItem>,
+    ) -> Self {
+        Self {
+            readback,
+            commit: ProjectContextCommitOutcome::Persisted(proof),
+            episode_append,
+            result_order,
+        }
+    }
+
+    /// Returns redaction-safe readback metadata.
+    pub fn readback(&self) -> &ProjectContextReadbackSummary {
+        &self.readback
+    }
+
+    /// Returns the context-pack commit outcome.
+    pub fn commit(&self) -> &ProjectContextCommitOutcome {
+        &self.commit
+    }
+
+    /// Returns the episode append outcome.
+    pub fn episode_append(&self) -> &ProjectContextEpisodeAppendOutcome {
+        &self.episode_append
+    }
+
+    /// Returns redaction-safe result ordering metadata.
+    pub fn result_order(&self) -> &[ProjectContextCommittedResultItem] {
+        &self.result_order
+    }
+}
+
+/// Redaction-safe context-pack commit outcome for a committed project-model query.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProjectContextCommitOutcome {
+    /// Readback verification or retrieval policy proved that no pack may be written.
+    NoWrite(ProjectContextPackNoWriteReason),
+    /// Readback-verified context pack was persisted through the commit typestate boundary.
+    Persisted(ProjectContextPackPersistedProof),
+}
+
+/// Redaction-safe episode append status for a committed project-model query.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProjectContextEpisodeAppendOutcome {
+    /// Episode append was not attempted because no persisted pack exists.
+    NotAttempted {
+        /// Typed no-attempt reason.
+        reason: ProjectContextEpisodeAppendNotAttemptedReason,
+    },
+    /// Episode append completed successfully.
+    Appended {
+        /// Stable redaction-safe episode fingerprint.
+        episode_fingerprint: String,
+    },
+    /// Episode append failed after the context pack was already persisted.
+    Failed {
+        /// Stable redaction-safe failure classification.
+        reason_code: ProjectContextEpisodeAppendFailureReason,
+    },
+}
+
+/// Typed reason that episode append was not attempted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProjectContextEpisodeAppendNotAttemptedReason {
+    /// No persisted context pack exists for this committed query.
+    NoPersistedContextPack,
+}
+
+/// Redaction-safe episode append failure classification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProjectContextEpisodeAppendFailureReason {
+    /// The episode ledger append operation failed.
+    EpisodeAppendFailed,
+}
+
+/// Redaction-safe readback summary for planned project-model evidence requests.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProjectContextReadbackSummary {
+    requested_count: usize,
+    succeeded_count: usize,
+    failed_count: usize,
+    evidence: Vec<ProjectContextReadbackEvidence>,
+}
+
+impl ProjectContextReadbackSummary {
+    /// Builds a readback summary from typed readback outcomes.
+    ///
+    /// # Arguments
+    ///
+    /// * `outcomes` - Readback outcomes produced from validated read requests.
+    pub fn from_outcomes(outcomes: &[ProjectContextReadbackOutcome]) -> Self {
+        let succeeded_count = outcomes
+            .iter()
+            .filter(|outcome| outcome.status == ProjectContextReadbackStatus::Succeeded)
+            .count();
+        let failed_count = outcomes.len().saturating_sub(succeeded_count);
+        Self {
+            requested_count: outcomes.len(),
+            succeeded_count,
+            failed_count,
+            evidence: outcomes
+                .iter()
+                .map(ProjectContextReadbackEvidence::from_outcome)
+                .collect(),
+        }
+    }
+
+    /// Returns the number of planned readbacks executed by the service.
+    pub fn requested_count(&self) -> usize {
+        self.requested_count
+    }
+
+    /// Returns the number of successful readbacks.
+    pub fn succeeded_count(&self) -> usize {
+        self.succeeded_count
+    }
+
+    /// Returns the number of failed readbacks.
+    pub fn failed_count(&self) -> usize {
+        self.failed_count
+    }
+
+    /// Returns evidence identifiers and ranges validated through read requests.
+    pub fn evidence(&self) -> &[ProjectContextReadbackEvidence] {
+        &self.evidence
+    }
+}
+
+/// Redaction-safe evidence id/range label derived from a validated read request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectContextReadbackEvidence {
+    evidence_id: String,
+    relative_manifest_path: String,
+    start_line: u32,
+    end_line: u32,
+    status: ProjectContextReadbackStatus,
+}
+
+impl ProjectContextReadbackEvidence {
+    fn from_outcome(outcome: &ProjectContextReadbackOutcome) -> Self {
+        Self {
+            evidence_id: outcome.evidence_id.clone(),
+            relative_manifest_path: outcome.relative_manifest_path.clone(),
+            start_line: outcome.start_line,
+            end_line: outcome.end_line,
+            status: outcome.status.clone(),
+        }
+    }
+
+    /// Returns the validated evidence identifier.
+    pub fn evidence_id(&self) -> &str {
+        &self.evidence_id
+    }
+
+    /// Returns the validated manifest-relative path label.
+    pub fn relative_manifest_path(&self) -> &str {
+        &self.relative_manifest_path
+    }
+
+    /// Returns the one-based inclusive start line.
+    pub fn start_line(&self) -> u32 {
+        self.start_line
+    }
+
+    /// Returns the one-based inclusive end line.
+    pub fn end_line(&self) -> u32 {
+        self.end_line
+    }
+
+    /// Returns the typed readback status.
+    pub fn status(&self) -> &ProjectContextReadbackStatus {
+        &self.status
+    }
+}
+
+/// Redaction-safe result ordering item for legacy adapters.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectContextCommittedResultItem {
+    evidence_id: String,
+    relevance: Option<f32>,
+}
+
+impl ProjectContextCommittedResultItem {
+    /// Builds a result ordering item from redaction-safe metadata.
+    ///
+    /// # Arguments
+    ///
+    /// * `evidence_id` - Evidence identifier returned by the planner.
+    /// * `relevance` - Optional redaction-safe relevance score.
+    pub fn new(evidence_id: impl Into<String>, relevance: Option<f32>) -> Self {
+        Self { evidence_id: evidence_id.into(), relevance }
+    }
+
+    /// Returns the evidence identifier.
+    pub fn evidence_id(&self) -> &str {
+        &self.evidence_id
+    }
+
+    /// Returns the optional relevance score.
+    pub fn relevance(&self) -> Option<f32> {
+        self.relevance
+    }
+}
+
 const PROJECT_MODEL_SEARCH_TOOL: &str = "project_model_search";
 const PROJECT_MODEL_SEARCH_SUCCESS: &str = "success";
 const PROJECT_MODEL_SEARCH_PROVENANCE_SOURCE: &str = "WorkspaceService::query_workspace";
@@ -35,7 +282,7 @@ pub struct ProjectContextPackCommit<State> {
 
 #[derive(Clone, Debug, PartialEq)]
 enum ProjectContextPackCommitState {
-    Selected(ProjectContextPackCommitSelected),
+    Selected(Box<ProjectContextPackCommitSelected>),
     Verified(ProjectContextPackCommitVerified),
 }
 
@@ -173,7 +420,7 @@ pub enum ProjectContextPackReadbackDecision {
     /// No context pack may be written.
     NoWrite(ProjectContextPackNoWrite),
     /// A readback-verified context pack may be persisted.
-    Write(ProjectContextPackCommit<ReadbackVerified>),
+    Write(Box<ProjectContextPackCommit<ReadbackVerified>>),
 }
 
 /// Typed context-pack write instruction produced only by verified readback state.
@@ -310,12 +557,14 @@ impl ProjectContextPackCommit<ReadRequestsSelected> {
             return Err(ProjectContextPackCommitError::MissingContextPackForWrite);
         }
         Ok(Self {
-            state: ProjectContextPackCommitState::Selected(ProjectContextPackCommitSelected {
-                context_pack: plan.context_pack.clone(),
-                read_requests: plan.read_requests.clone(),
-                write_decision: plan.write_decision.clone(),
-                replay_activation,
-            }),
+            state: ProjectContextPackCommitState::Selected(Box::new(
+                ProjectContextPackCommitSelected {
+                    context_pack: plan.context_pack.clone(),
+                    read_requests: plan.read_requests.clone(),
+                    write_decision: plan.write_decision.clone(),
+                    replay_activation,
+                },
+            )),
             _state: PhantomData,
         })
     }
@@ -497,14 +746,14 @@ impl ProjectContextPackCommit<ReadRequestsSelected> {
                 },
             ));
         }
-        Ok(ProjectContextPackReadbackDecision::Write(
+        Ok(ProjectContextPackReadbackDecision::Write(Box::new(
             ProjectContextPackCommit {
                 state: ProjectContextPackCommitState::Verified(ProjectContextPackCommitVerified {
                     context_pack: filtered_context_pack,
                 }),
                 _state: PhantomData,
             },
-        ))
+        )))
     }
 }
 
@@ -881,6 +1130,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn committed_no_write_result_cannot_contain_proof_or_episode_success() {
+        let setup =
+            ProjectContextReadbackSummary::from_outcomes(&[ProjectContextReadbackOutcome::new(
+                "main",
+                "src/main.rs",
+                1,
+                3,
+                ProjectContextReadbackStatus::Failed,
+            )
+            .unwrap()]);
+        let actual = ProjectContextCommittedQueryResult::no_write(
+            setup,
+            ProjectContextPackNoWriteReason::RequiredReadbackFailed,
+            vec![ProjectContextCommittedResultItem::new("main", Some(1.0))],
+        );
+        let expected = (
+            ProjectContextCommitOutcome::NoWrite(
+                ProjectContextPackNoWriteReason::RequiredReadbackFailed,
+            ),
+            ProjectContextEpisodeAppendOutcome::NotAttempted {
+                reason: ProjectContextEpisodeAppendNotAttemptedReason::NoPersistedContextPack,
+            },
+            1usize,
+        );
+
+        assert_eq!(
+            (
+                actual.commit().clone(),
+                actual.episode_append().clone(),
+                actual.readback().failed_count(),
+            ),
+            expected,
+        );
+    }
+
+    #[test]
+    fn committed_persisted_result_requires_persisted_proof_typestate() {
+        let setup_pack = pack(vec![evidence("main", "src/main.rs")]);
+        let setup_proof = verified_commit(&setup_pack).persisted_proof(
+            crate::ContextPackArtifactId::new("b".repeat(64)).unwrap(),
+            "context_packs/proof.json",
+        );
+        let actual = ProjectContextCommittedQueryResult::persisted(
+            ProjectContextReadbackSummary::from_outcomes(&[
+                ProjectContextReadbackOutcome::succeeded(&request("main", "src/main.rs")),
+            ]),
+            setup_proof.clone(),
+            ProjectContextEpisodeAppendOutcome::Appended {
+                episode_fingerprint: "episode-fingerprint".to_string(),
+            },
+            vec![ProjectContextCommittedResultItem::new("main", Some(1.0))],
+        );
+        let expected = ProjectContextCommitOutcome::Persisted(setup_proof);
+
+        assert_eq!(actual.commit(), &expected);
+    }
+
     fn no_write_reason(
         decision: ProjectContextPackReadbackDecision,
     ) -> ProjectContextPackNoWriteReason {
@@ -976,7 +1283,7 @@ mod tests {
             )
             .unwrap()
         {
-            ProjectContextPackReadbackDecision::Write(commit) => commit,
+            ProjectContextPackReadbackDecision::Write(commit) => *commit,
             ProjectContextPackReadbackDecision::NoWrite(_) => panic!("expected write decision"),
         }
     }

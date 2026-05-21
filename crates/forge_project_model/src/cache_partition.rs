@@ -566,7 +566,7 @@ impl ProjectModelCachePartition<ReadbackVerified> {
         );
         let bytes =
             serde_json::to_vec(&fields).expect("stable project-model payload is serializable");
-        if bytes.len() > self.identity.render_budget as usize {
+        if bytes.len() > self.identity.render_budget {
             return Err(CachePartitionError::BudgetOverflowUnclassified);
         }
         let stable_payload =

@@ -322,6 +322,8 @@ pub(super) struct TextMessageRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cacheable: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_class: Option<forge_domain::MessageCacheClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     kind: Option<forge_domain::TextMessageKind>,
 }
 
@@ -349,6 +351,7 @@ impl From<&forge_domain::TextMessage> for TextMessageRecord {
             droppable: msg.droppable,
             phase: msg.phase,
             cacheable: msg.cacheable,
+            cache_class: msg.cache_class,
             kind: msg.kind.clone(),
         }
     }
@@ -373,6 +376,7 @@ impl TryFrom<TextMessageRecord> for forge_domain::TextMessage {
             droppable: record.droppable,
             phase: record.phase,
             cacheable: record.cacheable,
+            cache_class: record.cache_class,
             kind: record.kind,
         })
     }

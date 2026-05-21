@@ -36,11 +36,14 @@ pub use cache_partition::{
     build_project_model_context_envelope, stable_cache_partition_sources_from_nodes,
 };
 pub use commit_boundary::{
-    ProjectContextEpisodeAppendInstruction, ProjectContextPackCommit,
-    ProjectContextPackCommitError, ProjectContextPackNoWrite, ProjectContextPackNoWriteReason,
-    ProjectContextPackPersistedProof, ProjectContextPackReadbackDecision,
-    ProjectContextPackWriteInstruction, ProjectContextReadbackOutcome,
-    ProjectContextReadbackStatus, ProjectModelSearchEpisodeInput, ReadRequestsSelected,
+    ProjectContextCommitOutcome, ProjectContextCommittedQueryResult,
+    ProjectContextCommittedResultItem, ProjectContextEpisodeAppendFailureReason,
+    ProjectContextEpisodeAppendInstruction, ProjectContextEpisodeAppendNotAttemptedReason,
+    ProjectContextEpisodeAppendOutcome, ProjectContextPackCommit, ProjectContextPackCommitError,
+    ProjectContextPackNoWrite, ProjectContextPackNoWriteReason, ProjectContextPackPersistedProof,
+    ProjectContextPackReadbackDecision, ProjectContextPackWriteInstruction,
+    ProjectContextReadbackEvidence, ProjectContextReadbackOutcome, ProjectContextReadbackStatus,
+    ProjectContextReadbackSummary, ProjectModelSearchEpisodeInput, ReadRequestsSelected,
     ReadbackVerified,
 };
 pub use context_adapter::{

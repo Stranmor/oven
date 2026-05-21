@@ -32,9 +32,11 @@ use forge_project_model::{
     EvidenceReplayScoreKind, ExternalFactArtifactIngestionReport, ExternalFactIngestionIssue,
     ExternalFactProductionReport, ExternalFactProductionRequest, ExternalFactProductionStatus,
     NativeLspReferenceProducer, NativeLspReferenceRequest, NativeLspReferenceRequestDerivation,
+    ProjectContextCommittedQueryResult, ProjectContextCommittedResultItem,
+    ProjectContextEpisodeAppendFailureReason, ProjectContextEpisodeAppendOutcome,
     ProjectContextIntegrationIdentity, ProjectContextPackCommit,
     ProjectContextPackReadbackDecision, ProjectContextPathScope, ProjectContextReadbackOutcome,
-    ProjectContextRerankerBoundary, ProjectContextRerankerReadiness,
+    ProjectContextReadbackSummary, ProjectContextRerankerBoundary, ProjectContextRerankerReadiness,
     ProjectContextRerankerUnavailableReason, ProjectContextRetrievalOptions,
     ProjectContextRetrievalPhaseStatus, ProjectContextRetrievalPlanningOutcome,
     ProjectContextRetrievalRequest, ProjectContextVectorIndexBoundary,
@@ -1257,11 +1259,11 @@ impl<
         }
     }
 
-    async fn query_local_workspace(
+    async fn query_local_workspace_committed(
         &self,
         path: PathBuf,
         params: SearchParams<'_>,
-    ) -> Result<Vec<Node>> {
+    ) -> Result<(ProjectContextCommittedQueryResult, Vec<Node>)> {
         let root = canonicalize_path(path)?;
         let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
         let manifest_path = local_project_model_manifest(&root);
@@ -1413,7 +1415,18 @@ impl<
                 }
             }
         }
-        match commit.verify_readbacks(readback_outcomes)? {
+        let readback_summary = ProjectContextReadbackSummary::from_outcomes(&readback_outcomes);
+        let result_order = plan
+            .return_order
+            .iter()
+            .map(|item| {
+                ProjectContextCommittedResultItem::new(
+                    item.evidence_id.clone(),
+                    Some(item.relevance),
+                )
+            })
+            .collect::<Vec<_>>();
+        let committed_result = match commit.verify_readbacks(readback_outcomes)? {
             ProjectContextPackReadbackDecision::NoWrite(no_write) => {
                 if matches!(
                     no_write.reason(),
@@ -1423,6 +1436,11 @@ impl<
                         anyhow::anyhow!("project-model required evidence readback failed")
                     }));
                 }
+                ProjectContextCommittedQueryResult::no_write(
+                    readback_summary,
+                    no_write.reason().clone(),
+                    result_order,
+                )
             }
             ProjectContextPackReadbackDecision::Write(verified_commit) => {
                 let proof = indexer.persist_verified_context_pack(&verified_commit)?;
@@ -1442,11 +1460,34 @@ impl<
                         timestamp: chrono::Utc::now().to_rfc3339(),
                     },
                 );
-                indexer
-                    .append_episode(episode_instruction.episode())
-                    .context("append project-model search episode")?;
+                let episode_fingerprint =
+                    episode_instruction.episode().provenance.fingerprint.clone();
+                let episode_append = match indexer.append_episode(episode_instruction.episode()) {
+                    Ok(_) => ProjectContextEpisodeAppendOutcome::Appended { episode_fingerprint },
+                    Err(error) => {
+                        let committed = ProjectContextCommittedQueryResult::persisted(
+                            readback_summary,
+                            proof,
+                            ProjectContextEpisodeAppendOutcome::Failed {
+                                reason_code:
+                                    ProjectContextEpisodeAppendFailureReason::EpisodeAppendFailed,
+                            },
+                            result_order,
+                        );
+                        return Err(error.context(format!(
+                            "append project-model search episode; project-model committed query episode append outcome: {:?}",
+                            committed.episode_append()
+                        )));
+                    }
+                };
+                ProjectContextCommittedQueryResult::persisted(
+                    readback_summary,
+                    proof,
+                    episode_append,
+                    result_order,
+                )
             }
-        }
+        };
         nodes.sort_by(|left, right| {
             right
                 .relevance
@@ -1454,6 +1495,15 @@ impl<
                 .total_cmp(&left.relevance.unwrap_or_default())
                 .then_with(|| left.node_id.as_str().cmp(right.node_id.as_str()))
         });
+        Ok((committed_result, nodes))
+    }
+
+    async fn query_local_workspace(
+        &self,
+        path: PathBuf,
+        params: SearchParams<'_>,
+    ) -> Result<Vec<Node>> {
+        let (_committed_result, nodes) = self.query_local_workspace_committed(path, params).await?;
         Ok(nodes)
     }
 }
@@ -5078,6 +5128,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_workspace_legacy_adapter_preserves_successful_committed_node_order_and_content()
+    -> Result<()> {
+        let (_committed_fixture, committed_root) = fixture_workspace()?;
+        write_fixture_project_model(&committed_root)?;
+        let committed_setup = fixture_sync_service(&committed_root);
+        let committed_params =
+            SearchParams::new("build runtime needle", "runtime integration proof")
+                .limit(5usize)
+                .ends_with(vec![".rs".to_string()]);
+        let (_legacy_fixture, legacy_root) = fixture_workspace()?;
+        write_fixture_project_model(&legacy_root)?;
+        let legacy_setup = fixture_sync_service(&legacy_root);
+        let legacy_params = SearchParams::new("build runtime needle", "runtime integration proof")
+            .limit(5usize)
+            .ends_with(vec![".rs".to_string()]);
+
+        let (_, actual) = committed_setup
+            .query_local_workspace_committed(committed_root, committed_params)
+            .await?;
+        let expected =
+            WorkspaceService::query_workspace(&legacy_setup, legacy_root, legacy_params).await?;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_workspace_committed_no_write_exposes_typed_no_episode_state() -> Result<()> {
+        let (_fixture, root) = fixture_workspace()?;
+        write_fixture_project_model(&root)?;
+        let setup = fixture_sync_service(&root);
+        let params = SearchParams::new("absent-token-for-no-evidence", "unused")
+            .limit(5usize)
+            .top_k(1u32)
+            .starts_with("src/".to_string());
+
+        let (actual, nodes) = setup.query_local_workspace_committed(root, params).await?;
+        let expected = (
+            forge_project_model::ProjectContextCommitOutcome::NoWrite(
+                forge_project_model::ProjectContextPackNoWriteReason::EmptyEvidence,
+            ),
+            forge_project_model::ProjectContextEpisodeAppendOutcome::NotAttempted {
+                reason: forge_project_model::ProjectContextEpisodeAppendNotAttemptedReason::NoPersistedContextPack,
+            },
+            0usize,
+        );
+
+        assert_eq!(nodes, Vec::<Node>::new());
+        assert_eq!(
+            (
+                actual.commit().clone(),
+                actual.episode_append().clone(),
+                actual.readback().requested_count(),
+            ),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn query_workspace_writes_no_context_pack_for_empty_evidence() -> Result<()> {
         let (_fixture, root) = fixture_workspace()?;
         write_fixture_project_model(&root)?;
@@ -5186,12 +5296,16 @@ mod tests {
 
         let actual = WorkspaceService::query_workspace(&setup, root.clone(), params).await;
         let expected = "append project-model search episode";
+        let expected_state = "EpisodeAppendFailed";
+        let forbidden_state = "RequiredReadbackFailed";
         let actual_error = match actual {
             Ok(nodes) => anyhow::bail!("expected episode append error, got {} nodes", nodes.len()),
             Err(error) => error.to_string(),
         };
         let indexer = ProjectIndexer::new(&root, local_project_model_dir(&root));
         assert!(actual_error.contains(expected));
+        assert!(actual_error.contains(expected_state));
+        assert!(!actual_error.contains(forbidden_state));
         assert_eq!(indexer.list_context_pack_artifacts()?.len(), 1);
         Ok(())
     }
