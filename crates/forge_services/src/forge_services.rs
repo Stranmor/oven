@@ -29,7 +29,9 @@ use crate::tool_services::{
     ForgeFetch, ForgeFollowup, ForgeFsPatch, ForgeFsRead, ForgeFsRemove, ForgeFsSearch,
     ForgeFsUndo, ForgeFsWrite, ForgeImageRead, ForgePlanCreate, ForgeShell, ForgeSkillFetch,
 };
-use crate::{ForgeProviderAuthService, ForgeSteerService};
+use crate::{
+    ForgeProviderAuthService, ForgeSteerService, ProductionProjectContextRuntimeRerankerSelector,
+};
 
 type McpService<F> = ForgeMcpService<ForgeMcpManager<F>, F, <F as McpServerInfra>::Client>;
 type AuthService<F> = ForgeAuthService<F>;
@@ -85,9 +87,20 @@ pub struct ForgeServices<
     command_loader_service: Arc<ForgeCommandLoaderService<F>>,
     policy_service: ForgePolicyService<F>,
     provider_auth_service: ForgeProviderAuthService<F>,
-    workspace_service: Arc<crate::context_engine::ForgeWorkspaceService<F, FdDefault<F>>>,
+    workspace_service: Arc<
+        crate::context_engine::ForgeWorkspaceService<
+            F,
+            FdDefault<F>,
+            ProductionProjectContextRuntimeRerankerSelector,
+        >,
+    >,
     skill_service: Arc<ForgeSkillFetch<F>>,
     infra: Arc<F>,
+}
+
+fn production_project_context_runtime_reranker_selector()
+-> Arc<ProductionProjectContextRuntimeRerankerSelector> {
+    Arc::new(ProductionProjectContextRuntimeRerankerSelector::default())
 }
 
 impl<
@@ -144,10 +157,12 @@ impl<
         let policy_service = ForgePolicyService::new(infra.clone());
         let provider_auth_service = ForgeProviderAuthService::new(infra.clone());
         let discovery = Arc::new(FdDefault::new(infra.clone()));
-        let workspace_service = Arc::new(crate::context_engine::ForgeWorkspaceService::new(
-            infra.clone(),
-            discovery,
-        ));
+        let workspace_service = Arc::new(
+            crate::context_engine::ForgeWorkspaceService::new(infra.clone(), discovery)
+                .with_project_context_reranker_selector(
+                    production_project_context_runtime_reranker_selector(),
+                ),
+        );
         let skill_service = Arc::new(ForgeSkillFetch::new(infra.clone()));
 
         Self {
@@ -248,7 +263,11 @@ impl<
     type CommandLoaderService = ForgeCommandLoaderService<F>;
     type PolicyService = ForgePolicyService<F>;
     type ProviderService = ForgeProviderService<F>;
-    type WorkspaceService = crate::context_engine::ForgeWorkspaceService<F, FdDefault<F>>;
+    type WorkspaceService = crate::context_engine::ForgeWorkspaceService<
+        F,
+        FdDefault<F>,
+        ProductionProjectContextRuntimeRerankerSelector,
+    >;
     type SkillFetchService = ForgeSkillFetch<F>;
 
     fn config_service(&self) -> &Self::AppConfigService {
@@ -405,5 +424,25 @@ impl<
 
     fn get_env_vars(&self) -> std::collections::BTreeMap<String, String> {
         self.infra.get_env_vars()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+    use crate::{ProjectContextRuntimeRerankerSelection, ProjectContextRuntimeRerankerSelector};
+
+    #[test]
+    fn production_workspace_reranker_selector_wiring_defaults_to_missing() {
+        let setup = production_project_context_runtime_reranker_selector();
+        let actual = matches!(
+            setup.select_project_context_reranker(),
+            ProjectContextRuntimeRerankerSelection::Missing
+        );
+        let expected = true;
+
+        assert_eq!(actual, expected);
     }
 }

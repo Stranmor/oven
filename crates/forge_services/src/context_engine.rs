@@ -105,6 +105,92 @@ impl ProjectContextRuntimeRerankerSelector for MissingProjectContextRuntimeReran
     }
 }
 
+#[derive(Clone)]
+enum ProductionProjectContextRuntimeRerankerState {
+    Missing,
+    ConfiguredNotReady {
+        identity: ProjectContextIntegrationIdentity,
+    },
+    Ready {
+        reranker: Arc<dyn forge_project_model::Reranker + Send + Sync>,
+        identity: ProjectContextIntegrationIdentity,
+    },
+}
+
+/// Production runtime reranker selector for project-context retrieval.
+///
+/// The selector is intentionally synchronous and side-effect free: it only
+/// reports readiness for already-constructed non-network reranker adapters and
+/// never performs provider calls or external reads during selection.
+#[derive(Clone)]
+pub struct ProductionProjectContextRuntimeRerankerSelector {
+    state: ProductionProjectContextRuntimeRerankerState,
+}
+
+impl Default for ProductionProjectContextRuntimeRerankerSelector {
+    fn default() -> Self {
+        Self::missing()
+    }
+}
+
+impl ProductionProjectContextRuntimeRerankerSelector {
+    /// Creates the production selector for the current configuration state where
+    /// no accepted runtime reranker source of truth exists.
+    pub fn missing() -> Self {
+        Self { state: ProductionProjectContextRuntimeRerankerState::Missing }
+    }
+
+    /// Creates a selector for a configured runtime reranker that is not yet
+    /// backed by a validated async-safe adapter or cache.
+    ///
+    /// # Arguments
+    ///
+    /// * `identity` - Redaction-safe runtime reranker identity.
+    pub fn configured_not_ready(identity: ProjectContextIntegrationIdentity) -> Self {
+        Self {
+            state: ProductionProjectContextRuntimeRerankerState::ConfiguredNotReady { identity },
+        }
+    }
+
+    /// Creates a selector around an already-constructed synchronous reranker
+    /// adapter.
+    ///
+    /// # Arguments
+    ///
+    /// * `reranker` - Prebuilt non-network reranker adapter boundary.
+    /// * `identity` - Redaction-safe runtime reranker identity.
+    pub fn ready_synchronous(
+        reranker: Arc<dyn forge_project_model::Reranker + Send + Sync>,
+        identity: ProjectContextIntegrationIdentity,
+    ) -> Self {
+        Self {
+            state: ProductionProjectContextRuntimeRerankerState::Ready { reranker, identity },
+        }
+    }
+}
+
+impl ProjectContextRuntimeRerankerSelector for ProductionProjectContextRuntimeRerankerSelector {
+    fn select_project_context_reranker(&self) -> ProjectContextRuntimeRerankerSelection<'_> {
+        match &self.state {
+            ProductionProjectContextRuntimeRerankerState::Missing => {
+                ProjectContextRuntimeRerankerSelection::Missing
+            }
+            ProductionProjectContextRuntimeRerankerState::ConfiguredNotReady { identity } => {
+                ProjectContextRuntimeRerankerSelection::Unavailable {
+                    identity: *identity,
+                    reason: ProjectContextRerankerUnavailableReason::RerankerNotReady,
+                }
+            }
+            ProductionProjectContextRuntimeRerankerState::Ready { reranker, identity } => {
+                ProjectContextRuntimeRerankerSelection::Ready {
+                    reranker: reranker.as_ref(),
+                    identity: *identity,
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct NotReadyProjectContextReranker {
     call_count: Arc<AtomicUsize>,
@@ -4273,6 +4359,76 @@ mod tests {
             0usize,
         );
         Ok(())
+    }
+
+    #[test]
+    fn production_runtime_reranker_selector_reports_missing_without_rerank() {
+        let setup = ProductionProjectContextRuntimeRerankerSelector::missing();
+        let actual = matches!(
+            setup.select_project_context_reranker(),
+            ProjectContextRuntimeRerankerSelection::Missing
+        );
+        let expected = true;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn production_runtime_reranker_selector_reports_configured_not_ready_without_rerank() {
+        let setup = ProductionProjectContextRuntimeRerankerSelector::configured_not_ready(
+            ProjectContextIntegrationIdentity {
+                provider: "test-runtime-reranker",
+                artifact: "configured-not-ready",
+            },
+        );
+
+        let actual = match setup.select_project_context_reranker() {
+            ProjectContextRuntimeRerankerSelection::Unavailable { identity, reason } => {
+                (identity.provider, identity.artifact, reason)
+            }
+            ProjectContextRuntimeRerankerSelection::Missing => (
+                "missing",
+                "missing",
+                ProjectContextRerankerUnavailableReason::MissingReranker,
+            ),
+            ProjectContextRuntimeRerankerSelection::Ready { .. } => (
+                "ready",
+                "ready",
+                ProjectContextRerankerUnavailableReason::MissingReranker,
+            ),
+        };
+        let expected = (
+            "test-runtime-reranker",
+            "configured-not-ready",
+            ProjectContextRerankerUnavailableReason::RerankerNotReady,
+        );
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn production_runtime_reranker_selector_reports_ready_boundary_without_rerank() {
+        let reranker = FakeRuntimeReranker::new();
+        let setup = ProductionProjectContextRuntimeRerankerSelector::ready_synchronous(
+            Arc::new(reranker.clone()),
+            ProjectContextIntegrationIdentity {
+                provider: "test-runtime-reranker",
+                artifact: "ready-sync-cache",
+            },
+        );
+
+        let actual = match setup.select_project_context_reranker() {
+            ProjectContextRuntimeRerankerSelection::Ready { identity, .. } => {
+                (identity.provider, identity.artifact, reranker.call_count())
+            }
+            ProjectContextRuntimeRerankerSelection::Missing => ("missing", "missing", usize::MAX),
+            ProjectContextRuntimeRerankerSelection::Unavailable { identity, .. } => {
+                (identity.provider, identity.artifact, usize::MAX)
+            }
+        };
+        let expected = ("test-runtime-reranker", "ready-sync-cache", 0usize);
+
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]
