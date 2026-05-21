@@ -4187,7 +4187,7 @@ mod tests {
             root.join("src/lib.rs"),
             "pub fn unrelated() {}\n\npub fn automatic_injection_needle() -> usize { 42 }\n",
         )?;
-        let indexer = ProjectIndexer::new(root, local_project_model_dir(root));
+        let indexer = ProjectIndexer::new(root, forge_project_model::local_project_model_dir(root));
         let manifest = indexer.index()?;
         indexer.write_manifest(&manifest)?;
         Ok(())
