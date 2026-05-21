@@ -307,7 +307,57 @@ expression: actual.tools
       "type": "object"
     },
     "strict": true,
-    "description": "AI-powered semantic code search. YOUR DEFAULT TOOL for code discovery and exploration when searching within {{env.cwd}}. Use this when you need to find code locations, understand implementations, discover patterns, or explore unfamiliar code - it works with natural language about behavior and concepts, not just keyword matching.\n\n**WHEN TO USE sem_search:**\n- Finding implementation of specific features or algorithms\n- Understanding how a system works across multiple files\n- Discovering architectural patterns and design approaches\n- Locating test examples or fixtures\n- Finding where specific technologies/libraries are used\n- Exploring unfamiliar codebases to learn structure\n- Finding documentation files (README, guides, API docs)\n\n**WHEN NOT TO USE (use {{tool_names.fs_search}} instead):**\n- Searching for exact strings, TODOs, or specific function names\n- Finding all occurrences of a variable or identifier\n- Searching in specific file paths or with regex patterns\n- When you know the exact text to search for\n\nIMPORTANT: Only searches within {{env.cwd}} and subdirectories. For paths outside this scope, use {{tool_names.fs_search}} with path parameter.\n\n**TIPS FOR SUCCESS:**\n- Use 2-3 varied queries to capture different aspects (e.g., \"OAuth token refresh\", \"JWT expiry handling\", \"authentication middleware\")\n- Balance specificity (focused results) with generality (don't miss relevant code)\n- Avoid overly broad queries like \"authentication\" or \"tools\" - be specific about what aspect you need\n- Keep queries targeted - too many broad queries can cause timeouts\n- **Match your intent**: If seeking documentation, use doc-focused keywords (\"setup guide\", \"configuration README\"); if seeking code, use implementation terms (\"token refresh logic\", \"error handling implementation\")\n\nReturns the topK most relevant file:line locations with code context. Each query is ranked independently, then reranked by relevance to your stated intent."
+    "description": "AI-powered semantic code search. YOUR DEFAULT TOOL for code discovery and exploration when searching within {{env.cwd}}. Use this when you need to find code locations, understand implementations, discover patterns, or explore unfamiliar code - it works with natural language about behavior and concepts, not just keyword matching.\n\n**WHEN TO USE sem_search:**\n- Finding implementation of specific features or algorithms\n- Understanding how a system works across multiple files\n- Discovering architectural patterns and design approaches\n- Locating test examples or fixtures\n- Finding where specific technologies/libraries are used\n- Exploring unfamiliar codebases to learn structure\n- Finding documentation files (README, guides, API docs)\n\n**WHEN NOT TO USE (use {{tool_names.fs_search}} instead):**\n- Searching for exact strings, TODOs, or specific function names\n- Finding all occurrences of a variable or identifier\n- Searching in specific file paths or with regex patterns\n- When you know the exact text to search for\n\nIMPORTANT: Only searches within {{env.cwd}} and subdirectories. For paths outside this scope, use {{tool_names.fs_search}} with path parameter.\n\n**TIPS FOR SUCCESS:**\n- Use 2-3 varied queries to capture different aspects (e.g., \"OAuth token refresh\", \"JWT expiry handling\", \"authentication middleware\")\n- Balance specificity (focused results) with generality (don't miss relevant code)\n- Avoid overly broad queries like \"authentication\" or \"tools\" - be specific about what aspect you need\n- Keep queries targeted - too many broad queries can cause timeouts\n- **Match your intent**: If seeking documentation, use doc-focused keywords (\"setup guide\", \"configuration README\"); if seeking code, use implementation terms (\"token refresh logic\", \"error handling implementation\")\n\nReturns the topK most relevant file:line locations with code context. Each query is embedded with the configured semantic embedding model and matched against an existing durable workspace vector index plus project-model retrieval signals. Production reranker runtime is not active yet (`reranker: None`), so do not assume cross-encoder reranking is applied."
+  },
+  {
+    "type": "function",
+    "name": "workspace_vector_index_build_continuation",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "embedding_model_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional explicit embedding model id. When omitted, the configured\nsemantic embedding model is used. When present, it must match the\nconfigured semantic embedding model for this build path."
+        },
+        "workspace_path": {
+          "description": "Workspace root path to validate and build for. The path must resolve to\nthe current allowed workspace root without escaping through symlinks.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "embedding_model_id",
+        "workspace_path"
+      ],
+      "type": "object"
+    },
+    "strict": true,
+    "description": "Agent-invoked vector index build continuation for semantic search readiness repair. Explicit only: this tool is never called by `sem_search`, diagnostics, automatic context injection, or tool-description rendering. Use only when a prior diagnostic indicates that the current workspace has a fresh manifest and a vector build is the safe next action.\n\nExecution is typed and service-owned: canonicalizes and validates the workspace root, runs a preflight diagnostic, builds only for `vector_build_suggested` with `safe_to_suggest_build=true`, calls the workspace vector-index build service directly, runs a post-build diagnostic, and returns a closed typed status. It never executes diagnostic display command text, never shells out, and never deletes, truncates, or cleans corrupt/ambiguous vector artifacts."
+  },
+  {
+    "type": "function",
+    "name": "workspace_exact_fact_reference_continuation",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "workspace_path": {
+          "description": "Workspace root path to validate and produce exact facts for. The path\nmust resolve to the current allowed workspace root without escaping\nthrough symlinks.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_path"
+      ],
+      "type": "object"
+    },
+    "strict": true,
+    "description": "Actuator tool that continues exact-fact reference production only for the current workspace root.\n\nUse this when the workspace exact-fact status is inactive and production is safe. The executor first validates that `workspace_path` canonicalizes to the current workspace root, then performs a read-only status preflight. It never accepts alternate modes and never exposes raw producer/status errors, source text, JSON-RPC, stdout, or stderr.\n\nInput:\n- `workspace_path`: workspace root path. Relative paths are resolved against the current working directory. The canonical requested path must equal the current workspace root.\n\nBehavior:\n- Already-active exact facts return a typed no-op status.\n- Missing, stale, corrupt, or unreadable status states return typed non-produced statuses.\n- Production is attempted at most once and only through the workspace service boundary.\n- Postflight status is always attempted after a producer attempt, and active success is reported only when postflight proves exact facts are active."
   },
   {
     "type": "function",
@@ -411,6 +461,25 @@ expression: actual.tools
     },
     "strict": true,
     "description": "This is a tool for making multiple edits to a single file in one operation. It is built on top of the {{tool_names.patch}} tool and allows you to perform multiple find-and-replace operations efficiently. Prefer this tool over the {{tool_names.patch}} tool when you need to make multiple edits to the same file.\n\nBefore using this tool:\n\n1. Use the Read tool to understand the file's contents and context\n2. Verify the directory path is correct\n\nTo make multiple file edits, provide the following:\n1. file_path: The absolute path to the file to modify (must be absolute, not relative)\n2. edits: An array of edit operations to perform, where each edit contains:\n   - oldString: The text to replace (must match the file contents exactly, including all whitespace and indentation)\n   - newString: The edited text to replace the oldString\n   - replaceAll: Replace all occurrences of oldString. This parameter is optional and defaults to false.\n\nIMPORTANT:\n- All edits are applied in sequence, in the order they are provided\n- Each edit operates on the result of the previous edit\n- All edits must be valid for the operation to succeed - if any edit fails, none will be applied\n- This tool is ideal when you need to make several changes to different parts of the same file\n\nCRITICAL REQUIREMENTS:\n1. All edits follow the same requirements as the single Edit tool\n2. The edits are atomic - either all succeed or none are applied\n3. Plan your edits carefully to avoid conflicts between sequential operations\n\nWARNING:\n- The tool will fail if edits.oldString doesn't match the file contents exactly (including whitespace)\n- The tool will fail if edits.oldString and edits.newString are the same\n- Since edits are applied in sequence, ensure that earlier edits don't affect the text that later edits are trying to find\n\nWhen making edits:\n- Ensure all edits result in idiomatic, correct code\n- Do not leave the code in a broken state\n- Always use absolute file paths (starting with /)\n- Only use emojis if the user explicitly requests it. Avoid adding emojis to files unless asked.\n- Use replaceAll for replacing and renaming strings across the file. This parameter is useful if you want to rename a variable for instance.\n\nIf you want to create a new file, use:\n- A new file path, including dir name if needed\n- First edit: empty oldString and the new file's contents as newString\n- Subsequent edits: normal edit operations on the created content"
+  },
+  {
+    "type": "function",
+    "name": "apply_patch",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "patch": {
+          "description": "Unified multi-file patch text beginning with *** Begin Patch and ending\nwith *** End Patch.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "patch"
+      ],
+      "type": "object"
+    },
+    "strict": true,
+    "description": "Use this tool for coordinated multi-file text patches when one logical change must touch more than one file with a shared all-or-none preflight.\n\nInput:\n- `patch`: a V4A-style patch string. The first non-empty line must be `*** Begin Patch` and the last non-empty line must be `*** End Patch`.\n\nSupported first-slice operations:\n- `*** Update File: <path>` with strict hunks using lines prefixed by `-` for removed text and `+` for replacement text. Blank hunk lines must still be prefixed. Matching is exact and deterministic; there is no fuzzy fallback.\n- `*** Add File: <path>` with new file lines prefixed by `+`. The file must not already exist and the parent directory must already exist.\n- `*** Delete File: <path>` is parsed but currently rejected fail-closed. Rename/move operations are not supported.\n\nUse `multi_patch` instead when you need multiple exact replacements in one existing file. Use `apply_patch` only when the patch coordinates multiple file-level operations or when the V4A patch format is the natural source format.\n\nSafety model:\n- Every target path is normalized relative to the current working directory and must remain inside the workspace.\n- Duplicate/conflicting targets are rejected before mutation.\n- Every `Update File` target must have been read earlier in the conversation.\n- Permissions are checked for every touched path before execution.\n- All update hunks and add-file checks are validated before any write.\n- Existing touched files are snapshotted before writing.\n- This is not a full filesystem transaction. It provides strict all-or-none preflight plus snapshot/checkpoint semantics; it does not claim rollback if the operating system fails mid-write.\n\nExample:\n\n```text\n*** Begin Patch\n*** Update File: src/lib.rs\n- old line\n+ new line\n*** Add File: src/new_module.rs\n+ pub fn value() -> u8 {\n+     1\n+ }\n*** End Patch\n```"
   },
   {
     "type": "function",

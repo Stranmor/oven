@@ -184,6 +184,38 @@ expression: tools
   ]
 }
 {
+  "title": "WorkspaceVectorIndexBuildContinuation",
+  "type": "object",
+  "properties": {
+    "embedding_model_id": {
+      "description": "Optional explicit embedding model id. When omitted, the configured\nsemantic embedding model is used. When present, it must match the\nconfigured semantic embedding model for this build path.",
+      "type": "string",
+      "nullable": true
+    },
+    "workspace_path": {
+      "description": "Workspace root path to validate and build for. The path must resolve to\nthe current allowed workspace root without escaping through symlinks.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_path"
+  ]
+}
+{
+  "title": "WorkspaceExactFactReferenceContinuation",
+  "type": "object",
+  "properties": {
+    "workspace_path": {
+      "description": "Workspace root path to validate and produce exact facts for. The path\nmust resolve to the current allowed workspace root without escaping\nthrough symlinks.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "workspace_path"
+  ]
+}
+{
   "title": "FSRemove",
   "type": "object",
   "properties": {
@@ -263,6 +295,20 @@ expression: tools
   "required": [
     "file_path",
     "edits"
+  ]
+}
+{
+  "title": "FSApplyPatch",
+  "type": "object",
+  "properties": {
+    "patch": {
+      "description": "Unified multi-file patch text beginning with *** Begin Patch and ending\nwith *** End Patch.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "patch"
   ]
 }
 {

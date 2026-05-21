@@ -959,11 +959,19 @@ impl<
                             format!("Add File parent does not exist: {}", parent.display()),
                         ));
                     }
-                    if path.exists() {
+                    if let Ok(metadata) = std::fs::symlink_metadata(path.as_path()) {
+                        let target_kind = if metadata.file_type().is_symlink() {
+                            "symlink"
+                        } else {
+                            "filesystem entry"
+                        };
                         return Ok(rejected_apply_patch_output(
                             &sections,
                             &paths,
-                            format!("Add File target already exists: {}", path.display()),
+                            format!(
+                                "Add File target already exists as {target_kind}: {}",
+                                path.display()
+                            ),
                         ));
                     }
                     let after = match parse_add_file_content(&section.lines) {
@@ -1427,6 +1435,26 @@ mod tests {
 
         let actual = service.apply_patch(patch).await.unwrap();
         assert_eq!(actual.files[0].status, ApplyPatchFileStatus::Rejected);
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_add_file_rejects_broken_symlink_escape() {
+        let fixture = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let escaped_target = outside.path().join("escaped.txt");
+        let symlink_target = fixture.path().join("link.txt");
+        std::os::unix::fs::symlink(&escaped_target, &symlink_target).unwrap();
+        let service = apply_patch_service(fixture.path().to_path_buf());
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: {}\n+ escaped\n*** End Patch\n",
+            symlink_target.display()
+        );
+
+        let actual = service.apply_patch(patch).await.unwrap();
+        let expected_exists = false;
+
+        assert_eq!(actual.files[0].status, ApplyPatchFileStatus::Rejected);
+        assert_eq!(escaped_target.exists(), expected_exists);
     }
 
     #[tokio::test]
