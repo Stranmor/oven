@@ -266,6 +266,17 @@
         }
       ]
     },
+    "project_context": {
+      "description": "Project-context runtime integration configuration.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ProjectContextConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "providers": {
       "description": "Additional provider definitions merged with the built-in provider list.\n\nEntries with an `id` matching a built-in provider override its fields;\nentries with a new `id` are appended and become available for model\nselection.",
       "type": "array",
@@ -743,6 +754,36 @@
           }
         }
       ]
+    },
+    "OfflineRerankScoreArtifactConfig": {
+      "description": "Local offline rerank-score artifact source configuration.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "description": "Local filesystem path to the offline rerank-score artifact JSON.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ]
+    },
+    "ProjectContextConfig": {
+      "description": "Local project-context runtime integration configuration.",
+      "type": "object",
+      "properties": {
+        "offline_rerank_score_artifact": {
+          "description": "Optional local offline rerank-score artifact source.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OfflineRerankScoreArtifactConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
     },
     "ProviderAuthMethod": {
       "description": "Authentication method supported by a provider.\n\nOnly the simple (non-OAuth) methods are available here; providers that\nrequire OAuth device or authorization-code flows must be configured via the\nfile-based `provider.json` override instead.",
