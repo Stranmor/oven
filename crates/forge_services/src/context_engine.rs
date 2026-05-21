@@ -2336,6 +2336,15 @@ impl<
         self.sem_search_diagnostic_for_model(path, embedding_model_id.as_deref())
     }
 
+    /// Performs semantic code search on a workspace and returns committed project-model metadata.
+    async fn query_workspace_committed(
+        &self,
+        path: PathBuf,
+        params: forge_domain::SearchParams<'_>,
+    ) -> Result<(ProjectContextCommittedQueryResult, Vec<forge_domain::Node>)> {
+        self.query_local_workspace_committed(path, params).await
+    }
+
     /// Performs semantic code search on a workspace.
     async fn query_workspace(
         &self,

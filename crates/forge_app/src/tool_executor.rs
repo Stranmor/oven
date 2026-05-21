@@ -1173,6 +1173,25 @@ mod tests {
             ))
         }
 
+        async fn query_workspace_committed(
+            &self,
+            path: PathBuf,
+            params: SearchParams<'_>,
+        ) -> anyhow::Result<(
+            forge_project_model::ProjectContextCommittedQueryResult,
+            Vec<Node>,
+        )> {
+            let nodes = self.query_workspace(path, params).await?;
+            Ok((
+                forge_project_model::ProjectContextCommittedQueryResult::no_write(
+                    Default::default(),
+                    forge_project_model::ProjectContextPackNoWriteReason::EmptyEvidence,
+                    Vec::new(),
+                ),
+                nodes,
+            ))
+        }
+
         async fn query_workspace(
             &self,
             _path: PathBuf,

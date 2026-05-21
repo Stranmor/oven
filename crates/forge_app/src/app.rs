@@ -1916,6 +1916,9 @@ mod tests {
         WorkspaceEvidenceReadinessDiagnostic, WorkspaceId, WorkspaceInfo,
         WorkspaceSemanticInjectionReadiness,
     };
+    use forge_project_model::{
+        ProjectContextCommittedQueryResult, ProjectContextPackNoWriteReason,
+    };
     use futures::StreamExt;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
@@ -2679,6 +2682,21 @@ mod tests {
                 &availability,
                 embedding_model_id.as_deref(),
                 &path,
+            ))
+        }
+
+        async fn query_workspace_committed(
+            &self,
+            _path: PathBuf,
+            _params: SearchParams<'_>,
+        ) -> Result<(ProjectContextCommittedQueryResult, Vec<Node>)> {
+            Ok((
+                ProjectContextCommittedQueryResult::no_write(
+                    Default::default(),
+                    ProjectContextPackNoWriteReason::EmptyEvidence,
+                    Vec::new(),
+                ),
+                Vec::new(),
             ))
         }
 
@@ -3633,6 +3651,22 @@ mod tests {
                 &availability,
                 embedding_model_id.as_deref(),
                 &path,
+            ))
+        }
+
+        async fn query_workspace_committed(
+            &self,
+            path: PathBuf,
+            params: SearchParams<'_>,
+        ) -> Result<(ProjectContextCommittedQueryResult, Vec<Node>)> {
+            let nodes = self.query_workspace(path, params).await?;
+            Ok((
+                ProjectContextCommittedQueryResult::no_write(
+                    Default::default(),
+                    ProjectContextPackNoWriteReason::EmptyEvidence,
+                    Vec::new(),
+                ),
+                nodes,
             ))
         }
 

@@ -22,6 +22,7 @@ use forge_domain::{
     WorkspaceSemanticInjectionReadiness, WorkspaceVectorIndexBuildReport,
 };
 use forge_eventsource::EventSource;
+use forge_project_model::ProjectContextCommittedQueryResult;
 use reqwest::Response;
 use reqwest::header::HeaderMap;
 use url::Url;
@@ -790,6 +791,13 @@ pub trait WorkspaceService: Send + Sync {
         path: PathBuf,
         embedding_model_id: Option<String>,
     ) -> anyhow::Result<SemSearchDiagnosticReport>;
+
+    /// Query the indexed workspace with semantic search and return committed project-model metadata.
+    async fn query_workspace_committed(
+        &self,
+        path: PathBuf,
+        params: SearchParams<'_>,
+    ) -> anyhow::Result<(ProjectContextCommittedQueryResult, Vec<Node>)>;
 
     /// Query the indexed workspace with semantic search
     async fn query_workspace(
@@ -1937,6 +1945,16 @@ impl<I: Services> WorkspaceService for I {
             .await
     }
 
+    async fn query_workspace_committed(
+        &self,
+        path: PathBuf,
+        params: SearchParams<'_>,
+    ) -> anyhow::Result<(ProjectContextCommittedQueryResult, Vec<Node>)> {
+        self.workspace_service()
+            .query_workspace_committed(path, params)
+            .await
+    }
+
     async fn query_workspace(
         &self,
         path: PathBuf,
@@ -2000,7 +2018,11 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
 
-    use forge_domain::{Context, ContextMessage, Initiator, Role, SteerQueue, TextMessage};
+    use forge_domain::{
+        Context, ContextMessage, FileChunk, Initiator, NodeData, NodeId, Role, SteerQueue,
+        TextMessage,
+    };
+    use forge_project_model::ProjectContextPackNoWriteReason;
     use pretty_assertions::assert_eq;
     use tokio::sync::Mutex;
 
@@ -2783,6 +2805,14 @@ mod tests {
             anyhow::bail!("unused workspace service")
         }
 
+        async fn query_workspace_committed(
+            &self,
+            _path: PathBuf,
+            _params: SearchParams<'_>,
+        ) -> anyhow::Result<(ProjectContextCommittedQueryResult, Vec<Node>)> {
+            anyhow::bail!("unused workspace service")
+        }
+
         async fn query_workspace(
             &self,
             _path: PathBuf,
@@ -2854,6 +2884,166 @@ mod tests {
         conversation: Arc<RawConversationService>,
         steer: Arc<RawSteerService>,
         noop: Arc<NoopService>,
+        workspace: Arc<FacadeWorkspaceService>,
+    }
+
+    #[derive(Default)]
+    struct FacadeWorkspaceService {
+        committed_result: Mutex<Option<(ProjectContextCommittedQueryResult, Vec<Node>)>>,
+    }
+
+    impl FacadeWorkspaceService {
+        async fn set_committed_result(
+            &self,
+            committed_result: ProjectContextCommittedQueryResult,
+            nodes: Vec<Node>,
+        ) {
+            *self.committed_result.lock().await = Some((committed_result, nodes));
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WorkspaceService for FacadeWorkspaceService {
+        async fn sync_workspace(
+            &self,
+            _path: PathBuf,
+        ) -> anyhow::Result<forge_stream::MpscStream<anyhow::Result<SyncProgress>>> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn produce_workspace_exact_fact_reference(
+            &self,
+            _path: PathBuf,
+        ) -> anyhow::Result<WorkspaceExactFactReferenceReport> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn workspace_exact_fact_status(
+            &self,
+            _path: PathBuf,
+        ) -> anyhow::Result<WorkspaceExactFactStatusReport> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn workspace_evidence_replay_diagnostic(
+            &self,
+            _path: PathBuf,
+        ) -> anyhow::Result<WorkspaceEvidenceReplayDiagnostic> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn workspace_evidence_replay_preview_diagnostic(
+            &self,
+            _path: PathBuf,
+        ) -> anyhow::Result<WorkspaceEvidenceReplayPreviewDiagnostic> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn build_workspace_vector_index(
+            &self,
+            _path: PathBuf,
+            _embedding_model_id: String,
+        ) -> anyhow::Result<WorkspaceVectorIndexBuildReport> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn embed_workspace_query(
+            &self,
+            _query: String,
+            _embedding_model_id: String,
+        ) -> anyhow::Result<ProjectSemanticEmbeddingOutput> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn semantic_injection_readiness(
+            &self,
+            _path: PathBuf,
+            _embedding_model_id: Option<String>,
+        ) -> anyhow::Result<WorkspaceSemanticInjectionReadiness> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn sem_search_availability(
+            &self,
+            _path: PathBuf,
+            _embedding_model_id: Option<String>,
+        ) -> anyhow::Result<SemSearchAvailability> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn sem_search_diagnostic(
+            &self,
+            _path: PathBuf,
+            _embedding_model_id: Option<String>,
+        ) -> anyhow::Result<SemSearchDiagnosticReport> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn query_workspace_committed(
+            &self,
+            _path: PathBuf,
+            _params: SearchParams<'_>,
+        ) -> anyhow::Result<(ProjectContextCommittedQueryResult, Vec<Node>)> {
+            self.committed_result
+                .lock()
+                .await
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("committed workspace query fixture missing"))
+        }
+
+        async fn query_workspace(
+            &self,
+            _path: PathBuf,
+            _params: SearchParams<'_>,
+        ) -> anyhow::Result<Vec<Node>> {
+            anyhow::bail!("legacy workspace query fixture missing")
+        }
+
+        async fn list_workspaces(&self) -> anyhow::Result<Vec<WorkspaceInfo>> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn get_workspace_info(
+            &self,
+            _path: PathBuf,
+        ) -> anyhow::Result<Option<WorkspaceInfo>> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn is_indexed(&self, _path: &Path) -> anyhow::Result<bool> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn delete_workspace(&self, _workspace_id: &WorkspaceId) -> anyhow::Result<()> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn delete_workspaces(&self, _workspace_ids: &[WorkspaceId]) -> anyhow::Result<()> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn project_model_context_diagnostic(
+            &self,
+            _path: &Path,
+        ) -> anyhow::Result<WorkspaceContextManifestDiagnostic> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn get_workspace_status(&self, _path: PathBuf) -> anyhow::Result<Vec<FileStatus>> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn is_authenticated(&self) -> anyhow::Result<bool> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn init_auth_credentials(&self) -> anyhow::Result<WorkspaceAuth> {
+            anyhow::bail!("unused workspace service")
+        }
+
+        async fn init_workspace(&self, _path: PathBuf) -> anyhow::Result<WorkspaceId> {
+            anyhow::bail!("unused workspace service")
+        }
     }
 
     impl EnvironmentInfra for FacadeFixture {
@@ -2917,7 +3107,7 @@ mod tests {
         type CommandLoaderService = NoopService;
         type PolicyService = NoopService;
         type ProviderAuthService = NoopService;
-        type WorkspaceService = NoopService;
+        type WorkspaceService = FacadeWorkspaceService;
         type SkillFetchService = NoopService;
 
         fn provider_service(&self) -> &Self::ProviderService {
@@ -3029,12 +3219,48 @@ mod tests {
         }
 
         fn workspace_service(&self) -> &Self::WorkspaceService {
-            &self.noop
+            &self.workspace
         }
 
         fn skill_fetch_service(&self) -> &Self::SkillFetchService {
             &self.noop
         }
+    }
+
+    #[tokio::test]
+    async fn workspace_committed_query_delegates_through_services_boundary() {
+        let setup = FacadeFixture::default();
+        let expected_metadata = ProjectContextCommittedQueryResult::no_write(
+            Default::default(),
+            ProjectContextPackNoWriteReason::EmptyEvidence,
+            Vec::new(),
+        );
+        let expected_nodes = vec![Node {
+            node_id: NodeId::new("symbol:src/lib.rs:committed_boundary"),
+            node: NodeData::FileChunk(FileChunk {
+                file_path: "src/lib.rs".to_string(),
+                content: "pub fn committed_boundary() {}".to_string(),
+                start_line: 1,
+                end_line: 1,
+            }),
+            relevance: Some(1.0),
+            distance: None,
+        }];
+        setup
+            .workspace
+            .set_committed_result(expected_metadata.clone(), expected_nodes.clone())
+            .await;
+
+        let (actual_metadata, actual_nodes) = setup
+            .query_workspace_committed(
+                PathBuf::from("/tmp/workspace"),
+                SearchParams::new("committed boundary", "test use case"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(actual_metadata, expected_metadata);
+        assert_eq!(actual_nodes, expected_nodes);
     }
 
     #[tokio::test]
