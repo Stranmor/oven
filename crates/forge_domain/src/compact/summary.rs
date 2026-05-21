@@ -345,6 +345,9 @@ fn extract_tool_info(call: &ToolCallFull, current_todos: &[Todo]) -> Option<Summ
             ToolCatalog::MultiPatch(input) => {
                 Some(SummaryTool::FileUpdate { path: input.file_path })
             }
+            ToolCatalog::ApplyPatch(_) => {
+                Some(SummaryTool::Mcp { name: "apply_patch".to_string() })
+            }
             ToolCatalog::Remove(input) => Some(SummaryTool::FileRemove { path: input.path }),
             ToolCatalog::Shell(input) => Some(SummaryTool::Shell { command: input.command }),
             ToolCatalog::ProcessStatus(_) => {

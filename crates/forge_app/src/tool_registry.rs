@@ -104,8 +104,8 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ToolReg
         context: &ToolCallContext,
     ) -> anyhow::Result<bool> {
         let cwd = self.services.get_environment().cwd;
-        let operation = tool_input.to_policy_operation(cwd.clone());
-        if let Some(operation) = operation {
+        let operations = tool_input.to_policy_operations(cwd.clone());
+        for operation in operations {
             let decision = self.services.check_operation_permission(&operation).await?;
 
             // Send custom policy message to the user when a policy file was created

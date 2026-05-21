@@ -56,6 +56,7 @@ pub enum ToolCatalog {
     Remove(FSRemove),
     Patch(FSPatch),
     MultiPatch(FSMultiPatch),
+    ApplyPatch(FSApplyPatch),
     Undo(FSUndo),
     Shell(Shell),
     ProcessStatus(ProcessStatusInput),
@@ -619,6 +620,15 @@ pub struct FSMultiPatch {
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema, ToolDescription, PartialEq)]
+#[tool_description_file = "crates/forge_domain/src/tools/descriptions/apply_patch.md"]
+#[schemars(deny_unknown_fields)]
+pub struct FSApplyPatch {
+    /// Unified multi-file patch text beginning with *** Begin Patch and ending
+    /// with *** End Patch.
+    pub patch: String,
+}
+
+#[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema, ToolDescription, PartialEq)]
 #[tool_description_file = "crates/forge_domain/src/tools/descriptions/fs_undo.md"]
 pub struct FSUndo {
     /// The absolute path of the file to revert to its previous state.
@@ -903,6 +913,7 @@ impl ToolDescription for ToolCatalog {
         match self {
             ToolCatalog::Patch(v) => v.description(),
             ToolCatalog::MultiPatch(v) => v.description(),
+            ToolCatalog::ApplyPatch(v) => v.description(),
             ToolCatalog::Shell(v) => v.description(),
             ToolCatalog::ProcessStatus(v) => v.description(),
             ToolCatalog::ProcessRead(v) => v.description(),
@@ -963,6 +974,20 @@ fn normalize_tool_name(name: &ToolName) -> ToolName {
         .unwrap_or_else(|| ToolName::new(trimmed))
 }
 
+fn apply_patch_policy_paths(patch: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for line in patch.lines().map(str::trim) {
+        let path = line
+            .strip_prefix("*** Update File: ")
+            .or_else(|| line.strip_prefix("*** Add File: "))
+            .or_else(|| line.strip_prefix("*** Delete File: "));
+        if let Some(path) = path {
+            paths.push(PathBuf::from(path.trim()));
+        }
+    }
+    paths
+}
+
 impl ToolCatalog {
     pub fn schema(&self) -> Schema {
         use schemars::generate::SchemaSettings;
@@ -978,6 +1003,7 @@ impl ToolCatalog {
         let mut schema = match self {
             ToolCatalog::Patch(_) => r#gen.into_root_schema_for::<FSPatch>(),
             ToolCatalog::MultiPatch(_) => r#gen.into_root_schema_for::<FSMultiPatch>(),
+            ToolCatalog::ApplyPatch(_) => r#gen.into_root_schema_for::<FSApplyPatch>(),
             ToolCatalog::Shell(_) => r#gen.into_root_schema_for::<Shell>(),
             ToolCatalog::ProcessStatus(_) => r#gen.into_root_schema_for::<ProcessStatusInput>(),
             ToolCatalog::ProcessRead(_) => r#gen.into_root_schema_for::<ProcessRead>(),
@@ -1037,6 +1063,26 @@ impl ToolCatalog {
         [ToolKind::Shell]
             .iter()
             .any(|v| v.to_string().to_case(Case::Snake).eq(normalized.as_str()))
+    }
+
+    pub fn to_policy_operations(&self, cwd: PathBuf) -> Vec<crate::policies::PermissionOperation> {
+        match self.to_policy_operation(cwd.clone()) {
+            Some(operation) => vec![operation],
+            None => match self {
+                ToolCatalog::ApplyPatch(input) => apply_patch_policy_paths(&input.patch)
+                    .into_iter()
+                    .map(|path| crate::policies::PermissionOperation::Write {
+                        message: format!(
+                            "Apply multi-file patch to: `{}`",
+                            format_display_path(path.as_path(), cwd.as_path())
+                        ),
+                        path,
+                        cwd: cwd.clone(),
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            },
+        }
     }
 
     /// Convert a tool input to its corresponding domain operation for policy
@@ -1134,6 +1180,7 @@ impl ToolCatalog {
                     display_path_for(&input.file_path)
                 ),
             }),
+            ToolCatalog::ApplyPatch(_) => None,
             ToolCatalog::Shell(input) => {
                 let execution_cwd = resolve_execution_cwd(input.cwd.as_ref(), &cwd);
                 Some(crate::policies::PermissionOperation::Execute {
@@ -2118,6 +2165,23 @@ mod tests {
             command: "printf traversal".to_string(),
             cwd: PathBuf::from("/workspace/forbidden"),
         };
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_apply_patch_policy_operations_include_every_touched_file() {
+        use crate::policies::PermissionOperation;
+
+        let fixture = ToolCatalog::ApplyPatch(FSApplyPatch {
+            patch: "*** Begin Patch\n*** Update File: one.txt\n- old\n+ new\n*** Add File: nested/two.txt\n+ content\n*** End Patch\n".to_string(),
+        });
+
+        let actual = fixture.to_policy_operations(PathBuf::from("/workspace"));
+        let expected = vec![
+            PermissionOperation::Write { path: PathBuf::from("/workspace/one.txt") },
+            PermissionOperation::Write { path: PathBuf::from("/workspace/nested/two.txt") },
+        ];
+
         assert_eq!(actual, expected);
     }
 

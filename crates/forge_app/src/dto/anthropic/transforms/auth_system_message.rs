@@ -82,6 +82,7 @@ mod tests {
             conversation_id: None,
             initiator: None,
             messages,
+            active_goal: None,
             tools: vec![],
             tool_choice: None,
             max_tokens: None,

@@ -79,6 +79,15 @@ fn resolve_tool_execution_cwd(requested_cwd: Option<&PathBuf>, environment_cwd: 
     resolve_execution_cwd(requested_cwd, environment_cwd)
 }
 
+fn apply_patch_update_paths(patch: &str) -> Vec<String> {
+    patch
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("*** Update File: ").map(str::trim))
+        .map(ToString::to_string)
+        .collect()
+}
+
 impl<
     S: FsReadService
         + ImageReadService
@@ -691,6 +700,10 @@ impl<
                     .await?;
                 (input, output).into()
             }
+            ToolCatalog::ApplyPatch(input) => {
+                let output = self.services.apply_patch(input.patch.clone()).await?;
+                ToolOperation::FsApplyPatch { input, output }
+            }
             ToolCatalog::Undo(input) => {
                 let normalized_path = self.normalize_path(input.path.clone());
                 let output = self.services.undo(normalized_path).await?;
@@ -817,6 +830,12 @@ impl<
 
         if let Some(path) = file_path {
             self.require_prior_read(context, path, "edit it")?;
+        }
+
+        if let ToolCatalog::ApplyPatch(input) = &tool_input {
+            for path in apply_patch_update_paths(&input.patch) {
+                self.require_prior_read(context, &path, "edit it")?;
+            }
         }
 
         // Enforce read-before-edit for overwrite writes
@@ -1663,6 +1682,12 @@ mod tests {
                 ) -> anyhow::Result<crate::PatchOutput> {
                     anyhow::bail!("unused fs multi patch")
                 }
+                async fn apply_patch(
+                    &self,
+                    _patch: String,
+                ) -> anyhow::Result<crate::ApplyPatchOutput> {
+                    anyhow::bail!("unused apply patch")
+                }
             }
             #[async_trait::async_trait]
             impl FsReadService for $type {
@@ -1987,6 +2012,34 @@ mod tests {
 
     fn tool_context() -> ToolCallContext {
         ToolCallContext::new(Metrics::default())
+    }
+
+    #[tokio::test]
+    async fn apply_patch_requires_prior_read_for_every_update_target() {
+        let executor = ToolExecutor::new(Arc::new(SemSearchFixture::new(
+            forge_config::ForgeConfig::default(),
+        )));
+        let context = tool_context();
+        context
+            .with_metrics(|metrics| {
+                metrics
+                    .files_accessed
+                    .insert("/workspace/one.txt".to_string());
+            })
+            .unwrap();
+        let fixture = ToolCatalog::ApplyPatch(forge_domain::FSApplyPatch {
+            patch: "*** Begin Patch\n*** Update File: /workspace/one.txt\n- old\n+ new\n*** Update File: /workspace/two.txt\n- old\n+ new\n*** End Patch\n".to_string(),
+        });
+
+        let actual = executor.execute(fixture, &context).await;
+
+        assert!(actual.is_err());
+        assert!(
+            actual
+                .unwrap_err()
+                .to_string()
+                .contains("must read the file")
+        );
     }
 
     fn exact_fact_status(

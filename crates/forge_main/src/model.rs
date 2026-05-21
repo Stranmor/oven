@@ -137,6 +137,7 @@ impl ForgeCommandManager {
                 | "config-edit"
                 | "ce"
                 | "skill"
+                | "goal"
                 | "edit"
                 | "ed"
                 | "commit-preview"
@@ -468,6 +469,15 @@ pub enum AppCommand {
     #[strum(props(usage = "List all available skills"))]
     Skill,
 
+    /// Manage the active conversation goal.
+    /// This can be triggered with the '/goal' command.
+    #[strum(props(usage = "Set/view/pause/resume/clear the active conversation goal"))]
+    Goal {
+        /// Goal objective or lifecycle action: view, pause, resume, clear.
+        #[arg(trailing_var_arg = true, num_args = 0.., allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Open an external editor to write a prompt.
     /// This can be triggered with the '/edit' command (alias: ed).
     #[strum(props(usage = "Open external editor to write a prompt [alias: ed]"))]
@@ -773,6 +783,7 @@ impl AppCommand {
             AppCommand::ConfigSuggestModel => "config-suggest-model",
             AppCommand::ConfigEdit => "config-edit",
             AppCommand::Skill => "skill",
+            AppCommand::Goal { .. } => "goal",
             AppCommand::Edit { .. } => "edit",
             AppCommand::CommitPreview => "commit-preview",
             AppCommand::Suggest { .. } => "suggest",
@@ -1709,6 +1720,34 @@ mod tests {
     fn test_rename_command_name() {
         let cmd = AppCommand::Rename { name: vec!["test".to_string()] };
         assert_eq!(cmd.name(), "rename");
+    }
+
+    #[test]
+    fn test_parse_goal_sets_objective() {
+        let fixture = ForgeCommandManager::default();
+        let actual = parse_command(&fixture, "/goal ship the first slice");
+        let expected = AppCommand::Goal {
+            args: vec![
+                "ship".to_string(),
+                "the".to_string(),
+                "first".to_string(),
+                "slice".to_string(),
+            ],
+        };
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_parse_goal_view() {
+        let fixture = ForgeCommandManager::default();
+        let actual = parse_command(&fixture, "/goal view");
+        let expected = AppCommand::Goal { args: vec!["view".to_string()] };
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_goal_is_reserved_command() {
+        assert!(ForgeCommandManager::is_reserved_command("goal"));
     }
 
     #[test]

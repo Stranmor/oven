@@ -803,6 +803,8 @@ pub(super) struct ContextRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     context_window_recovery: Option<ContextWindowRecoveryRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_goal: Option<forge_domain::ActiveGoal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     frequency_penalty: Option<f64>,
@@ -835,6 +837,7 @@ impl From<&Context> for ContextRecord {
                 .context_window_recovery
                 .as_ref()
                 .map(ContextWindowRecoveryRecord::from),
+            active_goal: context.active_goal.clone(),
             stream: context.stream,
             frequency_penalty: context.frequency_penalty,
             presence_penalty: context.presence_penalty,
@@ -888,6 +891,7 @@ impl TryFrom<ContextRecord> for Context {
             top_k: record.top_k.map(forge_domain::TopK::new_unchecked),
             reasoning: record.reasoning.map(Into::into),
             context_window_recovery: record.context_window_recovery.map(Into::into),
+            active_goal: record.active_goal,
             model_context_length: None,
             stream: record.stream,
             response_format: None,
@@ -1058,7 +1062,7 @@ impl ConversationRecord {
         let context = conversation
             .context
             .as_ref()
-            .filter(|ctx| !ctx.messages.is_empty())
+            .filter(|ctx| !ctx.messages.is_empty() || ctx.active_goal.is_some())
             .map(ContextRecord::from)
             .and_then(|ctx_record| serde_json::to_string(&ctx_record).ok());
         let updated_at = context.as_ref().map(|_| chrono::Utc::now().naive_utc());
@@ -1275,5 +1279,21 @@ mod tests {
         let expected = Some(recovery);
 
         assert_eq!(actual.context_window_recovery, expected);
+    }
+
+    #[test]
+    fn test_context_record_preserves_active_goal_without_messages() {
+        let goal = forge_domain::ActiveGoal::new("ship goal persistence").unwrap();
+        let setup = Context::default().set_active_goal(goal.clone());
+
+        let actual: Context = serde_json::from_str::<ContextRecord>(
+            &serde_json::to_string(&ContextRecord::from(&setup)).unwrap(),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        let expected = Some(goal);
+
+        assert_eq!(actual.active_goal, expected);
     }
 }

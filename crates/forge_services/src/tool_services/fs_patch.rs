@@ -1,9 +1,14 @@
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use anyhow::Context;
 use bytes::Bytes;
 use forge_app::domain::PatchOperation;
-use forge_app::{EnvironmentInfra, FileWriterInfra, FsPatchService, PatchOutput, compute_hash};
+use forge_app::{
+    ApplyPatchFileOutput, ApplyPatchFileStatus, ApplyPatchOutput, EnvironmentInfra,
+    FileWriterInfra, FsPatchService, PatchOutput, compute_hash,
+};
 use forge_config::ForgeConfig;
 use forge_domain::{
     FuzzySearchRepository, SearchMatch, SearchMode, SnapshotRepository, TextPatchBlock,
@@ -446,6 +451,300 @@ async fn apply_replace_operation<F: FuzzySearchRepository + TextPatchRepository>
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyPatchOperation {
+    Update,
+    Add,
+    Delete,
+}
+
+#[derive(Debug, Clone)]
+struct ApplyPatchSection {
+    operation: ApplyPatchOperation,
+    path: String,
+    lines: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedApplyPatchFile {
+    section: ApplyPatchSection,
+    absolute_path: PathBuf,
+    before: Option<String>,
+    after: Option<String>,
+    hunks_applied: usize,
+}
+
+fn parse_apply_patch(input: &str) -> anyhow::Result<Vec<ApplyPatchSection>> {
+    let raw_lines: Vec<&str> = input.lines().collect();
+    let first = raw_lines
+        .iter()
+        .position(|line| !line.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("apply_patch input is empty"))?;
+    let last = raw_lines
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("apply_patch input is empty"))?;
+
+    let first_line = raw_lines
+        .get(first)
+        .ok_or_else(|| anyhow::anyhow!("apply_patch first marker is out of bounds"))?;
+    if first_line.trim() != "*** Begin Patch" {
+        anyhow::bail!("apply_patch first non-empty line must be '*** Begin Patch'");
+    }
+    let last_line = raw_lines
+        .get(last)
+        .ok_or_else(|| anyhow::anyhow!("apply_patch last marker is out of bounds"))?;
+    if last_line.trim() != "*** End Patch" {
+        anyhow::bail!("apply_patch last non-empty line must be '*** End Patch'");
+    }
+
+    let mut sections = Vec::new();
+    let mut current: Option<ApplyPatchSection> = None;
+    let mut seen = HashSet::new();
+
+    let section_start = first
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("apply_patch first marker index overflowed"))?;
+    let body_lines = raw_lines
+        .get(section_start..last)
+        .ok_or_else(|| anyhow::anyhow!("apply_patch body range is invalid"))?;
+    for line in body_lines {
+        if line.trim().is_empty() && current.is_none() {
+            continue;
+        }
+
+        if let Some((operation, path)) = parse_apply_patch_section_header(line)? {
+            if let Some(section) = current.take() {
+                sections.push(section);
+            }
+            let normalized_key = lexical_normalized_path_key(path)?;
+            if !seen.insert(normalized_key.clone()) {
+                anyhow::bail!("apply_patch contains duplicate target: {normalized_key}");
+            }
+            current = Some(ApplyPatchSection {
+                operation,
+                path: path.trim().to_string(),
+                lines: Vec::new(),
+            });
+            continue;
+        }
+
+        if line.trim_start().starts_with("*** ") {
+            anyhow::bail!("apply_patch contains unknown section header: {line}");
+        }
+
+        let section = current
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("apply_patch content appeared before a file section"))?;
+        section.lines.push((*line).to_string());
+    }
+
+    if let Some(section) = current.take() {
+        sections.push(section);
+    }
+
+    if sections.is_empty() {
+        anyhow::bail!("apply_patch must contain at least one file section");
+    }
+
+    Ok(sections)
+}
+
+fn parse_apply_patch_section_header(
+    line: &str,
+) -> anyhow::Result<Option<(ApplyPatchOperation, &str)>> {
+    let trimmed = line.trim();
+    let header = trimmed
+        .strip_prefix("*** Update File: ")
+        .map(|path| (ApplyPatchOperation::Update, path))
+        .or_else(|| {
+            trimmed
+                .strip_prefix("*** Add File: ")
+                .map(|path| (ApplyPatchOperation::Add, path))
+        })
+        .or_else(|| {
+            trimmed
+                .strip_prefix("*** Delete File: ")
+                .map(|path| (ApplyPatchOperation::Delete, path))
+        });
+
+    if header.is_none() && trimmed.starts_with("*** ") {
+        anyhow::bail!("unsupported apply_patch section: {trimmed}");
+    }
+
+    if let Some((operation, path)) = header {
+        if path.trim().is_empty() {
+            anyhow::bail!("apply_patch file section path cannot be empty");
+        }
+        Ok(Some((operation, path)))
+    } else {
+        Ok(None)
+    }
+}
+
+fn lexical_normalized_path_key(path: &str) -> anyhow::Result<String> {
+    let path = Path::new(path.trim());
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) => anyhow::bail!("Windows path prefixes are not supported"),
+            Component::RootDir => components.clear(),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                anyhow::bail!("path traversal is not allowed: {}", path.display())
+            }
+            Component::Normal(value) => components.push(value.to_string_lossy().to_string()),
+        }
+    }
+    if components.is_empty() {
+        anyhow::bail!("apply_patch path must target a file: {}", path.display());
+    }
+    Ok(components.join("/"))
+}
+
+fn normalize_apply_patch_target(path: &str, cwd: &Path) -> anyhow::Result<PathBuf> {
+    lexical_normalized_path_key(path)?;
+    let raw = Path::new(path.trim());
+    let absolute = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        cwd.join(raw)
+    };
+    if absolute
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        anyhow::bail!("path traversal is not allowed: {}", absolute.display());
+    }
+    Ok(absolute)
+}
+
+fn ensure_target_inside_workspace(path: &Path, cwd: &Path, must_exist: bool) -> anyhow::Result<()> {
+    let canonical_workspace = std::fs::canonicalize(cwd)
+        .with_context(|| format!("Failed to canonicalize workspace root: {}", cwd.display()))?;
+    let canonical_target = if must_exist {
+        std::fs::canonicalize(path)
+            .with_context(|| format!("Failed to canonicalize target: {}", path.display()))?
+    } else {
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Target has no parent: {}", path.display()))?;
+        let canonical_parent = std::fs::canonicalize(parent)
+            .with_context(|| format!("Failed to canonicalize parent: {}", parent.display()))?;
+        canonical_parent.join(
+            path.file_name()
+                .ok_or_else(|| anyhow::anyhow!("Target has no file name: {}", path.display()))?,
+        )
+    };
+    if !canonical_target.starts_with(&canonical_workspace) {
+        anyhow::bail!(
+            "apply_patch target '{}' escapes workspace '{}'",
+            canonical_target.display(),
+            canonical_workspace.display()
+        );
+    }
+    Ok(())
+}
+
+fn apply_update_lines(source: &str, lines: &[String]) -> anyhow::Result<(String, usize)> {
+    let mut output = source.to_string();
+    let mut index = 0;
+    let mut hunks = 0usize;
+    while index < lines.len() {
+        let mut removed = Vec::new();
+        let mut added = Vec::new();
+
+        while let Some(line) = lines.get(index) {
+            let Some(stripped) = line.strip_prefix('-') else {
+                break;
+            };
+            removed.push(strip_patch_line_payload(stripped));
+            index = index
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("apply_patch line index overflowed"))?;
+        }
+        while let Some(line) = lines.get(index) {
+            let Some(stripped) = line.strip_prefix('+') else {
+                break;
+            };
+            added.push(strip_patch_line_payload(stripped));
+            index = index
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("apply_patch line index overflowed"))?;
+        }
+
+        if removed.is_empty() && added.is_empty() {
+            let invalid_line = lines
+                .get(index)
+                .map(String::as_str)
+                .unwrap_or("<end of patch>");
+            anyhow::bail!(
+                "Update File hunks support only '-' removed lines followed by '+' replacement lines; invalid line: {}",
+                invalid_line
+            );
+        }
+        if removed.is_empty() {
+            anyhow::bail!("Update File hunk must include at least one '-' line");
+        }
+
+        let old = join_patch_lines(&removed);
+        let new = join_patch_lines(&added);
+        let normalized_old = Range::normalize_search_line_endings(&output, &old);
+        let normalized_new = Range::normalize_search_line_endings(&output, &new);
+        let range = Range::find_exact(&output, &normalized_old)
+            .ok_or_else(|| anyhow::anyhow!("apply_patch hunk did not match exactly: {old:?}"))?;
+        output.replace_range(std::ops::Range::<usize>::from(range), &normalized_new);
+        hunks = hunks.saturating_add(1);
+    }
+    Ok((output, hunks))
+}
+
+fn strip_patch_line_payload(payload: &str) -> String {
+    payload.strip_prefix(' ').unwrap_or(payload).to_string()
+}
+
+fn parse_add_file_content(lines: &[String]) -> anyhow::Result<String> {
+    let mut content = Vec::new();
+    for line in lines {
+        let Some(stripped) = line.strip_prefix('+') else {
+            anyhow::bail!("Add File content lines must start with '+': {line}");
+        };
+        content.push(strip_patch_line_payload(stripped));
+    }
+    Ok(join_patch_lines(&content))
+}
+
+fn join_patch_lines(lines: &[String]) -> String {
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    }
+}
+
+fn rejected_apply_patch_output(
+    sections: &[ApplyPatchSection],
+    paths: &[PathBuf],
+    message: impl Into<String>,
+) -> ApplyPatchOutput {
+    let message = message.into();
+    let files = sections
+        .iter()
+        .zip(paths.iter())
+        .map(|(section, path)| ApplyPatchFileOutput {
+            path: path.display().to_string(),
+            status: ApplyPatchFileStatus::Rejected,
+            hunks_applied: 0,
+            before: None,
+            after: None,
+            before_hash: None,
+            after_hash: None,
+            errors: vec![format!("{}: {message}", section.path)],
+            validation_errors: Vec::new(),
+        })
+        .collect();
+    ApplyPatchOutput { files }
+}
 /// Service for patching files with snapshot coordination
 ///
 /// This service coordinates between infrastructure (file I/O) and repository
@@ -593,13 +892,162 @@ impl<
             content_hash,
         })
     }
+
+    async fn apply_patch(&self, patch: String) -> anyhow::Result<ApplyPatchOutput> {
+        let sections = parse_apply_patch(&patch)?;
+        let cwd = self.infra.get_environment().cwd;
+        let mut paths = Vec::new();
+        for section in &sections {
+            let path = normalize_apply_patch_target(&section.path, cwd.as_path())?;
+            assert_absolute_path(path.as_path())?;
+            paths.push(path);
+        }
+
+        if sections
+            .iter()
+            .any(|section| matches!(section.operation, ApplyPatchOperation::Delete))
+        {
+            return Ok(rejected_apply_patch_output(
+                &sections,
+                &paths,
+                "Delete File is parsed but not supported by this safe first slice",
+            ));
+        }
+
+        let mut planned = Vec::new();
+        for (section, path) in sections.iter().cloned().zip(paths.iter().cloned()) {
+            match section.operation {
+                ApplyPatchOperation::Update => {
+                    ensure_target_inside_workspace(path.as_path(), cwd.as_path(), true)?;
+                    let before = match fs::read_to_string(path.as_path()).await {
+                        Ok(content) => content,
+                        Err(error) => {
+                            return Ok(rejected_apply_patch_output(
+                                &sections,
+                                &paths,
+                                format!("Failed to read update target: {error}"),
+                            ));
+                        }
+                    };
+                    let (after, hunks_applied) = match apply_update_lines(&before, &section.lines) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            return Ok(rejected_apply_patch_output(
+                                &sections,
+                                &paths,
+                                error.to_string(),
+                            ));
+                        }
+                    };
+                    planned.push(PlannedApplyPatchFile {
+                        section,
+                        absolute_path: path,
+                        before: Some(before),
+                        after: Some(after),
+                        hunks_applied,
+                    });
+                }
+                ApplyPatchOperation::Add => {
+                    ensure_target_inside_workspace(path.as_path(), cwd.as_path(), false)?;
+                    let parent = path.parent().ok_or_else(|| {
+                        anyhow::anyhow!("Add File target has no parent: {}", path.display())
+                    })?;
+                    if !parent.exists() {
+                        return Ok(rejected_apply_patch_output(
+                            &sections,
+                            &paths,
+                            format!("Add File parent does not exist: {}", parent.display()),
+                        ));
+                    }
+                    if path.exists() {
+                        return Ok(rejected_apply_patch_output(
+                            &sections,
+                            &paths,
+                            format!("Add File target already exists: {}", path.display()),
+                        ));
+                    }
+                    let after = match parse_add_file_content(&section.lines) {
+                        Ok(content) => content,
+                        Err(error) => {
+                            return Ok(rejected_apply_patch_output(
+                                &sections,
+                                &paths,
+                                error.to_string(),
+                            ));
+                        }
+                    };
+                    planned.push(PlannedApplyPatchFile {
+                        section,
+                        absolute_path: path,
+                        before: None,
+                        after: Some(after),
+                        hunks_applied: 0,
+                    });
+                }
+                ApplyPatchOperation::Delete => unreachable!("delete was rejected before planning"),
+            }
+        }
+
+        for file in &planned {
+            if file.before.is_some() {
+                self.infra
+                    .insert_snapshot(file.absolute_path.as_path())
+                    .await?;
+            }
+        }
+
+        for file in &planned {
+            let after = file.after.as_deref().unwrap_or_default();
+            self.infra
+                .write(file.absolute_path.as_path(), Bytes::from(after.to_string()))
+                .await?;
+        }
+
+        let mut files = Vec::new();
+        for file in planned {
+            let after = file.after.unwrap_or_default();
+            let validation_errors = self
+                .infra
+                .validate_file(file.absolute_path.as_path(), &after)
+                .await
+                .unwrap_or_default();
+            let before_hash = file.before.as_ref().map(|content| compute_hash(content));
+            let after_hash = compute_hash(&after);
+            let status = match file.section.operation {
+                ApplyPatchOperation::Update => ApplyPatchFileStatus::Updated,
+                ApplyPatchOperation::Add => ApplyPatchFileStatus::Created,
+                ApplyPatchOperation::Delete => ApplyPatchFileStatus::Rejected,
+            };
+            files.push(ApplyPatchFileOutput {
+                path: file.absolute_path.display().to_string(),
+                status,
+                hunks_applied: file.hunks_applied,
+                before: file.before,
+                after: Some(after),
+                before_hash,
+                after_hash: Some(after_hash),
+                errors: Vec::new(),
+                validation_errors,
+            });
+        }
+
+        Ok(ApplyPatchOutput { files })
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use bytes::Bytes;
     use forge_app::domain::PatchOperation;
-    use forge_domain::{SearchMatch, TextPatchBlock};
+    use forge_app::{ApplyPatchFileStatus, EnvironmentInfra, FileWriterInfra, FsPatchService};
+    use forge_config::ForgeConfig;
+    use forge_domain::{Environment, SearchMatch, Snapshot, TextPatchBlock};
     use pretty_assertions::assert_eq;
+
+    use super::{ForgeFsPatch, lexical_normalized_path_key, parse_apply_patch};
 
     struct StubTextPatchRepository;
 
@@ -755,6 +1203,287 @@ mod tests {
             };
             Ok(actual)
         }
+    }
+
+    #[derive(Clone)]
+    struct ApplyPatchTestInfra {
+        cwd: PathBuf,
+    }
+
+    impl ApplyPatchTestInfra {
+        fn new(cwd: PathBuf) -> Self {
+            Self { cwd }
+        }
+    }
+
+    impl EnvironmentInfra for ApplyPatchTestInfra {
+        type Config = ForgeConfig;
+
+        fn get_env_var(&self, _key: &str) -> Option<String> {
+            None
+        }
+
+        fn get_env_vars(&self) -> std::collections::BTreeMap<String, String> {
+            std::collections::BTreeMap::new()
+        }
+
+        fn get_environment(&self) -> Environment {
+            Environment {
+                os: "linux".to_string(),
+                cwd: self.cwd.clone(),
+                home: None,
+                shell: "/bin/sh".to_string(),
+                base_path: self.cwd.clone(),
+            }
+        }
+
+        fn get_config(&self) -> anyhow::Result<Self::Config> {
+            Ok(ForgeConfig::default())
+        }
+
+        async fn update_environment(
+            &self,
+            _ops: Vec<forge_domain::ConfigOperation>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FileWriterInfra for ApplyPatchTestInfra {
+        async fn write(&self, path: &Path, contents: Bytes) -> anyhow::Result<()> {
+            tokio::fs::write(path, contents).await?;
+            Ok(())
+        }
+
+        async fn append(&self, path: &Path, contents: Bytes) -> anyhow::Result<()> {
+            use tokio::io::AsyncWriteExt;
+
+            let mut file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .await?;
+            file.write_all(&contents).await?;
+            Ok(())
+        }
+
+        async fn write_temp(
+            &self,
+            prefix: &str,
+            ext: &str,
+            content: &str,
+        ) -> anyhow::Result<PathBuf> {
+            let path = self.cwd.join(format!("{prefix}{ext}"));
+            tokio::fs::write(&path, content).await?;
+            Ok(path)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl forge_domain::SnapshotRepository for ApplyPatchTestInfra {
+        async fn insert_snapshot(&self, file_path: &Path) -> anyhow::Result<Snapshot> {
+            Snapshot::create(file_path.to_path_buf())
+        }
+
+        async fn undo_snapshot(&self, _file_path: &Path) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl forge_domain::ValidationRepository for ApplyPatchTestInfra {
+        async fn validate_file(
+            &self,
+            _path: impl AsRef<Path> + Send,
+            _content: &str,
+        ) -> anyhow::Result<Vec<forge_domain::SyntaxError>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl forge_domain::FuzzySearchRepository for ApplyPatchTestInfra {
+        async fn fuzzy_search(
+            &self,
+            _needle: &str,
+            _haystack: &str,
+            _mode: forge_domain::SearchMode,
+        ) -> anyhow::Result<Vec<forge_domain::SearchMatch>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl forge_domain::TextPatchRepository for ApplyPatchTestInfra {
+        async fn build_text_patch(
+            &self,
+            _haystack: &str,
+            _old_string: &str,
+            _new_string: &str,
+        ) -> anyhow::Result<forge_domain::TextPatchBlock> {
+            anyhow::bail!("unused")
+        }
+    }
+
+    fn apply_patch_service(cwd: PathBuf) -> ForgeFsPatch<ApplyPatchTestInfra> {
+        ForgeFsPatch::new(Arc::new(ApplyPatchTestInfra::new(cwd)))
+    }
+
+    fn patch_for(path: &Path, old: &str, new: &str) -> String {
+        format!(
+            "*** Begin Patch\n*** Update File: {}\n- {}\n+ {}\n*** End Patch\n",
+            path.display(),
+            old,
+            new
+        )
+    }
+
+    #[test]
+    fn test_parse_apply_patch_accepts_two_update_sections() {
+        let fixture = "*** Begin Patch\n*** Update File: a.txt\n- a\n+ b\n*** Update File: b.txt\n- c\n+ d\n*** End Patch\n";
+
+        let actual = parse_apply_patch(fixture).unwrap();
+        let expected = 2;
+
+        assert_eq!(actual.len(), expected);
+    }
+
+    #[test]
+    fn test_parse_apply_patch_rejects_malformed_begin_end() {
+        let fixture = "*** Begin\n*** Update File: a.txt\n- a\n+ b\n*** End Patch\n";
+
+        let actual = parse_apply_patch(fixture);
+
+        assert!(actual.is_err());
+    }
+
+    #[test]
+    fn test_parse_apply_patch_rejects_unknown_operation() {
+        let fixture = "*** Begin Patch\n*** Move File: a.txt\n*** End Patch\n";
+
+        let actual = parse_apply_patch(fixture);
+
+        assert!(actual.is_err());
+    }
+
+    #[test]
+    fn test_parse_apply_patch_rejects_duplicate_target() {
+        let fixture = "*** Begin Patch\n*** Update File: a.txt\n- a\n+ b\n*** Update File: ./a.txt\n- c\n+ d\n*** End Patch\n";
+
+        let actual = parse_apply_patch(fixture);
+
+        assert!(actual.is_err());
+    }
+
+    #[test]
+    fn test_apply_patch_rejects_path_traversal() {
+        let fixture = "../outside.txt";
+
+        let actual = lexical_normalized_path_key(fixture);
+
+        assert!(actual.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_second_file_hunk_mismatch_leaves_first_file_unchanged() {
+        let fixture = tempfile::tempdir().unwrap();
+        let first = fixture.path().join("first.txt");
+        let second = fixture.path().join("second.txt");
+        tokio::fs::write(&first, "alpha\n").await.unwrap();
+        tokio::fs::write(&second, "beta\n").await.unwrap();
+        let service = apply_patch_service(fixture.path().to_path_buf());
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {}\n- alpha\n+ changed\n*** Update File: {}\n- missing\n+ changed\n*** End Patch\n",
+            first.display(),
+            second.display()
+        );
+
+        let actual = service.apply_patch(patch).await.unwrap();
+        let expected_content = "alpha\n";
+
+        assert_eq!(
+            tokio::fs::read_to_string(&first).await.unwrap(),
+            expected_content
+        );
+        assert_eq!(actual.files[0].status, ApplyPatchFileStatus::Rejected);
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_add_file_success_and_collision_failure() {
+        let fixture = tempfile::tempdir().unwrap();
+        let target = fixture.path().join("new.txt");
+        let service = apply_patch_service(fixture.path().to_path_buf());
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: {}\n+ hello\n*** End Patch\n",
+            target.display()
+        );
+
+        let actual = service.apply_patch(patch.clone()).await.unwrap();
+        let expected = "hello\n";
+
+        assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), expected);
+        assert_eq!(actual.files[0].status, ApplyPatchFileStatus::Created);
+
+        let actual = service.apply_patch(patch).await.unwrap();
+        assert_eq!(actual.files[0].status, ApplyPatchFileStatus::Rejected);
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_delete_fails_closed() {
+        let fixture = tempfile::tempdir().unwrap();
+        let target = fixture.path().join("delete.txt");
+        tokio::fs::write(&target, "delete me\n").await.unwrap();
+        let service = apply_patch_service(fixture.path().to_path_buf());
+        let patch = format!(
+            "*** Begin Patch\n*** Delete File: {}\n*** End Patch\n",
+            target.display()
+        );
+
+        let actual = service.apply_patch(patch).await.unwrap();
+        let expected = "delete me\n";
+
+        assert_eq!(actual.files[0].status, ApplyPatchFileStatus::Rejected);
+        assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_output_includes_every_touched_file() {
+        let fixture = tempfile::tempdir().unwrap();
+        let first = fixture.path().join("first.txt");
+        let second = fixture.path().join("second.txt");
+        tokio::fs::write(&first, "alpha\n").await.unwrap();
+        tokio::fs::write(&second, "beta\n").await.unwrap();
+        let service = apply_patch_service(fixture.path().to_path_buf());
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {}\n- alpha\n+ one\n*** Update File: {}\n- beta\n+ two\n*** End Patch\n",
+            first.display(),
+            second.display()
+        );
+
+        let actual = service.apply_patch(patch).await.unwrap();
+        let expected = 2;
+
+        assert_eq!(actual.files.len(), expected);
+        assert_eq!(actual.files[0].hunks_applied, 1);
+        assert_eq!(actual.files[1].hunks_applied, 1);
+        assert!(actual.files[0].before_hash.is_some());
+        assert!(actual.files[1].after_hash.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_has_no_fuzzy_fallback_on_near_match() {
+        let fixture = tempfile::tempdir().unwrap();
+        let target = fixture.path().join("file.txt");
+        tokio::fs::write(&target, "alpha\n").await.unwrap();
+        let service = apply_patch_service(fixture.path().to_path_buf());
+        let patch = patch_for(&target, "alphaa", "changed");
+
+        let actual = service.apply_patch(patch).await.unwrap();
+        let expected = "alpha\n";
+
+        assert_eq!(actual.files[0].status, ApplyPatchFileStatus::Rejected);
+        assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), expected);
     }
 
     #[test]

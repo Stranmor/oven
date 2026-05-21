@@ -148,6 +148,7 @@ impl FormatContent for ToolCatalog {
                         .into(),
                 )
             }
+            ToolCatalog::ApplyPatch(_) => Some(TitleFormat::debug("Apply Patch").into()),
             ToolCatalog::Undo(input) => {
                 let display_path = display_path_for(&input.path);
                 Some(TitleFormat::debug("Undo").sub_title(display_path).into())

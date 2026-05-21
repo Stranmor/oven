@@ -474,6 +474,98 @@ fn reasoning_content_char_count(text_message: &TextMessage) -> usize {
         })
 }
 
+/// Lifecycle state for a conversation-scoped goal.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalStatus {
+    /// Goal is active and should be considered by the next model turn.
+    Active,
+    /// Goal is retained for the thread but not injected into the next model turn.
+    Paused,
+}
+
+/// Validated objective text for a conversation-scoped goal.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct GoalObjective(String);
+
+impl GoalObjective {
+    /// Creates a non-empty goal objective.
+    ///
+    /// # Arguments
+    /// * `objective` - Goal text supplied by the user.
+    ///
+    /// # Errors
+    /// Returns an error when the objective is empty or whitespace-only.
+    pub fn new(objective: impl Into<String>) -> anyhow::Result<Self> {
+        let objective = objective.into().trim().to_string();
+        if objective.is_empty() {
+            anyhow::bail!("Usage: /goal <objective>. Please provide a non-empty goal.");
+        }
+        Ok(Self(objective))
+    }
+
+    /// Returns the objective text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One conversation-scoped goal persisted in typed state.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Setters)]
+#[setters(into)]
+pub struct ActiveGoal {
+    /// Objective the model should keep in mind for this conversation.
+    pub objective: GoalObjective,
+    /// Current lifecycle state.
+    pub status: GoalStatus,
+}
+
+impl ActiveGoal {
+    /// Creates an active goal from validated objective text.
+    ///
+    /// # Arguments
+    /// * `objective` - Goal objective text.
+    ///
+    /// # Errors
+    /// Returns an error when objective validation fails.
+    pub fn new(objective: impl Into<String>) -> anyhow::Result<Self> {
+        Ok(Self {
+            objective: GoalObjective::new(objective)?,
+            status: GoalStatus::Active,
+        })
+    }
+
+    /// Returns true when the goal should be injected into the next model request.
+    pub fn is_active(&self) -> bool {
+        self.status == GoalStatus::Active
+    }
+
+    /// Pauses the goal while retaining it in conversation state.
+    pub fn pause(&mut self) {
+        self.status = GoalStatus::Paused;
+    }
+
+    /// Resumes the goal for model-context injection.
+    pub fn resume(&mut self) {
+        self.status = GoalStatus::Active;
+    }
+
+    /// Renders this goal as an uncached internal context payload.
+    pub fn render_prompt_xml(&self) -> String {
+        Element::new("conversation_goal")
+            .attr(
+                "status",
+                match self.status {
+                    GoalStatus::Active => "active",
+                    GoalStatus::Paused => "paused",
+                },
+            )
+            .append(Element::new("objective").text(self.objective.as_str()))
+            .render()
+    }
+}
+
 /// Semantic cache partition class for provider prompt-cache translation.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -502,6 +594,8 @@ pub enum TextMessageKind {
     ProjectModelVolatileSidecar,
     /// Project-model context injected as an internal user-scoped payload.
     ProjectModelContext,
+    /// Active goal context injected as an internal user-scoped payload.
+    GoalContext,
     /// Reviewed self-learning context injected as an internal user-scoped payload.
     LearningContext,
     /// Context compaction summary replacing older conversation messages.
@@ -590,6 +684,7 @@ impl TextMessage {
                     | TextMessageKind::StableProjectModelContext
                     | TextMessageKind::ProjectModelVolatileSidecar
                     | TextMessageKind::ProjectModelContext
+                    | TextMessageKind::GoalContext
                     | TextMessageKind::LearningContext
                     | TextMessageKind::CompactionSummary
             )
@@ -633,6 +728,20 @@ impl TextMessage {
     pub fn project_model_context(role: Role, content: impl Into<String>) -> Self {
         Self::new(role, content)
             .kind(TextMessageKind::ProjectModelContext)
+            .droppable(true)
+            .cacheable(false)
+            .cache_class(MessageCacheClass::Uncached)
+    }
+
+    /// Returns whether this message is an active goal context payload.
+    pub fn is_goal_context(&self) -> bool {
+        self.kind == Some(TextMessageKind::GoalContext)
+    }
+
+    /// Marks this message as an uncached active goal context payload.
+    pub fn goal_context(role: Role, content: impl Into<String>) -> Self {
+        Self::new(role, content)
+            .kind(TextMessageKind::GoalContext)
             .droppable(true)
             .cacheable(false)
             .cache_class(MessageCacheClass::Uncached)
@@ -806,6 +915,9 @@ pub struct Context {
     /// output cap for persisted oversized conversations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window_recovery: Option<ContextWindowRecovery>,
+    /// Active conversation-scoped goal persisted independently of chat text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_goal: Option<ActiveGoal>,
     /// Selected model context length carried from resolved provider metadata
     /// for final provider-side request guards. This is runtime safety
     /// metadata, not a provider payload field.
@@ -899,6 +1011,21 @@ impl Context {
             .iter()
             .find(|message| message.has_role(Role::System))
             .and_then(|msg| msg.content())
+    }
+
+    /// Sets or replaces the conversation goal.
+    ///
+    /// # Arguments
+    /// * `goal` - Goal to persist for the conversation.
+    pub fn set_active_goal(mut self, goal: ActiveGoal) -> Self {
+        self.active_goal = Some(goal);
+        self
+    }
+
+    /// Clears the persisted conversation goal.
+    pub fn clear_active_goal(mut self) -> Self {
+        self.active_goal = None;
+        self
     }
 
     pub fn add_base64_url(mut self, image: Image) -> Self {
@@ -1295,6 +1422,30 @@ mod tests {
 
     fn assistant_message(content: impl Into<String>) -> MessageEntry {
         ContextMessage::assistant(content.into(), None, None, None).into()
+    }
+
+    #[test]
+    fn test_active_goal_rejects_empty_objective() {
+        let actual = ActiveGoal::new(" \t\n ").is_err();
+        let expected = true;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_active_goal_renders_escaped_prompt_xml() {
+        let fixture = ActiveGoal::new("ship <safe> & typed goal").unwrap();
+        let actual = fixture.render_prompt_xml();
+        let expected = "<conversation_goal status=\"active\"><objective>ship &lt;safe&gt; &amp; typed goal</objective></conversation_goal>";
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_context_active_goal_lifecycle_helpers() {
+        let goal = ActiveGoal::new("finish goal slice").unwrap();
+        let setup = Context::default().set_active_goal(goal);
+        let actual = setup.clear_active_goal().active_goal;
+        let expected = None;
+        assert_eq!(actual, expected);
     }
 
     #[test]

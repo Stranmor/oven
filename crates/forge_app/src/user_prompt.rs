@@ -44,6 +44,7 @@ impl<S: AttachmentService + EnvironmentInfra<Config = forge_config::ForgeConfig>
 
         let (conversation, content) = self.add_rendered_message(conversation).await?;
         let conversation = self.add_runtime_context(conversation);
+        let conversation = self.add_goal_context(conversation);
         let conversation = if is_resume {
             self.add_todos_on_resume(conversation)?
         } else {
@@ -79,6 +80,24 @@ impl<S: AttachmentService + EnvironmentInfra<Config = forge_config::ForgeConfig>
 
     fn is_stale_runtime_context_message(message: &MessageEntry) -> bool {
         matches!(&message.message, ContextMessage::Text(text) if text.is_runtime_context())
+    }
+
+    /// Adds an active thread goal from typed conversation state.
+    fn add_goal_context(&self, mut conversation: Conversation) -> Conversation {
+        let mut context = conversation.context.take().unwrap_or_default();
+        context
+            .messages
+            .retain(|message| !Self::is_stale_goal_context_message(message));
+        if let Some(goal) = context.active_goal.clone().filter(ActiveGoal::is_active) {
+            let message = TextMessage::goal_context(Role::User, goal.render_prompt_xml())
+                .model(self.agent.model.clone());
+            context = context.add_message(ContextMessage::Text(message));
+        }
+        conversation.context(context)
+    }
+
+    fn is_stale_goal_context_message(message: &MessageEntry) -> bool {
+        matches!(&message.message, ContextMessage::Text(text) if text.is_goal_context())
     }
 
     /// Adds existing todos as a user message when resuming a conversation
@@ -507,6 +526,51 @@ mod tests {
         ));
         assert_eq!(runtime_message.is_cache_eligible(), false);
         assert_eq!(runtime_message.is_droppable(), false);
+    }
+
+    #[tokio::test]
+    async fn test_active_goal_is_injected_from_typed_state() {
+        let agent = fixture_agent_without_user_prompt();
+        let event = Event::new("First task");
+        let conversation = fixture_conversation().context(
+            Context::default().set_active_goal(ActiveGoal::new("finish the slice").unwrap()),
+        );
+        let generator = fixture_generator(agent.clone(), event);
+
+        let actual = generator.add_user_prompt(conversation).await.unwrap();
+
+        let messages = actual.context.unwrap().messages;
+        let goal_message = messages
+            .iter()
+            .find(|message| {
+                matches!(&message.message, ContextMessage::Text(text) if text.is_goal_context())
+            })
+            .expect("goal context should be injected");
+        let actual = goal_message.content().unwrap();
+        let expected = "<conversation_goal status=\"active\"><objective>finish the slice</objective></conversation_goal>";
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_paused_goal_is_persisted_but_not_injected() {
+        let agent = fixture_agent_without_user_prompt();
+        let event = Event::new("First task");
+        let mut goal = ActiveGoal::new("finish the slice").unwrap();
+        goal.pause();
+        let conversation = fixture_conversation().context(Context::default().set_active_goal(goal));
+        let generator = fixture_generator(agent.clone(), event);
+
+        let actual = generator.add_user_prompt(conversation).await.unwrap();
+
+        let context = actual.context.unwrap();
+        let actual = (
+            context.active_goal.is_some(),
+            context.messages.iter().any(|message| {
+                matches!(&message.message, ContextMessage::Text(text) if text.is_goal_context())
+            }),
+        );
+        let expected = (true, false);
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]

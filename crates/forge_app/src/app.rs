@@ -2887,6 +2887,10 @@ mod tests {
                 ) -> Result<crate::PatchOutput> {
                     anyhow::bail!("unused fs multi patch")
                 }
+
+                async fn apply_patch(&self, _patch: String) -> Result<crate::ApplyPatchOutput> {
+                    anyhow::bail!("unused apply patch")
+                }
             }
 
             #[async_trait::async_trait]

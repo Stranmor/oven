@@ -103,6 +103,7 @@ mod tests {
                 })
                 .map(|msg| msg.into())
                 .collect(),
+            active_goal: None,
             tools: vec![],
             tool_choice: None,
             max_tokens: None,

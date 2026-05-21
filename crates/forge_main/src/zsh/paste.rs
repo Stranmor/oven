@@ -109,6 +109,14 @@ mod tests {
     }
 
     #[test]
+    fn test_wrap_pasted_text_does_not_wrap_plain_text_in_xml() {
+        let fixture = "Implement /goal without changing paste semantics";
+        let actual = wrap_pasted_text(fixture);
+        let expected = "Implement /goal without changing paste semantics";
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn test_wrap_pasted_text_cyrillic_no_crash() {
         let fixture = "Проверь ПОЛНОСТЬЮ этот проект на соответствие КАЖДОГО пункта функционала исходному тексту задачи";
         let actual = wrap_pasted_text(fixture);

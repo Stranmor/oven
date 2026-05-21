@@ -1288,6 +1288,9 @@ mod tests {
         async fn multi_patch(&self, _path: String, _edits: Vec<PatchEdit>) -> Result<PatchOutput> {
             anyhow::bail!("unused patch service")
         }
+        async fn apply_patch(&self, _patch: String) -> Result<forge_app::ApplyPatchOutput> {
+            anyhow::bail!("unused patch service")
+        }
     }
     #[async_trait::async_trait]
     impl FsReadService for NoopService {

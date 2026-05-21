@@ -76,6 +76,49 @@ pub struct PatchOutput {
     pub content_hash: String,
 }
 
+/// Per-file execution status for the `apply_patch` tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyPatchFileStatus {
+    /// Existing file content was updated.
+    Updated,
+    /// New file was created.
+    Created,
+    /// File operation was rejected during preflight and no write was attempted.
+    Rejected,
+    /// File operation failed during execution after preflight.
+    Failed,
+}
+
+/// Per-file result produced by the `apply_patch` tool.
+#[derive(Debug, Clone)]
+pub struct ApplyPatchFileOutput {
+    /// Absolute path targeted by this file operation.
+    pub path: String,
+    /// Final status for this file operation.
+    pub status: ApplyPatchFileStatus,
+    /// Number of exact update hunks applied for this file.
+    pub hunks_applied: usize,
+    /// File content before the operation when available.
+    pub before: Option<String>,
+    /// File content after the operation when available.
+    pub after: Option<String>,
+    /// Stable hash of the content before the operation when available.
+    pub before_hash: Option<String>,
+    /// Stable hash of the content after the operation when available.
+    pub after_hash: Option<String>,
+    /// Preflight or execution errors associated with this file.
+    pub errors: Vec<String>,
+    /// Syntax validation errors reported for the resulting file content.
+    pub validation_errors: Vec<SyntaxError>,
+}
+
+/// Structured output produced by the `apply_patch` tool.
+#[derive(Debug, Clone)]
+pub struct ApplyPatchOutput {
+    /// Per-file results for every parsed target in the patch.
+    pub files: Vec<ApplyPatchFileOutput>,
+}
+
 #[derive(Debug, Setters)]
 #[setters(into)]
 pub struct ReadOutput {
@@ -911,6 +954,9 @@ pub trait FsPatchService: Send + Sync {
         path: String,
         edits: Vec<forge_domain::PatchEdit>,
     ) -> anyhow::Result<PatchOutput>;
+
+    /// Applies a coordinated multi-file textual patch with all-or-none preflight.
+    async fn apply_patch(&self, patch: String) -> anyhow::Result<ApplyPatchOutput>;
 }
 
 #[async_trait::async_trait]
@@ -1612,6 +1658,10 @@ impl<I: Services> FsPatchService for I {
         edits: Vec<forge_domain::PatchEdit>,
     ) -> anyhow::Result<PatchOutput> {
         self.fs_patch_service().multi_patch(path, edits).await
+    }
+
+    async fn apply_patch(&self, patch: String) -> anyhow::Result<ApplyPatchOutput> {
+        self.fs_patch_service().apply_patch(patch).await
     }
 }
 
@@ -2578,6 +2628,10 @@ mod tests {
             _path: String,
             _edits: Vec<forge_domain::PatchEdit>,
         ) -> anyhow::Result<PatchOutput> {
+            anyhow::bail!("unused patch service")
+        }
+
+        async fn apply_patch(&self, _patch: String) -> anyhow::Result<ApplyPatchOutput> {
             anyhow::bail!("unused patch service")
         }
     }

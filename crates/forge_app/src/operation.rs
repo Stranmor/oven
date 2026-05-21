@@ -7,8 +7,8 @@ use derive_setters::Setters;
 use forge_config::ForgeConfig;
 use forge_display::DiffFormat;
 use forge_domain::{
-    CodebaseSearchResults, Environment, FSMultiPatch, FSPatch, FSRead, FSRemove, FSSearch, FSUndo,
-    FSWrite, FileOperation, LineNumbers, Metrics, NetFetch, PlanCreate, ToolKind,
+    CodebaseSearchResults, Environment, FSApplyPatch, FSMultiPatch, FSPatch, FSRead, FSRemove,
+    FSSearch, FSUndo, FSWrite, FileOperation, LineNumbers, Metrics, NetFetch, PlanCreate, ToolKind,
     WorkspaceExactFactReferenceContinuationReport, WorkspaceVectorIndexBuildContinuationReport,
 };
 use forge_template::Element;
@@ -19,9 +19,10 @@ use crate::truncation::{
 };
 use crate::utils::{compute_hash, format_display_path};
 use crate::{
-    FsRemoveOutput, FsUndoOutput, FsWriteOutput, HttpResponse, PatchOutput, PlanCreateOutput,
-    ProcessKillServiceOutput, ProcessOutput, ProcessReadServiceOutput, ProcessStartServiceOutput,
-    ReadOutput, ResponseContext, SearchResult, ShellOutput,
+    ApplyPatchFileStatus, ApplyPatchOutput, FsRemoveOutput, FsUndoOutput, FsWriteOutput,
+    HttpResponse, PatchOutput, PlanCreateOutput, ProcessKillServiceOutput, ProcessOutput,
+    ProcessReadServiceOutput, ProcessStartServiceOutput, ReadOutput, ResponseContext, SearchResult,
+    ShellOutput,
 };
 
 #[derive(Debug, Default, Setters)]
@@ -65,6 +66,10 @@ pub enum ToolOperation {
     FsMultiPatch {
         input: FSMultiPatch,
         output: PatchOutput,
+    },
+    FsApplyPatch {
+        input: FSApplyPatch,
+        output: ApplyPatchOutput,
     },
     FsUndo {
         input: FSUndo,
@@ -543,6 +548,74 @@ impl ToolOperation {
                 );
 
                 forge_domain::ToolOutput::text(elm)
+            }
+            ToolOperation::FsApplyPatch { input: _, output } => {
+                let mut root = Element::new("apply_patch_result").attr("files", output.files.len());
+
+                for file in output.files {
+                    let status = match file.status {
+                        ApplyPatchFileStatus::Updated => "updated",
+                        ApplyPatchFileStatus::Created => "created",
+                        ApplyPatchFileStatus::Rejected => "rejected",
+                        ApplyPatchFileStatus::Failed => "failed",
+                    };
+                    let mut elm = Element::new("file")
+                        .attr("path", &file.path)
+                        .attr("status", status)
+                        .attr("hunks_applied", file.hunks_applied);
+
+                    if let Some(before_hash) = &file.before_hash {
+                        elm = elm.attr("before_hash", before_hash);
+                    }
+                    if let Some(after_hash) = &file.after_hash {
+                        elm = elm.attr("after_hash", after_hash);
+                    }
+
+                    if let (Some(before), Some(after)) = (&file.before, &file.after) {
+                        let diff_result = DiffFormat::format(before, after);
+                        let diff = console::strip_ansi_codes(diff_result.diff()).to_string();
+                        elm = elm
+                            .attr("total_lines", after.lines().count())
+                            .append(Element::new("file_diff").cdata(diff));
+                        *metrics = metrics.clone().insert(
+                            file.path.clone(),
+                            FileOperation::new(tool_kind)
+                                .lines_added(diff_result.lines_added())
+                                .lines_removed(diff_result.lines_removed())
+                                .content_hash(file.after_hash.clone()),
+                        );
+                    } else if matches!(file.status, ApplyPatchFileStatus::Created) {
+                        let after = file.after.as_deref().unwrap_or("");
+                        *metrics = metrics.clone().insert(
+                            file.path.clone(),
+                            FileOperation::new(tool_kind)
+                                .lines_added(after.lines().count() as u64)
+                                .content_hash(file.after_hash.clone()),
+                        );
+                        elm = elm.attr("total_lines", after.lines().count());
+                    }
+
+                    if !file.validation_errors.is_empty() {
+                        elm = elm.append(create_validation_warning(
+                            &file.path,
+                            &file.validation_errors,
+                        ));
+                    }
+
+                    if !file.errors.is_empty() {
+                        elm = elm.append(
+                            Element::new("errors").append(
+                                file.errors
+                                    .iter()
+                                    .map(|error| Element::new("error").cdata(error)),
+                            ),
+                        );
+                    }
+
+                    root = root.append(elm);
+                }
+
+                forge_domain::ToolOutput::text(root)
             }
             ToolOperation::FsUndo { input, output } => {
                 // Diff between snapshot state (after_undo) and modified state
@@ -2315,6 +2388,44 @@ mod tests {
             &mut multi_patch_metrics,
         );
 
+        let mut apply_patch_metrics = Metrics::default();
+        let apply_patch_fixture = ToolOperation::FsApplyPatch {
+            input: forge_domain::FSApplyPatch { patch: "*** Begin Patch\n*** Update File: /home/user/apply_one.txt\n- red\n+ yellow\n*** Add File: /home/user/apply_two.txt\n+ created\n*** End Patch\n".to_string() },
+            output: ApplyPatchOutput {
+                files: vec![
+                    crate::ApplyPatchFileOutput {
+                        path: "/home/user/apply_one.txt".to_string(),
+                        status: ApplyPatchFileStatus::Updated,
+                        hunks_applied: 1,
+                        before: Some("let color = red;\n".to_string()),
+                        after: Some("let color = yellow;\n".to_string()),
+                        before_hash: Some(compute_hash("let color = red;\n")),
+                        after_hash: Some(compute_hash("let color = yellow;\n")),
+                        errors: vec![],
+                        validation_errors: vec![],
+                    },
+                    crate::ApplyPatchFileOutput {
+                        path: "/home/user/apply_two.txt".to_string(),
+                        status: ApplyPatchFileStatus::Created,
+                        hunks_applied: 0,
+                        before: None,
+                        after: Some("created\n".to_string()),
+                        before_hash: None,
+                        after_hash: Some(compute_hash("created\n")),
+                        errors: vec![],
+                        validation_errors: vec![],
+                    },
+                ],
+            },
+        };
+        let apply_patch_output = apply_patch_fixture.into_tool_output(
+            ToolKind::ApplyPatch,
+            TempContentFiles::default(),
+            &env,
+            &config,
+            &mut apply_patch_metrics,
+        );
+
         let write_operation = write_metrics
             .file_operations
             .get("/home/user/write.txt")
@@ -2327,6 +2438,14 @@ mod tests {
             .file_operations
             .get("/home/user/multi_patch.txt")
             .expect("multi-patch metrics should be recorded");
+        let apply_patch_update_operation = apply_patch_metrics
+            .file_operations
+            .get("/home/user/apply_one.txt")
+            .expect("apply-patch update metrics should be recorded");
+        let apply_patch_add_operation = apply_patch_metrics
+            .file_operations
+            .get("/home/user/apply_two.txt")
+            .expect("apply-patch add metrics should be recorded");
 
         assert_eq!(write_operation.lines_added, 1);
         assert_eq!(write_operation.lines_removed, 1);
@@ -2334,8 +2453,17 @@ mod tests {
         assert_eq!(patch_operation.lines_removed, 1);
         assert_eq!(multi_patch_operation.lines_added, 1);
         assert_eq!(multi_patch_operation.lines_removed, 1);
+        assert_eq!(apply_patch_update_operation.lines_added, 1);
+        assert_eq!(apply_patch_update_operation.lines_removed, 1);
+        assert_eq!(apply_patch_add_operation.lines_added, 1);
+        assert_eq!(apply_patch_add_operation.lines_removed, 0);
 
-        for actual in [write_output, patch_output, multi_patch_output] {
+        for actual in [
+            write_output,
+            patch_output,
+            multi_patch_output,
+            apply_patch_output,
+        ] {
             let actual = to_value(actual);
             assert!(actual.contains("let color = red;"));
             assert!(actual.contains("let color = yellow;"));

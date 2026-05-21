@@ -18,13 +18,13 @@ use forge_app::{CommitResult, ToolResolver};
 use forge_config::ForgeConfig;
 use forge_display::MarkdownFormat;
 use forge_domain::{
-    AuthMethod, ChatResponseContent, ConsoleWriter, ContextMessage, Role, TitleFormat, UserCommand,
-    WorkspaceEvidenceLedgerActivationDiagnostic, WorkspaceEvidenceReadinessDiagnostic,
-    WorkspaceEvidenceReplayPreviewDiagnostic, WorkspaceExactFactReadinessDiagnostic,
-    WorkspaceRetrievalPhaseDiagnostics, WorkspaceRetrievalPhaseInvalidReason,
-    WorkspaceRetrievalPhaseSkipReason, WorkspaceRetrievalPhaseStatus,
-    WorkspaceRetrievalPhaseUnavailableReason, WorkspaceRetrievalPlanDiagnostic,
-    WorkspaceSemanticReadinessDiagnostic,
+    ActiveGoal, AuthMethod, ChatResponseContent, ConsoleWriter, ContextMessage, GoalStatus, Role,
+    TitleFormat, UserCommand, WorkspaceEvidenceLedgerActivationDiagnostic,
+    WorkspaceEvidenceReadinessDiagnostic, WorkspaceEvidenceReplayPreviewDiagnostic,
+    WorkspaceExactFactReadinessDiagnostic, WorkspaceRetrievalPhaseDiagnostics,
+    WorkspaceRetrievalPhaseInvalidReason, WorkspaceRetrievalPhaseSkipReason,
+    WorkspaceRetrievalPhaseStatus, WorkspaceRetrievalPhaseUnavailableReason,
+    WorkspaceRetrievalPlanDiagnostic, WorkspaceSemanticReadinessDiagnostic,
 };
 use forge_fs::ForgeFS;
 use forge_select::{ForgeWidget, SelectRow};
@@ -76,6 +76,28 @@ fn mark_internal_agent_session_if_requested(
 fn mark_background_session_if_requested(conversation: &mut Conversation, background_session: bool) {
     if background_session {
         conversation.mark_background();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GoalSlashAction {
+    Set(String),
+    View,
+    Pause,
+    Resume,
+    Clear,
+}
+
+impl GoalSlashAction {
+    fn from_args(args: Vec<String>) -> Self {
+        let first = args.first().map(String::as_str);
+        match first {
+            None | Some("") | Some("view") => Self::View,
+            Some("pause") => Self::Pause,
+            Some("resume") => Self::Resume,
+            Some("clear") => Self::Clear,
+            Some(_) => Self::Set(args.join(" ").trim().to_string()),
+        }
     }
 }
 
@@ -2804,6 +2826,9 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             AppCommand::Skill => {
                 self.on_show_skills(false, false).await?;
             }
+            AppCommand::Goal { args } => {
+                self.on_goal(args).await?;
+            }
             AppCommand::Edit { content } => {
                 let initial = if content.is_empty() {
                     None
@@ -2900,6 +2925,75 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             "Conversation renamed to '{}'",
             name.bold()
         )))?;
+        Ok(())
+    }
+
+    async fn on_goal(&mut self, args: Vec<String>) -> anyhow::Result<()> {
+        let action = GoalSlashAction::from_args(args);
+        let conversation_id = self.init_conversation().await?;
+        let mut conversation = self
+            .api
+            .conversation(&conversation_id)
+            .await?
+            .ok_or_else(|| forge_domain::Error::ConversationNotFound(conversation_id))?;
+        let mut context = conversation.context.take().unwrap_or_default();
+
+        match action {
+            GoalSlashAction::View => {
+                self.write_goal_status(context.active_goal.as_ref())?;
+            }
+            GoalSlashAction::Set(objective) => {
+                let goal = ActiveGoal::new(objective)?;
+                context = context.set_active_goal(goal);
+                conversation.context = Some(context.clone());
+                self.api.upsert_conversation(conversation).await?;
+                self.write_goal_status(context.active_goal.as_ref())?;
+            }
+            GoalSlashAction::Pause => {
+                if let Some(goal) = context.active_goal.as_mut() {
+                    goal.pause();
+                    conversation.context = Some(context.clone());
+                    self.api.upsert_conversation(conversation).await?;
+                }
+                self.write_goal_status(context.active_goal.as_ref())?;
+            }
+            GoalSlashAction::Resume => {
+                if let Some(goal) = context.active_goal.as_mut() {
+                    goal.resume();
+                    conversation.context = Some(context.clone());
+                    self.api.upsert_conversation(conversation).await?;
+                }
+                self.write_goal_status(context.active_goal.as_ref())?;
+            }
+            GoalSlashAction::Clear => {
+                context = context.clear_active_goal();
+                conversation.context = Some(context);
+                self.api.upsert_conversation(conversation).await?;
+                self.writeln_title(TitleFormat::info("Goal cleared"))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn write_goal_status(&mut self, goal: Option<&ActiveGoal>) -> anyhow::Result<()> {
+        match goal {
+            Some(goal) => {
+                let status = match goal.status {
+                    GoalStatus::Active => "active",
+                    GoalStatus::Paused => "paused",
+                };
+                self.writeln_title(TitleFormat::info(format!(
+                    "Goal ({status}): {}",
+                    goal.objective.as_str().bold()
+                )))?;
+            }
+            None => {
+                self.writeln_title(TitleFormat::info(
+                    "No active goal. Use /goal <objective> to set one.",
+                ))?;
+            }
+        }
         Ok(())
     }
 

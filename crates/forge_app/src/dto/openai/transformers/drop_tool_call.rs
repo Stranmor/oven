@@ -63,6 +63,7 @@ mod tests {
                 .into(),
                 ContextMessage::Tool(tool_result).into(),
             ],
+            active_goal: None,
             tools: vec![forge_domain::ToolDefinition::new("test_tool").description("A test tool")],
             tool_choice: None,
             max_tokens: None,

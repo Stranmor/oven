@@ -31,6 +31,19 @@ impl FormatContent for ToolOperation {
                         .to_string(),
                 ))
             }
+            ToolOperation::FsApplyPatch { input, output } => {
+                let summary = output
+                    .files
+                    .iter()
+                    .map(|file| format!("{}: {:?}", file.path, file.status))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Some(ChatResponseContent::ToolOutput(format!(
+                    "patch_lines: {}\n{}",
+                    input.patch.lines().count(),
+                    summary
+                )))
+            }
             ToolOperation::PlanCreate { input: _, output } => Some({
                 let title = TitleFormat::debug(format!(
                     "Create {}",
